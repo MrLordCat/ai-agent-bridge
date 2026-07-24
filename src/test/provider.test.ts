@@ -1521,6 +1521,31 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.deepEqual(names, ["run_in_terminal", "read_file"]);
         });
 
+        test("convertTools apiDirect keeps runSubagent in the default 70-tool subset", () => {
+            const fillerTools = Array.from({ length: 79 }, (_, index) => ({
+                name: `random_tool_${index}`,
+                description: `Random tool ${index}`,
+                inputSchema: { type: "object", properties: {} },
+            }));
+            const out = convertTools(
+                {
+                    toolMode: vscode.LanguageModelChatToolMode.Auto,
+                    tools: [
+                        ...fillerTools,
+                        { name: "runSubagent", description: "Run a listed agent", inputSchema: { type: "object", properties: {} } },
+                        { name: "run_in_terminal", description: "Terminal", inputSchema: { type: "object", properties: {} } },
+                        { name: "read_file", description: "Read", inputSchema: { type: "object", properties: {} } },
+                        { name: "grep_search", description: "Search", inputSchema: { type: "object", properties: {} } },
+                    ],
+                } satisfies vscode.ProvideLanguageModelChatResponseOptions,
+                { mode: "apiDirect", apiDirectToolTokenBudget: 65536 }
+            );
+
+            const names = (out.tools ?? []).map(t => t.function.name);
+            assert.equal(names.length, 70);
+            assert.ok(names.includes("runSubagent"));
+        });
+
         test("convertTools apiDirect compacts schema metadata", () => {
             const out = convertTools(
                 {
@@ -1700,8 +1725,8 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.equal((out.tools ?? []).length, 3);
         });
 
-		test("convertTools apiDirect subset never expands past the efficient default", () => {
-			const tools = Array.from({ length: 70 }, (_, index) => ({
+        test("convertTools apiDirect subset never expands past the prioritized default", () => {
+            const tools = Array.from({ length: 83 }, (_, index) => ({
 				name: `tool_${index}`,
 				description: "Utility tool",
 				inputSchema: { type: "object", properties: {} },
@@ -1711,7 +1736,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 				{ mode: "apiDirect", apiDirectIncludeAllTools: false, apiDirectMaxTools: 128 }
 			);
 
-			assert.equal((out.tools ?? []).length, 48);
+            assert.equal((out.tools ?? []).length, 70);
 		});
 
 		test("convertTools apiDirect respects the approximate schema token budget", () => {

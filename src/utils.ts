@@ -600,6 +600,10 @@ export function convertTools(
 			terminal_last_command: 100,
 			terminal_selection: 96,
 			llamacpp_delete_memory: 92,
+			runSubagent: 170,
+			executeSubagent: 168,
+			exploreSubagent: 166,
+			terminate: 164,
 		};
 		return directPriority[name] ?? 0;
 	};
@@ -666,7 +670,7 @@ export function convertTools(
 
 		const countLimit = apiDirectIncludeAllTools
 			? apiDirectMaxTools
-			: Math.min(apiDirectMaxTools, 48);
+			: Math.min(apiDirectMaxTools, 70);
 		return stableTools.slice(0, countLimit);
 	})();
 

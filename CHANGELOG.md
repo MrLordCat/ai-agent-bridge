@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.32 - 2026-07-24
+
+- Raised the default prioritized `apiDirect` tool subset from 48 to 70 so the
+  current VS Code tool catalog can retain native subagent delegation tools.
+- Assigned explicit priority to `runSubagent` and related delegation tools so
+  they remain available even when a larger catalog must still be truncated.
+- Added regression coverage for an 83-tool catalog: the request keeps exactly
+  70 prioritized tools and includes `runSubagent`.
+
 ## 1.5.31 - 2026-07-24
 
 - Added global custom agents for all available model tiers: Qwen 3.6 27B

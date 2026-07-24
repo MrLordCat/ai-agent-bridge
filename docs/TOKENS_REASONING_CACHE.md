@@ -147,7 +147,7 @@ Quality-oriented local coding:
   "llamacpp.accurateTokenCounting": true,
   "llamacpp.cachePrompt": true,
   "llamacpp.toolCallingMode": "apiDirect",
-  "llamacpp.apiDirectMaxTools": 48,
+  "llamacpp.apiDirectMaxTools": 70,
   "llamacpp.apiDirectToolTokenBudget": 12000,
   "llamacpp.apiDirectIncludeAllTools": false
 }

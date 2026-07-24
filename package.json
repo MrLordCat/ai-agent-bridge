@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
 	},
-	"version": "1.5.31",
+	"version": "1.5.32",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -457,7 +457,7 @@
 				},
 				"llamacpp.apiDirectMaxTools": {
 					"type": "number",
-					"default": 48,
+					"default": 70,
 					"minimum": 1,
 					"maximum": 128,
 					"description": "Maximum number of prioritized tools included when toolCallingMode=apiDirect."

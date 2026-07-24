@@ -754,7 +754,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			await config.update("maxOutputTokensCap", DEEPSEEK_MAX_OUTPUT_TOKENS, vscode.ConfigurationTarget.Global);
 			await config.update("thinkingMode", "deep", vscode.ConfigurationTarget.Global);
 			await config.update("toolCallingMode", "apiDirect", vscode.ConfigurationTarget.Global);
-			await config.update("apiDirectMaxTools", 48, vscode.ConfigurationTarget.Global);
+			await config.update("apiDirectMaxTools", 70, vscode.ConfigurationTarget.Global);
 			await config.update("apiDirectIncludeAllTools", false, vscode.ConfigurationTarget.Global);
 			await config.update("apiDirectToolTokenBudget", 12000, vscode.ConfigurationTarget.Global);
 			await config.update("deepSeekDefaultMaxOutputTokens", 65536, vscode.ConfigurationTarget.Global);

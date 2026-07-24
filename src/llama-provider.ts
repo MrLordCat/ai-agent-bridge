@@ -1886,7 +1886,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             && cfg.get<boolean>("preserveThinking", true) !== false;
         const toolResultModeConfig = this.normalizeToolResultMode(cfg.get("toolResultMode", "auto"));
         const toolCallingModeConfig = this.normalizeToolCallingMode(cfg.get("toolCallingMode", "apiDirect"));
-        const apiDirectMaxTools = this.clampInt(cfg.get("apiDirectMaxTools", 48), 1, 128, 48);
+        const apiDirectMaxTools = this.clampInt(cfg.get("apiDirectMaxTools", 70), 1, 128, 70);
         const apiDirectIncludeAllTools = cfg.get<boolean>("apiDirectIncludeAllTools", false) === true;
         const apiDirectToolTokenBudget = this.clampInt(cfg.get("apiDirectToolTokenBudget", 12000), 256, 65536, 12000);
         const knowledgeMode = normalizeKnowledgeMode(cfg.get("knowledgeMode", "adaptive"));
