@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import type { RequestCancellation } from "../transport/openai-http";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
 
-export interface ServerTokenCountInput {
+interface ServerTokenCountInput {
 	serverUrl: string;
 	model: string;
 	headers: Record<string, string>;
@@ -13,7 +13,7 @@ export interface ServerTokenCountInput {
 	cancellation: RequestCancellation;
 }
 
-export type TokenCounterRequest = (
+type TokenCounterRequest = (
 	url: string,
 	init: RequestInit,
 	timeoutMs: number,

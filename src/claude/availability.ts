@@ -25,7 +25,7 @@ function normalizeBucket(value: string): string {
 }
 
 function familyForModel(modelId: string): string | undefined {
-	return ["haiku", "sonnet", "opus", "fable"].find(family => modelId.toLowerCase().includes(family));
+	return modelId.toLowerCase().includes("opus") ? "opus" : undefined;
 }
 
 function parseReset(value: string | null | undefined): number | undefined {
@@ -46,7 +46,7 @@ export function buildClaudeModelAvailability(
 ): ClaudeModelAvailability {
 	if (
 		rateLimit
-		&& rateLimit.status !== "allowed"
+		&& rateLimit.status === "rejected"
 		&& rateLimitCheckedAt !== undefined
 		&& now - rateLimitCheckedAt <= CLAUDE_AVAILABILITY_MAX_AGE_MS
 	) {
@@ -108,14 +108,12 @@ export function buildClaudeModelAvailability(
 	const family = familyForModel(modelId);
 	if (family === "opus") {
 		addWindow("weekly Opus", limits.seven_day_opus);
-	} else if (family === "sonnet") {
-		addWindow("weekly Sonnet", limits.seven_day_sonnet);
 	}
 
 	if (family) {
 		for (const scoped of limits.model_scoped ?? []) {
 			const bucket = normalizeBucket(scoped.display_name);
-			if (bucket === family) {
+			if (bucket === family || bucket.startsWith(family)) {
 				addWindow(`weekly ${scoped.display_name}`, scoped);
 			}
 		}

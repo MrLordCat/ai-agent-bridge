@@ -1,0 +1,487 @@
+- generic [ref=e2]:
+  - region "Skip to main content":
+    - link "Skip to main content" [ref=e3] [cursor=pointer]:
+      - /url: "#__docusaurus_skipToContent_fallback"
+  - navigation "Main" [ref=e4]:
+    - generic [ref=e5]:
+      - link "DeepSeek API Docs Logo DeepSeek API Docs" [ref=e7] [cursor=pointer]:
+        - /url: /
+        - img "DeepSeek API Docs Logo" [ref=e9]
+        - generic [ref=e10]: DeepSeek API Docs
+      - generic [ref=e11]:
+        - button "English" [ref=e13] [cursor=pointer]
+        - link "DeepSeek Platform" [ref=e16] [cursor=pointer]:
+          - /url: https://platform.deepseek.com/
+        - button "Switch between dark and light mode (currently light mode)" [ref=e20] [cursor=pointer]
+  - generic [ref=e25]:
+    - complementary [ref=e26]:
+      - navigation "Docs sidebar" [ref=e29]:
+        - list [ref=e30]:
+          - listitem [ref=e31]:
+            - link "Quick Start" [expanded] [ref=e33] [cursor=pointer]:
+              - /url: "#"
+            - list [ref=e34]:
+              - listitem [ref=e35]:
+                - link "Your First API Call" [ref=e36] [cursor=pointer]:
+                  - /url: /
+              - listitem [ref=e37]:
+                - link "Models & Pricing" [ref=e38] [cursor=pointer]:
+                  - /url: /quick_start/pricing
+              - listitem [ref=e39]:
+                - link "Token & Token Usage" [ref=e40] [cursor=pointer]:
+                  - /url: /quick_start/token_usage
+              - listitem [ref=e41]:
+                - link "Rate Limit & Isolation" [ref=e42] [cursor=pointer]:
+                  - /url: /quick_start/rate_limit
+              - listitem [ref=e43]:
+                - link "Error Codes" [ref=e44] [cursor=pointer]:
+                  - /url: /quick_start/error_codes
+              - listitem [ref=e45]:
+                - link "Agent Integrations" [ref=e47] [cursor=pointer]:
+                  - /url: "#"
+          - listitem [ref=e48]:
+            - link "API Guides" [expanded] [ref=e50] [cursor=pointer]:
+              - /url: "#"
+            - list [ref=e51]:
+              - listitem [ref=e52]:
+                - link "Thinking Mode" [ref=e53] [cursor=pointer]:
+                  - /url: /guides/thinking_mode
+              - listitem [ref=e54]:
+                - link "Multi-round Conversation" [ref=e55] [cursor=pointer]:
+                  - /url: /guides/multi_round_chat
+              - listitem [ref=e56]:
+                - link "Chat Prefix Completion (Beta)" [ref=e57] [cursor=pointer]:
+                  - /url: /guides/chat_prefix_completion
+              - listitem [ref=e58]:
+                - link "FIM Completion (Beta)" [ref=e59] [cursor=pointer]:
+                  - /url: /guides/fim_completion
+              - listitem [ref=e60]:
+                - link "JSON Output" [ref=e61] [cursor=pointer]:
+                  - /url: /guides/json_mode
+              - listitem [ref=e62]:
+                - link "Tool Calls" [ref=e63] [cursor=pointer]:
+                  - /url: /guides/tool_calls
+              - listitem [ref=e64]:
+                - link "Context Caching" [ref=e65] [cursor=pointer]:
+                  - /url: /guides/kv_cache
+              - listitem [ref=e66]:
+                - link "Anthropic API" [ref=e67] [cursor=pointer]:
+                  - /url: /guides/anthropic_api
+          - listitem [ref=e68]:
+            - link "API Reference" [ref=e70] [cursor=pointer]:
+              - /url: "#"
+          - listitem [ref=e71]:
+            - link "News" [ref=e73] [cursor=pointer]:
+              - /url: "#"
+          - listitem [ref=e74]:
+            - link "Other Resources" [ref=e76] [cursor=pointer]:
+              - /url: "#"
+          - listitem [ref=e77]:
+            - link "FAQ" [ref=e78] [cursor=pointer]:
+              - /url: https://static.deepseek.com/faq/index.html?lang=en#/category/4
+          - listitem [ref=e81]:
+            - link "Change Log" [ref=e82] [cursor=pointer]:
+              - /url: /updates
+    - main [ref=e83]:
+      - generic [ref=e85]:
+        - generic [ref=e87]:
+          - article [ref=e88]:
+            - navigation "Breadcrumbs" [ref=e89]:
+              - list [ref=e90]:
+                - listitem [ref=e91]:
+                  - link "Home page" [ref=e92] [cursor=pointer]:
+                    - /url: /
+                - listitem [ref=e95]:
+                  - generic [ref=e96]: API Guides
+                - listitem [ref=e97]:
+                  - generic [ref=e98]: Thinking Mode
+            - generic [ref=e101]:
+              - heading "Thinking Mode" [level=1] [ref=e102]
+              - paragraph [ref=e103]: "The DeepSeek model supports the thinking mode: before outputting the final answer, the model will first output a chain-of-thought reasoning to improve the accuracy of the final response."
+              - heading [level=2] [ref=e104]:
+                - text: Thinking Mode Toggle and Effort Control
+                - link "Direct link to Thinking Mode Toggle and Effort Control" [ref=e105] [cursor=pointer]:
+                  - /url: "#thinking-mode-toggle-and-effort-control"
+                  - text: "#"
+              - table [ref=e108]:
+                - row [ref=e109]:
+                  - cell [ref=e110]
+                  - cell "Control Parameter (OpenAI Format)" [ref=e111]
+                  - cell "Control Parameter (Anthropic Format)" [ref=e112]
+                - row [ref=e113]:
+                  - cell [ref=e114]:
+                    - text: Thinking Mode Toggle
+                    - superscript [ref=e115]: (1)
+                  - cell [ref=e116]:
+                    - code [ref=e117]: "{\"thinking\": {\"type\": \"enabled/disabled\"}}"
+                - row [ref=e118]:
+                  - cell [ref=e119]:
+                    - text: Thinking Effort Control
+                    - superscript [ref=e120]: (2)(3)
+                  - cell [ref=e121]:
+                    - code [ref=e122]: "{\"reasoning_effort\": \"high/max\"}"
+                  - cell [ref=e123]:
+                    - code [ref=e124]: "{\"output_config\": {\"effort\": \"high/max\"}}"
+              - paragraph [ref=e126]:
+                - text: (1) The thinking toggle defaults to
+                - code [ref=e127]: enabled
+                - text: (2) In thinking mode, the default effort is
+                - code [ref=e128]: high
+                - text: for regular requests; for some complex agent requests (such as Claude Code, OpenCode), effort is automatically set to
+                - code [ref=e129]: max
+                - text: (3) In thinking mode, for compatibility,
+                - code [ref=e130]: low
+                - text: and
+                - code [ref=e131]: medium
+                - text: are mapped to
+                - code [ref=e132]: high
+                - text: ", and"
+                - code [ref=e133]: xhigh
+                - text: is mapped to
+                - code [ref=e134]: max
+              - paragraph [ref=e135]:
+                - text: When using the OpenAI SDK, you need to pass the
+                - code [ref=e136]: thinking
+                - text: parameter within
+                - code [ref=e137]: extra_body
+                - text: ":"
+              - generic [ref=e139]:
+                - code [ref=e141]:
+                  - generic [ref=e142]: response = client.chat.completions.create(
+                  - generic [ref=e143]: model="deepseek-v4-pro",
+                  - generic [ref=e144]: "# ..."
+                  - generic [ref=e145]: reasoning_effort="high",
+                  - generic [ref=e146]: "extra_body={\"thinking\": {\"type\": \"enabled\"}}"
+                  - generic [ref=e147]: )
+                - button "Copy code to clipboard" [ref=e149] [cursor=pointer]
+              - heading [level=2] [ref=e155]:
+                - text: Input and Output Parameters
+                - link "Direct link to Input and Output Parameters" [ref=e156] [cursor=pointer]:
+                  - /url: "#input-and-output-parameters"
+                  - text: "#"
+              - paragraph [ref=e157]:
+                - text: Thinking mode does not support the
+                - code [ref=e158]: temperature
+                - text: ","
+                - code [ref=e159]: top_p
+                - text: ","
+                - code [ref=e160]: presence_penalty
+                - text: ", or"
+                - code [ref=e161]: frequency_penalty
+                - text: parameters. Please note that, for compatibility with existing software, setting these parameters will not trigger an error but will also have no effect.
+              - paragraph [ref=e162]:
+                - text: In thinking mode, the chain-of-thought content is returned via the
+                - code [ref=e163]: reasoning_content
+                - text: parameter, at the same level as
+                - code [ref=e164]: content
+                - text: . When concatenating subsequent turns, you can selectively return
+                - code [ref=e165]: reasoning_content
+                - text: "to the API:"
+              - list [ref=e166]:
+                - listitem [ref=e167]:
+                  - text: Between two
+                  - code [ref=e168]: user
+                  - text: messages, if the model
+                  - strong [ref=e169]: did not perform a tool call
+                  - text: ", the intermediate"
+                  - code [ref=e170]: assistant
+                  - text: "'s"
+                  - code [ref=e171]: reasoning_content
+                  - text: does not need to participate in the context concatenation. If passed to the API in subsequent turns, it will be ignored. See
+                  - link "Multi-turn Conversation" [ref=e172] [cursor=pointer]:
+                    - /url: "#multi-turn-conversation"
+                  - text: for details.
+                - listitem [ref=e173]:
+                  - text: Between two
+                  - code [ref=e174]: user
+                  - text: messages, if the model
+                  - strong [ref=e175]: performed a tool call
+                  - text: ", the intermediate"
+                  - code [ref=e176]: assistant
+                  - text: "'s"
+                  - code [ref=e177]: reasoning_content
+                  - text: must participate in the context concatenation and must be
+                  - strong [ref=e178]: passed back to the API
+                  - text: in all subsequent user interaction turns. See
+                  - link "Tool Calls" [ref=e179] [cursor=pointer]:
+                    - /url: "#tool-calls"
+                  - text: for details.
+              - heading [level=2] [ref=e180]:
+                - text: Multi-turn Conversation
+                - link "Direct link to Multi-turn Conversation" [ref=e181] [cursor=pointer]:
+                  - /url: "#multi-turn-conversation"
+                  - text: "#"
+              - paragraph [ref=e182]:
+                - text: In each turn of the conversation, the model outputs the CoT (
+                - code [ref=e183]: reasoning_content
+                - text: ) and the final answer (
+                - code [ref=e184]: content
+                - text: "). If there is no tool call, the CoT content from previous turns will not be concatenated into the context in the next turn, as illustrated in the following diagram:"
+              - heading [level=3] [ref=e187]:
+                - text: Sample Code
+                - link "Direct link to Sample Code" [ref=e188] [cursor=pointer]:
+                  - /url: "#sample-code"
+                  - text: "#"
+              - paragraph [ref=e189]: The following code, using Python as an example, demonstrates how to access the CoT and the final answer, as well as how to concatenate context in multi-turn conversations.
+              - generic [ref=e190]:
+                - tablist [ref=e191]:
+                  - tab "NoStreaming" [selected] [ref=e192] [cursor=pointer]
+                  - tab "Streaming" [ref=e193] [cursor=pointer]
+                - tabpanel [ref=e195]:
+                  - generic [ref=e197]:
+                    - code [ref=e199]:
+                      - generic [ref=e200]: from openai import OpenAI
+                      - generic [ref=e201]: client = OpenAI(api_key="<DeepSeek API Key>", base_url="https://api.deepseek.com")
+                      - generic [ref=e202]: "# Turn 1"
+                      - generic [ref=e203]: "messages = [{\"role\": \"user\", \"content\": \"9.11 and 9.8, which is greater?\"}]"
+                      - generic [ref=e204]: response = client.chat.completions.create(
+                      - generic [ref=e205]: model="deepseek-v4-pro",
+                      - generic [ref=e206]: messages=messages,
+                      - generic [ref=e207]: reasoning_effort="high"
+                      - generic [ref=e208]: "extra_body={\"thinking\": {\"type\": \"enabled\"}},"
+                      - generic [ref=e209]: )
+                      - generic [ref=e210]: reasoning_content = response.choices[0].message.reasoning_content
+                      - generic [ref=e211]: content = response.choices[0].message.content
+                      - generic [ref=e212]: "# Turn 2"
+                      - generic [ref=e213]: "# The reasoning_content will be ignored by the API"
+                      - generic [ref=e214]: messages.append(response.choices[0].message)
+                      - generic [ref=e215]: "messages.append({'role': 'user', 'content': \"How many Rs are there in the word 'strawberry'?\"})"
+                      - generic [ref=e216]: response = client.chat.completions.create(
+                      - generic [ref=e217]: model="deepseek-v4-pro",
+                      - generic [ref=e218]: messages=messages,
+                      - generic [ref=e219]: reasoning_effort="high"
+                      - generic [ref=e220]: "extra_body={\"thinking\": {\"type\": \"enabled\"}},"
+                      - generic [ref=e221]: )
+                      - generic [ref=e222]: "# ..."
+                    - generic [ref=e223]:
+                      - button "Toggle word wrap" [ref=e224] [cursor=pointer]
+                      - button "Copy code to clipboard" [ref=e227] [cursor=pointer]
+              - heading [level=2] [ref=e233]:
+                - text: Tool Calls
+                - link "Direct link to Tool Calls" [ref=e234] [cursor=pointer]:
+                  - /url: "#tool-calls"
+                  - text: "#"
+              - paragraph [ref=e235]: "The DeepSeek model's thinking mode supports tool calls. Before outputting the final answer, the model can perform multiple turns of reasoning and tool calls to improve the quality of the response. The calling pattern is illustrated below:"
+              - paragraph [ref=e238]:
+                - text: Please note that, unlike turns in thinking mode that do not involve tool calls, for turns that do perform tool calls, the
+                - code [ref=e239]: reasoning_content
+                - text: must be fully passed back to the API in all subsequent requests.
+              - paragraph [ref=e240]:
+                - text: If your code does not correctly pass back
+                - code [ref=e241]: reasoning_content
+                - text: ", the API will return a 400 error. Please refer to the sample code below for the correct approach."
+              - heading [level=3] [ref=e242]:
+                - text: Sample Code
+                - link "Direct link to Sample Code" [ref=e243] [cursor=pointer]:
+                  - /url: "#sample-code-1"
+                  - text: "#"
+              - paragraph [ref=e244]: "Below is a simple sample code for tool calls in thinking mode:"
+              - generic [ref=e246]:
+                - code [ref=e248]:
+                  - generic [ref=e249]: import os
+                  - generic [ref=e250]: import json
+                  - generic [ref=e251]: from openai import OpenAI
+                  - generic [ref=e252]: from datetime import datetime
+                  - generic [ref=e253]: "# The definition of the tools"
+                  - generic [ref=e254]: tools = [
+                  - generic [ref=e255]: "{"
+                  - generic [ref=e256]: "\"type\": \"function\","
+                  - generic [ref=e257]: "\"function\": {"
+                  - generic [ref=e258]: "\"name\": \"get_date\","
+                  - generic [ref=e259]: "\"description\": \"Get the current date\","
+                  - generic [ref=e260]: "\"parameters\": { \"type\": \"object\", \"properties\": {} },"
+                  - generic [ref=e261]: "}"
+                  - generic [ref=e262]: "},"
+                  - generic [ref=e263]: "{"
+                  - generic [ref=e264]: "\"type\": \"function\","
+                  - generic [ref=e265]: "\"function\": {"
+                  - generic [ref=e266]: "\"name\": \"get_weather\","
+                  - generic [ref=e267]: "\"description\": \"Get weather of a location, the user should supply the location and date.\","
+                  - generic [ref=e268]: "\"parameters\": {"
+                  - generic [ref=e269]: "\"type\": \"object\","
+                  - generic [ref=e270]: "\"properties\": {"
+                  - generic [ref=e271]: "\"location\": { \"type\": \"string\", \"description\": \"The city name\" },"
+                  - generic [ref=e272]: "\"date\": { \"type\": \"string\", \"description\": \"The date in format YYYY-mm-dd\" },"
+                  - generic [ref=e273]: "},"
+                  - generic [ref=e274]: "\"required\": [\"location\", \"date\"]"
+                  - generic [ref=e275]: "},"
+                  - generic [ref=e276]: "}"
+                  - generic [ref=e277]: "},"
+                  - generic [ref=e278]: "]"
+                  - generic [ref=e279]: "# The mocked version of the tool calls"
+                  - generic [ref=e280]: "def get_date_mock():"
+                  - generic [ref=e281]: return datetime.now().strftime("%Y-%m-%d")
+                  - generic [ref=e282]: "def get_weather_mock(location, date):"
+                  - generic [ref=e283]: return "Cloudy 7~13°C"
+                  - generic [ref=e284]: "TOOL_CALL_MAP = {"
+                  - generic [ref=e285]: "\"get_date\": get_date_mock,"
+                  - generic [ref=e286]: "\"get_weather\": get_weather_mock"
+                  - generic [ref=e287]: "}"
+                  - generic [ref=e288]: "def run_turn(turn, messages):"
+                  - generic [ref=e289]: sub_turn = 1
+                  - generic [ref=e290]: "while True:"
+                  - generic [ref=e291]: response = client.chat.completions.create(
+                  - generic [ref=e292]: model='deepseek-v4-pro',
+                  - generic [ref=e293]: messages=messages,
+                  - generic [ref=e294]: tools=tools,
+                  - generic [ref=e295]: reasoning_effort="high",
+                  - generic [ref=e296]: "extra_body={ \"thinking\": { \"type\": \"enabled\" } },"
+                  - generic [ref=e297]: )
+                  - generic [ref=e298]: messages.append(response.choices[0].message)
+                  - generic [ref=e299]: reasoning_content = response.choices[0].message.reasoning_content
+                  - generic [ref=e300]: content = response.choices[0].message.content
+                  - generic [ref=e301]: tool_calls = response.choices[0].message.tool_calls
+                  - generic [ref=e302]: "print(f\"Turn {turn}.{sub_turn}\\n{reasoning_content=}\\n{content=}\\n{tool_calls=}\")"
+                  - generic [ref=e303]: "# If there is no tool calls, then the model should get a final answer and we need to stop the loop"
+                  - generic [ref=e304]: "if tool_calls is None:"
+                  - generic [ref=e305]: break
+                  - generic [ref=e306]: "for tool in tool_calls:"
+                  - generic [ref=e307]: tool_function = TOOL_CALL_MAP[tool.function.name]
+                  - generic [ref=e308]: tool_result = tool_function(**json.loads(tool.function.arguments))
+                  - generic [ref=e309]: "print(f\"tool result for {tool.function.name}: {tool_result}\\n\")"
+                  - generic [ref=e310]: "messages.append({"
+                  - generic [ref=e311]: "\"role\": \"tool\","
+                  - generic [ref=e312]: "\"tool_call_id\": tool.id,"
+                  - generic [ref=e313]: "\"content\": tool_result,"
+                  - generic [ref=e314]: "})"
+                  - generic [ref=e315]: sub_turn += 1
+                  - generic [ref=e316]: print()
+                  - generic [ref=e317]: client = OpenAI(
+                  - generic [ref=e318]: api_key=os.environ.get('DEEPSEEK_API_KEY'),
+                  - generic [ref=e319]: base_url=os.environ.get('DEEPSEEK_BASE_URL'),
+                  - generic [ref=e320]: )
+                  - generic [ref=e321]: "# The user starts a question"
+                  - generic [ref=e322]: turn = 1
+                  - generic [ref=e323]: "messages = [{"
+                  - generic [ref=e324]: "\"role\": \"user\","
+                  - generic [ref=e325]: "\"content\": \"How's the weather in Hangzhou Tomorrow\""
+                  - generic [ref=e326]: "}]"
+                  - generic [ref=e327]: run_turn(turn, messages)
+                  - generic [ref=e328]: "# The user starts a new question"
+                  - generic [ref=e329]: turn = 2
+                  - generic [ref=e330]: "messages.append({"
+                  - generic [ref=e331]: "\"role\": \"user\","
+                  - generic [ref=e332]: "\"content\": \"How's the weather in Guangzhou Tomorrow\""
+                  - generic [ref=e333]: "})"
+                  - generic [ref=e334]: run_turn(turn, messages)
+                - generic [ref=e335]:
+                  - button "Toggle word wrap" [ref=e336] [cursor=pointer]
+                  - button "Copy code to clipboard" [ref=e339] [cursor=pointer]
+              - paragraph [ref=e345]:
+                - text: In each sub-request of Turn 1, the
+                - code [ref=e346]: reasoning_content
+                - text: generated during that turn is sent to the API, allowing the model to continue its previous reasoning.
+                - code [ref=e347]: response.choices[0].message
+                - text: contains all necessary fields for the
+                - code [ref=e348]: assistant
+                - text: message, including
+                - code [ref=e349]: content
+                - text: ","
+                - code [ref=e350]: reasoning_content
+                - text: ", and"
+                - code [ref=e351]: tool_calls
+                - text: ". For simplicity, you can directly append the message to the end of the messages list using the following code:"
+              - generic [ref=e353]:
+                - code [ref=e355]:
+                  - generic [ref=e356]: messages.append(response.choices[0].message)
+                - button "Copy code to clipboard" [ref=e358] [cursor=pointer]
+              - paragraph [ref=e364]: "This line of code is equivalent to:"
+              - generic [ref=e366]:
+                - code [ref=e368]:
+                  - generic [ref=e369]: "messages.append({"
+                  - generic [ref=e370]: "'role': 'assistant',"
+                  - generic [ref=e371]: "'content': response.choices[0].message.content,"
+                  - generic [ref=e372]: "'reasoning_content': response.choices[0].message.reasoning_content,"
+                  - generic [ref=e373]: "'tool_calls': response.choices[0].message.tool_calls,"
+                  - generic [ref=e374]: "})"
+                - button "Copy code to clipboard" [ref=e376] [cursor=pointer]
+              - paragraph [ref=e382]:
+                - text: Additionally, in the Turn 2 request, we still pass the
+                - code [ref=e383]: reasoning_content
+                - text: generated in Turn 1 to the API.
+              - paragraph [ref=e384]: "The sample output of this code is as follows:"
+              - generic [ref=e386]:
+                - code [ref=e388]:
+                  - generic [ref=e389]: Turn 1.1
+                  - generic [ref=e390]: reasoning_content="The user is asking about the weather in Hangzhou tomorrow. I need to get tomorrow's date first, then call the weather function."
+                  - generic [ref=e391]: content="Let me check tomorrow's weather in Hangzhou for you. First, let me get tomorrow's date."
+                  - generic [ref=e392]: "tool_calls=[ChatCompletionMessageFunctionToolCall(id='call_00_kw66qNnNto11bSfJVIdlV5Oo', function=Function(arguments='{}', name='get_date'), type='function', index=0)]"
+                  - generic [ref=e393]: "tool result for get_date: 2026-04-19"
+                  - generic [ref=e394]: Turn 1.2
+                  - generic [ref=e395]: reasoning_content="Today is 2026-04-19, so tomorrow is 2026-04-20. Now I'll call the weather function for Hangzhou."
+                  - generic [ref=e396]: content=''
+                  - generic [ref=e397]: "tool_calls=[ChatCompletionMessageFunctionToolCall(id='call_00_H2SCW6136vWJGq9SQlBuhVt4', function=Function(arguments='{\"location\": \"Hangzhou\", \"date\": \"2026-04-20\"}', name='get_weather'), type='function', index=0)]"
+                  - generic [ref=e398]: "tool result for get_weather: Cloudy 7~13°C"
+                  - generic [ref=e399]: Turn 1.3
+                  - generic [ref=e400]: reasoning_content='The weather result is in. Let me share this with the user.'
+                  - generic [ref=e401]: content="Here's the weather forecast for **Hangzhou tomorrow (April 20, 2026)**:\n\n- 🌤 **Condition:** Cloudy \n- 🌡 **Temperature:** 7°C ~ 13°C (45°F ~ 55°F)\n\nIt'll be on the cooler side, so you might want to bring a light jacket if you're heading out! Let me know if you need anything else."
+                  - generic [ref=e402]: tool_calls=None
+                  - generic [ref=e403]: Turn 2.1
+                  - generic [ref=e404]: reasoning_content='The user is asking about the weather in Guangzhou tomorrow. Today is 2026-04-19, so tomorrow is 2026-04-20. I can directly call the weather function.'
+                  - generic [ref=e405]: content=''
+                  - generic [ref=e406]: "tool_calls=[ChatCompletionMessageFunctionToolCall(id='call_00_8URkLt5NjmNkVKhDmMcNq9Mo', function=Function(arguments='{\"location\": \"Guangzhou\", \"date\": \"2026-04-20\"}', name='get_weather'), type='function', index=0)]"
+                  - generic [ref=e407]: "tool result for get_weather: Cloudy 7~13°C"
+                  - generic [ref=e408]: Turn 2.2
+                  - generic [ref=e409]: reasoning_content='The weather result for Guangzhou is the same as Hangzhou. Let me share this with the user.'
+                  - generic [ref=e410]: content="Here's the weather forecast for **Guangzhou tomorrow (April 20, 2026)**:\n\n- 🌤 **Condition:** Cloudy \n- 🌡 **Temperature:** 7°C ~ 13°C (45°F ~ 55°F)\n\nIt'll be cool and cloudy, so a light jacket would be a good idea if you're going out. Let me know if there's anything else you'd like to know!"
+                  - generic [ref=e411]: tool_calls=None
+                - generic [ref=e412]:
+                  - button "Toggle word wrap" [ref=e413] [cursor=pointer]
+                  - button "Copy code to clipboard" [ref=e416] [cursor=pointer]
+          - navigation "Docs pages" [ref=e423]:
+            - link "Previous « Langcli" [ref=e424] [cursor=pointer]:
+              - /url: /quick_start/agent_integrations/langcli
+              - generic [ref=e425]: Previous
+              - generic [ref=e426]: « Langcli
+            - link "Next Multi-round Conversation »" [ref=e427] [cursor=pointer]:
+              - /url: /guides/multi_round_chat
+              - generic [ref=e428]: Next
+              - generic [ref=e429]: Multi-round Conversation »
+        - list [ref=e432]:
+          - listitem [ref=e433]:
+            - link "Thinking Mode Toggle and Effort Control" [ref=e434] [cursor=pointer]:
+              - /url: "#thinking-mode-toggle-and-effort-control"
+          - listitem [ref=e435]:
+            - link "Input and Output Parameters" [ref=e436] [cursor=pointer]:
+              - /url: "#input-and-output-parameters"
+          - listitem [ref=e437]:
+            - link "Multi-turn Conversation" [ref=e438] [cursor=pointer]:
+              - /url: "#multi-turn-conversation"
+            - list [ref=e439]:
+              - listitem [ref=e440]:
+                - link "Sample Code" [ref=e441] [cursor=pointer]:
+                  - /url: "#sample-code"
+          - listitem [ref=e442]:
+            - link "Tool Calls" [ref=e443] [cursor=pointer]:
+              - /url: "#tool-calls"
+            - list [ref=e444]:
+              - listitem [ref=e445]:
+                - link "Sample Code" [ref=e446] [cursor=pointer]:
+                  - /url: "#sample-code-1"
+  - contentinfo [ref=e447]:
+    - generic [ref=e448]:
+      - generic [ref=e449]:
+        - generic [ref=e450]:
+          - generic [ref=e451]: WeChat Official Account
+          - list [ref=e452]:
+            - listitem [ref=e453]:
+              - img "WeChat QRcode" [ref=e454]
+        - generic [ref=e455]:
+          - generic [ref=e456]: Community
+          - list [ref=e457]:
+            - listitem [ref=e458]:
+              - link "Email" [ref=e459] [cursor=pointer]:
+                - /url: mailto:api-service@deepseek.com
+            - listitem [ref=e462]:
+              - link "Discord" [ref=e463] [cursor=pointer]:
+                - /url: https://discord.gg/Tc7c45Zzu5
+            - listitem [ref=e466]:
+              - link "Twitter" [ref=e467] [cursor=pointer]:
+                - /url: https://twitter.com/deepseek_ai
+        - generic [ref=e470]:
+          - generic [ref=e471]: More
+          - list [ref=e472]:
+            - listitem [ref=e473]:
+              - link "GitHub" [ref=e474] [cursor=pointer]:
+                - /url: https://github.com/deepseek-ai
+      - generic [ref=e477]: Copyright © 2026 DeepSeek, Inc.

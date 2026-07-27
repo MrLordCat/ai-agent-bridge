@@ -115,7 +115,7 @@ suite("quick access", () => {
 			() => [
 				{ id: "fiveHour", label: "Session Limit (5h)", description: "42% used" },
 				{ id: "sevenDay", label: "Weekly Limit", description: "87% used" },
-				{ id: "model.Fable", label: "Weekly Fable Limit", description: "12% used" },
+				{ id: "sevenDayOpus", label: "Weekly Opus Limit", description: "12% used" },
 			]
 		);
 		const claude = (await getItems(provider)).find(item => labelOf(item) === "Claude");
@@ -128,7 +128,7 @@ suite("quick access", () => {
 		const limitChildren = await getItems(provider, limits);
 		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Session Limit (5h)")?.description, "42% used");
 		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Limit")?.description, "87% used");
-		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Fable Limit")?.description, "12% used");
+		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Opus Limit")?.description, "12% used");
 	});
 
 	test("exposes independent Claude and DeepSeek maximum context controls", async () => {

@@ -5,6 +5,7 @@ import type { ClaudeChatModelProvider } from "../claude/claude-provider";
 import { CodexAppServerClient, JsonLineBuffer, type CodexServerNotification } from "../codex/app-server-client";
 import { CompositeChatModelProvider } from "../composite-provider";
 import {
+	assertCodexThreadPersistence,
 	canResumeCodexToolTurn,
 	CodexChatModelProvider,
 	createCodexRuntimeFingerprints,
@@ -12,6 +13,7 @@ import {
 	diffCodexThreadUsage,
 	intersectCodexThreadTools,
 	mapCodexTokenUsageMetrics,
+	resolveCodexSessionPersistence,
 	shouldRecoverCodexFailedToolTurn,
 	shouldRecoverCodexToolTurnException,
 } from "../codex/codex-provider";
@@ -1094,6 +1096,200 @@ suite("Codex subscription provider", () => {
 		assert.ok(dynamic.callableNames.has("private_tool"));
 	});
 
+	test("keeps the Codex dynamic catalog stable across tool permutations", () => {
+		const first = buildCodexDynamicTools([
+			{ name: "zeta_tool", description: "Z", inputSchema: { type: "object", properties: { b: { type: "string" }, a: { type: "number" } } } },
+			{ name: "alpha_tool", description: "A", inputSchema: { required: ["value"], properties: { value: { type: "string" } }, type: "object" } },
+		], { deferNonCoreTools: false });
+		const second = buildCodexDynamicTools([
+			{ name: "alpha_tool", description: "A", inputSchema: { type: "object", properties: { value: { type: "string" } }, required: ["value"] } },
+			{ name: "zeta_tool", description: "Z", inputSchema: { properties: { a: { type: "number" }, b: { type: "string" } }, type: "object" } },
+		], { deferNonCoreTools: false });
+		assert.deepStrictEqual(first.specs, second.specs);
+		assert.deepStrictEqual(first.runtimeSignatures, second.runtimeSignatures);
+	});
+
+	test("enables durable Codex sessions unless an explicit scope disables them", () => {
+		assert.deepStrictEqual(resolveCodexSessionPersistence({
+			persistProviderSessions: { defaultValue: false },
+			codexEphemeralThreads: { defaultValue: true },
+		}), {
+			enabled: true,
+			useEphemeralThreads: false,
+			persistProviderSessionsOverride: undefined,
+			codexEphemeralThreadsOverride: undefined,
+		});
+		assert.deepStrictEqual(resolveCodexSessionPersistence({
+			persistProviderSessions: { globalValue: false },
+			codexEphemeralThreads: {},
+		}), {
+			enabled: false,
+			useEphemeralThreads: true,
+			persistProviderSessionsOverride: false,
+			codexEphemeralThreadsOverride: undefined,
+		});
+		assert.deepStrictEqual(resolveCodexSessionPersistence({
+			persistProviderSessions: { globalValue: false, workspaceValue: true },
+			codexEphemeralThreads: { globalValue: true, workspaceFolderValue: false },
+		}), {
+			enabled: true,
+			useEphemeralThreads: false,
+			persistProviderSessionsOverride: true,
+			codexEphemeralThreadsOverride: false,
+		});
+	});
+
+	test("resolves the contributed VS Code defaults to durable Codex threads", () => {
+		const config = vscode.workspace.getConfiguration("llamacpp");
+		const persistence = resolveCodexSessionPersistence({
+			persistProviderSessions: config.inspect<boolean>("persistProviderSessions"),
+			codexEphemeralThreads: config.inspect<boolean>("codexEphemeralThreads"),
+		});
+		assert.strictEqual(config.get<boolean>("persistProviderSessions"), true);
+		assert.strictEqual(config.get<boolean>("codexEphemeralThreads"), false);
+		assert.strictEqual(persistence.enabled, true);
+		assert.strictEqual(persistence.useEphemeralThreads, false);
+	});
+
+	test("rejects a thread persistence mismatch before a model turn can start", () => {
+		assert.strictEqual(assertCodexThreadPersistence(false, false), false);
+		assert.strictEqual(assertCodexThreadPersistence(true, true), true);
+		assert.throws(
+			() => assertCodexThreadPersistence(false, true),
+			/returned ephemeral=true.*No model turn was started/
+		);
+		assert.throws(
+			() => assertCodexThreadPersistence(false, undefined),
+			/returned ephemeral=undefined.*No model turn was started/
+		);
+	});
+
+	test("awaits and restores durable Codex thread metadata from workspace state", async () => {
+		const values = new Map<string, unknown>();
+		let updateCompleted = false;
+		const workspaceState = {
+			keys: () => [...values.keys()],
+			get: <T>(key: string, defaultValue?: T): T | undefined =>
+				(values.has(key) ? values.get(key) as T : defaultValue),
+			update: async (key: string, value: unknown): Promise<void> => {
+				await Promise.resolve();
+				values.set(key, value);
+				updateCompleted = true;
+			},
+		} as vscode.Memento;
+		const provider = new CodexChatModelProvider("test", undefined, workspaceState);
+		await (provider as unknown as { rememberConversationThread(value: unknown): Promise<void> }).rememberConversationThread({
+			threadId: "thread-durable-1",
+			ephemeral: false,
+			modelId: "gpt-5.6-terra",
+			runtimeKey: "runtime-key",
+			toolCatalogKey: "tools-key",
+			callableNames: new Set(["read_file"]),
+			toolNamespaces: new Map<string, string>(),
+			toolSignatures: new Map([["read_file", "signature"]]),
+			copilotConversationId: "conversation-1",
+			copilotTurnIndex: 1,
+			anchor: createCodexConversationAnchor([vscode.LanguageModelChatMessage.User("request")], "answer"),
+			lastUsedAt: Date.now(),
+			processGeneration: 0,
+		});
+		assert.strictEqual(updateCompleted, true);
+		provider.dispose();
+
+		const restored = new CodexChatModelProvider("test", undefined, workspaceState);
+		const threads = (restored as unknown as { conversationThreads: Map<string, { ephemeral: boolean; processGeneration: number }> })
+			.conversationThreads;
+		assert.strictEqual(threads.size, 1);
+		assert.strictEqual(threads.get("thread-durable-1")?.ephemeral, false);
+		assert.strictEqual(threads.get("thread-durable-1")?.processGeneration, -1);
+		restored.dispose();
+	});
+
+	test("arms an explicit Codex rollover for the newest durable thread", async () => {
+		const values = new Map<string, unknown>();
+		const workspaceState = {
+			keys: () => [...values.keys()],
+			get: <T>(key: string, defaultValue?: T): T | undefined =>
+				(values.has(key) ? values.get(key) as T : defaultValue),
+			update: async (key: string, value: unknown): Promise<void> => {
+				values.set(key, value);
+			},
+		} as vscode.Memento;
+		const provider = new CodexChatModelProvider("test", undefined, workspaceState);
+		await (provider as unknown as { rememberConversationThread(value: unknown): Promise<void> }).rememberConversationThread({
+			threadId: "thread-rollover-1",
+			ephemeral: false,
+			modelId: "codex::gpt-5.6-terra",
+			runtimeKey: "runtime-key",
+			toolCatalogKey: "tools-key",
+			callableNames: new Set(["read_file"]),
+			toolNamespaces: new Map<string, string>(),
+			toolSignatures: new Map([["read_file", "signature"]]),
+			copilotConversationId: "large-chat",
+			copilotTurnIndex: 42,
+			anchor: createCodexConversationAnchor([vscode.LanguageModelChatMessage.User("request")], "answer"),
+			lastUsedAt: Date.now(),
+			processGeneration: 0,
+		});
+
+		const prepared = await provider.prepareLatestDurableThreadRollover();
+		assert.strictEqual(prepared.modelId, "codex::gpt-5.6-terra");
+		assert.strictEqual(prepared.sourceConversationId, "large-chat");
+		assert.deepStrictEqual(
+			values.get("llamacpp.codexPendingRollover.v1"),
+			{
+				threadId: "thread-rollover-1",
+				modelId: "codex::gpt-5.6-terra",
+				sourceConversationId: "large-chat",
+				armedAt: (values.get("llamacpp.codexPendingRollover.v1") as { armedAt: number }).armedAt,
+			}
+		);
+		provider.dispose();
+	});
+
+	test("reattaches a durable Codex thread with thread/resume", async () => {
+		const provider = new CodexChatModelProvider("test");
+		const calls: Array<{ method: string; params: unknown; timeoutMs: number | undefined }> = [];
+		const fakeClient = {
+			generation: 7,
+			request: async (method: string, params: unknown, timeoutMs?: number) => {
+				calls.push({ method, params, timeoutMs });
+				return {
+					thread: { id: "thread-durable-1", ephemeral: false, historyMode: "legacy" },
+					model: "gpt-5.6-terra",
+					modelProvider: "openai",
+				};
+			},
+			dispose: () => undefined,
+		};
+		const internals = provider as unknown as {
+			client: typeof fakeClient;
+			reattachDurableThread(value: Record<string, unknown>): Promise<boolean>;
+		};
+		Object.defineProperty(internals, "client", { value: fakeClient });
+		const conversation = {
+			threadId: "thread-durable-1",
+			ephemeral: false,
+			modelId: "gpt-5.6-terra",
+			runtimeKey: "runtime-key",
+			toolCatalogKey: "tools-key",
+			callableNames: new Set<string>(),
+			toolNamespaces: new Map<string, string>(),
+			toolSignatures: new Map<string, string>(),
+			anchor: createCodexConversationAnchor([vscode.LanguageModelChatMessage.User("request")], "answer"),
+			lastUsedAt: Date.now(),
+			processGeneration: -1,
+		};
+		assert.strictEqual(await internals.reattachDurableThread(conversation), true);
+		assert.deepStrictEqual(calls, [{
+			method: "thread/resume",
+			params: { threadId: "thread-durable-1", excludeTurns: true },
+			timeoutMs: 15_000,
+		}]);
+		assert.strictEqual(conversation.processGeneration, 7);
+		provider.dispose();
+	});
+
 	test("adds model-routing guidance to the native subagent tool", () => {
 		const dynamic = buildCodexDynamicTools([{
 			name: "runSubagent",
@@ -1103,7 +1299,7 @@ suite("Codex subscription provider", () => {
 		const tool = dynamic.specs.find(spec => spec.type === "function");
 		assert.ok(tool && tool.type === "function");
 		assert.ok(tool.description.includes("Subagent model routing"));
-		assert.ok(tool.description.includes("Never omit runSubagent.model and never select a Copilot built-in or free-tier model"));
+		assert.ok(tool.description.includes("Never omit runSubagent.model"));
 	});
 
 	test("defers uncommon Codex tools while keeping the core agent loop eager", () => {

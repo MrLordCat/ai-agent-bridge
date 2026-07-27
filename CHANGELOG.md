@@ -1,5 +1,149 @@
 # Changelog
 
+## 1.8.0 - 2026-07-27
+
+- Fixed the root cause of long-session prompt-cache collapse. VS Code attaches
+  `cache_control` breakpoint markers to chat content and moves them between
+  messages as a conversation grows. Every conversion path rendered them into
+  message text — as `{"$mid":…}` JSON in the llama/DeepSeek path, as
+  `[data cache_control, N bytes]` in the Codex and Claude tool-result paths,
+  and as `{"type":"data",…}` in the serialized Claude transcript. A moving
+  marker rewrote already-sent history and invalidated the whole upstream
+  prefix. Diagnostics showed the prefix diverging at message 2 of 420 with an
+  unchanged message count, pinning DeepSeek at ~10% cache hit for entire
+  sessions. All paths now drop the markers before any textual rendering.
+- Scoped the reasoning map per conversation. It was a single global map with
+  LRU eviction at 256 entries shared by every chat and model, so a second busy
+  conversation silently evicted entries the first one's cached prefix depended
+  on. Whole conversations are now evicted instead of individual entries.
+- Bound the positional reasoning fallback to the actual tool-call ids. The
+  fallback target moved forward each turn, so the previous target lost its
+  `reasoning_content` and changed shape after it had already been sent.
+- Added `chat.cache.report` diagnostics to the local, DeepSeek, Codex, and
+  Claude providers. Codex and Claude previously reported no cache telemetry at
+  all. The report includes cached/uncached token split, hit and miss percent,
+  and a classified miss reason: `cold_start`, `request_params_changed`,
+  `tool_catalog_changed`, `system_prompt_changed`, `history_rewritten`,
+  `history_truncated`, `session_not_reused`, or `upstream_expired`.
+
+## 1.7.5 - 2026-07-27
+
+- Persisted the DeepSeek reasoning map (`_reasoningByToolCallId`) to
+  `globalState` so it survives Extension Host restarts.  Previously a reload
+  cleared the in-memory map, causing historical tool-call messages to lose
+  their `reasoning_content` and breaking DeepSeek prompt-cache prefix reuse.
+- Added lazy `loadPersistedReasoningMap()` and `persistReasoningMap()` with
+  LRU-aware merge so new entries never overwrite previously persisted ones.
+- Overrode `processStreamingResponse` in the llama provider to restore the
+  map before streaming and persist it after every successful response.
+- Added `MockMemento` and two regression tests that reproduce the cache-prefix
+  instability across simulated restarts and verify the map is fully restored.
+
+## 1.7.4 - 2026-07-27
+
+- Fixed a severe DeepSeek prompt-cache regression where the newest reasoning
+  block could be copied into every historical assistant tool-call message.
+  Stored reasoning is now restored only by its exact tool-call id, with a
+  newest-message-only compatibility fallback.
+- Stabilized the exact API Direct tool catalog for each Copilot conversation.
+  Optional tool activation no longer rewrites the cached prefix unless a tool
+  is explicitly activated or a previously available tool disappears.
+- Upgraded the guarded Copilot integration to patch v9. It now also bounds
+  terminal output, native tool text, and non-text tool payloads before VS Code
+  serializes them into chat history, preventing multi-hundred-megabyte session
+  snapshots and extension-host stalls.
+- Added `Local LLM: Continue Latest Codex Thread in New Chat` to resume the
+  newest durable completed Codex thread without loading an already bloated VS
+  Code transcript.
+- Added bounded-output guidance to Codex terminal, file, and search tools so
+  large logs, JSONL data, repository listings, and binary content stay out of
+  native tool cards unless a narrow excerpt is required.
+
+## 1.7.3 - 2026-07-26
+
+- Added an explicit Claude rollover command for chats that have grown too large
+  for VS Code's renderer-to-extension-host RPC serialization. It opens a new
+  lightweight chat and resumes the newest persisted Agent SDK session while
+  sending only the new user turn.
+- Persisted rollover intent for 30 minutes so a reload between the command and
+  the first new message does not lose the recovery operation.
+- Made completed Claude durable-session metadata writes awaited, preventing an
+  immediate reload from racing the workspace-state update.
+- Kept the original durable mapping and rollover intent intact when a resume
+  fails, avoiding a silent cold-start fallback that would lose conversation
+  context.
+
+## 1.7.2 - 2026-07-26
+
+- Fixed Claude cold starts failing with `Invalid string length` on very long
+  Copilot chats by applying `claudeMaxInputChars` while serializing messages,
+  instead of constructing an unbounded JSON string before truncation.
+- Added a 5,109-message regression that verifies bounded cold-start input and
+  preserves the complete transcript for small conversations.
+- Upgraded the guarded Copilot integration to patch v8. Prompt rendering now
+  remains bounded by the effective model budget instead of cloning the endpoint
+  with `Number.MAX_SAFE_INTEGER`, preventing multi-second full-history materialization
+  and garbage-collection stalls in long chats.
+- Added pre-turn diagnostics for Claude input preparation failures and the
+  effective cold-start character limit.
+
+## 1.7.1 - 2026-07-26
+
+- Fixed Codex conversations silently starting as ephemeral when an effective
+  contributed configuration default disagreed with the new durable defaults.
+  Only explicit user/workspace overrides can now disable persistence.
+- Replaced the incorrect post-reload `thread/read` probe with the official
+  `thread/resume` operation and verify the returned thread id and persistence.
+- Made durable `workspaceState` writes part of completed-turn finalization and
+  added diagnostics for requested/returned persistence plus stored thread ids.
+- Added a fail-closed pre-turn check: if app-server does not honor the requested
+  persistence mode, the thread is removed before any paid model turn starts.
+- Added a zero-model-turn, two-process app-server persistence smoke test covering
+  `dynamicTools`, history materialization, restart, resume, read, and cleanup.
+
+## 1.7.0 - 2026-07-26
+
+- Added durable completed-session resume across VS Code reloads for Claude and
+  Codex, keyed by the stable Copilot conversation identity and validated
+  provider/runtime/history fingerprints.
+- Enabled official Claude Agent SDK transcript persistence for user chats with
+  safe session forking and a full-history fallback before visible output.
+- Made Codex threads durable by default, reattaching them through `thread/read`
+  after app-server restart while retaining an explicit ephemeral privacy mode.
+- Canonicalized Claude MCP and Codex dynamic tool ordering plus JSON Schema key
+  ordering so Copilot tool re-enumeration cannot cause a false semantic cold start.
+- Documented that physical VS Code extension/tool registration still occurs,
+  while Local and DeepSeek preserve stable upstream prompt-cache prefixes.
+
+## 1.6.2 - 2026-07-26
+
+- Fixed Claude subscription availability so the SDK's `allowed_warning` status
+  remains advisory near the usage limit; only `rejected` blocks new requests.
+- Added regression coverage for both warning and rejected runtime statuses.
+
+## 1.6.1 - 2026-07-26
+
+- Added the backend-confirmed `claude-opus-5` subscription profile and removed
+  Sonnet 4.5, Haiku 4.5, Fable 5, and Opus 4.8 from the curated Claude picker.
+- Raised the default Claude output advertisement to the backend-reported Opus 5
+  limit of 32,000 tokens and updated the personal Opus agent to the new model id.
+
+## 1.6.0 - 2026-07-26
+
+- Embedded guarded Copilot Chat patch v7 into the main extension with silent
+  startup verification, apply/status/restore commands, exact backups, and
+  fail-closed compatibility checks for native context and thinking controls.
+- Compiled mandatory subagent `model` schema enforcement directly into the
+  Codex and Claude bridges, removing the need for Patch Guardian on this extension.
+- Consolidated the repository patch CLI onto the same runtime implementation,
+  updated integration documentation, and synchronized the dependency lockfile.
+- Removed stale reasoning state and passed the full lint plus 236-test quality gate.
+
+## 1.5.33 - 2026-07-24
+
+- Fix `summarizeToolResultContent` for base64/image-result data (was skipping binary content).
+- Rewrite `subagent-guidance` with clearer model-selection rules and quoting around model labels.
+
 ## 1.5.32 - 2026-07-24
 
 - Raised the default prioritized `apiDirect` tool subset from 48 to 70 so the

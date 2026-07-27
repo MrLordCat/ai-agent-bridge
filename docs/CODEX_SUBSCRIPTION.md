@@ -35,13 +35,18 @@ Copilot Chat UI
         -> Codex shell, file edits, web, MCP, skills, and sandbox
 ```
 
-Copilot Chat owns the visible and durable chat history. The first provider
-request creates an ephemeral Codex thread and supplies the current VS Code
-conversation as serialized data. Native tool-result rounds reuse that in-memory
-thread and send only the matching result tail. A normal follow-up user turn also
-reuses the thread when the prior history and answer are unchanged. Switching
-among local, DeepSeek, and Codex models remains predictable without repeatedly
-uploading the full chat during an agent run.
+Copilot Chat owns the visible chat history. With `persistProviderSessions`
+enabled, the first provider request creates a durable Codex thread and stores
+only its id plus validation fingerprints in VS Code workspace state. Native
+tool-result rounds reuse the live thread, while a completed matching thread can
+be reattached after a VS Code reload and receive only the new user turn. If the
+stored thread is missing or its conversation anchor no longer matches, the
+provider safely starts a new thread with the current full VS Code history.
+Before any paid `turn/start`, the provider verifies that app-server honored the
+requested durable/ephemeral mode. Cross-process restoration uses the official
+`thread/resume` operation; metadata-only `thread/read` is never treated as a
+resume. Run `npm run test:codex-persistence` to validate this contract without
+starting a model turn or consuming subscription quota.
 
 Codex owns the inner agent loop. Through the app-server experimental
 `dynamicTools` protocol, it selects directly from the tools advertised by the
@@ -71,7 +76,7 @@ built-ins while preserving native Copilot execution and tool cards.
 
 Completed conversation threads stay available in memory for up to four hours
 (maximum 16). Reuse first checks the complete SHA-256 history and answer
-digests. Copilot patch v7 additionally forwards a stable conversation id and
+digests. Copilot patch v9 additionally forwards a stable conversation id and
 turn index so the provider can tolerate rewritten service, tool, or rendered
 prompt history while still requiring an advancing turn and the exact prior
 answer. Without the patch, a conservative fallback ignores mutable tool
@@ -88,6 +93,13 @@ Quick Access reports both the in-process thread-reuse ratio and the last
 prompt-cache percentage returned by Codex. Body-free
 codex.chat.thread_reuse_miss events categorize reuse failures without logging
 conversation ids, text, or hashes.
+
+If the native VS Code transcript has already become too large, run
+`Local LLM: Continue Latest Codex Thread in New Chat`. The command arms the
+newest durable completed Codex thread for 30 minutes and opens a clean chat.
+Keep the same Codex model selected and send the next user message there. The
+provider resumes the inner Codex thread but does not serialize the old VS Code
+transcript again.
 
 This design also supports private caller tools that are not present in
 `vscode.lm.tools`, including Copilot's terminal implementation. Native calls use
@@ -126,7 +138,8 @@ shown or written to extension logs.
 | `llamacpp.codexReasoningEffort` | `auto` | Use model default or a supported effort. |
 | `llamacpp.codexReasoningSummary` | `auto` | Thinking summary detail. |
 | `llamacpp.codexFastServiceTier` | `false` | Request priority service when offered; uses quota faster. |
-| `llamacpp.codexEphemeralThreads` | `true` | Avoid duplicating Copilot-owned histories. |
+| `llamacpp.persistProviderSessions` | `true` | Resume completed Codex and Claude sessions across reloads. |
+| `llamacpp.codexEphemeralThreads` | `false` | Force Codex threads to stay in-memory and disable cross-reload resume. |
 | `llamacpp.codexContextLength` | `258400` | Context advertised to VS Code. |
 | `llamacpp.codexMaxInputChars` | `600000` | Serialized conversation limit below the app-server hard request limit. |
 | `llamacpp.codexMaxToolResultChars` | `12000` | Per-result history cap that preserves more conversational turns. |
@@ -196,3 +209,9 @@ usually keeps all user and assistant turns available.
 protocol overhead. The `codex.chat.start` log event records original and final
 character counts plus omitted and truncated message and image counts. Images
 belonging to omitted history messages are not resent.
+
+Patch v9 additionally caps terminal and native tool data before VS Code writes
+it into its own chat-session snapshots. This prevents future transcript growth;
+it does not shrink sessions that were already persisted. Use the Codex rollover
+command above to leave an existing oversized chat while preserving the latest
+durable completed Codex thread.

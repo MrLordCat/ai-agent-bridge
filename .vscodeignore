@@ -1,6 +1,9 @@
 .vscode/**
 .vscode-test/**
 .vscode-test.mjs
+.agents/**
+.playwright-mcp/**
+AGENTS.md
 .venv/**
 .tools/**
 .github/**

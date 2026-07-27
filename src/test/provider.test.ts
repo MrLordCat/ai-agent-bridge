@@ -1,8 +1,8 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
-import { LlamaCppChatModelProvider } from "../llama-provider";
+import { LlamaCppChatModelProvider, stripCacheControlArtifacts } from "../llama-provider";
 import { ToolCallValidationError, type ToolCallReliabilityMetrics } from "../tools/tool-call-reliability";
-import type { OpenAIFunctionToolDef } from "../types";
+import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
 import { convertMessages, convertTools, validateRequest } from "../utils";
 
 // Mock SecretStorage
@@ -23,6 +23,14 @@ class MockSecretStorage implements vscode.SecretStorage {
         return Promise.resolve(Array.from(this.secrets.keys()));
     }
     onDidChange: vscode.Event<vscode.SecretStorageChangeEvent> = new vscode.EventEmitter<vscode.SecretStorageChangeEvent>().event;
+}
+
+/** Simple in-memory Memento that survives provider restarts in tests. */
+class MockMemento implements vscode.Memento {
+    private store = new Map<string, unknown>();
+    keys(): readonly string[] { return [...this.store.keys()]; }
+    get<T>(key: string): T | undefined { return this.store.get(key) as T | undefined; }
+    update(key: string, value: unknown): Thenable<void> { this.store.set(key, value); return Promise.resolve(); }
 }
 
 suite("Llama.cpp Chat Provider Extension", () => {
@@ -492,6 +500,146 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.ok(truncated[0].content!.includes("tool result summarized"));
         });
 
+        test("strips every cache_control marker shape so tool text stays stable", () => {
+            const legacy = 'result {"$mid":17,"mimeType":"cache_control","data":"QUJD"} tail';
+            assert.strictEqual(stripCacheControlArtifacts(legacy), "result  tail");
+
+            // Shape VS Code emits today; the previous regex did not match it and the
+            // leftover marker moved between turns, breaking the cached prefix.
+            const modern = 'result {"type":"data","mimeType":"cache_control","bytes":9} tail';
+            assert.strictEqual(stripCacheControlArtifacts(modern), "result  tail");
+
+            const reordered = 'a {"bytes":9,"mimeType":"cache_control","type":"data"} b';
+            assert.strictEqual(stripCacheControlArtifacts(reordered), "a  b");
+
+            const textual = "output line\n[data cache_control, 9 bytes]";
+            assert.strictEqual(stripCacheControlArtifacts(textual), "output line\n");
+
+            // Unrelated JSON must survive untouched.
+            const unrelated = '{"mimeType":"text/plain","data":"keep"}';
+            assert.strictEqual(stripCacheControlArtifacts(unrelated), unrelated);
+
+            // Nested markers are removed without eating the enclosing object.
+            const nested = '{"a":1,"parts":[{"type":"data","mimeType":"cache_control","bytes":9}],"b":2}';
+            assert.strictEqual(stripCacheControlArtifacts(nested), '{"a":1,"parts":[],"b":2}');
+
+            // Idempotent: sanitising twice must not change the result again.
+            const once = stripCacheControlArtifacts(modern);
+            assert.strictEqual(stripCacheControlArtifacts(once), once);
+        });
+
+        test("drops cache_control parts before they reach message text", () => {
+            // A data part that lost its Uint8Array payload crossing the extension
+            // host boundary used to fall through to JSON.stringify and land in the
+            // tool result text, which moved between turns and broke the prefix.
+            const serializedMarker = { $mid: 17, mimeType: "cache_control", data: "QUJD" };
+            const messages = [
+                vscode.LanguageModelChatMessage.Assistant([
+                    new vscode.LanguageModelToolCallPart("call-1", "read_file", { path: "a.txt" }),
+                ]),
+                vscode.LanguageModelChatMessage.User([
+                    new vscode.LanguageModelToolResultPart("call-1", [
+                        new vscode.LanguageModelTextPart("file contents"),
+                        serializedMarker as unknown as vscode.LanguageModelTextPart,
+                    ]),
+                ]),
+            ];
+
+            const converted = convertMessages(messages, { toolResultMode: "tool" });
+            const serialized = JSON.stringify(converted);
+            assert.ok(!serialized.includes("cache_control"), "no marker may survive into the request");
+            assert.ok(serialized.includes("file contents"), "real tool output must be preserved");
+        });
+
+        test("keeps historical reasoning stable across turns and parallel conversations", () => {
+            const memento = new MockMemento();
+            const target = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const api = target as unknown as {
+                setReasoningScope: (scope: string | undefined) => void;
+                rememberReasoningValueForToolCall: (callId: string, reasoning: string) => void;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+
+            const toolCallMessage = (callId: string): OpenAIChatMessage => ({
+                role: "assistant",
+                content: "",
+                tool_calls: [{
+                    id: callId,
+                    type: "function" as const,
+                    function: { name: "read_file", arguments: "{}" },
+                }],
+            });
+
+            api.setReasoningScope("chat-a");
+            api.rememberReasoningValueForToolCall("call-early", "early-reasoning");
+
+            // A second conversation stores far more entries than the old global
+            // 256-entry budget allowed, which used to evict "call-early".
+            api.setReasoningScope("chat-b");
+            for (let index = 0; index < 600; index += 1) {
+                api.rememberReasoningValueForToolCall(`b-${index}`, `reasoning-${index}`);
+            }
+
+            api.setReasoningScope("chat-a");
+            const history: OpenAIChatMessage[] = [
+                { role: "system", content: "system" },
+                { role: "user", content: "first" },
+                toolCallMessage("call-early"),
+                { role: "tool", tool_call_id: "call-early", content: "result" },
+                { role: "user", content: "next" },
+            ];
+
+            const injected = api.injectStoredReasoningContent(history);
+            assert.strictEqual(
+                injected[2].reasoning_content,
+                "early-reasoning",
+                "a busy parallel conversation must not evict this conversation's reasoning"
+            );
+        });
+
+        test("binds fallback reasoning to call ids so the prefix stops drifting", async () => {
+            const memento = new MockMemento();
+            const target = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const api = target as unknown as {
+                setReasoningScope: (scope: string | undefined) => void;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            const state = target as unknown as { _currentTurnReasoningContent: string };
+
+            api.setReasoningScope("chat-drift");
+            state._currentTurnReasoningContent = "turn-1-reasoning";
+
+            const first: OpenAIChatMessage[] = [
+                { role: "user", content: "go" },
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call-1", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+            ];
+            const firstPass = api.injectStoredReasoningContent(first);
+            assert.strictEqual(firstPass[1].reasoning_content, "turn-1-reasoning");
+
+            // Next turn appends another tool call, so the positional fallback moves on.
+            state._currentTurnReasoningContent = "turn-2-reasoning";
+            const second: OpenAIChatMessage[] = [
+                ...first,
+                { role: "tool", tool_call_id: "call-1", content: "result" },
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call-2", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+            ];
+            const secondPass = api.injectStoredReasoningContent(second);
+            assert.strictEqual(
+                secondPass[1].reasoning_content,
+                "turn-1-reasoning",
+                "the earlier message must keep the reasoning it was already sent with"
+            );
+            assert.strictEqual(secondPass[3].reasoning_content, "turn-2-reasoning");
+        });
+
         test("serializes local chat request slots", async () => {
             const providerAny = provider as unknown as {
                 acquireChatRequestSlot: (
@@ -603,6 +751,469 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.ok(text.includes("done"));
             assert.ok(hasThinkingPart || hasNonTextPart || text.includes("step 1 -> step 2"));
             assert.strictEqual(measuredThinking, "step 1 -> step 2");
+        });
+
+        test("retains native thinking for the next DeepSeek tool turn", async () => {
+            class NativeThinkingPart {
+                constructor(
+                    readonly text: string,
+                    readonly id?: string,
+                    readonly metadata?: unknown
+                ) {}
+            }
+
+            const isolatedProvider = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent");
+            const providerAny = isolatedProvider as unknown as {
+                getThinkingConstructor: () => (new (text: string, id?: string, metadata?: unknown) => unknown) | undefined;
+                configureToolCallReliability: (
+                    tools: readonly OpenAIFunctionToolDef[],
+                    options: { repairEnabled: boolean; validateSchema: boolean }
+                ) => void;
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken
+                ) => Promise<void>;
+                getCurrentTurnReasoningContent: () => string;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            providerAny.getThinkingConstructor = () => NativeThinkingPart;
+            providerAny.configureToolCallReliability(
+                [{
+                    type: "function",
+                    function: {
+                        name: "list_dir",
+                        parameters: {
+                            type: "object",
+                            properties: { path: { type: "string" } },
+                            required: ["path"],
+                        },
+                    },
+                }],
+                { repairEnabled: true, validateSchema: true }
+            );
+
+            const encoder = new TextEncoder();
+            const payload =
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"inspect the project first\"}}]}\n\n" +
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-native-thinking\",\"function\":{\"name\":\"list_dir\",\"arguments\":\"{\\\"path\\\":\\\"D:/Game\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+                "data: [DONE]\n\n";
+            const stream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode(payload));
+                    controller.close();
+                },
+            });
+
+            const parts: vscode.LanguageModelResponsePart[] = [];
+            await providerAny.processStreamingResponse(
+                stream,
+                { report: part => parts.push(part) },
+                new vscode.CancellationTokenSource().token
+            );
+
+            assert.ok(parts.some(part => part instanceof NativeThinkingPart));
+            const toolCall = parts.find(
+                (part): part is vscode.LanguageModelToolCallPart => part instanceof vscode.LanguageModelToolCallPart
+            );
+            assert.ok(toolCall);
+            assert.strictEqual(providerAny.getCurrentTurnReasoningContent(), "inspect the project first");
+
+            const nextMessages = providerAny.injectStoredReasoningContent([
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{
+                        id: "old-call",
+                        type: "function",
+                        function: { name: "list_dir", arguments: "{\"path\":\"D:/Old\"}" },
+                    }],
+                },
+                { role: "tool", tool_call_id: "old-call", content: "old directory contents" },
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{
+                        id: toolCall.callId,
+                        type: "function",
+                        function: { name: toolCall.name, arguments: JSON.stringify(toolCall.input) },
+                    }],
+                },
+                { role: "tool", tool_call_id: toolCall.callId, content: "directory contents" },
+            ]);
+            assert.strictEqual(nextMessages[0].reasoning_content, undefined);
+            assert.strictEqual(nextMessages[2].reasoning_content, "inspect the project first");
+            assert.strictEqual(providerAny.getCurrentTurnReasoningContent(), "inspect the project first");
+
+            const finalStream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n" +
+                        "data: [DONE]\n\n"
+                    ));
+                    controller.close();
+                },
+            });
+            await providerAny.processStreamingResponse(
+                finalStream,
+                { report: () => undefined },
+                new vscode.CancellationTokenSource().token
+            );
+            assert.strictEqual(providerAny.getCurrentTurnReasoningContent(), "");
+        });
+
+        test("loses historical reasoning_content after simulated restart, breaking cache prefix", async () => {
+            // This test reproduces the DeepSeek prompt-cache regression:
+            // after a VS Code restart, the in-memory _reasoningByToolCallId map is
+            // lost.  VS Code may also omit LanguageModelThinkingPart from the
+            // replayed history.  injectStoredReasoningContent then cannot restore
+            // reasoning_content for historical tool-call messages, so the outgoing
+            // prefix differs from what DeepSeek previously cached → cache miss.
+
+            class NativeThinkingPart {
+                constructor(
+                    readonly text: string,
+                    readonly id?: string,
+                    readonly metadata?: unknown
+                ) {}
+            }
+
+            // --- Turn 1: model responds with reasoning and a tool call ---
+            const memento = new MockMemento();
+            const preRestart = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const pre = preRestart as unknown as {
+                getThinkingConstructor: () => (new (text: string, id?: string, metadata?: unknown) => unknown) | undefined;
+                configureToolCallReliability: (
+                    tools: readonly OpenAIFunctionToolDef[],
+                    options: { repairEnabled: boolean; validateSchema: boolean }
+                ) => void;
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken
+                ) => Promise<void>;
+                getCurrentTurnReasoningContent: () => string;
+                getReasoningForToolCall: (callId: string) => string | undefined;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            pre.getThinkingConstructor = () => NativeThinkingPart;
+            pre.configureToolCallReliability(
+                [{
+                    type: "function",
+                    function: {
+                        name: "read_file",
+                        parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+                    },
+                }],
+                { repairEnabled: true, validateSchema: true }
+            );
+
+            const encoder = new TextEncoder();
+            const stream1 = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(encoder.encode(
+                        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"turn-1-reasoning\"}}]}\n\n" +
+                        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call-turn1\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"D:/a.txt\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+                        "data: [DONE]\n\n"
+                    ));
+                    controller.close();
+                },
+            });
+            const turn1Parts: vscode.LanguageModelResponsePart[] = [];
+            await pre.processStreamingResponse(stream1, { report: p => turn1Parts.push(p) }, new vscode.CancellationTokenSource().token);
+
+            const toolCall1 = turn1Parts.find(
+                (p): p is vscode.LanguageModelToolCallPart => p instanceof vscode.LanguageModelToolCallPart
+            );
+            assert.ok(toolCall1, "expected a tool call in turn 1 response");
+            assert.strictEqual(pre.getCurrentTurnReasoningContent(), "turn-1-reasoning");
+            assert.strictEqual(pre.getReasoningForToolCall(toolCall1.callId), "turn-1-reasoning");
+
+            // Verify: same provider can inject reasoning for its own call
+            const beforeRestart = pre.injectStoredReasoningContent([
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{
+                        id: toolCall1.callId,
+                        type: "function" as const,
+                        function: { name: toolCall1.name, arguments: JSON.stringify(toolCall1.input) },
+                    }],
+                },
+                { role: "tool", tool_call_id: toolCall1.callId, content: "file contents" },
+                { role: "user", content: "next question" },
+            ]);
+            assert.strictEqual(beforeRestart[0].reasoning_content, "turn-1-reasoning",
+                "pre-restart: reasoning should be injected via exact callId match");
+
+            // --- Simulate VS Code / Extension Host restart ---
+            // A fresh provider has an empty _reasoningByToolCallId map and empty
+            // _currentTurnReasoningContent.  VS Code history may also omit
+            // LanguageModelThinkingPart, so convertMessages won't add reasoning_content.
+            const postRestart = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const post = postRestart as unknown as {
+                getCurrentTurnReasoningContent: () => string;
+                getReasoningForToolCall: (callId: string) => string | undefined;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+
+            // Map is empty — nothing persisted across the restart.
+            assert.strictEqual(post.getCurrentTurnReasoningContent(), "",
+                "after restart: current turn reasoning should be empty");
+            assert.strictEqual(post.getReasoningForToolCall(toolCall1.callId), undefined,
+                "after restart: reasoning map has no entry for the historical call");
+
+            // The messages below represent what convertMessages produces after
+            // restart when VS Code drops thinking parts: tool-call messages
+            // without reasoning_content.
+            const historicalWithoutReasoning: OpenAIChatMessage[] = [
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{
+                        id: toolCall1.callId,
+                        type: "function" as const,
+                        function: { name: toolCall1.name, arguments: JSON.stringify(toolCall1.input) },
+                    }],
+                    // Intentionally NO reasoning_content — simulates VS Code history
+                    // that lost LanguageModelThinkingPart across restart.
+                },
+                { role: "tool", tool_call_id: toolCall1.callId, content: "file contents" },
+                { role: "user", content: "next question" },
+            ];
+
+            const afterRestart = post.injectStoredReasoningContent(historicalWithoutReasoning);
+
+            // THIS IS THE BUG: after restart, historical tool-call messages
+            // cannot get their reasoning restored.  The outgoing prefix differs
+            // from what DeepSeek previously cached → permanent cache miss.
+            assert.strictEqual(
+                afterRestart[0].reasoning_content,
+                "turn-1-reasoning",
+                "BUG: reasoning should survive restart (via persistence to globalState). " +
+                "Without it, the first request after restart has a different prefix, " +
+                "and DeepSeek cache misses for every historical tool-call message."
+            );
+        });
+
+        test("prefix drifts across turns after restart because only the newest call gets reasoning", async () => {
+            // After restart, injectStoredReasoningContent only restores reasoning
+            // for the last tool-call message via the fallback.  Historical
+            // messages remain without reasoning until their callIds happen to be
+            // re-added to the map over many turns.  Each turn the prefix changes
+            // because a different message gains reasoning_content.
+
+            class NativeThinkingPart {
+                constructor(
+                    readonly text: string,
+                    readonly id?: string,
+                    readonly metadata?: unknown
+                ) {}
+            }
+
+            const encoder = new TextEncoder();
+
+            function makeStream(reasoning: string, callId: string, callName: string, callArgs: string): ReadableStream<Uint8Array> {
+                return new ReadableStream<Uint8Array>({
+                    start(controller) {
+                        controller.enqueue(encoder.encode(
+                            `data: {"choices":[{"delta":{"reasoning_content":"${reasoning}"}}]}\n\n` +
+                            `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"${callId}","function":{"name":"${callName}","arguments":"${callArgs.replace(/"/g, '\\"')}"}}]},"finish_reason":"tool_calls"}]}\n\n` +
+                            "data: [DONE]\n\n"
+                        ));
+                        controller.close();
+                    },
+                });
+            }
+
+            // --- Turn 1: first call ---
+            const memento2 = new MockMemento();
+            const prov = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento2);
+            const p = prov as unknown as {
+                getThinkingConstructor: () => (new (text: string, id?: string, metadata?: unknown) => unknown) | undefined;
+                configureToolCallReliability: (
+                    tools: readonly OpenAIFunctionToolDef[],
+                    options: { repairEnabled: boolean; validateSchema: boolean }
+                ) => void;
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken
+                ) => Promise<void>;
+                getCurrentTurnReasoningContent: () => string;
+                getReasoningForToolCall: (callId: string) => string | undefined;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            p.getThinkingConstructor = () => NativeThinkingPart;
+            p.configureToolCallReliability(
+                [
+                    { type: "function", function: { name: "read_file", parameters: { type: "object" } } },
+                    { type: "function", function: { name: "grep_search", parameters: { type: "object" } } },
+                ],
+                { repairEnabled: true, validateSchema: true }
+            );
+
+            // Turn 1: reason_A, call_A
+            await p.processStreamingResponse(
+                makeStream("reason-A", "call-A", "read_file", '{"path":"D:/a.txt"}'),
+                { report: () => undefined },
+                new vscode.CancellationTokenSource().token
+            );
+
+            // Turn 2: reason_B, call_B
+            await p.processStreamingResponse(
+                makeStream("reason-B", "call-B", "grep_search", '{"query":"test"}'),
+                { report: () => undefined },
+                new vscode.CancellationTokenSource().token
+            );
+
+            // After 2 turns, both callIds should be in the map
+            assert.strictEqual(p.getReasoningForToolCall("call-A"), "reason-A");
+            assert.strictEqual(p.getReasoningForToolCall("call-B"), "reason-B");
+
+            // Now build messages representing a 3-turn history where BOTH
+            // historical tool-call messages are present.
+            const fullHistory: OpenAIChatMessage[] = [
+                {
+                    role: "assistant", content: "",
+                    tool_calls: [{ id: "call-A", type: "function" as const, function: { name: "read_file", arguments: '{"path":"D:/a.txt"}' } }],
+                },
+                { role: "tool", tool_call_id: "call-A", content: "content A" },
+                { role: "user", content: "next" },
+                {
+                    role: "assistant", content: "",
+                    tool_calls: [{ id: "call-B", type: "function" as const, function: { name: "grep_search", arguments: '{"query":"test"}' } }],
+                },
+                { role: "tool", tool_call_id: "call-B", content: "content B" },
+                { role: "user", content: "one more" },
+            ];
+
+            const withReasoning = p.injectStoredReasoningContent(fullHistory);
+            assert.strictEqual(withReasoning[0].reasoning_content, "reason-A",
+                "call-A should get its own reasoning via exact callId match");
+            assert.strictEqual(withReasoning[3].reasoning_content, "reason-B",
+                "call-B should get its own reasoning via exact callId match");
+
+            // --- Simulate restart: new provider, empty map ---
+            const prov2 = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento2);
+            const p2 = prov2 as unknown as {
+                getCurrentTurnReasoningContent: () => string;
+                getReasoningForToolCall: (callId: string) => string | undefined;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            assert.strictEqual(p2.getReasoningForToolCall("call-A"), undefined);
+            assert.strictEqual(p2.getReasoningForToolCall("call-B"), undefined);
+
+            // After restart, NEITHER historical call gets reasoning.
+            const afterRestartAll = p2.injectStoredReasoningContent(fullHistory);
+            assert.strictEqual(
+                afterRestartAll[0].reasoning_content,
+                "reason-A",
+                "BUG: call-A should get reasoning restored after restart"
+            );
+            assert.strictEqual(
+                afterRestartAll[3].reasoning_content,
+                "reason-B",
+                "BUG: call-B should get reasoning restored after restart"
+            );
+
+            // ---- Now simulate Turn 3 after restart ----
+            // One new turn populates the map with call-C, but call-A and
+            // call-B are still missing.  This shows why the prefix keeps
+            // changing across turns.
+            const prov3 = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento2);
+            const p3 = prov3 as unknown as {
+                getThinkingConstructor: () => (new (text: string, id?: string, metadata?: unknown) => unknown) | undefined;
+                configureToolCallReliability: (tools: readonly OpenAIFunctionToolDef[], o: { repairEnabled: boolean; validateSchema: boolean }) => void;
+                processStreamingResponse: (b: ReadableStream<Uint8Array>, pr: vscode.Progress<vscode.LanguageModelResponsePart>, t: vscode.CancellationToken) => Promise<void>;
+                getCurrentTurnReasoningContent: () => string;
+                getReasoningForToolCall: (callId: string) => string | undefined;
+                injectStoredReasoningContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+            p3.getThinkingConstructor = () => NativeThinkingPart;
+            p3.configureToolCallReliability(
+                [{ type: "function", function: { name: "grep_search", parameters: { type: "object" } } }],
+                { repairEnabled: true, validateSchema: true }
+            );
+            await p3.processStreamingResponse(
+                makeStream("reason-C", "call-C", "grep_search", '{"query":"new"}'),
+                { report: () => undefined },
+                new vscode.CancellationTokenSource().token
+            );
+
+            // With persistence, loadPersistedReasoningMap inside processStreamingResponse
+            // restores call-A and call-B before streaming adds call-C.
+            assert.strictEqual(p3.getReasoningForToolCall("call-A"), "reason-A");
+            assert.strictEqual(p3.getReasoningForToolCall("call-B"), "reason-B");
+            assert.strictEqual(p3.getReasoningForToolCall("call-C"), "reason-C");
+
+            // History now includes call-A, call-B, AND call-C.
+            const extendedHistory: OpenAIChatMessage[] = [
+                ...fullHistory,
+                {
+                    role: "assistant", content: "",
+                    tool_calls: [{ id: "call-C", type: "function" as const, function: { name: "grep_search", arguments: '{"query":"new"}' } }],
+                },
+                { role: "tool", tool_call_id: "call-C", content: "content C" },
+                { role: "user", content: "final" },
+            ];
+
+            const afterTurn3 = p3.injectStoredReasoningContent(extendedHistory);
+            // With persistence, all historical calls retain their reasoning.
+            assert.strictEqual(
+                afterTurn3[0].reasoning_content,
+                "reason-A",
+                "call-A should keep its reasoning across turns with persistence"
+            );
+            assert.strictEqual(
+                afterTurn3[3].reasoning_content,
+                "reason-B",
+                "call-B should keep its reasoning across turns with persistence"
+            );
+            // call-C gets reasoning from exact match (map has it).
+            assert.strictEqual(afterTurn3[6].reasoning_content, "reason-C");
+        });
+
+        test("keeps the API Direct tool prefix stable within one Copilot conversation", () => {
+            const providerAny = provider as unknown as {
+                stabilizeToolCatalog: (
+                    modelId: string,
+                    options: vscode.ProvideLanguageModelChatResponseOptions,
+                    config: ReturnType<typeof convertTools>,
+                    messages: readonly OpenAIChatMessage[],
+                    requestId: string
+                ) => ReturnType<typeof convertTools>;
+            };
+            const tool = (name: string): vscode.LanguageModelChatTool => ({
+                name,
+                description: name,
+                inputSchema: { type: "object", properties: {} },
+            });
+            const baseOptions = {
+                modelOptions: { _copilotConversationId: "conversation-cache-1" },
+                tools: [tool("y_tool"), tool("z_tool")],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            const expandedOptions = {
+                modelOptions: { _copilotConversationId: "conversation-cache-1" },
+                tools: [tool("a_tool"), tool("y_tool"), tool("z_tool")],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            const first = providerAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                baseOptions,
+                convertTools(baseOptions, { mode: "apiDirect", apiDirectMaxTools: 2 }),
+                [{ role: "user", content: "first" }],
+                "request-1"
+            );
+            const second = providerAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                expandedOptions,
+                convertTools(expandedOptions, { mode: "apiDirect", apiDirectMaxTools: 2 }),
+                [{ role: "user", content: "next" }],
+                "request-2"
+            );
+            assert.deepStrictEqual(second.tools, first.tools);
         });
 
         test("returns exact usage from the final SSE usage chunk", async () => {
@@ -1342,6 +1953,66 @@ suite("Llama.cpp Chat Provider Extension", () => {
           assert.strictEqual(out[1].tool_call_id, callId);
           assert.ok((out[1].content as string).includes("ok"));
           });
+
+        test("preserves tool-result images for vision models", () => {
+            const callId = "call_image_1";
+            const imagePart = vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png");
+            const messages: vscode.LanguageModelChatMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.Assistant,
+                    content: [new vscode.LanguageModelToolCallPart(callId, "view_image", { filePath: "capture.png" })],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [
+                        new vscode.LanguageModelToolResultPart(callId, [
+                            new vscode.LanguageModelTextPart("capture loaded"),
+                            imagePart as unknown as vscode.LanguageModelTextPart,
+                        ]),
+                    ],
+                    name: undefined,
+                },
+            ];
+
+            const out = convertMessages(messages, { toolResultMode: "tool", supportsImageInput: true });
+            assert.strictEqual(out.length, 3);
+            assert.strictEqual(out[1].role, "tool");
+            assert.strictEqual(out[1].content, "capture loaded");
+            assert.strictEqual(out[2].role, "user");
+            assert.ok(Array.isArray(out[2].content));
+            const image = (out[2].content as Array<{ type: string; image_url?: { url?: string } }>).find(
+                part => part.type === "image_url"
+            );
+            assert.strictEqual(image?.image_url?.url, "data:image/png;base64,AQID");
+        });
+
+        test("uses a placeholder for tool-result images without vision support", () => {
+            const callId = "call_image_fallback";
+            const imagePart = vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png");
+            const messages: vscode.LanguageModelChatMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.Assistant,
+                    content: [new vscode.LanguageModelToolCallPart(callId, "view_image", { filePath: "capture.png" })],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [
+                        new vscode.LanguageModelToolResultPart(callId, [
+                            imagePart as unknown as vscode.LanguageModelTextPart,
+                        ]),
+                    ],
+                    name: undefined,
+                },
+            ];
+
+            const out = convertMessages(messages, { toolResultMode: "tool", supportsImageInput: false });
+            assert.strictEqual(out.length, 2);
+            assert.strictEqual(out[1].role, "tool");
+            assert.ok(String(out[1].content).includes("image input not supported"));
+            assert.ok(!String(out[1].content).includes("AQID"));
+        });
 
         test("preserves reasoning_content on assistant tool-call messages", () => {
             const thinkingPart = {

@@ -67,8 +67,62 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     private _emittedTextToolCallIds = new Set<string>();
     private _thinkingTagBuffer = "";
     private _insideThinkingTag = false;
-    private _thinkingFallbackHeaderEmitted = false;
     private _emittedThinkingParts = new WeakMap<object, string>();
+    private _currentTurnReasoningContent = "";
+    private _reasoningScope = "";
+    private readonly _reasoningByScope = new Map<string, Map<string, string>>();
+
+    /** Number of recent conversations that keep their reasoning entries. */
+    private static readonly MAX_REASONING_SCOPES = 12;
+    /** Per-conversation character budget for retained reasoning. */
+    private static readonly MAX_REASONING_SCOPE_CHARS = 2_000_000;
+
+    /**
+     * Binds reasoning storage to a single conversation.
+     *
+     * Evicting one historical entry silently removes `reasoning_content` from an
+     * assistant message that was already sent, which changes the outgoing prompt
+     * prefix and invalidates the whole upstream cache. Scoping stops a second
+     * busy chat from evicting the entries of the first one.
+     */
+    protected setReasoningScope(scope: string | undefined): void {
+        this._reasoningScope = typeof scope === "string" ? scope : "";
+    }
+
+    private reasoningMapFor(scope: string, create: boolean): Map<string, string> | undefined {
+        const existing = this._reasoningByScope.get(scope);
+        if (existing) {
+            // Refresh the LRU position of the scope that is still in use.
+            this._reasoningByScope.delete(scope);
+            this._reasoningByScope.set(scope, existing);
+            return existing;
+        }
+        if (!create) {
+            return undefined;
+        }
+        const created = new Map<string, string>();
+        this._reasoningByScope.set(scope, created);
+        while (this._reasoningByScope.size > BaseChatModelProvider.MAX_REASONING_SCOPES) {
+            const oldest = this._reasoningByScope.keys().next().value as string | undefined;
+            if (oldest === undefined || oldest === scope) {
+                break;
+            }
+            this._reasoningByScope.delete(oldest);
+        }
+        return created;
+    }
+
+    /** Exposed for subclass persistence (survives Extension Host restarts). */
+    protected exportReasoningScopes(): Array<[string, Array<[string, string]>]> {
+        return [...this._reasoningByScope].map(([scope, entries]) => [scope, [...entries]]);
+    }
+
+    protected restoreReasoningEntry(callId: string, reasoning: string, scope = ""): void {
+        if (!callId || !reasoning) {
+            return;
+        }
+        this.reasoningMapFor(scope, true)?.set(callId, reasoning);
+    }
     private readonly _toolCallReliability = new ToolCallReliabilityGuard();
 
     protected configureToolCallReliability(
@@ -292,6 +346,9 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
         token: vscode.CancellationToken
     ): Promise<ChatTokenUsage | undefined> {
+        // The previous turn's reasoning has already been injected into the outgoing
+        // request by this point. Start a fresh buffer for the response that follows.
+        this.clearCurrentTurnReasoningContent();
         this._toolCallBuffers.clear();
         this._completedToolCallIndices.clear();
         this._hasEmittedAssistantText = false;
@@ -303,7 +360,6 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         this._emittedTextToolCallIds.clear();
         this._thinkingTagBuffer = "";
         this._insideThinkingTag = false;
-        this._thinkingFallbackHeaderEmitted = false;
         this._emittedThinkingParts = new WeakMap<object, string>();
 
         const reader = responseBody.getReader();
@@ -377,7 +433,6 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             this._emittedTextToolCallKeys.clear();
             this._thinkingTagBuffer = "";
             this._insideThinkingTag = false;
-            this._thinkingFallbackHeaderEmitted = false;
         }
 
         return latestUsage;
@@ -639,6 +694,11 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             return false;
         }
 
+        // Always retain reasoning for the next tool-result request. VS Code may render
+        // a native ThinkingPart but omit it from the LanguageModelChatRequestMessage
+        // history that is passed back to third-party providers.
+        this._currentTurnReasoningContent += text;
+
         const ThinkingCtor = this.getThinkingConstructor();
         if (ThinkingCtor) {
             const part = new (ThinkingCtor as new (text: string, id?: string, metadata?: unknown) => unknown)(
@@ -651,13 +711,9 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             return true;
         }
 
-        if (!this._thinkingFallbackHeaderEmitted) {
-            progress.report(new vscode.LanguageModelTextPart("\n[thinking]\n"));
-            this._thinkingFallbackHeaderEmitted = true;
-        }
-        const fallbackPart = new vscode.LanguageModelTextPart(text);
-        this.rememberThinkingPart(fallbackPart, text);
-        progress.report(fallbackPart);
+        // Fallback: LanguageModelThinkingPart is not available. Keep the reasoning
+        // hidden from visible text; the buffer above still carries it into a follow-up
+        // tool request as reasoning_content.
         return true;
     }
 
@@ -672,6 +728,61 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             return undefined;
         }
         return this._emittedThinkingParts.get(part);
+    }
+
+    /** Returns the accumulated reasoning content from the current turn's stream. */
+    protected getCurrentTurnReasoningContent(): string {
+        return this._currentTurnReasoningContent;
+    }
+
+    protected getReasoningForToolCall(callId: string): string | undefined {
+        if (!callId) {
+            return undefined;
+        }
+        const scoped = this.reasoningMapFor(this._reasoningScope, false)?.get(callId);
+        if (scoped !== undefined || !this._reasoningScope) {
+            return scoped;
+        }
+        // Entries persisted before conversation scoping existed live in the "" bucket.
+        return this.reasoningMapFor("", false)?.get(callId);
+    }
+
+    /**
+     * Stores reasoning against the call ids it was produced with, so later turns
+     * rebuild a byte-identical assistant message instead of dropping the field.
+     */
+    protected rememberReasoningValueForToolCall(callId: string, reasoning: string): void {
+        if (!callId || !reasoning) {
+            return;
+        }
+        const map = this.reasoningMapFor(this._reasoningScope, true);
+        if (!map) {
+            return;
+        }
+        map.delete(callId);
+        map.set(callId, reasoning);
+
+        let retained = 0;
+        for (const value of map.values()) {
+            retained += value.length;
+        }
+        while (retained > BaseChatModelProvider.MAX_REASONING_SCOPE_CHARS && map.size > 1) {
+            const oldest = map.keys().next().value as string | undefined;
+            if (oldest === undefined || oldest === callId) {
+                break;
+            }
+            retained -= map.get(oldest)?.length ?? 0;
+            map.delete(oldest);
+        }
+    }
+
+    private rememberReasoningForToolCall(callId: string): void {
+        this.rememberReasoningValueForToolCall(callId, this._currentTurnReasoningContent);
+    }
+
+    /** Clears reasoning after it has been injected into the outgoing request and before the next response stream. */
+    protected clearCurrentTurnReasoningContent(): void {
+        this._currentTurnReasoningContent = "";
     }
 
     private extractThinkingPayload(value: unknown): { text: string; id?: string; metadata?: unknown } {
@@ -957,6 +1068,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         }
         this._emittedTextToolCallKeys.add(key);
         const id = `tct_${Math.random().toString(36).slice(2, 10)}`;
+        this.rememberReasoningForToolCall(id);
         progress.report(new vscode.LanguageModelToolCallPart(id, evaluated.name, evaluated.arguments));
         return true;
     }
@@ -1000,6 +1112,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         } catch {
             /* ignore */
         }
+        this.rememberReasoningForToolCall(id);
         progress.report(new vscode.LanguageModelToolCallPart(id, evaluated.name, parameters));
         this._toolCallBuffers.delete(index);
         this._completedToolCallIndices.add(index);
@@ -1039,6 +1152,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             } catch {
                 /* ignore */
             }
+            this.rememberReasoningForToolCall(id);
             progress.report(new vscode.LanguageModelToolCallPart(id, name, evaluated.arguments));
             this._toolCallBuffers.delete(idx);
             this._completedToolCallIndices.add(idx);

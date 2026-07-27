@@ -1,4 +1,4 @@
-export interface ContextBudgetInput {
+interface ContextBudgetInput {
 	contextLength: number;
 	contextUtilization: number;
 	hardContextUtilization: number;
@@ -15,7 +15,7 @@ export interface ContextBudget {
 	hardInputTarget: number;
 }
 
-export interface ContextUsageEstimate {
+interface ContextUsageEstimate {
 	estimatedUsedTokens: number;
 	estimatedFreeTokens: number;
 	estimatedUsagePercent: number;

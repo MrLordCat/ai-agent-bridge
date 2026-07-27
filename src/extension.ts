@@ -37,6 +37,7 @@ import {
 	UsageExperimentTracker,
 	type ExperimentVariant,
 } from "./usage-experiment";
+import { registerCopilotPatchIntegration } from "./copilot-patch-runtime";
 
 interface ContextUsageDisplay {
 	summary: string;
@@ -188,11 +189,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(usageExperiments);
 	await Promise.all([logService.initialize(), memoryService.initialize()]);
 	registerMemoryTools(context, memoryService);
+	registerCopilotPatchIntegration(context);
 
 	// Llama.cpp Provider
-	const llamaProvider = new LlamaCppChatModelProvider(context.secrets, ua, logService, memoryService);
-	const codexProvider = new CodexChatModelProvider(extVersion, logService);
-	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService);
+	const llamaProvider = new LlamaCppChatModelProvider(context.secrets, ua, logService, memoryService, context.globalState);
+	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
+	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
 	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
 	const compositeProvider = new CompositeChatModelProvider(llamaProvider, codexProvider, claudeProvider);
@@ -649,6 +651,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.codexContinueLatestInNewChat", async () => {
+			try {
+				const prepared = await codexProvider.prepareLatestDurableThreadRollover();
+				await vscode.commands.executeCommand("workbench.action.chat.newChat");
+				vscode.window.showInformationMessage(
+					`New chat opened. Keep the same Codex model selected and send the next message within 30 minutes `
+					+ `to continue the thread saved at ${new Date(prepared.lastUsedAt).toLocaleString()}.`
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to continue the Codex thread: ${message}`);
+			}
+		})
+	);
+
+	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleClaudeSubscription", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 			const next = config.get<boolean>("enableClaudeSubscription", true) === false;
@@ -701,6 +719,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				vscode.window.showErrorMessage(`Unable to read Claude status: ${message}`);
+			}
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.claudeContinueLatestInNewChat", async () => {
+			try {
+				const prepared = await claudeProvider.prepareLatestDurableSessionRollover();
+				await vscode.commands.executeCommand("workbench.action.chat.newChat");
+				vscode.window.showInformationMessage(
+					`New chat opened. Keep Claude Opus selected and send the next message within 30 minutes `
+					+ `to continue the session saved at ${new Date(prepared.lastUsedAt).toLocaleString()}.`
+				);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to continue the Claude session: ${message}`);
 			}
 		})
 	);

@@ -79,10 +79,12 @@ export interface CodexRateLimitsResponse {
 }
 
 export interface CodexThreadStartResponse {
-	thread: { id: string; ephemeral?: boolean };
+	thread: { id: string; ephemeral: boolean; historyMode?: "legacy" | "paginated" };
 	model: string;
 	modelProvider: string;
 }
+
+export type CodexThreadResumeResponse = CodexThreadStartResponse;
 
 export interface CodexTurnStartResponse {
 	turn: { id: string; status: string };

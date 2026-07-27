@@ -1,5 +1,6 @@
 import type * as vscode from "vscode";
-import { enhanceSubagentToolDescription } from "../subagent-guidance";
+import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
+import { stableJsonStringify } from "../utils";
 
 const MAX_TOOL_DESCRIPTION_CHARS = 4_096;
 export const CODEX_DEFERRED_TOOL_NAMESPACE = "vscode_deferred";
@@ -82,7 +83,7 @@ function normalizeJsonSchema(value: object | undefined): unknown {
 		return { type: "object", additionalProperties: true };
 	}
 	try {
-		return JSON.parse(JSON.stringify(value)) as unknown;
+		return JSON.parse(stableJsonStringify(value)) as unknown;
 	} catch {
 		return { type: "object", additionalProperties: true };
 	}
@@ -95,6 +96,21 @@ function isValidDynamicToolName(name: string): boolean {
 function isCoreAgentTool(name: string): boolean {
 	const normalized = name.toLowerCase().replace(/[^a-z0-9]/g, "");
 	return EAGER_TOOL_SUFFIXES.some(suffix => normalized === suffix || normalized.endsWith(suffix));
+}
+
+function boundedOutputHint(name: string): string {
+	switch (name) {
+		case "run_in_terminal":
+			return " Keep output bounded: use rg, filters, counts, head, or tail and never dump an entire large log, JSON/JSONL file, repository file list, or binary payload into chat.";
+		case "get_terminal_output":
+			return " Read only the smallest useful output slice and avoid repeatedly returning the complete terminal buffer.";
+		case "read_file":
+			return " Read focused line ranges for large files instead of returning the complete file.";
+		case "grep_search":
+			return " Use a narrow query and result limit before broader reads.";
+		default:
+			return "";
+	}
 }
 
 /** Converts the outer Copilot tool catalog into app-server dynamic tool specs. */
@@ -110,7 +126,17 @@ export function buildCodexDynamicTools(
 	const toolNamespaces = new Map<string, string>();
 	const skippedNames: string[] = [];
 
-	for (const tool of advertisedTools) {
+	const stableAdvertisedTools = [...advertisedTools].sort((left, right) => {
+		const nameOrder = left.name.localeCompare(right.name);
+		if (nameOrder !== 0) {
+			return nameOrder;
+		}
+		return stableJsonStringify(left.inputSchema ?? {}).localeCompare(
+			stableJsonStringify(right.inputSchema ?? {})
+		);
+	});
+
+	for (const tool of stableAdvertisedTools) {
 		if (
 			callableNames.has(tool.name)
 			|| EXCLUDED_VSCODE_TOOLS.has(tool.name)
@@ -121,14 +147,16 @@ export function buildCodexDynamicTools(
 		}
 		const useNativeNamespace = CODEX_BUILTIN_TOOL_COLLISIONS.has(tool.name);
 		const deferLoading = !useNativeNamespace && options.deferNonCoreTools === true && !isCoreAgentTool(tool.name);
+		const routedTool = withRequiredSubagentModel(tool);
 		const spec: CodexDynamicFunctionToolSpec = {
 			type: "function",
-			name: tool.name,
+			name: routedTool.name,
 			description: enhanceSubagentToolDescription(
-				tool.name,
-				tool.description || `Invoke the VS Code tool ${tool.name}.`
+				routedTool.name,
+				(routedTool.description || `Invoke the VS Code tool ${routedTool.name}.`)
+				+ boundedOutputHint(routedTool.name)
 			).slice(0, MAX_TOOL_DESCRIPTION_CHARS),
-			inputSchema: normalizeJsonSchema(tool.inputSchema),
+			inputSchema: normalizeJsonSchema(routedTool.inputSchema),
 			...(deferLoading ? { deferLoading: true } : {}),
 		};
 		if (useNativeNamespace) {

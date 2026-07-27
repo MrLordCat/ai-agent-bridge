@@ -1,6 +1,8 @@
 import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
+import { buildCacheDiagnostics } from "../context/cache-diagnostics";
+import { calculatePromptCacheUsage } from "../context/usage";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { setSubagentModelProfiles } from "../subagent-guidance";
@@ -39,6 +41,7 @@ import type {
 	CodexModel,
 	CodexModelListResponse,
 	CodexRateLimitsResponse,
+	CodexThreadResumeResponse,
 	CodexThreadTokenUsage,
 	CodexThreadStartResponse,
 } from "./protocol";
@@ -49,6 +52,9 @@ const CODEX_CONTINUATION_TTL_MS = 30 * 60_000;
 const MAX_CODEX_CONTINUATIONS = 64;
 const CODEX_CONVERSATION_TTL_MS = 4 * 60 * 60_000;
 const MAX_CODEX_CONVERSATIONS = 16;
+const CODEX_DURABLE_CONVERSATION_STATE_KEY = "llamacpp.codexDurableConversations.v1";
+const CODEX_PENDING_ROLLOVER_STATE_KEY = "llamacpp.codexPendingRollover.v1";
+const CODEX_PENDING_ROLLOVER_TTL_MS = 30 * 60_000;
 const CODEX_ACCOUNT_CACHE_TTL_MS = 5 * 60_000;
 const CODEX_STATUS_REFRESH_INTERVAL_MS = 60_000;
 const CODEX_MODEL_CATALOG_TTL_MS = 30_000;
@@ -65,6 +71,7 @@ const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"Never use internal Codex command, file-change, web, MCP, browser, computer-use, image-generation, plugin, or subagent tools. The provider blocks and interrupts any such attempt.",
 	"Prefer the outer run_in_terminal tool for commands when it is available.",
 	"Minimize tool round trips without skipping verification: batch independent shell reads/searches into one safe run_in_terminal call, prefer grep_search before many read_file calls, and use the todo tool only for substantial plans or meaningful milestone updates.",
+	"Keep every native tool result small. Filter potentially large command output with rg, counts, head, or tail; never dump full logs, JSON/JSONL files, repository file lists, generated artifacts, or binary/base64 data into chat.",
 	"Some less common dynamic tools are loaded on demand. Use tool_search when the required outer tool is not already visible.",
 	"Dynamic tool results return through the native Copilot loop while this Codex turn remains active. Continue directly from each result without repeating the call.",
 	"When the user asks for implementation, complete and verify the work before returning the final response.",
@@ -141,6 +148,80 @@ interface CodexConversationThread {
 	anchor: CodexConversationAnchor;
 	lastUsedAt: number;
 	processGeneration: number;
+}
+
+interface PersistedCodexConversationThread {
+	threadId: string;
+	modelId: string;
+	runtimeKey: string;
+	toolCatalogKey: string;
+	callableNames: string[];
+	toolNamespaces: Array<[string, string]>;
+	toolSignatures: Array<[string, string]>;
+	copilotConversationId?: string;
+	copilotTurnIndex?: number;
+	anchor: CodexConversationAnchor;
+	lastUsedAt: number;
+}
+
+interface PendingCodexThreadRollover {
+	threadId: string;
+	modelId: string;
+	sourceConversationId?: string;
+	armedAt: number;
+}
+
+const EXPLICIT_BOOLEAN_CONFIGURATION_KEYS = [
+	"globalValue",
+	"workspaceValue",
+	"workspaceFolderValue",
+	"globalLanguageValue",
+	"workspaceLanguageValue",
+	"workspaceFolderLanguageValue",
+] as const;
+
+export function resolveExplicitBooleanConfiguration(inspected: unknown): boolean | undefined {
+	if (!inspected || typeof inspected !== "object") {
+		return undefined;
+	}
+	const values = inspected as Record<string, unknown>;
+	let resolved: boolean | undefined;
+	for (const key of EXPLICIT_BOOLEAN_CONFIGURATION_KEYS) {
+		if (typeof values[key] === "boolean") {
+			resolved = values[key];
+		}
+	}
+	return resolved;
+}
+
+export function resolveCodexSessionPersistence(value: {
+	persistProviderSessions: unknown;
+	codexEphemeralThreads: unknown;
+}): {
+	enabled: boolean;
+	useEphemeralThreads: boolean;
+	persistProviderSessionsOverride?: boolean;
+	codexEphemeralThreadsOverride?: boolean;
+} {
+	const persistProviderSessionsOverride = resolveExplicitBooleanConfiguration(value.persistProviderSessions);
+	const codexEphemeralThreadsOverride = resolveExplicitBooleanConfiguration(value.codexEphemeralThreads);
+	const enabled = persistProviderSessionsOverride !== false;
+	return {
+		enabled,
+		useEphemeralThreads: !enabled || codexEphemeralThreadsOverride === true,
+		persistProviderSessionsOverride,
+		codexEphemeralThreadsOverride,
+	};
+}
+
+export function assertCodexThreadPersistence(requestedEphemeral: boolean, returnedEphemeral: unknown): boolean {
+	if (returnedEphemeral !== requestedEphemeral) {
+		throw new Error(
+			`Codex app-server returned ephemeral=${String(returnedEphemeral)} after `
+			+ `ephemeral=${String(requestedEphemeral)} was requested. No model turn was started.`
+		);
+	}
+	return returnedEphemeral;
 }
 
 export function createCodexRuntimeFingerprints(value: {
@@ -306,6 +387,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private readonly dynamicToolContexts = new Map<string, ActiveDynamicToolContext>();
 	private readonly activeToolTurns = new Map<string, ActiveCodexToolTurn>();
 	private readonly conversationThreads = new Map<string, CodexConversationThread>();
+	private pendingRollover: PendingCodexThreadRollover | undefined;
 	private readonly models = new Map<string, CodexModel>();
 	private status: CodexProviderStatus = { state: "signedOut", summary: "Checking..." };
 	private requestCount = 0;
@@ -326,10 +408,13 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	constructor(
 		extensionVersion: string,
-		private readonly logSink?: LlamaLogSink
+		private readonly logSink?: LlamaLogSink,
+		private readonly workspaceState?: vscode.Memento
 	) {
 		this.client = new CodexAppServerClient(extensionVersion, logSink);
 		this.client.setServerRequestHandler(request => this.handleServerRequest(request));
+		this.loadDurableConversationThreads();
+		this.loadPendingRollover();
 	}
 
 	get statusSummary(): string {
@@ -452,6 +537,49 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		vscode.window.showInformationMessage(`Codex subscription: ${detail}`);
 	}
 
+	async prepareLatestDurableThreadRollover(): Promise<{
+		modelId: string;
+		lastUsedAt: number;
+		sourceConversationId?: string;
+	}> {
+		if (!this.workspaceState || !this.durableSessionsEnabled()) {
+			throw new Error("Durable provider sessions are disabled for this workspace.");
+		}
+		this.pruneConversationThreads();
+		const candidates = [...this.conversationThreads.values()]
+			.filter(candidate => !candidate.ephemeral)
+			.sort((left, right) => right.lastUsedAt - left.lastUsedAt);
+		for (const candidate of candidates) {
+			if (
+				candidate.processGeneration !== this.client.generation
+				&& !await this.reattachDurableThread(candidate)
+			) {
+				continue;
+			}
+			this.pendingRollover = {
+				threadId: candidate.threadId,
+				modelId: candidate.modelId,
+				sourceConversationId: candidate.copilotConversationId,
+				armedAt: Date.now(),
+			};
+			await Promise.resolve(
+				this.workspaceState.update(CODEX_PENDING_ROLLOVER_STATE_KEY, this.pendingRollover)
+			);
+			this.logSink?.log("codex.chat.rollover_armed", {
+				threadId: candidate.threadId,
+				model: candidate.modelId,
+				sourceConversationId: candidate.copilotConversationId,
+				lastUsedAt: candidate.lastUsedAt,
+			}, "warn");
+			return {
+				modelId: candidate.modelId,
+				lastUsedAt: candidate.lastUsedAt,
+				sourceConversationId: candidate.copilotConversationId,
+			};
+		}
+		throw new Error("No resumable completed Codex thread is available in this workspace.");
+	}
+
 	async provideLanguageModelChatInformation(
 		_options: { silent: boolean },
 		token: vscode.CancellationToken
@@ -566,7 +694,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const serviceTier = fastTier && model.serviceTiers?.some(tier => tier.id === "priority")
 			? "priority"
 			: undefined;
-		const useEphemeralThreads = config.get<boolean>("codexEphemeralThreads", true) !== false;
+		const persistence = resolveCodexSessionPersistence({
+			persistProviderSessions: config.inspect<boolean>("persistProviderSessions"),
+			codexEphemeralThreads: config.inspect<boolean>("codexEphemeralThreads"),
+		});
+		const useEphemeralThreads = persistence.useEphemeralThreads;
 		const dynamicToolSet = buildCodexDynamicTools(options.tools ?? [], {
 			deferNonCoreTools: config.get<boolean>("codexDeferNonCoreTools", true) !== false,
 		});
@@ -616,15 +748,53 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		let conversationContinuation: CodexConversationThread | undefined;
 		let conversationTail: readonly vscode.LanguageModelChatRequestMessage[] | undefined;
-		let conversationMatchStrategy: "exact" | "conversation-id" | "suffix" | undefined;
+		let conversationMatchStrategy: "exact" | "conversation-id" | "suffix" | "rollover" | undefined;
 		let copilotConversationMatched = false;
 		let matchedUserMessages = 0;
+		let rolledOver = false;
 		const reuseMissReasons = new Map<string, number>();
 		const countReuseMiss = (reason: string): void => {
 			reuseMissReasons.set(reason, (reuseMissReasons.get(reason) ?? 0) + 1);
 		};
-		if (!activeTurn) {
+		const pendingRollover = this.getPendingRollover(model.id);
+		if (!activeTurn && pendingRollover && !copilotConversationId) {
+			throw new Error(
+				"Codex rollover is armed, but VS Code did not provide a new conversation id. "
+				+ "Create a new chat and retry with the same Codex model."
+			);
+		}
+		if (!activeTurn && pendingRollover && copilotConversationId) {
+			const candidate = this.conversationThreads.get(pendingRollover.threadId);
+			if (!candidate) {
+				await this.clearPendingRollover();
+				throw new Error("The saved Codex thread is no longer available.");
+			}
+			if (
+				candidate.processGeneration !== this.client.generation
+				&& !await this.reattachDurableThread(candidate)
+			) {
+				await this.clearPendingRollover();
+				throw new Error("The saved Codex thread could not be resumed.");
+			}
+			conversationContinuation = candidate;
+			conversationTail = messages.length > 0 ? messages.slice(-1) : messages;
+			conversationMatchStrategy = "rollover";
+			copilotConversationMatched = false;
+			matchedUserMessages = 1;
+			rolledOver = true;
+			this.logSink?.log("codex.chat.rollover_started", {
+				threadId: candidate.threadId,
+				model: model.id,
+				sourceConversationId: pendingRollover.sourceConversationId,
+				targetConversationId: copilotConversationId,
+			}, "warn");
+		}
+		if (!activeTurn && !conversationContinuation) {
 			for (const candidate of [...this.conversationThreads.values()].sort((left, right) => right.lastUsedAt - left.lastUsedAt)) {
+				if (useEphemeralThreads && !candidate.ephemeral) {
+					countReuseMiss("persistence-disabled");
+					continue;
+				}
 				if (candidate.modelId !== model.id) {
 					countReuseMiss("model-changed");
 					continue;
@@ -634,8 +804,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					continue;
 				}
 				if (candidate.processGeneration !== this.client.generation) {
-					countReuseMiss("process-restarted");
-					continue;
+					if (candidate.ephemeral || !await this.reattachDurableThread(candidate)) {
+						countReuseMiss("process-restarted");
+						continue;
+					}
 				}
 				if (
 					copilotConversationId
@@ -733,7 +905,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			approvalPolicy,
 			vsCodeToolsOnly: true,
 			planType: account.planType,
+			persistProviderSessions: persistence.enabled,
+			persistProviderSessionsOverride: persistence.persistProviderSessionsOverride,
+			codexEphemeralThreadsOverride: persistence.codexEphemeralThreadsOverride,
+			requestedEphemeral: useEphemeralThreads,
 			continuation: Boolean(activeTurn),
+			rolledOver,
 			continuationCallId: continuationMatch?.callId,
 			inputMode,
 			toolSchemaChars: JSON.stringify(dynamicToolSet.specs).length,
@@ -775,11 +952,28 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				config: vsCodeOnlyPolicy.config,
 				developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
 				ephemeral: useEphemeralThreads,
+				historyMode: "legacy",
 				...(dynamicToolSet.specs.length > 0 ? { dynamicTools: dynamicToolSet.specs } : {}),
 				...(serviceTier ? { serviceTier } : {}),
 			});
 			threadId = thread.thread.id;
-			bridge = this.createTurnBridge(threadId, model.id, thread.thread.ephemeral ?? useEphemeralThreads);
+			this.logSink?.log("codex.chat.thread_started", {
+				threadId,
+				requestedEphemeral: useEphemeralThreads,
+				returnedEphemeral: thread.thread.ephemeral,
+				historyMode: thread.thread.historyMode,
+			});
+			try {
+				assertCodexThreadPersistence(useEphemeralThreads, thread.thread.ephemeral);
+			} catch (error) {
+				try {
+					await this.client.request("thread/delete", { threadId }, 10_000);
+				} catch (deleteError) {
+					this.logSink?.logError("codex.chat.thread_persistence_cleanup_failed", deleteError, { threadId });
+				}
+				throw error;
+			}
+			bridge = this.createTurnBridge(threadId, model.id, thread.thread.ephemeral);
 		}
 		if (!activeTurn && effectiveTools.callableNames.size > 0) {
 			this.dynamicToolContexts.set(threadId, {
@@ -953,6 +1147,18 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					prompt_tokens_details: { cached_tokens: bridge.tokenUsage.last.cachedInputTokens },
 				};
 				progress.report(vscode.LanguageModelDataPart.text(JSON.stringify(usage), "usage"));
+				this.logSink?.log("chat.cache.report", buildCacheDiagnostics({
+					provider: "codex",
+					modelId: model.id,
+					requestId: bridge.turnId ?? threadId,
+					usage: calculatePromptCacheUsage(usage),
+					session: {
+						reused: Boolean(reusedThread),
+						reuseMissReason: reusedThread
+							? undefined
+							: "no durable thread matched this conversation",
+					},
+				}));
 			}
 			this.logSink?.log("codex.chat.completed", {
 				threadId,
@@ -967,7 +1173,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			});
 			const finalText = bridge.segmentText;
 			if (finalText.trim()) {
-				this.rememberConversationThread({
+				await this.rememberConversationThread({
 					threadId,
 					ephemeral: bridge.ephemeral,
 					modelId: model.id,
@@ -982,6 +1188,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					lastUsedAt: Date.now(),
 					processGeneration: this.client.generation,
 				});
+				if (rolledOver) {
+					await this.clearPendingRollover();
+				}
 			}
 			this.statusChanges.fire(this.status);
 			this.refreshStatusIfStale();
@@ -1184,16 +1393,22 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}, ephemeral, true);
 	}
 
-	private rememberConversationThread(conversation: CodexConversationThread): void {
+	private async rememberConversationThread(conversation: CodexConversationThread): Promise<void> {
 		this.conversationThreads.set(conversation.threadId, conversation);
 		this.pruneConversationThreads();
+		await this.persistDurableConversationThreads();
 	}
 
 	private pruneConversationThreads(): void {
 		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		let changed = false;
 		for (const [threadId, conversation] of this.conversationThreads) {
-			if (conversation.lastUsedAt < oldestAllowed || conversation.processGeneration !== this.client.generation) {
+			if (
+				conversation.lastUsedAt < oldestAllowed
+				|| (conversation.ephemeral && conversation.processGeneration !== this.client.generation)
+			) {
 				this.conversationThreads.delete(threadId);
+				changed = true;
 			}
 		}
 		while (this.conversationThreads.size > MAX_CODEX_CONVERSATIONS) {
@@ -1203,6 +1418,171 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				break;
 			}
 			this.conversationThreads.delete(oldest.threadId);
+			changed = true;
+		}
+		if (changed) {
+			void this.persistDurableConversationThreads();
+		}
+	}
+
+	private durableSessionsEnabled(): boolean {
+		const config = this.getConfig();
+		return resolveCodexSessionPersistence({
+			persistProviderSessions: config.inspect<boolean>("persistProviderSessions"),
+			codexEphemeralThreads: config.inspect<boolean>("codexEphemeralThreads"),
+		}).enabled;
+	}
+
+	private loadDurableConversationThreads(): void {
+		const stored = this.workspaceState?.get<unknown>(CODEX_DURABLE_CONVERSATION_STATE_KEY);
+		if (!Array.isArray(stored)) {
+			return;
+		}
+		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		for (const candidate of stored) {
+			if (!candidate || typeof candidate !== "object") {
+				continue;
+			}
+			const entry = candidate as Partial<PersistedCodexConversationThread>;
+			if (
+				typeof entry.threadId !== "string"
+				|| typeof entry.modelId !== "string"
+				|| typeof entry.runtimeKey !== "string"
+				|| typeof entry.toolCatalogKey !== "string"
+				|| !Array.isArray(entry.callableNames)
+				|| !Array.isArray(entry.toolNamespaces)
+				|| !Array.isArray(entry.toolSignatures)
+				|| !entry.anchor
+				|| typeof entry.lastUsedAt !== "number"
+				|| entry.lastUsedAt < oldestAllowed
+			) {
+				continue;
+			}
+			this.conversationThreads.set(entry.threadId, {
+				threadId: entry.threadId,
+				ephemeral: false,
+				modelId: entry.modelId,
+				runtimeKey: entry.runtimeKey,
+				toolCatalogKey: entry.toolCatalogKey,
+				callableNames: new Set(entry.callableNames.filter(value => typeof value === "string")),
+				toolNamespaces: new Map(entry.toolNamespaces.filter(pair =>
+					Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string"
+				)),
+				toolSignatures: new Map(entry.toolSignatures.filter(pair =>
+					Array.isArray(pair) && typeof pair[0] === "string" && typeof pair[1] === "string"
+				)),
+				copilotConversationId: typeof entry.copilotConversationId === "string"
+					? entry.copilotConversationId
+					: undefined,
+				copilotTurnIndex: typeof entry.copilotTurnIndex === "number"
+					? entry.copilotTurnIndex
+					: undefined,
+				anchor: entry.anchor,
+				lastUsedAt: entry.lastUsedAt,
+				processGeneration: -1,
+			});
+		}
+	}
+
+	private loadPendingRollover(): void {
+		const candidate = this.workspaceState?.get<unknown>(CODEX_PENDING_ROLLOVER_STATE_KEY);
+		if (!candidate || typeof candidate !== "object") {
+			return;
+		}
+		const entry = candidate as Partial<PendingCodexThreadRollover>;
+		if (
+			typeof entry.threadId !== "string"
+			|| typeof entry.modelId !== "string"
+			|| typeof entry.armedAt !== "number"
+			|| Date.now() - entry.armedAt > CODEX_PENDING_ROLLOVER_TTL_MS
+		) {
+			void Promise.resolve(
+				this.workspaceState?.update(CODEX_PENDING_ROLLOVER_STATE_KEY, undefined)
+			).catch(error => this.logSink?.logError("codex.rollover_state.clear_failed", error));
+			return;
+		}
+		this.pendingRollover = entry as PendingCodexThreadRollover;
+	}
+
+	private getPendingRollover(modelId: string): PendingCodexThreadRollover | undefined {
+		if (!this.pendingRollover) {
+			return undefined;
+		}
+		if (Date.now() - this.pendingRollover.armedAt > CODEX_PENDING_ROLLOVER_TTL_MS) {
+			void this.clearPendingRollover();
+			return undefined;
+		}
+		return this.pendingRollover.modelId === modelId ? this.pendingRollover : undefined;
+	}
+
+	private async clearPendingRollover(): Promise<void> {
+		this.pendingRollover = undefined;
+		if (this.workspaceState) {
+			await Promise.resolve(
+				this.workspaceState.update(CODEX_PENDING_ROLLOVER_STATE_KEY, undefined)
+			);
+		}
+	}
+
+	private async persistDurableConversationThreads(): Promise<void> {
+		if (!this.workspaceState || !this.durableSessionsEnabled()) {
+			return;
+		}
+		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		const entries: PersistedCodexConversationThread[] = [...this.conversationThreads.values()]
+			.filter(conversation => !conversation.ephemeral && conversation.lastUsedAt >= oldestAllowed)
+			.sort((left, right) => right.lastUsedAt - left.lastUsedAt)
+			.slice(0, MAX_CODEX_CONVERSATIONS)
+			.map(conversation => ({
+				threadId: conversation.threadId,
+				modelId: conversation.modelId,
+				runtimeKey: conversation.runtimeKey,
+				toolCatalogKey: conversation.toolCatalogKey,
+				callableNames: [...conversation.callableNames],
+				toolNamespaces: [...conversation.toolNamespaces],
+				toolSignatures: [...conversation.toolSignatures],
+				copilotConversationId: conversation.copilotConversationId,
+				copilotTurnIndex: conversation.copilotTurnIndex,
+				anchor: conversation.anchor,
+				lastUsedAt: conversation.lastUsedAt,
+			}));
+		try {
+			await this.workspaceState.update(CODEX_DURABLE_CONVERSATION_STATE_KEY, entries);
+			this.logSink?.log("codex.session_state.persisted", {
+				threadCount: entries.length,
+				threadIds: entries.map(entry => entry.threadId),
+			});
+		} catch (error) {
+			this.logSink?.logError("codex.session_state.persist_failed", error);
+		}
+	}
+
+	private async reattachDurableThread(conversation: CodexConversationThread): Promise<boolean> {
+		try {
+			const resumed = await this.client.request<CodexThreadResumeResponse>("thread/resume", {
+				threadId: conversation.threadId,
+				excludeTurns: true,
+			}, 15_000);
+			if (resumed.thread.id !== conversation.threadId) {
+				throw new Error(
+					`Codex resumed unexpected thread ${resumed.thread.id}; expected ${conversation.threadId}`
+				);
+			}
+			assertCodexThreadPersistence(false, resumed.thread.ephemeral);
+			conversation.processGeneration = this.client.generation;
+			this.logSink?.log("codex.chat.thread_reattached", {
+				threadId: conversation.threadId,
+				historyMode: resumed.thread.historyMode,
+				conversationIdPresent: conversation.copilotConversationId !== undefined,
+			});
+			return true;
+		} catch (error) {
+			this.logSink?.logError("codex.chat.thread_reattach_failed", error, {
+				threadId: conversation.threadId,
+			});
+			this.conversationThreads.delete(conversation.threadId);
+			void this.persistDurableConversationThreads();
+			return false;
 		}
 	}
 

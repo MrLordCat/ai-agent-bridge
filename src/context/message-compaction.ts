@@ -5,7 +5,11 @@ const MAX_SUMMARY_MESSAGES = 32;
 const MAX_SUMMARY_CHARS = 6000;
 const MAX_SUMMARY_LINE_CHARS = 480;
 
-export interface CompactMessagesOptions {
+const SIGNAL_REGEX = /(?:^|\b)(?:error|failed|failure|warning|fixed|implemented|changed|created|updated|removed|decision|todo|next|path|file|commit|ошиб|сбой|исправ|реализ|измен|созда|обнов|удал|решен|решил|далее|следующ)/i;
+const PATH_REGEX = /(?:[A-Za-z]:\\|\.?\.?\/|[\w.-]+\/)[\w./\\-]+\.[A-Za-z0-9]{1,10}(?::\d+)?/;
+const FENCED_CODE_REGEX = /```([\w.+-]*)\s*\n([\s\S]*?)```/g;
+
+interface CompactMessagesOptions {
 	tokenBudget: number;
 	keepLastCount: number;
 	label: string;
@@ -42,14 +46,12 @@ function summarizeCodeAwareText(content: string): { text: string; priority: numb
 	}
 
 	const lines = normalized.split("\n").map(line => line.trim()).filter(Boolean);
-	const signalPattern = /(?:^|\b)(?:error|failed|failure|warning|fixed|implemented|changed|created|updated|removed|decision|todo|next|path|file|commit|ошиб|сбой|исправ|реализ|измен|созда|обнов|удал|решен|решил|далее|следующ)/i;
-	const pathPattern = /(?:[A-Za-z]:\\|\.?\.?\/|[\w.-]+\/)[\w./\\-]+\.[A-Za-z0-9]{1,10}(?::\d+)?/;
-	const fencedCode = /```([\w.+-]*)\s*\n([\s\S]*?)```/g;
+
 	const details: string[] = [];
 	let priority = 1;
 
 	for (const line of lines) {
-		if ((signalPattern.test(line) || pathPattern.test(line)) && !details.includes(line)) {
+		if ((SIGNAL_REGEX.test(line) || PATH_REGEX.test(line)) && !details.includes(line)) {
 			details.push(line);
 			priority = Math.max(priority, 3);
 			if (details.length >= 3) {
@@ -59,7 +61,8 @@ function summarizeCodeAwareText(content: string): { text: string; priority: numb
 	}
 
 	let match: RegExpExecArray | null;
-	while ((match = fencedCode.exec(normalized)) !== null && details.length < 4) {
+	FENCED_CODE_REGEX.lastIndex = 0;
+	while ((match = FENCED_CODE_REGEX.exec(normalized)) !== null && details.length < 4) {
 		const codeLines = match[2].split("\n").map(line => line.trim()).filter(Boolean);
 		if (codeLines.length === 0) {
 			continue;

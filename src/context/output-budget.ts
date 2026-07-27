@@ -1,4 +1,4 @@
-export interface OutputTokenBudgetInput {
+interface OutputTokenBudgetInput {
 	family: string;
 	requestedMaxTokens?: number;
 	modelMaxOutputTokens: number;
@@ -8,7 +8,7 @@ export interface OutputTokenBudgetInput {
 	deepSeekMaximum: number;
 }
 
-export interface OutputTokenBudget {
+interface OutputTokenBudget {
 	defaultMaxTokens: number;
 	requestedMaxTokens: number;
 	maxTokens: number;

@@ -2,7 +2,7 @@ import type { OpenAIChatMessage } from "../types";
 
 export type KnowledgeMode = "off" | "adaptive" | "strict";
 
-export interface KnowledgeSystemPromptOptions {
+interface KnowledgeSystemPromptOptions {
 	mode: KnowledgeMode;
 	currentDate: string;
 	customPrompt?: string;

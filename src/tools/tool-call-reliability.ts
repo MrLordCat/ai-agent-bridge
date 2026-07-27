@@ -16,26 +16,26 @@ export interface ToolCallReliabilityMetrics {
 	loopDetected: boolean;
 }
 
-export interface AcceptedToolCall {
+interface AcceptedToolCall {
 	ok: true;
 	name: string;
 	arguments: Record<string, unknown>;
 	repaired: boolean;
 }
 
-export interface PendingToolCall {
+interface PendingToolCall {
 	ok: false;
 	pending: true;
 }
 
-export interface RejectedToolCall {
+interface RejectedToolCall {
 	ok: false;
 	pending: false;
 	reason: string;
 	kind: "json" | "unknown_tool" | "schema";
 }
 
-export type ToolCallEvaluation = AcceptedToolCall | PendingToolCall | RejectedToolCall;
+type ToolCallEvaluation = AcceptedToolCall | PendingToolCall | RejectedToolCall;
 
 export class ToolCallValidationError extends Error {
 	constructor(
@@ -345,6 +345,48 @@ function repairTerminalTimeout(
 	return true;
 }
 
+/**
+ * Auto-fills empty string defaults for the `description` field when it is required but missing.
+ * VS Code Copilot tools (e.g. subagent dispatch) often require `description` in their input
+ * schema, but local models may omit it. An empty description is safe as a fallback.
+ */
+function repairMissingRequiredDescription(
+	argumentsValue: Record<string, unknown>,
+	schema: object | undefined,
+	repairEnabled: boolean
+): boolean {
+	if (!repairEnabled || !schema || typeof schema !== "object") {
+		return false;
+	}
+	if ("description" in argumentsValue) {
+		return false;
+	}
+	const schemaObj = schema as Record<string, unknown>;
+	const required = Array.isArray(schemaObj.required)
+		? schemaObj.required.filter((item): item is string => typeof item === "string")
+		: [];
+	if (!required.includes("description")) {
+		return false;
+	}
+	const properties = schemaObj.properties && typeof schemaObj.properties === "object"
+		? schemaObj.properties as Record<string, unknown>
+		: {};
+	const descSchema = properties["description"];
+	// Only fill if the schema expects a string (most common case).
+	// Handle both direct "string" type and type unions like ["string", "null"].
+	if (descSchema && typeof descSchema === "object") {
+		const descType = (descSchema as Record<string, unknown>).type;
+		const isStringType =
+			descType === "string" ||
+			(Array.isArray(descType) && descType.includes("string"));
+		if (isStringType) {
+			argumentsValue["description"] = "";
+			return true;
+		}
+	}
+	return false;
+}
+
 export class ToolCallReliabilityGuard {
 	private definitions = new Map<string, OpenAIFunctionToolDef>();
 	private namesByLowerCase = new Map<string, string>();
@@ -396,6 +438,11 @@ export class ToolCallReliabilityGuard {
 		}
 
 		const definition = this.definitions.get(name);
+		if (this.options.repairEnabled) {
+			if (repairMissingRequiredDescription(parsed.value, definition?.function.parameters, this.options.repairEnabled)) {
+				repaired = true;
+			}
+		}
 		if (this.options.validateSchema && definition) {
 			const issues = validateToolArguments(parsed.value, definition.function.parameters);
 			if (issues.length > 0) {

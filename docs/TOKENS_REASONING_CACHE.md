@@ -99,6 +99,9 @@ that prefix in several ways:
 - One-off Copilot compaction requests deliberately use `cache_prompt=false`.
 - Tool definitions are priority-sorted, compacted, count-limited, and bounded
   by `apiDirectToolTokenBudget` so the catalog remains stable and affordable.
+- Tool and JSON Schema key ordering is canonical across Local, DeepSeek, Codex,
+  and Claude, so Copilot's post-reload enumeration order cannot change the
+  provider prompt or runtime fingerprint by itself.
 - Retrieved shared memory is inserted immediately before the latest user turn,
   rather than rewriting the first system message.
 - Raw tool results are sanitized and capped before budgeting.
@@ -111,6 +114,12 @@ Compaction necessarily changes the prefix once because old turns are replaced
 by a summary. Later turns can reuse that new compacted prefix. Switching models,
 changing system instructions, changing tool catalogs, or alternating multiple
 independent chats on a single llama.cpp slot can also lower cache reuse.
+
+Local and DeepSeek remain stateless HTTP providers and must include tools in
+each request, but an unchanged canonical prefix can still be served from the
+upstream prompt cache. Codex and Claude additionally restore completed durable
+sessions when `persistProviderSessions` is enabled. Process startup and VS Code
+tool registration still occur after reload; full-history prefill does not.
 
 `chat.messages.auto_compact`, `chat.messages.hard_compact`, and overflow retry
 logs report `compactDurationMs`. Exact `/apply-template` + `/tokenize` preflight

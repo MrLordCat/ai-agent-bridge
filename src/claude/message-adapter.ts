@@ -4,12 +4,16 @@ export const CLAUDE_MODEL_ID_PREFIX = "claude::";
 export function encodeClaudeModelId(modelId: string): string { return `${CLAUDE_MODEL_ID_PREFIX}${modelId}`; }
 export function decodeClaudeModelId(modelId: string): string | undefined { return modelId.startsWith(CLAUDE_MODEL_ID_PREFIX) ? modelId.slice(CLAUDE_MODEL_ID_PREFIX.length) : undefined; }
 
-/** Claude subscription models (updated from extension.js v2.1.212 defaults). */
+/**
+ * Curated Claude subscription catalog. Claude Code accepts backend model ids
+ * that are not yet present in its bundled UI catalog.
+ */
 export const CLAUDE_SUBSCRIPTION_MODELS = [
-	{ id: "claude-sonnet-4-5",  name: "Sonnet 4.5 (Claude)",  description: "Best balance of speed and capability" },
-	{ id: "claude-opus-4-8",    name: "Opus 4.8 (Claude)",    description: "Most capable model for complex analysis" },
-	{ id: "claude-haiku-4-5",   name: "Haiku 4.5 (Claude)",   description: "Fastest model for quick tasks" },
-	{ id: "claude-fable-5",     name: "Fable 5 (Claude)",     description: "Vision-capable coding model" },
+	{
+		id: "claude-opus-5",
+		name: "Opus 5 (Claude)",
+		description: "Latest high-capability Claude model for complex analysis and implementation",
+	},
 ];
 
 export function estimateClaudeTokens(value: string | vscode.LanguageModelChatRequestMessage): number {

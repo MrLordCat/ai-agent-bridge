@@ -83,7 +83,9 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
   discovery run independently; fulfilled catalogs are merged and sorted.
 3. For a chat turn, the source-prefixed model id selects exactly one provider.
   Local and DeepSeek requests follow the OpenAI-compatible flow below; Codex
-  and Claude retain their own warm runtime state.
+  and Claude retain their own warm runtime state. Completed subscription
+  sessions can be restored from provider-owned durable transcripts after an
+  Extension Host restart.
 4. A session-scoped native reasoning selection overrides the global mode when
    Copilot supplies it through `modelOptions`.
 5. Internal Copilot compaction prompts are classified before normal request
@@ -118,7 +120,9 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
 4. Calls arriving after a delegated boundary are queued and exposed in the
   next native segment; only already visible calls require results on resume.
 5. Completed compatible threads reuse an exact conversation anchor and send
-  only incremental input. Runtime or catalog incompatibility fails closed.
+  only incremental input. Non-ephemeral thread ids and validation fingerprints
+  are stored in workspace state, reattached with `thread/resume` after reload,
+  and fall back to a new full-history thread when reattachment fails.
 
 ### Claude subscription flow
 
@@ -128,8 +132,30 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
   `mcp__vscode__*` names.
 3. Matching conversations reuse warm sessions. Native tool results resume the
   suspended SDK query rather than constructing a second request history.
-4. Subscription and model-context probes refresh periodically; probes for
+4. Completed sessions use the Agent SDK transcript store. A stable Copilot
+  conversation id, model/runtime fingerprint, and user-history prefix select a
+  resumable session after reload; an invalid resume safely retries from full
+  VS Code history before visible output is emitted.
+5. Subscription and model-context probes refresh periodically; probes for
   Claude availability never block Local, DeepSeek, or Codex requests.
+
+### Reload and tool-catalog stability
+
+Closing VS Code necessarily restarts Copilot Chat, Extension Host processes,
+and subscription-provider subprocesses. The extension cannot skip VS Code's
+physical tool registration, but it prevents that registration from becoming a
+semantic cold start:
+
+- the guarded Copilot integration forwards a stable conversation identity;
+- Local and DeepSeek canonicalize tool order and JSON Schema keys so the exact
+  server-side prompt-cache prefix survives a reload;
+- Codex canonicalizes dynamic tools and reattaches a durable app-server thread;
+- Claude canonicalizes its MCP tool catalog and resumes a persisted SDK session.
+
+Changing the model, workspace, reasoning effort, or effective tool schema still
+invalidates the relevant session intentionally. Reload during an unfinished
+native tool call also uses the full-history fallback because JavaScript promise
+state cannot survive process termination.
 
 ## Persistent Data
 
@@ -138,6 +164,9 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
 - Diagnostics: `<globalStorage>/logs/*.jsonl`.
 - Generated reports: `<globalStorage>/reports/*.{md,json}`.
 - Token usage and comparison experiments: bounded JSON under `<globalStorage>`.
+- Provider resume mappings: bounded ids, hashes, and history anchors in VS Code
+  workspace state. Claude message transcripts remain in the official Agent SDK
+  session store; Codex transcripts remain in the Codex app-server store.
 - User configuration: `llamacpp.*` VS Code settings.
 
 DeepSeek has a dedicated `llamacpp.deepSeekApiKey` secret. The generic primary

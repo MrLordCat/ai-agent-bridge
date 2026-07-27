@@ -14,7 +14,8 @@ import type {
 	SDKUserMessage,
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type { LlamaLogSink } from "../logger";
-import { enhanceSubagentToolDescription } from "../subagent-guidance";
+import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
+import { isCacheControlPart } from "../utils";
 
 const ACTIVE_TURN_TIMEOUT_MS = 90_000;
 const TOOL_CARD_SETTLE_MS = 30;
@@ -44,7 +45,7 @@ export interface ClaudeAgentUsage {
 }
 
 export interface ClaudeRateLimitInfo {
-	status: string;
+	status: "allowed" | "allowed_warning" | "rejected";
 	resetsAt?: number;
 	utilization?: number;
 }
@@ -67,8 +68,20 @@ export interface ClaudeAgentSessionOptions {
 	extensionVersion: string;
 	tools: readonly vscode.LanguageModelChatTool[];
 	effort?: "low" | "medium" | "high" | "xhigh" | "max";
+	persistSession?: boolean;
+	resumeSessionId?: string;
 	logSink?: LlamaLogSink;
 	callbacks: ClaudeAgentSessionCallbacks;
+}
+
+export async function hasPersistedClaudeSession(sessionId: string, cwd: string): Promise<boolean> {
+	try {
+		const sdk = await import("@anthropic-ai/claude-agent-sdk");
+		const messages = await sdk.getSessionMessages(sessionId, { dir: cwd, limit: 1 });
+		return messages.length > 0;
+	} catch {
+		return false;
+	}
 }
 
 interface ActiveTurn {
@@ -159,12 +172,17 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	private query: Query | undefined;
 	private pump: Promise<void> | undefined;
 	private activeTurn: ActiveTurn | undefined;
+	private lastTurnProducedOutput = false;
 	private disposed = false;
 
 	constructor(private readonly options: ClaudeAgentSessionOptions) {}
 
 	get pendingCallIds(): ReadonlySet<string> {
 		return new Set(this.pendingTools.keys());
+	}
+
+	get canRetryLastTurn(): boolean {
+		return !this.lastTurnProducedOutput && this.pendingTools.size === 0;
 	}
 
 	hasPendingCall(callId: string): boolean {
@@ -268,14 +286,15 @@ export class ClaudeAgentSession implements vscode.Disposable {
 
 		const sdk = await import("@anthropic-ai/claude-agent-sdk");
 		const mcpTools = this.options.tools.map((definition, index) => {
-			const mcpName = createMcpToolName(definition.name, index);
-			const schema = createZodShape(definition.inputSchema);
+			const routedDefinition = withRequiredSubagentModel(definition);
+			const mcpName = createMcpToolName(routedDefinition.name, index);
+			const schema = createZodShape(routedDefinition.inputSchema);
 			return sdk.tool(
 				mcpName,
-				createToolDescription(definition),
+				createToolDescription(routedDefinition),
 				schema,
-				async args => this.delegateTool(definition.name, asRecord(args)),
-				{ alwaysLoad: isCoreTool(definition.name) }
+				async args => this.delegateTool(routedDefinition.name, asRecord(args)),
+				{ alwaysLoad: isCoreTool(routedDefinition.name) }
 			);
 		});
 		const vscodeServer = sdk.createSdkMcpServer({
@@ -297,7 +316,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			settingSources: [],
 			skills: [],
 			plugins: [],
-			persistSession: false,
+			persistSession: this.options.persistSession === true,
 			includePartialMessages: true,
 			permissionMode: "default",
 			canUseTool: async (toolName, input) => isClaudeVsCodeToolName(toolName)
@@ -314,6 +333,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 					this.options.logSink?.log("claude.sdk.stderr", { message: message.slice(0, 4000) }, "debug");
 				}
 			},
+			...(this.options.resumeSessionId
+				? { resume: this.options.resumeSessionId, forkSession: true }
+				: {}),
 		};
 
 		this.query = sdk.query({ prompt: this.input, options: agentOptions });
@@ -323,6 +345,8 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			model: this.options.model,
 			toolCount: this.options.tools.length,
 			executable: this.options.executable,
+			persistent: this.options.persistSession === true,
+			resumed: this.options.resumeSessionId !== undefined,
 		});
 	}
 
@@ -333,6 +357,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		if (this.activeTurn) {
 			throw new Error("Claude session already has an active VS Code turn");
 		}
+		this.lastTurnProducedOutput = false;
 		return new Promise<void>((resolve, reject) => {
 			const cancellation = token.onCancellationRequested(() => {
 				this.failActiveTurn(new vscode.CancellationError());
@@ -540,6 +565,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		clearTimeout(active.timeout);
 		clearTimeout(active.toolSettleTimer);
 		active.cancellation.dispose();
+		this.lastTurnProducedOutput = active.reportedTextChars > 0
+			|| active.partialThinkingSeen
+			|| this.pendingTools.size > 0;
 		this.activeTurn = undefined;
 		return active;
 	}
@@ -617,6 +645,11 @@ function convertToolResult(result: vscode.LanguageModelToolResultPart): CallTool
 	for (const item of result.content) {
 		if (item instanceof vscode.LanguageModelTextPart) {
 			textParts.push(item.value);
+			continue;
+		}
+		if (isCacheControlPart(item)) {
+			// Never render the cache breakpoint marker as text: it moves between
+			// turns and would rewrite already-cached tool output.
 			continue;
 		}
 		if (item instanceof vscode.LanguageModelDataPart) {

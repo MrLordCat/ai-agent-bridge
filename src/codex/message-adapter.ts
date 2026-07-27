@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
+import { isCacheControlPart } from "../utils";
 import type { CodexDynamicToolCallResponse } from "./dynamic-tools";
 
 interface SerializedConversationMessage {
@@ -558,6 +559,11 @@ export function convertCodexToolResult(
 	const contentItems: CodexDynamicToolCallResponse["contentItems"] = [];
 	const textParts: string[] = [];
 	for (const content of part.content) {
+		if (isCacheControlPart(content)) {
+			// Rendering this marker as "[data cache_control, N bytes]" would move with
+			// the marker between turns and break the upstream prompt-cache prefix.
+			continue;
+		}
 		if (content instanceof vscode.LanguageModelDataPart && content.mimeType.startsWith("image/")) {
 			contentItems.push({
 				type: "inputImage",

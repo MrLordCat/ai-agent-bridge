@@ -120,7 +120,14 @@ function sanitizeSchema(input: unknown, propName?: string): Record<string, unkno
 
     schema = pruneUnknownSchemaKeywords(schema);
 
-    let t = schema.type as string | undefined;
+    let t = schema.type as string | string[] | undefined;
+    // Normalize type unions (e.g., ["string","null"]) to the first string type,
+    // so downstream code that checks `type === "string"` works correctly.
+    if (Array.isArray(t)) {
+        const firstString = t.find((item): item is string => typeof item === "string");
+        t = firstString ?? String(t[0]);
+        schema.type = t;
+    }
     if (t == null) {
         t = "object";
         schema.type = t;
@@ -182,6 +189,10 @@ function appendToolDescription(base: string, extra: string | undefined): string 
  * exact prompt prefix and therefore affects prompt-cache reuse.
  */
 export function stableJsonStringify(value: unknown): string {
+	// Fast path: primitives don't need cyclic detection or key sorting
+	if (value === null || value === undefined || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+		return JSON.stringify(value);
+	}
 	const seen = new WeakSet<object>();
 	const normalize = (candidate: unknown): unknown => {
 		if (Array.isArray(candidate)) {
@@ -243,17 +254,22 @@ function getToolExecutionHint(name: string, hasRunInTerminal: boolean): string |
 export type ToolResultMode = "user" | "tool";
 export type ToolCallingMode = "classic" | "apiDirect";
 
-export interface ConvertMessagesOptions {
+interface ConvertMessagesOptions {
 	toolResultMode?: ToolResultMode;
 	/** When false, image DataParts are converted to text placeholders instead of image_url blocks. */
 	supportsImageInput?: boolean;
 }
 
-export interface ConvertToolsOptions {
+interface ConvertToolsOptions {
 	mode?: ToolCallingMode;
 	apiDirectMaxTools?: number;
 	apiDirectIncludeAllTools?: boolean;
 	apiDirectToolTokenBudget?: number;
+}
+
+interface LanguageModelDataPartLike {
+	mimeType: string;
+	data: Uint8Array;
 }
 
 /**
@@ -267,6 +283,34 @@ function bytesToBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
+function asLanguageModelDataPart(value: unknown): LanguageModelDataPartLike | undefined {
+	if (!value || typeof value !== "object") {
+		return undefined;
+	}
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.mimeType !== "string" || !(candidate.data instanceof Uint8Array)) {
+		return undefined;
+	}
+	return { mimeType: candidate.mimeType, data: candidate.data };
+}
+
+/**
+ * True for the cache-breakpoint markers VS Code attaches to chat content.
+ *
+ * These parts carry no model-visible information, but VS Code moves them between
+ * messages as a conversation grows. Serializing one into message text rewrites
+ * already-sent history on a later turn and destroys the upstream prompt-cache
+ * prefix, so they must be dropped before any textual rendering. The check is
+ * shape-tolerant because the parts lose their class and `Uint8Array` payload
+ * when they cross the extension host boundary.
+ */
+export function isCacheControlPart(value: unknown): boolean {
+	if (!value || typeof value !== "object") {
+		return false;
+	}
+	return (value as { mimeType?: unknown }).mimeType === "cache_control";
+}
+
 function collectThinkingPartText(part: unknown): string {
 	if (!part || typeof part !== "object") {
 		return "";
@@ -278,13 +322,23 @@ function collectThinkingPartText(part: unknown): string {
 	const obj = part as Record<string, unknown>;
 	const ctorName = (part as { constructor?: { name?: string } }).constructor?.name;
 	const isThinkingCtor = ctorName === "LanguageModelThinkingPart";
+	// Serialized thinking parts (constructor name lost during IPC) are plain
+	// objects with a `text` property and no `mimeType`.  The `metadata` field
+	// is optional so we cannot require it — but any unknown part with `text`
+	// and no `mimeType` that isn't a known VS Code part is treated as thinking.
+	const isSerializedThinkingPart =
+		!isThinkingCtor &&
+		typeof obj.text === "string" &&
+		obj.mimeType === undefined &&
+		!("callId" in obj) &&
+		!("tool_call_id" in obj);
 	const candidates = [
 		obj.reasoning_content,
 		obj.reasoning,
 		obj.thinking,
 		isThinkingCtor ? obj.text : undefined,
 		isThinkingCtor ? obj.value : undefined,
-		typeof obj.text === "string" && obj.metadata !== undefined && obj.mimeType === undefined ? obj.text : undefined,
+		isSerializedThinkingPart ? obj.text : undefined,
 	];
 
 	for (const candidate of candidates) {
@@ -320,8 +374,8 @@ export function convertMessages(
 		const textParts: string[] = [];
 		const reasoningParts: string[] = [];
 		const toolCalls: OpenAIToolCall[] = [];
-		const toolResults: { callId: string; content: string; name?: string }[] = [];
-		const dataParts: vscode.LanguageModelDataPart[] = [];
+		const toolResults: { callId: string; content: string; dataParts: LanguageModelDataPartLike[]; name?: string }[] = [];
+		const dataParts: LanguageModelDataPartLike[] = [];
 
 		for (const [partIndex, part] of (m.content ?? []).entries()) {
 			if (part instanceof vscode.LanguageModelTextPart) {
@@ -343,10 +397,15 @@ export function convertMessages(
 				toolCalls.push({ id, type: "function", function: { name: part.name, arguments: args } });
 			} else if (isToolResultPart(part)) {
 				const callId = (part as { callId?: string }).callId ?? "";
-				const content = collectToolResultText(part as { content?: ReadonlyArray<unknown> });
-				toolResults.push({ callId, content, name: knownToolNames.get(callId) });
+				const collected = collectToolResultContent(part as { content?: ReadonlyArray<unknown> });
+				toolResults.push({ callId, ...collected, name: knownToolNames.get(callId) });
+			} else if (isCacheControlPart(part)) {
+				continue;
 			} else if (part instanceof vscode.LanguageModelDataPart) {
-				dataParts.push(part);
+				const dataPart = asLanguageModelDataPart(part);
+				if (dataPart) {
+					dataParts.push(dataPart);
+				}
 			} else {
 				const thinkingText = collectThinkingPartText(part);
 				if (thinkingText) {
@@ -357,14 +416,16 @@ export function convertMessages(
 
 		// Build multimodal content when images are present.
 		// For providers without image support (DeepSeek), images degrade to text placeholders.
-		const buildContentPayload = (): string | OpenAIContentPart[] | undefined => {
-			const text = textParts.join("");
-			if (dataParts.length === 0) {
+		const buildContentPayload = (
+			text: string,
+			contentDataParts: readonly LanguageModelDataPartLike[]
+		): string | OpenAIContentPart[] | undefined => {
+			if (contentDataParts.length === 0) {
 				return text || undefined;
 			}
 			const canSendImages = options?.supportsImageInput === true;
 			const contentParts: OpenAIContentPart[] = [];
-			for (const dp of dataParts) {
+			for (const dp of contentDataParts) {
 				if (dp.mimeType.startsWith("image/")) {
 					if (canSendImages) {
 						const base64 = bytesToBase64(dp.data);
@@ -408,20 +469,40 @@ export function convertMessages(
 		}
 
 		for (const tr of toolResults) {
-			if (toolResultMode === "tool" && tr.callId) {
-				raw.push({ role: "tool", tool_call_id: tr.callId, name: tr.name, content: tr.content || "" });
-				continue;
-			}
-
 			const callMeta = tr.callId ? ` call_id=${tr.callId}` : "";
 			const nameMeta = tr.name ? ` name=${tr.name}` : "";
 			const prefix = `[tool_result${callMeta}${nameMeta}]`;
-			raw.push({ role: "user", content: tr.content ? `${prefix}\n${tr.content}` : prefix });
+			if (toolResultMode === "tool" && tr.callId) {
+				let toolContent = tr.content || "";
+				if (tr.dataParts.length > 0 && options?.supportsImageInput !== true) {
+					const placeholders = tr.dataParts.map(dp => {
+						const sizeKb = (dp.data.byteLength / 1024).toFixed(1);
+						return `[Image: ${dp.mimeType}, ${sizeKb} KB — image input not supported by this provider]`;
+					});
+					toolContent = [toolContent, ...placeholders].filter(Boolean).join("\n");
+				}
+				raw.push({ role: "tool", tool_call_id: tr.callId, name: tr.name, content: toolContent });
+				if (tr.dataParts.length > 0 && options?.supportsImageInput === true) {
+					const imagePayload = buildContentPayload(`${prefix}\nImage output from the tool:`, tr.dataParts);
+					if (imagePayload) {
+						raw.push({ role: "user", content: imagePayload });
+					}
+				}
+				continue;
+			}
+
+			const toolText = tr.content ? `${prefix}\n${tr.content}` : prefix;
+			raw.push({ role: "user", content: buildContentPayload(toolText, tr.dataParts) ?? toolText });
 		}
 
-		const contentPayload = buildContentPayload();
+		const contentPayload = buildContentPayload(textParts.join(""), dataParts);
 		if (contentPayload && (role === "system" || role === "user" || (role === "assistant" && !emittedAssistantToolCall))) {
-			raw.push({ role, content: contentPayload });
+			const msg: OpenAIChatMessage = { role, content: contentPayload };
+			const reasoningContent = reasoningParts.join("");
+			if (reasoningContent) {
+				msg.reasoning_content = reasoningContent;
+			}
+			raw.push(msg);
 		}
 	}
 
@@ -621,7 +702,8 @@ export function convertTools(
 	};
 
 	const compactApiDirectSchema = (value: unknown): unknown => {
-		if (!value || typeof value !== "object") {
+		// Fast path: primitives and arrays of primitives
+		if (value === null || value === undefined || typeof value !== "object") {
 			return value;
 		}
 		if (Array.isArray(value)) {
@@ -840,24 +922,40 @@ function mapRole(message: vscode.LanguageModelChatRequestMessage): Exclude<OpenA
 }
 
 /**
- * Concatenate tool result content into a single text string.
+ * Collect text and image data from a tool result.
  * @param pr Tool result-like object with content array.
  */
 /**
- * Collects text content from a tool result part.
- * Extracts and concatenates text from the content array.
+ * Collects text content and preserves image DataParts from a tool result part.
  *
  * @param pr - The tool result part with content.
- * @returns The concatenated text content.
+ * @returns The concatenated text plus image data parts.
  */
-function collectToolResultText(pr: { content?: ReadonlyArray<unknown> }): string {
+function collectToolResultContent(pr: { content?: ReadonlyArray<unknown> }): {
+	content: string;
+	dataParts: LanguageModelDataPartLike[];
+} {
 	let text = "";
+	const dataParts: LanguageModelDataPartLike[] = [];
 	for (const c of pr.content ?? []) {
 		if (c instanceof vscode.LanguageModelTextPart) {
 			text += c.value;
 		} else if (typeof c === "string") {
 			text += c;
+		} else if (isCacheControlPart(c)) {
+			// Dropped before the JSON.stringify fallback below, which would otherwise
+			// serialize the marker straight into the tool result text.
+			continue;
 		} else {
+			const dataPart = asLanguageModelDataPart(c);
+			if (dataPart) {
+				if (dataPart.mimeType.startsWith("image/")) {
+					dataParts.push(dataPart);
+				} else if (dataPart.mimeType === "text/plain" || dataPart.mimeType === "text/markdown") {
+					text += new TextDecoder().decode(dataPart.data);
+				}
+				continue;
+			}
 			try {
 				text += JSON.stringify(c);
 			} catch {
@@ -865,7 +963,7 @@ function collectToolResultText(pr: { content?: ReadonlyArray<unknown> }): string
 			}
 		}
 	}
-	return text;
+	return { content: text, dataParts };
 }
 
 /**

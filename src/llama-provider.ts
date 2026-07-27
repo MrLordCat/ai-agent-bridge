@@ -34,6 +34,7 @@ import {
 } from "./context/system-prompt";
 import { summarizeToolResultContent } from "./context/tool-result-summary";
 import { calculatePromptCacheUsage, estimateChatTokenUsage, mergeChatTokenUsage, type ChatTokenUsage } from "./context/usage";
+import { buildCacheDiagnostics, type CachePrefixTelemetry } from "./context/cache-diagnostics";
 import {
     calculateOverallHealth,
     type HealthCheckItem,
@@ -171,6 +172,111 @@ interface CachePrefixSnapshot {
     messageChars: number;
 }
 
+interface StableToolCatalogSnapshot {
+    tools: NonNullable<ReturnType<typeof convertTools>["tools"]>;
+    toolChoice: ReturnType<typeof convertTools>["tool_choice"];
+    fingerprint: string;
+}
+
+const CACHE_CONTROL_MARKER = /"mimeType"\s*:\s*"cache_control"/g;
+const CACHE_CONTROL_TEXT_MARKER = /\[data cache_control(?:,[^\]\n]*)?\]/g;
+
+/** Spans of every balanced JSON object in the text, string literals respected. */
+function collectJsonObjectSpans(text: string): Array<{ start: number; end: number }> {
+    const spans: Array<{ start: number; end: number }> = [];
+    const stack: number[] = [];
+    let inString = false;
+    let escaped = false;
+    for (let index = 0; index < text.length; index += 1) {
+        const code = text.charCodeAt(index);
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            } else if (code === 92 /* \ */) {
+                escaped = true;
+            } else if (code === 34 /* " */) {
+                inString = false;
+            }
+            continue;
+        }
+        if (code === 34 /* " */) {
+            inString = true;
+        } else if (code === 123 /* { */) {
+            stack.push(index);
+        } else if (code === 125 /* } */) {
+            const start = stack.pop();
+            if (start !== undefined) {
+                spans.push({ start, end: index + 1 });
+            }
+        }
+    }
+    return spans;
+}
+
+/**
+ * Removes VS Code cache-breakpoint markers from tool result text.
+ *
+ * VS Code renders these markers in more than one shape (`{"$mid":N,...,"data":"..."}`
+ * and `{"type":"data",...,"bytes":N}`) and moves them between messages as the
+ * conversation grows. Any marker left behind rewrites historical tool output on
+ * a later turn and destroys the upstream prompt-cache prefix, so every shape has
+ * to be stripped by locating the innermost object that carries the mime type.
+ */
+export function stripCacheControlArtifacts(text: string): string {
+    if (!text.includes("cache_control")) {
+        return text;
+    }
+
+    const markers: number[] = [];
+    CACHE_CONTROL_MARKER.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = CACHE_CONTROL_MARKER.exec(text)) !== null) {
+        markers.push(match.index);
+    }
+
+    let result = text;
+    if (markers.length > 0) {
+        const spans = collectJsonObjectSpans(text);
+        const chosen: Array<{ start: number; end: number }> = [];
+        for (const position of markers) {
+            let innermost: { start: number; end: number } | undefined;
+            for (const span of spans) {
+                if (span.start > position || position >= span.end) {
+                    continue;
+                }
+                if (!innermost || span.end - span.start < innermost.end - innermost.start) {
+                    innermost = span;
+                }
+            }
+            if (innermost) {
+                chosen.push(innermost);
+            }
+        }
+
+        if (chosen.length > 0) {
+            chosen.sort((left, right) => left.start - right.start);
+            const merged: Array<{ start: number; end: number }> = [];
+            for (const span of chosen) {
+                const last = merged[merged.length - 1];
+                if (last && span.start <= last.end) {
+                    last.end = Math.max(last.end, span.end);
+                } else {
+                    merged.push({ ...span });
+                }
+            }
+            let rebuilt = "";
+            let cursor = 0;
+            for (const span of merged) {
+                rebuilt += text.slice(cursor, span.start);
+                cursor = span.end;
+            }
+            result = rebuilt + text.slice(cursor);
+        }
+    }
+
+    return result.replace(CACHE_CONTROL_TEXT_MARKER, "");
+}
+
 /**
  * Chat model provider for Llama.cpp servers.
  * Implements the VS Code language model chat provider interface for Llama.cpp compatible APIs.
@@ -188,7 +294,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly modelListInflight = new Map<string, ModelListInflightEntry>();
     private readonly runtimeContextCache = new Map<string, RuntimeContextCacheEntry>();
     private readonly cachePrefixSnapshots = new Map<string, CachePrefixSnapshot>();
+    private readonly stableToolCatalogs = new Map<string, StableToolCatalogSnapshot>();
     private readonly chatRequestQueue: SerialRequestQueue;
+    private reasoningMapLoaded = false;
     private readonly httpTransport = new OpenAIHttpTransport();
     private readonly serverTokenCounter = new ServerTokenCounter(
         (url, init, timeoutMs, cancellation) => this.httpTransport.request(url, init, timeoutMs, cancellation)
@@ -205,7 +313,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         secrets: vscode.SecretStorage,
         private readonly userAgent: string,
         private readonly logger?: LlamaLogSink,
-        private readonly sharedMemory?: SharedMemoryContextProvider
+        private readonly sharedMemory?: SharedMemoryContextProvider,
+        private readonly globalState?: vscode.Memento
     ) {
         super(secrets);
         this.chatRequestQueue = new SerialRequestQueue(event => {
@@ -217,6 +326,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     refreshLanguageModelChatInformation(): void {
         this.modelListCache.clear();
         this.runtimeContextCache.clear();
+        this.stableToolCatalogs.clear();
         this.serverTokenCounter.clear();
         this.log("models.refresh.requested");
         this._onDidChangeLanguageModelChatInformation.fire();
@@ -530,16 +640,92 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const conversationId = typeof modelOptions?._copilotConversationId === "string"
             ? modelOptions._copilotConversationId.trim()
             : "";
+        if (conversationId) {
+            return [modelId, conversationId].join("\0");
+        }
         const trace = modelOptions?._otelTraceContext;
         const traceRecord = trace && typeof trace === "object"
             ? trace as Record<string, unknown>
             : undefined;
         const traceId = typeof traceRecord?.traceId === "string" ? traceRecord.traceId : "";
         const spanId = typeof traceRecord?.spanId === "string" ? traceRecord.spanId : "";
-        if (!conversationId && !traceId && !spanId) {
+        if (!traceId && !spanId) {
             return undefined;
         }
-        return [modelId, conversationId, traceId, spanId].join("\0");
+        return [modelId, traceId, spanId].join("\0");
+    }
+
+    private stabilizeToolCatalog(
+        modelId: string,
+        options: ProvideLanguageModelChatResponseOptions,
+        config: ReturnType<typeof convertTools>,
+        messages: readonly OpenAIChatMessage[],
+        requestId: string
+    ): ReturnType<typeof convertTools> {
+        const scope = this.cachePrefixScope(modelId, options);
+        if (
+            !scope
+            || options.toolMode === vscode.LanguageModelChatToolMode.Required
+            || !Array.isArray(config.tools)
+        ) {
+            return config;
+        }
+
+        const availableNames = new Set((options.tools ?? []).map(tool => tool.name));
+        const currentFingerprint = this.shortHash(stableJsonStringify(config.tools));
+        const previous = this.stableToolCatalogs.get(scope);
+        const recentActivation = messages.slice(-8).some(message =>
+            message.role === "assistant"
+            && message.tool_calls?.some(call => call.function.name.startsWith("activate_"))
+        );
+        const previousStillAvailable = previous?.tools.every(tool =>
+            availableNames.has(tool.function.name)
+        ) === true;
+
+        if (previous && previousStillAvailable && !recentActivation) {
+            this.stableToolCatalogs.delete(scope);
+            this.stableToolCatalogs.set(scope, previous);
+            if (previous.fingerprint !== currentFingerprint) {
+                this.log("chat.tools.catalog_stabilized", {
+                    requestId,
+                    modelId,
+                    retainedToolCount: previous.tools.length,
+                    currentToolCount: config.tools.length,
+                    retainedFingerprint: previous.fingerprint,
+                    currentFingerprint,
+                });
+            }
+            return {
+                ...config,
+                tools: previous.tools,
+                tool_choice: previous.toolChoice,
+            };
+        }
+
+        const next: StableToolCatalogSnapshot = {
+            tools: config.tools,
+            toolChoice: config.tool_choice,
+            fingerprint: currentFingerprint,
+        };
+        this.stableToolCatalogs.delete(scope);
+        this.stableToolCatalogs.set(scope, next);
+        while (this.stableToolCatalogs.size > 32) {
+            const oldest = this.stableToolCatalogs.keys().next().value as string | undefined;
+            if (!oldest) {
+                break;
+            }
+            this.stableToolCatalogs.delete(oldest);
+        }
+        if (previous) {
+            this.log("chat.tools.catalog_refreshed", {
+                requestId,
+                modelId,
+                reason: recentActivation ? "activation" : "tool-unavailable",
+                previousFingerprint: previous.fingerprint,
+                currentFingerprint,
+            });
+        }
+        return config;
     }
 
     private trackCachePrefix(
@@ -1047,6 +1233,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         }
                     }
                 }
+                if (typeof msg.reasoning_content === "string") {
+                    charCount += msg.reasoning_content.length;
+                }
                 if (Array.isArray(msg.tool_calls)) {
                     try {
                         charCount += JSON.stringify(msg.tool_calls).length;
@@ -1170,8 +1359,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             let nextContent = content;
             if (this.getSanitizeToolResultArtifacts()) {
                 // Remove transient transport metadata sometimes appended to tool output text.
-                const cleaned = nextContent
-                    .replace(/\{\s*"\$mid"\s*:\s*\d+\s*,\s*"mimeType"\s*:\s*"cache_control"\s*,\s*"data"\s*:\s*"[A-Za-z0-9+/=]+"\s*\}/g, "")
+                const cleaned = stripCacheControlArtifacts(nextContent)
                     .replace(/\n{3,}/g, "\n\n")
                     .trimEnd();
                 if (cleaned !== nextContent) {
@@ -1210,6 +1398,142 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
 
         return nextMessages;
+    }
+
+    private static readonly REASONING_MAP_STATE_KEY = "llamacpp.deepseek_reasoning_map";
+
+    private loadPersistedReasoningMap(): void {
+        if (this.reasoningMapLoaded || !this.globalState) {
+            return;
+        }
+        this.reasoningMapLoaded = true;
+        try {
+            const stored = this.globalState.get<Record<string, unknown>>(
+                LlamaCppChatModelProvider.REASONING_MAP_STATE_KEY
+            );
+            if (!stored || typeof stored !== "object") {
+                return;
+            }
+            let restored = 0;
+            for (const [key, value] of Object.entries(stored)) {
+                if (typeof value === "string") {
+                    // Legacy flat shape written before conversation scoping: { callId: reasoning }.
+                    if (key && value) {
+                        this.restoreReasoningEntry(key, value);
+                        restored += 1;
+                    }
+                    continue;
+                }
+                if (!value || typeof value !== "object") {
+                    continue;
+                }
+                for (const [callId, reasoning] of Object.entries(value as Record<string, unknown>)) {
+                    if (typeof reasoning === "string" && callId && reasoning) {
+                        this.restoreReasoningEntry(callId, reasoning, key);
+                        restored += 1;
+                    }
+                }
+            }
+            if (restored > 0) {
+                this.log("chat.reasoning.map_restored", { restoredEntries: restored });
+            }
+        } catch (error) {
+            this.logError("chat.reasoning.map_restore_failed", error);
+            this.reasoningMapLoaded = false; // retry next turn
+        }
+    }
+
+    private persistReasoningMap(): void {
+        if (!this.globalState) {
+            return;
+        }
+        try {
+            const serializable: Record<string, Record<string, string>> = {};
+            for (const [scope, entries] of this.exportReasoningScopes()) {
+                const bucket: Record<string, string> = {};
+                for (const [callId, reasoning] of entries) {
+                    bucket[callId] = reasoning;
+                }
+                serializable[scope] = bucket;
+            }
+            void this.globalState.update(
+                LlamaCppChatModelProvider.REASONING_MAP_STATE_KEY,
+                serializable
+            );
+        } catch (error) {
+            this.logError("chat.reasoning.map_persist_failed", error);
+        }
+    }
+
+    protected async processStreamingResponse(
+        responseBody: ReadableStream<Uint8Array>,
+        progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+        token: vscode.CancellationToken
+    ): Promise<ChatTokenUsage | undefined> {
+        // Restore persisted reasoning entries before streaming adds new ones,
+        // so persistReasoningMap writes a merged set rather than overwriting.
+        this.loadPersistedReasoningMap();
+        const result = await super.processStreamingResponse(responseBody, progress, token);
+        this.persistReasoningMap();
+        return result;
+    }
+
+    /**
+     * Injects accumulated reasoning content from the previous turn into assistant
+     * messages that carry tool calls but lack a reasoning_content field.
+     *
+     * DeepSeek (and other thinking-mode APIs) require reasoning_content to be
+     * passed back on follow-up requests when tool calls were involved.  Without it,
+     * the API returns a 400 error.
+     *
+    * VS Code may render LanguageModelThinkingPart while omitting it from the next
+    * provider history. During streaming the same reasoning text is therefore also
+    * retained in BaseProvider._currentTurnReasoningContent; this method restores
+    * the provider-specific field before the next request is sent.
+     */
+    private injectStoredReasoningContent(messages: OpenAIChatMessage[]): OpenAIChatMessage[] {
+        this.loadPersistedReasoningMap();
+        let fallbackIndex = -1;
+        const currentReasoning = this.getCurrentTurnReasoningContent();
+        for (let index = messages.length - 1; index >= 0; index--) {
+            const message = messages[index];
+            if (
+                message.role === "assistant"
+                && message.tool_calls?.length
+                && !message.reasoning_content
+            ) {
+                fallbackIndex = index;
+                break;
+            }
+        }
+
+        // Bind reasoning to the call ids emitted with that response.
+        return messages.map((message, index) => {
+            if (
+                message.role !== "assistant"
+                || !message.tool_calls?.length
+                || message.reasoning_content
+            ) {
+                return message;
+            }
+            const exactReasoning = message.tool_calls
+                .map(call => this.getReasoningForToolCall(call.id))
+                .find((value): value is string => Boolean(value));
+            if (exactReasoning) {
+                return { ...message, reasoning_content: exactReasoning };
+            }
+            if (index !== fallbackIndex || !currentReasoning) {
+                return message;
+            }
+            // Bind the positional fallback to the actual call ids so the next turn
+            // resolves this message by identity. Without it the fallback target
+            // moves forward every turn and the previous target silently loses
+            // reasoning_content, which breaks the cached prompt prefix.
+            for (const call of message.tool_calls) {
+                this.rememberReasoningValueForToolCall(call.id, currentReasoning);
+            }
+            return { ...message, reasoning_content: currentReasoning };
+        });
     }
 
     private compactOpenAiMessages(
@@ -1322,13 +1646,17 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
     }
 
+    private isCacheStillValid(
+        cached: { serverUrl: string; apiKeyPresent: boolean },
+        serverUrl: string,
+        apiKeyPresent: boolean
+    ): boolean {
+        return cached.serverUrl === serverUrl && cached.apiKeyPresent === apiKeyPresent;
+    }
+
     private getFreshCachedModels(serverUrl: string, apiKeyPresent: boolean, ttlMs: number): LlamaCppModelInfo[] | undefined {
         const cached = this.modelListCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (ttlMs <= 0 || !cached) {
-            return undefined;
-        }
-
-        if (cached.serverUrl !== serverUrl || cached.apiKeyPresent !== apiKeyPresent) {
+        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
@@ -1341,11 +1669,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
     private getAnyCachedModels(serverUrl: string, apiKeyPresent: boolean): LlamaCppModelInfo[] | undefined {
         const cached = this.modelListCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (!cached) {
-            return undefined;
-        }
-
-        if (cached.serverUrl !== serverUrl || cached.apiKeyPresent !== apiKeyPresent) {
+        if (!cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
@@ -1367,11 +1691,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         ttlMs: number
     ): number | undefined {
         const cached = this.runtimeContextCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (ttlMs <= 0 || !cached) {
-            return undefined;
-        }
-
-        if (cached.serverUrl !== serverUrl || cached.apiKeyPresent !== apiKeyPresent) {
+        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
@@ -1789,6 +2109,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const requestId = randomUUID();
         const turnStartedAt = Date.now();
         const resolvedFamily = this.resolveModelFamily(requestModelId, source.familyOverride);
+        // Reasoning must be looked up and stored per conversation so a parallel chat
+        // cannot evict entries that this conversation's cached prefix depends on.
+        this.setReasoningScope(this.cachePrefixScope(requestModelId, options));
         const imageInputSupported = model.capabilities?.imageInput === true;
         const processedMessages = imageInputSupported
             ? messages
@@ -1961,12 +2284,19 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 sharedMemoryMaxTokens,
             },
         });
-        const toolConfig = convertTools(options, {
+        const convertedToolConfig = convertTools(options, {
             mode: toolCallingModeConfig as ToolCallingMode,
             apiDirectMaxTools,
             apiDirectIncludeAllTools,
             apiDirectToolTokenBudget,
         });
+        const toolConfig = this.stabilizeToolCatalog(
+            requestModelId,
+            options,
+            convertedToolConfig,
+            inspectionMessages,
+            requestId
+        );
         const toolLoopDetection = toolLoopProtection
             ? detectRepeatedToolCallLoop(inspectionMessages, toolLoopDetectionThreshold)
             : undefined;
@@ -2003,7 +2333,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 toolResultMode: mode,
                 supportsImageInput: imageInputSupported,
             });
-            const withKnowledge = injectKnowledgeSystemPrompt(converted, knowledgeSystemPrompt);
+            const withReasoning = this.injectStoredReasoningContent(converted);
+            const withKnowledge = injectKnowledgeSystemPrompt(withReasoning, knowledgeSystemPrompt);
             const withMemory = injectSharedMemoryContext(withKnowledge, sharedMemoryContext?.text);
             const withLoopGuard = injectToolLoopGuard(withMemory, toolLoopDetection);
             const profiled = useCopilotCompactionProfile
@@ -2334,6 +2665,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
         let attemptCounter = 0;
         let latestContextUsage: LlamaChatContextUsageMetrics | undefined;
+        let latestCachePrefix: CachePrefixTelemetry | undefined;
         const attemptRequest = async (sourceMessages: OpenAIChatMessage[]): Promise<AttemptResult> => {
             attemptCounter += 1;
             const attemptNo = attemptCounter;
@@ -2377,6 +2709,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             this.log("chat.context.usage", latestContextUsage);
             this._onDidUpdateContextUsage.fire(latestContextUsage);
 
+            const cachePrefix = this.trackCachePrefix(
+                requestId,
+                requestModelId,
+                options,
+                requestBody,
+                prepared.messages
+            );
+            latestCachePrefix = cachePrefix as CachePrefixTelemetry;
             this.log("chat.request.send", {
                 requestId,
                 attemptNo,
@@ -2385,13 +2725,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 toolResultMode: activeToolResultMode,
                 headers: this.redactHeaders(headers),
                 requestBody: this.summarizeRequestBodyForLog(requestBody),
-                cachePrefix: this.trackCachePrefix(
-                    requestId,
-                    requestModelId,
-                    options,
-                    requestBody,
-                    prepared.messages
-                ),
+                cachePrefix,
             });
 
             let response: Response;
@@ -2847,6 +3181,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 usage: reportedUsage,
                 promptCache: promptCacheUsage,
             });
+
+            if (usageSource === "server") {
+                this.log("chat.cache.report", buildCacheDiagnostics({
+                    provider: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                    modelId: requestModelId,
+                    requestId,
+                    usage: promptCacheUsage,
+                    prefix: latestCachePrefix,
+                }));
+            }
 
             const metrics: LlamaChatTurnMetrics = {
                 requestId,
