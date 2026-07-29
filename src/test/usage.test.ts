@@ -1,5 +1,9 @@
 import * as assert from "assert";
-import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
+import {
+	buildCacheDiagnostics,
+	classifyCodexTurnCache,
+	promptCacheUsageFromCacheReads,
+} from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage, estimateChatTokenUsage, mergeChatTokenUsage, normalizeChatTokenUsage } from "../context/usage";
 
 suite("chat token usage", () => {
@@ -144,6 +148,25 @@ suite("prompt cache diagnostics", () => {
 			usage: usage(1000, 10),
 			session: { reused: true },
 		}).reason, "upstream_expired");
+	});
+
+	test("separates a cold Codex startup from healthy continuation reuse", () => {
+		assert.deepStrictEqual(classifyCodexTurnCache({
+			threadMode: "new",
+			threadReuseMissReason: "no-stored-thread",
+			initialSegmentHitPercent: 0,
+			finalSegmentHitPercent: 99.5,
+			processedHitPercent: 74.5,
+		}), {
+			reason: "healthy",
+			detail: "A new Codex thread was required (no-stored-thread). Its first model segment was 0.0% cache hit, then continuation recovered to 99.5% cache hit.",
+		});
+
+		assert.strictEqual(classifyCodexTurnCache({
+			threadMode: "new",
+			initialSegmentHitPercent: 0,
+			finalSegmentHitPercent: 42,
+		}).reason, "session_not_reused");
 	});
 
 	test("derives usage from Anthropic cache-read counters", () => {

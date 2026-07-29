@@ -17,7 +17,12 @@ import {
 	resolveClaudeContextLength,
 } from "../claude/claude-provider";
 import { buildClaudeModelAvailability } from "../claude/availability";
-import { isClaudeVsCodeToolName } from "../claude/app-server-client";
+import {
+	createClaudeNativeContextUsage,
+	createClaudeNativeUsage,
+	isClaudeVsCodeToolName,
+	parseClaudeAssistantUsage,
+} from "../claude/app-server-client";
 
 type UsageSnapshot = Parameters<typeof buildClaudeUsageLimits>[0];
 const AVAILABILITY_NOW = Date.parse("2026-07-19T09:00:00Z");
@@ -40,6 +45,90 @@ suite("Claude subscription provider", () => {
 		assert.strictEqual(isClaudeVsCodeToolName("Read"), false);
 		assert.strictEqual(isClaudeVsCodeToolName("Bash"), false);
 		assert.strictEqual(isClaudeVsCodeToolName("mcp__other__write_file"), false);
+	});
+
+	test("parses exact Claude cache read, creation, and thinking usage", () => {
+		const segment = parseClaudeAssistantUsage({
+			id: "message-1",
+			usage: {
+				input_tokens: 312,
+				cache_read_input_tokens: 4096,
+				cache_creation_input_tokens: 512,
+				output_tokens: 120,
+				output_tokens_details: { thinking_tokens: 80 },
+			},
+		}, "fallback", 2, "2026-07-29T08:00:00.000Z");
+
+		assert.deepStrictEqual(segment, {
+			id: "message-1",
+			index: 2,
+			recordedAt: "2026-07-29T08:00:00.000Z",
+			freshInputTokens: 312,
+			cacheReadInputTokens: 4096,
+			cacheCreationInputTokens: 512,
+			inputTokens: 4920,
+			outputTokens: 120,
+			thinkingTokens: 80,
+			totalTokens: 5040,
+			cacheHitPercent: 83.3,
+		});
+	});
+
+	test("emits Claude usage in the native Copilot context contract", () => {
+		assert.deepStrictEqual(createClaudeNativeUsage({
+			inputTokens: 312,
+			cacheReadInputTokens: 4096,
+			cacheCreationInputTokens: 512,
+			outputTokens: 120,
+			durationMs: 1000,
+			numTurns: 1,
+		}), {
+			prompt_tokens: 4920,
+			completion_tokens: 120,
+			total_tokens: 5040,
+			prompt_tokens_details: { cached_tokens: 4096 },
+		});
+	});
+
+	test("uses the final Claude model segment for native context occupancy", () => {
+		assert.deepStrictEqual(createClaudeNativeContextUsage({
+			inputTokens: 10_000,
+			cacheReadInputTokens: 15_000,
+			cacheCreationInputTokens: 2_000,
+			outputTokens: 500,
+			durationMs: 2_000,
+			numTurns: 2,
+		}, [
+			{
+				id: "segment-1",
+				index: 1,
+				recordedAt: "2026-07-29T08:00:00.000Z",
+				freshInputTokens: 10_000,
+				cacheReadInputTokens: 7_000,
+				cacheCreationInputTokens: 1_700,
+				inputTokens: 18_700,
+				outputTokens: 400,
+				thinkingTokens: 200,
+				totalTokens: 19_100,
+			},
+			{
+				id: "segment-2",
+				index: 2,
+				recordedAt: "2026-07-29T08:00:01.000Z",
+				freshInputTokens: 200,
+				cacheReadInputTokens: 8_000,
+				cacheCreationInputTokens: 300,
+				inputTokens: 8_500,
+				outputTokens: 100,
+				thinkingTokens: 50,
+				totalTokens: 8_600,
+			},
+		]), {
+			prompt_tokens: 8_500,
+			completion_tokens: 100,
+			total_tokens: 8_600,
+			prompt_tokens_details: { cached_tokens: 8_000 },
+		});
 	});
 
 	test("canonicalizes Claude tool and schema order across Copilot reloads", () => {

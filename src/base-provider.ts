@@ -740,11 +740,26 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             return undefined;
         }
         const scoped = this.reasoningMapFor(this._reasoningScope, false)?.get(callId);
-        if (scoped !== undefined || !this._reasoningScope) {
+        if (scoped !== undefined) {
             return scoped;
         }
         // Entries persisted before conversation scoping existed live in the "" bucket.
-        return this.reasoningMapFor("", false)?.get(callId);
+        const legacy = this.reasoningMapFor("", false)?.get(callId);
+        if (legacy !== undefined) {
+            return legacy;
+        }
+        // Cross-scope fallback: subagents may run with a different conversation
+        // scope than the main chat, so the exact callId match fails in the
+        // scoped lookup.  Searching all scopes ensures historical tool-call
+        // messages get their reasoning restored even when Copilot assigns a
+        // different conversation id to an inline subagent turn.
+        for (const [, entries] of this._reasoningByScope) {
+            const found = entries.get(callId);
+            if (found !== undefined) {
+                return found;
+            }
+        }
+        return undefined;
     }
 
     /**

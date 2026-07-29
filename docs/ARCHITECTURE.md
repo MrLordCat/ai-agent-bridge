@@ -23,9 +23,11 @@ uses an independent transport and lifecycle.
 - `src/logger.ts` writes structured JSONL diagnostics without message bodies or
   authorization headers.
 - `src/codex/` owns ChatGPT subscription discovery, `codex app-server` JSONL,
-  thread reuse, dynamic VS Code tools, and the fail-closed native tool bridge.
-- `src/claude/` owns Claude Code discovery, Agent SDK sessions, subscription
-  limits, warm conversation reuse, and an MCP allowlist limited to VS Code.
+  thread reuse, dynamic VS Code tools, the fail-closed native tool bridge, and
+  exact rollout/live model-segment metrics.
+- `src/claude/` owns Claude Code discovery, persistent Agent SDK queries,
+  subscription limits, warm conversation reuse, a VS Code-only MCP allowlist,
+  and live logical-turn usage/context/tool metrics.
 - `src/provider-metrics.ts`, `src/token-usage-history.ts`, and
   `src/usage-experiment.ts` normalize provider telemetry and persist bounded
   comparison data without prompt bodies.
@@ -36,11 +38,10 @@ uses an independent transport and lifecycle.
 - `src/tools/tool-call-reliability.ts` owns deterministic tool argument repair,
   schema validation, metrics, and repeated identical-call detection.
 - `src/diagnostics/` owns provider health reports and session-quality
-  aggregation/rendering.
+  aggregation. Running turns are upserted by request id so provider re-entry
+  after a native tool result does not create duplicate logical turns.
 - `src/context/context-budget.ts` owns pure soft/hard input budgets and context
   usage estimates shared by initial requests and overflow retries.
-- `src/context/copilot-compaction.ts` recognizes Copilot's internal summary
-  requests and applies a bounded no-reasoning service profile.
 - `src/context/output-budget.ts` separates normal per-source output defaults
   from explicit request limits and the global hard ceiling.
 - `src/context/message-compaction.ts` owns deterministic non-mutating history
@@ -65,6 +66,9 @@ uses an independent transport and lifecycle.
   cancellation, queue timeouts, and idempotent slot release.
 - `src/ui/quick-access.ts` owns the grouped Quick Access tree, compact endpoint
   labels, native icons, and live state summaries.
+- `src/ui/session-quality-panel.ts` owns the live, state-preserving diagnostics
+  webview with filters, issue highlighting, expandable turn details, usage
+  segments, and Codex model/tool step timelines.
 - `src/ui/model-behavior-commands.ts` owns reasoning and tool-mode pickers and
   command handlers.
 - `src/constants.ts` contains shared product, provider, endpoint, and limit
@@ -88,41 +92,47 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
   Extension Host restart.
 4. A session-scoped native reasoning selection overrides the global mode when
    Copilot supplies it through `modelOptions`.
-5. Internal Copilot compaction prompts are classified before normal request
-   tuning so they cannot inherit the user's expensive reasoning profile.
-6. VS Code messages and tools are converted to OpenAI format.
-7. The stable provider knowledge policy is prepended to native system
-   instructions; Copilot compaction service requests skip this policy.
-8. Relevant non-expired memory for the active workspace/model scope is inserted
+5. VS Code messages and tools are converted to OpenAI format.
+6. The stable provider knowledge policy is prepended to native system instructions.
+7. Relevant non-expired memory for the active workspace/model scope is inserted
    immediately before the latest user turn, preserving the stable cached prefix.
-9. Tool results are sanitized/summarized and the complete local prompt is
+8. Tool results are sanitized/summarized and the complete local prompt is
    counted with the active server template and tokenizer when available.
-10. The serial transport queue grants the request slot.
-11. The pure request builder applies local or DeepSeek fields, then the request
+9. The serial transport queue grants the request slot.
+10. The pure request builder applies local or DeepSeek fields, then the request
    is sent to the source-specific chat completion endpoint.
-12. SSE chunks are coalesced; tool calls are repaired conservatively and
+11. SSE chunks are coalesced; tool calls are repaired conservatively and
    validated against the advertised schema before they are emitted to VS Code.
-13. A rejected tool call can trigger one bounded correction request when no
+12. A rejected tool call can trigger one bounded correction request when no
    visible output or executable tool call has escaped the failed stream.
-14. The final upstream usage chunk is validated and emitted as native `usage`
+13. The final upstream usage chunk is validated and emitted as native `usage`
    response data, with an estimate used only when the server omits it.
-15. Transient transport failures can retry only before streaming starts;
+14. Transient transport failures can retry only before streaming starts;
    context overflow, tool-role incompatibility, or empty output use separate
    bounded recovery paths.
 
 ### Codex subscription flow
 
-1. A strict thread starts in read-only mode with built-in shell, file, web,
-  MCP, browser, plugin, hook, and subagent actions disabled.
-2. The current Copilot tool catalog is advertised as app-server dynamic tools.
-3. Tool calls are emitted as native VS Code cards and the app-server turn is
-  suspended until their results return.
-4. Calls arriving after a delegated boundary are queued and exposed in the
+1. The user selects a discovered `codex::` model and reasoning effort in the
+  normal VS Code model picker; there is no separate chat participant.
+2. A strict app-server thread starts in read-only mode with built-in shell,
+  file, web, MCP, browser, plugin, hook, image, and subagent actions disabled.
+3. The current VS Code/Copilot tool catalog is canonicalized and advertised as
+  app-server dynamic tools. Core coding tools stay eager; uncommon schemas can
+  be loaded through the app-server tool-search mechanism.
+4. Tool calls are emitted as native VS Code cards and the app-server turn is
+  suspended until their results return. VS Code may re-enter the provider with
+  a tool result, but the same app-server turn resumes instead of starting a new
+  model request or serializing a continuation prompt.
+5. Calls arriving after a delegated boundary are queued and exposed in the
   next native segment; only already visible calls require results on resume.
-5. Completed compatible threads reuse an exact conversation anchor and send
+6. Completed compatible threads reuse an exact conversation anchor and send
   only incremental input. Non-ephemeral thread ids and validation fingerprints
   are stored in workspace state, reattached with `thread/resume` after reload,
   and fall back to a new full-history thread when reattachment fails.
+7. App-server token notifications and persisted rollout data feed one running
+  Session Quality record. Model usage segments and tool-step state update live;
+  final rollout metrics replace the fallback snapshot when available.
 
 ### Claude subscription flow
 
@@ -138,6 +148,13 @@ model provider surface. Update it explicitly with `npm run update-vscode-api`.
   VS Code history before visible output is emitted.
 5. Subscription and model-context probes refresh periodically; probes for
   Claude availability never block Local, DeepSeek, or Codex requests.
+6. One stable logical-turn id spans assistant model segments and all native
+  tool-result provider re-entry. Stream events, assistant usage, aggregate
+  result usage, MCP tool duration, terminal status, and `getContextUsage()`
+  snapshots upsert the same Session Quality record.
+7. Anthropic fresh input, cache read, and cache creation remain distinct. The
+  report does not misclassify cache creation as either a hit or ordinary fresh
+  input, and it retains thinking tokens per assistant model segment.
 
 ### Reload and tool-catalog stability
 
@@ -177,6 +194,8 @@ working.
 
 - Source prefixes are never sent as model ids to upstream servers.
 - Codex and Claude cannot execute actions outside native VS Code tool cards.
+- A selected Codex model uses the contributed model-provider path; no secondary
+  participant or hidden execution surface may be introduced for the same flow.
 - A detached Codex bridge may queue only calls belonging to an already pending
   native tool turn; an unrelated detached call is rejected and logged.
 - DeepSeek-only fields and llama.cpp-only fields stay source-specific.

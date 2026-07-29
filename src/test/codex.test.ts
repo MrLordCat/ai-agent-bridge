@@ -11,8 +11,10 @@ import {
 	createCodexRuntimeFingerprints,
 	createCodexVsCodeOnlyPolicy,
 	diffCodexThreadUsage,
+	findLatestCodexUserTail,
 	intersectCodexThreadTools,
 	mapCodexTokenUsageMetrics,
+	mergeCodexTurnSteps,
 	resolveCodexSessionPersistence,
 	shouldRecoverCodexFailedToolTurn,
 	shouldRecoverCodexToolTurnException,
@@ -38,6 +40,7 @@ import {
 	resolveCodexReasoningEffort,
 } from "../codex/model-adapter";
 import type { CodexModel } from "../codex/protocol";
+import { parseCodexRolloutMetrics } from "../codex/rollout-metrics";
 import {
 	CodexInternalToolBlockedError,
 	CodexStaleTurnError,
@@ -162,6 +165,140 @@ suite("Codex subscription provider", () => {
 			reasoningOutputTokens: 50,
 		});
 		assert.strictEqual(diffCodexThreadUsage(next, next), undefined);
+	});
+
+	test("extracts private-free per-segment metrics from a Codex rollout", () => {
+		const line = (timestamp: string, type: string, payload: Record<string, unknown>): string =>
+			JSON.stringify({ timestamp, type, payload });
+		const rollout = [
+			line("2026-07-28T14:00:00.000Z", "event_msg", {
+				type: "task_started",
+				turn_id: "turn-target",
+			}),
+			line("2026-07-28T14:00:01.000Z", "event_msg", {
+				type: "agent_reasoning",
+				text: "private reasoning that must not be retained",
+			}),
+			line("2026-07-28T14:00:02.000Z", "response_item", {
+				type: "function_call",
+				call_id: "call-1",
+				name: "read_file",
+				arguments: "private arguments",
+			}),
+			line("2026-07-28T14:00:05.000Z", "response_item", {
+				type: "function_call_output",
+				call_id: "call-1",
+				output: "private tool output",
+			}),
+			line("2026-07-28T14:00:06.000Z", "event_msg", {
+				type: "token_count",
+				info: {
+					last_token_usage: {
+						input_tokens: 1000,
+						cached_input_tokens: 900,
+						output_tokens: 100,
+						reasoning_output_tokens: 40,
+						total_tokens: 1100,
+					},
+				},
+			}),
+			line("2026-07-28T14:00:07.000Z", "event_msg", {
+				type: "agent_message",
+				message: "private answer",
+			}),
+			line("2026-07-28T14:00:08.000Z", "event_msg", {
+				type: "token_count",
+				info: {
+					last_token_usage: {
+						input_tokens: 1200,
+						cached_input_tokens: 1140,
+						output_tokens: 80,
+						reasoning_output_tokens: 10,
+						total_tokens: 1280,
+					},
+				},
+			}),
+			line("2026-07-28T14:00:09.000Z", "event_msg", {
+				type: "task_complete",
+				turn_id: "turn-target",
+			}),
+			"{partially flushed",
+		].join("\n");
+
+		const metrics = parseCodexRolloutMetrics(rollout, "turn-target");
+		assert.ok(metrics);
+		assert.strictEqual(metrics.completed, true);
+		assert.strictEqual(metrics.durationMs, 9000);
+		assert.strictEqual(metrics.firstModelEventLatencyMs, 1000);
+		assert.strictEqual(metrics.firstVisibleMessageLatencyMs, 7000);
+		assert.strictEqual(metrics.modelSegments, 2);
+		assert.strictEqual(metrics.inputTokens, 2200);
+		assert.strictEqual(metrics.cachedInputTokens, 2040);
+		assert.strictEqual(metrics.outputTokens, 180);
+		assert.strictEqual(metrics.reasoningOutputTokens, 50);
+		assert.strictEqual(metrics.cacheHitPercent, 92.7);
+		assert.strictEqual(metrics.toolCalls, 1);
+		assert.strictEqual(metrics.toolOutputs, 1);
+		assert.deepStrictEqual(metrics.toolNames, { read_file: 1 });
+		assert.deepStrictEqual(metrics.toolDuration, {
+			count: 1,
+			totalMs: 3000,
+			averageMs: 3000,
+			maximumMs: 3000,
+			p95Ms: 3000,
+		});
+		assert.strictEqual(metrics.steps.filter(step => step.kind === "model").length, 2);
+		const rolloutToolStep = metrics.steps.find(step => step.kind === "tool");
+		assert.strictEqual(rolloutToolStep?.label, "read_file");
+		assert.strictEqual(rolloutToolStep?.status, "completed");
+		assert.strictEqual(rolloutToolStep?.toolCategory, "vscode");
+		assert.doesNotMatch(JSON.stringify(metrics), /private/);
+	});
+
+	test("keeps only the latest user turn when resuming an interrupted Codex thread", () => {
+		const messages = [
+			vscode.LanguageModelChatMessage.User("old request"),
+			vscode.LanguageModelChatMessage.Assistant("old answer"),
+			vscode.LanguageModelChatMessage.User("stop the subagent and inspect the cache"),
+		];
+		const tail = findLatestCodexUserTail(messages);
+		assert.strictEqual(tail.length, 1);
+		assert.strictEqual(tail[0], messages[2]);
+	});
+
+	test("merges rollout catalog steps with live delegated tool terminal state", () => {
+		const steps = mergeCodexTurnSteps(
+			[{
+				id: "model-1",
+				index: 1,
+				kind: "model" as const,
+				label: "Model segment 1",
+				status: "completed" as const,
+				startedAt: "2026-07-29T07:00:00.000Z",
+			}],
+			[{
+				id: "tool-call-subagent",
+				index: 1,
+				kind: "tool" as const,
+				label: "runSubagent",
+				status: "timed_out" as const,
+				toolCategory: "vscode" as const,
+				startedAt: "2026-07-29T07:00:01.000Z",
+			}, {
+				id: "tool-search-1",
+				index: 2,
+				kind: "tool" as const,
+				label: "Tool catalog search",
+				status: "completed" as const,
+				toolCategory: "catalog" as const,
+				startedAt: "2026-07-29T07:00:02.000Z",
+			}]
+		);
+		assert.deepStrictEqual(steps.map(step => [step.index, step.label, step.status]), [
+			[1, "Model segment 1", "completed"],
+			[2, "runSubagent", "timed_out"],
+			[3, "Tool catalog search", "completed"],
+		]);
 	});
 
 	test("serializes VS Code text and tool history as conversation data", () => {
@@ -292,13 +429,17 @@ suite("Codex subscription provider", () => {
 		} as unknown as CodexAppServerClient;
 		const usageSnapshots: number[] = [];
 		const outputEstimates: number[] = [];
+		let metricUpdates = 0;
 		const bridge = new CodexTurnBridge(
 			fakeClient,
 			"thread-1",
 			undefined,
 			undefined,
 			(_bridge, usage) => usageSnapshots.push(usage.last.totalTokens),
-			(_bridge, tokens) => outputEstimates.push(tokens)
+			(_bridge, tokens) => outputEstimates.push(tokens),
+			false,
+			false,
+			() => metricUpdates++
 		);
 		const firstParts: vscode.LanguageModelResponsePart[] = [];
 		const secondParts: vscode.LanguageModelResponsePart[] = [];
@@ -337,6 +478,10 @@ suite("Codex subscription provider", () => {
 		const toolResponse = { contentItems: [{ type: "inputText" as const, text: "file contents" }], success: true };
 		const resumed = bridge.resume(new Map([["call-1", toolResponse]]), { report: part => secondParts.push(part) }, tokenSource.token);
 		assert.deepStrictEqual(await dynamicResponsePromise, toolResponse);
+		const toolStep = bridge.liveMetrics.steps.find(step => step.kind === "tool");
+		assert.strictEqual(toolStep?.label, "read_file");
+		assert.strictEqual(toolStep?.status, "completed");
+		assert.ok(metricUpdates >= 3);
 		notifications.fire({
 			method: "item/agentMessage/delta",
 			params: { threadId: "thread-1", turnId: "turn-1", itemId: "answer", delta: "done" },
@@ -363,13 +508,14 @@ suite("Codex subscription provider", () => {
 		const notifications = new vscode.EventEmitter<CodexServerNotification>();
 		const stops = new vscode.EventEmitter<Error>();
 		const requests: string[] = [];
+		let turnStarts = 0;
 		const fakeClient = {
 			onNotification: notifications.event,
 			onDidStop: stops.event,
 			request: async (method: string) => {
 				requests.push(method);
 				return method === "turn/start"
-					? { turn: { id: "turn-strict", status: "inProgress" } }
+					? { turn: { id: `turn-strict-${++turnStarts}`, status: "inProgress" } }
 					: {};
 			},
 		} as unknown as CodexAppServerClient;
@@ -394,13 +540,25 @@ suite("Codex subscription provider", () => {
 			method: "item/started",
 			params: {
 				threadId: "thread-strict",
-				turnId: "turn-strict",
+				turnId: "turn-strict-1",
 				item: { id: "internal-command", type: "commandExecution", command: "echo bypass" },
 			},
 		});
 		await assert.rejects(boundary, CodexInternalToolBlockedError);
-		await new Promise<void>(resolve => setImmediate(resolve));
+		await bridge.waitForBlockedInternalToolInterrupt();
 		assert.ok(requests.includes("turn/interrupt"));
+		const restarted = bridge.restart(
+			{ threadId: "thread-strict", input: [{ type: "text", text: "use native tools" }] },
+			{ report: () => undefined },
+			tokenSource.token
+		);
+		await new Promise<void>(resolve => setImmediate(resolve));
+		notifications.fire({
+			method: "turn/completed",
+			params: { threadId: "thread-strict", turn: { id: "turn-strict-2", status: "completed", error: null } },
+		});
+		assert.strictEqual((await restarted).kind, "completed");
+		assert.strictEqual(turnStarts, 2);
 		assert.strictEqual(isCodexInternalActionItem({ type: "fileChange" }), true);
 		assert.strictEqual(isCodexInternalActionItem({ type: "agentMessage" }), false);
 		bridge.dispose();
@@ -475,6 +633,7 @@ suite("Codex subscription provider", () => {
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Rate limit exceeded"), false);
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Request was interrupted"), false);
 		assert.strictEqual(shouldRecoverCodexToolTurnException(new CodexStaleTurnError("stale")), true);
+		assert.strictEqual(shouldRecoverCodexToolTurnException(new CodexInternalToolBlockedError("commandExecution")), true);
 		assert.strictEqual(shouldRecoverCodexToolTurnException(new Error("transport failed")), false);
 	});
 
@@ -854,6 +1013,46 @@ suite("Codex subscription provider", () => {
 		assert.strictEqual((await toolResponse).success, false);
 		assert.strictEqual(stopCallbacks, 1);
 		assert.strictEqual(bridge.pendingCalls.length, 0);
+		bridge.dispose();
+		tokenSource.dispose();
+		notifications.dispose();
+		stops.dispose();
+	});
+
+	test("marks a suspended native tool call timed out and emits terminal metrics", async () => {
+		const notifications = new vscode.EventEmitter<CodexServerNotification>();
+		const stops = new vscode.EventEmitter<Error>();
+		const fakeClient = {
+			onNotification: notifications.event,
+			onDidStop: stops.event,
+			request: async () => ({ turn: { id: "turn-timeout", status: "inProgress" } }),
+		} as unknown as CodexAppServerClient;
+		let timeoutReason: string | undefined;
+		let metricUpdates = 0;
+		const bridge = new CodexTurnBridge(
+			fakeClient,
+			"thread-timeout",
+			undefined,
+			(_bridge, reason) => timeoutReason = reason,
+			undefined,
+			undefined,
+			false,
+			false,
+			() => metricUpdates++,
+			5
+		);
+		const tokenSource = new vscode.CancellationTokenSource();
+		const boundaryPromise = bridge.start(
+			{ threadId: "thread-timeout", input: [] },
+			{ report: () => undefined },
+			tokenSource.token
+		);
+		const toolResponse = bridge.delegate({ callId: "call-timeout", tool: "runSubagent", input: {} });
+		assert.strictEqual((await boundaryPromise).kind, "delegated");
+		assert.strictEqual((await toolResponse).success, false);
+		assert.strictEqual(timeoutReason, "timeout");
+		assert.strictEqual(bridge.liveMetrics.steps.find(step => step.kind === "tool")?.status, "timed_out");
+		assert.ok(metricUpdates >= 2);
 		bridge.dispose();
 		tokenSource.dispose();
 		notifications.dispose();

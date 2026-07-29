@@ -44,6 +44,153 @@ export interface ClaudeAgentUsage {
 	numTurns: number;
 }
 
+export interface ClaudeNativeUsagePayload {
+	prompt_tokens: number;
+	completion_tokens: number;
+	total_tokens: number;
+	prompt_tokens_details: {
+		cached_tokens: number;
+	};
+}
+
+export function createClaudeNativeUsage(usage: ClaudeAgentUsage): ClaudeNativeUsagePayload {
+	const promptTokens = Math.max(0, usage.inputTokens)
+		+ Math.max(0, usage.cacheReadInputTokens)
+		+ Math.max(0, usage.cacheCreationInputTokens);
+	const completionTokens = Math.max(0, usage.outputTokens);
+	return {
+		prompt_tokens: promptTokens,
+		completion_tokens: completionTokens,
+		total_tokens: promptTokens + completionTokens,
+		prompt_tokens_details: {
+			cached_tokens: Math.max(0, usage.cacheReadInputTokens),
+		},
+	};
+}
+
+export function createClaudeNativeContextUsage(
+	aggregate: ClaudeAgentUsage,
+	segments: readonly ClaudeAgentUsageSegment[]
+): ClaudeNativeUsagePayload {
+	const finalSegment = [...segments].sort((left, right) => left.index - right.index).at(-1);
+	return createClaudeNativeUsage(finalSegment
+		? {
+			inputTokens: finalSegment.freshInputTokens,
+			cacheReadInputTokens: finalSegment.cacheReadInputTokens,
+			cacheCreationInputTokens: finalSegment.cacheCreationInputTokens,
+			outputTokens: finalSegment.outputTokens,
+			durationMs: aggregate.durationMs,
+			numTurns: 1,
+		}
+		: aggregate);
+}
+
+export type ClaudeAgentTurnPhase = "running" | "completed" | "failed" | "timed_out" | "cancelled";
+
+export type ClaudeAgentSessionMode = "new" | "warm" | "restored" | "rollover" | "resume-fallback";
+
+export interface ClaudeAgentTurnContext {
+	sessionMode: ClaudeAgentSessionMode;
+	inputMode: "full" | "user-turn";
+	conversationKey?: string;
+	messageCount: number;
+	toolCount: number;
+	toolSchemaTokens: number;
+}
+
+export interface ClaudeAgentUsageSegment {
+	id: string;
+	index: number;
+	recordedAt: string;
+	freshInputTokens: number;
+	cacheReadInputTokens: number;
+	cacheCreationInputTokens: number;
+	inputTokens: number;
+	outputTokens: number;
+	thinkingTokens: number;
+	totalTokens: number;
+	cacheHitPercent?: number;
+}
+
+export interface ClaudeAgentTurnStep {
+	id: string;
+	index: number;
+	kind: "model" | "tool";
+	label: string;
+	status: "running" | "completed" | "failed" | "timed_out" | "cancelled";
+	startedAt: string;
+	completedAt?: string;
+	durationMs?: number;
+	toolCategory?: "vscode";
+	inputTokens?: number;
+	cacheReadInputTokens?: number;
+	cacheCreationInputTokens?: number;
+	outputTokens?: number;
+	thinkingTokens?: number;
+	totalTokens?: number;
+	cacheHitPercent?: number;
+}
+
+export interface ClaudeAgentTurnUpdate {
+	requestId: string;
+	phase: ClaudeAgentTurnPhase;
+	sessionId?: string;
+	startedAt: string;
+	durationMs: number;
+	firstModelEventLatencyMs?: number;
+	firstVisibleMessageLatencyMs?: number;
+	outputChars: number;
+	thinkingChars: number;
+	usage?: ClaudeAgentUsage;
+	usageSegments: ClaudeAgentUsageSegment[];
+	steps: ClaudeAgentTurnStep[];
+	toolCalls: number;
+	toolNames: Record<string, number>;
+	toolDuration: {
+		count: number;
+		totalMs: number;
+		averageMs: number;
+		maximumMs: number;
+		p95Ms: number;
+	};
+	context: ClaudeAgentTurnContext;
+	terminalDetail?: string;
+}
+
+export function parseClaudeAssistantUsage(
+	message: unknown,
+	fallbackId: string,
+	index: number,
+	recordedAt = new Date().toISOString()
+): ClaudeAgentUsageSegment | undefined {
+	const messageRecord = asRecord(message);
+	const usage = asRecord(messageRecord.usage);
+	if (Object.keys(usage).length === 0) {
+		return undefined;
+	}
+	const freshInputTokens = readNumber(usage.input_tokens);
+	const cacheReadInputTokens = readNumber(usage.cache_read_input_tokens);
+	const cacheCreationInputTokens = readNumber(usage.cache_creation_input_tokens);
+	const inputTokens = freshInputTokens + cacheReadInputTokens + cacheCreationInputTokens;
+	const outputTokens = readNumber(usage.output_tokens);
+	const thinkingTokens = readNumber(asRecord(usage.output_tokens_details).thinking_tokens);
+	return {
+		id: typeof messageRecord.id === "string" ? messageRecord.id : fallbackId,
+		index,
+		recordedAt,
+		freshInputTokens,
+		cacheReadInputTokens,
+		cacheCreationInputTokens,
+		inputTokens,
+		outputTokens,
+		thinkingTokens,
+		totalTokens: inputTokens + outputTokens,
+		cacheHitPercent: inputTokens > 0
+			? Number((cacheReadInputTokens / inputTokens * 100).toFixed(1))
+			: undefined,
+	};
+}
+
 export interface ClaudeRateLimitInfo {
 	status: "allowed" | "allowed_warning" | "rejected";
 	resetsAt?: number;
@@ -56,6 +203,7 @@ export type ClaudeContextUsageSnapshot = SDKControlGetContextUsageResponse;
 export interface ClaudeAgentSessionCallbacks {
 	onUsage(usage: ClaudeAgentUsage): void;
 	onRateLimit(info: ClaudeRateLimitInfo): void;
+	onTurnUpdate?(update: ClaudeAgentTurnUpdate): void;
 	onUsageSnapshot?(snapshot: ClaudeSubscriptionUsageSnapshot): void;
 	onContextUsage?(snapshot: ClaudeContextUsageSnapshot): void;
 	onSessionId?(sessionId: string): void;
@@ -101,8 +249,24 @@ interface PendingToolCall {
 	callId: string;
 	name: string;
 	input: Record<string, unknown>;
+	startedAt: number;
 	resolve: (result: CallToolResult) => void;
 	reject: (error: Error) => void;
+}
+
+interface ClaudeLogicalTurn {
+	requestId: string;
+	startedAt: number;
+	context: ClaudeAgentTurnContext;
+	firstModelEventAt?: number;
+	firstVisibleMessageAt?: number;
+	outputChars: number;
+	thinkingChars: number;
+	usage?: ClaudeAgentUsage;
+	usageSegments: Map<string, ClaudeAgentUsageSegment>;
+	steps: Map<string, ClaudeAgentTurnStep>;
+	currentModelStepId?: string;
+	terminal: boolean;
 }
 
 class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
@@ -172,6 +336,8 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	private query: Query | undefined;
 	private pump: Promise<void> | undefined;
 	private activeTurn: ActiveTurn | undefined;
+	private logicalTurn: ClaudeLogicalTurn | undefined;
+	private sessionId: string | undefined;
 	private lastTurnProducedOutput = false;
 	private disposed = false;
 
@@ -192,12 +358,32 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	async runUserTurn(
 		message: SDKUserMessage,
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-		token: vscode.CancellationToken
+		token: vscode.CancellationToken,
+		context: ClaudeAgentTurnContext
 	): Promise<void> {
-		await this.ensureStarted();
-		const completion = this.attachTurn(progress, token);
-		this.input.push(message);
-		return completion;
+		if (this.logicalTurn && !this.logicalTurn.terminal) {
+			throw new Error("Claude session already has an active logical turn");
+		}
+		this.logicalTurn = {
+			requestId: randomUUID(),
+			startedAt: Date.now(),
+			context: { ...context },
+			outputChars: 0,
+			thinkingChars: 0,
+			usageSegments: new Map(),
+			steps: new Map(),
+			terminal: false,
+		};
+		this.emitTurnUpdate("running");
+		try {
+			await this.ensureStarted();
+			const completion = this.attachTurn(progress, token);
+			this.input.push(message);
+			return completion;
+		} catch (error) {
+			this.finishLogicalTurn("failed", error instanceof Error ? error.message : String(error));
+			throw error;
+		}
 	}
 
 	async resumeToolResults(
@@ -205,6 +391,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 		token: vscode.CancellationToken
 	): Promise<void> {
+		if (!this.logicalTurn || this.logicalTurn.terminal) {
+			throw new Error("Claude tool continuation has no active logical turn");
+		}
 		await this.ensureStarted();
 		const completion = this.attachTurn(progress, token);
 		let resolved = 0;
@@ -214,11 +403,14 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				continue;
 			}
 			this.pendingTools.delete(result.callId);
+			this.finishToolStep(pending, "completed");
 			pending.resolve(convertToolResult(result));
 			resolved++;
 		}
 		if (resolved === 0) {
-			this.failActiveTurn(new Error("Claude tool continuation no longer exists"));
+			this.failActiveTurn(new Error("Claude tool continuation no longer exists"), "failed");
+		} else {
+			this.emitTurnUpdate("running");
 		}
 		return completion;
 	}
@@ -268,12 +460,13 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		this.disposed = true;
 		this.input.close();
 		this.query?.close();
-		this.failActiveTurn(new Error("Claude session closed"));
 		for (const pending of this.pendingTools.values()) {
+			this.finishToolStep(pending, "cancelled");
 			pending.reject(new Error("Claude session closed before the VS Code tool returned"));
 		}
 		this.pendingTools.clear();
 		this.queuedToolCalls.length = 0;
+		this.failActiveTurn(new Error("Claude session closed"), "cancelled");
 	}
 
 	private async ensureStarted(): Promise<void> {
@@ -360,11 +553,11 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		this.lastTurnProducedOutput = false;
 		return new Promise<void>((resolve, reject) => {
 			const cancellation = token.onCancellationRequested(() => {
-				this.failActiveTurn(new vscode.CancellationError());
+				this.failActiveTurn(new vscode.CancellationError(), "cancelled");
 				void this.interrupt();
 			});
 			const timeout = setTimeout(() => {
-				this.failActiveTurn(new Error("Claude produced no completed response for 90 seconds"));
+				this.failActiveTurn(new Error("Claude produced no completed response for 90 seconds"), "timed_out");
 				void this.interrupt();
 			}, ACTIVE_TURN_TIMEOUT_MS);
 			this.activeTurn = {
@@ -400,15 +593,17 @@ export class ClaudeAgentSession implements vscode.Disposable {
 
 	private handleMessage(message: SDKMessage): void {
 		if (message.type === "stream_event") {
+			this.recordModelEvent(message.event);
 			this.handleStreamEvent(message.event);
 			return;
 		}
 		if (message.type === "assistant") {
+			this.recordModelEvent();
 			if (message.error) {
-				this.failActiveTurn(new Error(`Claude API error: ${message.error}`));
+				this.failActiveTurn(new Error(`Claude API error: ${message.error}`), "failed");
 				return;
 			}
-			this.handleAssistantMessage(message.message);
+			this.handleAssistantMessage(message.message, message.uuid);
 			return;
 		}
 		if (message.type === "result") {
@@ -424,6 +619,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			return;
 		}
 		if (message.type === "system" && message.subtype === "init") {
+			this.sessionId = message.session_id;
 			this.options.callbacks.onSessionId?.(message.session_id);
 			this.options.logSink?.log("claude.sdk.initialized", { sessionId: message.session_id });
 		}
@@ -440,18 +636,28 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		const delta = asRecord(record.delta);
 		if (delta.type === "text_delta" && typeof delta.text === "string" && delta.text) {
+			const firstVisible = this.recordVisibleMessage();
 			active.partialTextSeen = true;
 			active.reportedTextChars += delta.text.length;
+			if (this.logicalTurn) {
+				this.logicalTurn.outputChars += delta.text.length;
+			}
 			active.progress.report(new vscode.LanguageModelTextPart(delta.text));
+			if (firstVisible) {
+				this.emitTurnUpdate("running");
+			}
 			return;
 		}
 		if (delta.type === "thinking_delta" && typeof delta.thinking === "string" && delta.thinking) {
 			active.partialThinkingSeen = true;
+			if (this.logicalTurn) {
+				this.logicalTurn.thinkingChars += delta.thinking.length;
+			}
 			emitThinking(delta.thinking, active.progress);
 		}
 	}
 
-	private handleAssistantMessage(message: unknown): void {
+	private handleAssistantMessage(message: unknown, fallbackId: string): void {
 		const active = this.activeTurn;
 		if (!active) {
 			return;
@@ -460,24 +666,55 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		for (const rawBlock of content) {
 			const block = asRecord(rawBlock);
 			if (!active.partialTextSeen && block.type === "text" && typeof block.text === "string" && block.text) {
+				this.recordVisibleMessage();
 				active.reportedTextChars += block.text.length;
+				if (this.logicalTurn) {
+					this.logicalTurn.outputChars += block.text.length;
+				}
 				active.progress.report(new vscode.LanguageModelTextPart(block.text));
 			}
 			if (!active.partialThinkingSeen && block.type === "thinking" && typeof block.thinking === "string" && block.thinking) {
+				if (this.logicalTurn) {
+					this.logicalTurn.thinkingChars += block.thinking.length;
+				}
 				emitThinking(block.thinking, active.progress);
 			}
 		}
+		this.recordAssistantUsage(message, fallbackId);
+		this.emitTurnUpdate("running");
 	}
 
 	private handleResult(message: Extract<SDKMessage, { type: "result" }>): void {
 		const usage = asRecord(message.usage);
-		this.options.callbacks.onUsage({
+		const aggregateUsage: ClaudeAgentUsage = {
 			inputTokens: readNumber(usage.input_tokens),
 			outputTokens: readNumber(usage.output_tokens),
 			cacheReadInputTokens: readNumber(usage.cache_read_input_tokens),
 			cacheCreationInputTokens: readNumber(usage.cache_creation_input_tokens),
 			durationMs: message.duration_ms,
 			numTurns: message.num_turns,
+		};
+		if (this.logicalTurn) {
+			this.logicalTurn.usage = aggregateUsage;
+		}
+		this.options.callbacks.onUsage(aggregateUsage);
+		const active = this.activeTurn;
+		const finalSegment = this.logicalTurn
+			? [...this.logicalTurn.usageSegments.values()].sort((left, right) => left.index - right.index).at(-1)
+			: undefined;
+		const nativeUsage = createClaudeNativeContextUsage(
+			aggregateUsage,
+			this.logicalTurn ? [...this.logicalTurn.usageSegments.values()] : []
+		);
+		active?.progress.report(vscode.LanguageModelDataPart.text(
+			JSON.stringify(nativeUsage),
+			"usage"
+		));
+		this.options.logSink?.log("chat.response.usage", {
+			provider: "claude",
+			source: finalSegment ? "agent-sdk-final-segment" : "agent-sdk-aggregate-fallback",
+			emittedToNativeChat: active !== undefined,
+			usage: nativeUsage,
 		});
 		void Promise.allSettled([
 			this.refreshUsageSnapshot(),
@@ -491,13 +728,17 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		});
 		if (message.subtype !== "success" || message.is_error) {
 			const errors = "errors" in message ? message.errors.join("; ") : "";
-			this.failActiveTurn(new Error(errors || `Claude request failed: ${message.subtype}`));
+			this.failActiveTurn(new Error(errors || `Claude request failed: ${message.subtype}`), "failed");
 			return;
 		}
-		const active = this.activeTurn;
 		if (active && active.reportedTextChars === 0 && message.result) {
+			this.recordVisibleMessage();
+			if (this.logicalTurn) {
+				this.logicalTurn.outputChars += message.result.length;
+			}
 			active.progress.report(new vscode.LanguageModelTextPart(message.result));
 		}
+		this.finishLogicalTurn("completed");
 		this.completeActiveTurn();
 	}
 
@@ -507,8 +748,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		const callId = randomUUID();
 		return new Promise<CallToolResult>((resolve, reject) => {
-			const call: PendingToolCall = { callId, name, input, resolve, reject };
+			const call: PendingToolCall = { callId, name, input, startedAt: Date.now(), resolve, reject };
 			this.pendingTools.set(callId, call);
+			this.startToolStep(call);
 			if (this.activeTurn) {
 				this.reportToolCall(call);
 				this.scheduleToolTurnCompletion();
@@ -534,6 +776,197 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		active.toolSettleTimer = setTimeout(() => this.completeActiveTurn(), TOOL_CARD_SETTLE_MS);
 	}
 
+	private recordModelEvent(event?: unknown): void {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal) {
+			return;
+		}
+		const firstEvent = turn.firstModelEventAt === undefined;
+		turn.firstModelEventAt ??= Date.now();
+		const record = asRecord(event);
+		if (record.type === "message_start") {
+			const message = asRecord(record.message);
+			const id = typeof message.id === "string" ? message.id : `segment-${turn.usageSegments.size + 1}`;
+			this.beginModelStep(id);
+		}
+		if (firstEvent) {
+			this.emitTurnUpdate("running");
+		}
+	}
+
+	private beginModelStep(modelMessageId: string): ClaudeAgentTurnStep | undefined {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal) {
+			return undefined;
+		}
+		const stepId = `model-${modelMessageId}`;
+		let step = turn.steps.get(stepId);
+		if (!step) {
+			step = {
+				id: stepId,
+				index: turn.steps.size + 1,
+				kind: "model",
+				label: `Model segment ${turn.usageSegments.size + 1}`,
+				status: "running",
+				startedAt: new Date().toISOString(),
+			};
+			turn.steps.set(stepId, step);
+			this.emitTurnUpdate("running");
+		}
+		turn.currentModelStepId = stepId;
+		return step;
+	}
+
+	private recordAssistantUsage(message: unknown, fallbackId: string): void {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal) {
+			return;
+		}
+		const provisionalId = typeof asRecord(message).id === "string"
+			? String(asRecord(message).id)
+			: fallbackId;
+		const existing = turn.usageSegments.get(provisionalId);
+		const segment = parseClaudeAssistantUsage(
+			message,
+			fallbackId,
+			existing?.index ?? turn.usageSegments.size + 1
+		);
+		if (!segment) {
+			return;
+		}
+		const step = this.beginModelStep(segment.id);
+		turn.usageSegments.set(segment.id, segment);
+		if (step) {
+			const completedAt = new Date();
+			Object.assign(step, {
+				status: "completed",
+				completedAt: completedAt.toISOString(),
+				durationMs: Math.max(0, completedAt.getTime() - Date.parse(step.startedAt)),
+				inputTokens: segment.inputTokens,
+				cacheReadInputTokens: segment.cacheReadInputTokens,
+				cacheCreationInputTokens: segment.cacheCreationInputTokens,
+				outputTokens: segment.outputTokens,
+				thinkingTokens: segment.thinkingTokens,
+				totalTokens: segment.totalTokens,
+				cacheHitPercent: segment.cacheHitPercent,
+			});
+		}
+		if (turn.currentModelStepId === step?.id) {
+			turn.currentModelStepId = undefined;
+		}
+	}
+
+	private recordVisibleMessage(): boolean {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal || turn.firstVisibleMessageAt !== undefined) {
+			return false;
+		}
+		turn.firstVisibleMessageAt = Date.now();
+		return true;
+	}
+
+	private startToolStep(call: PendingToolCall): void {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal) {
+			return;
+		}
+		turn.steps.set(`tool-${call.callId}`, {
+			id: `tool-${call.callId}`,
+			index: turn.steps.size + 1,
+			kind: "tool",
+			label: call.name,
+			status: "running",
+			startedAt: new Date(call.startedAt).toISOString(),
+			toolCategory: "vscode",
+		});
+		this.emitTurnUpdate("running");
+	}
+
+	private finishToolStep(
+		call: PendingToolCall,
+		status: Extract<ClaudeAgentTurnStep["status"], "completed" | "failed" | "timed_out" | "cancelled">
+	): void {
+		const step = this.logicalTurn?.steps.get(`tool-${call.callId}`);
+		if (!step || step.status !== "running") {
+			return;
+		}
+		const completedAt = Date.now();
+		step.status = status;
+		step.completedAt = new Date(completedAt).toISOString();
+		step.durationMs = Math.max(0, completedAt - call.startedAt);
+	}
+
+	private finishLogicalTurn(
+		phase: Exclude<ClaudeAgentTurnPhase, "running">,
+		terminalDetail?: string
+	): void {
+		const turn = this.logicalTurn;
+		if (!turn || turn.terminal) {
+			return;
+		}
+		turn.terminal = true;
+		for (const step of turn.steps.values()) {
+			if (step.status !== "running") {
+				continue;
+			}
+			const completedAt = Date.now();
+			step.status = phase === "timed_out" ? "timed_out" : phase === "cancelled" ? "cancelled" : phase === "completed" ? "completed" : "failed";
+			step.completedAt = new Date(completedAt).toISOString();
+			step.durationMs = Math.max(0, completedAt - Date.parse(step.startedAt));
+		}
+		this.emitTurnUpdate(phase, terminalDetail);
+	}
+
+	private emitTurnUpdate(phase: ClaudeAgentTurnPhase, terminalDetail?: string): void {
+		const turn = this.logicalTurn;
+		if (!turn || !this.options.callbacks.onTurnUpdate) {
+			return;
+		}
+		const steps = [...turn.steps.values()]
+			.sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt))
+			.map((step, index) => ({ ...step, index: index + 1 }));
+		const usageSegments = [...turn.usageSegments.values()]
+			.sort((left, right) => left.index - right.index)
+			.map((segment, index) => ({ ...segment, index: index + 1 }));
+		const toolSteps = steps.filter(step => step.kind === "tool");
+		const toolNames = new Map<string, number>();
+		const durations: number[] = [];
+		for (const step of toolSteps) {
+			toolNames.set(step.label, (toolNames.get(step.label) ?? 0) + 1);
+			if (step.durationMs !== undefined) {
+				durations.push(step.durationMs);
+			}
+		}
+		durations.sort((left, right) => left - right);
+		const totalDuration = durations.reduce((sum, value) => sum + value, 0);
+		const p95Index = durations.length > 0 ? Math.min(durations.length - 1, Math.ceil(durations.length * 0.95) - 1) : 0;
+		this.options.callbacks.onTurnUpdate({
+			requestId: turn.requestId,
+			phase,
+			sessionId: this.sessionId,
+			startedAt: new Date(turn.startedAt).toISOString(),
+			durationMs: turn.usage?.durationMs ?? Math.max(0, Date.now() - turn.startedAt),
+			firstModelEventLatencyMs: turn.firstModelEventAt === undefined ? undefined : turn.firstModelEventAt - turn.startedAt,
+			firstVisibleMessageLatencyMs: turn.firstVisibleMessageAt === undefined ? undefined : turn.firstVisibleMessageAt - turn.startedAt,
+			outputChars: turn.outputChars,
+			thinkingChars: turn.thinkingChars,
+			usage: turn.usage ? { ...turn.usage } : undefined,
+			usageSegments,
+			steps,
+			toolCalls: toolSteps.length,
+			toolNames: Object.fromEntries([...toolNames.entries()].sort(([left], [right]) => left.localeCompare(right))),
+			toolDuration: {
+				count: durations.length,
+				totalMs: totalDuration,
+				averageMs: durations.length > 0 ? Math.round(totalDuration / durations.length) : 0,
+				maximumMs: durations.at(-1) ?? 0,
+				p95Ms: durations[p95Index] ?? 0,
+			},
+			context: { ...turn.context },
+			terminalDetail,
+		});
+	}
+
 	private touchActiveTurn(): void {
 		const active = this.activeTurn;
 		if (!active) {
@@ -541,7 +974,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		clearTimeout(active.timeout);
 		active.timeout = setTimeout(() => {
-			this.failActiveTurn(new Error("Claude produced no activity for 90 seconds"));
+			this.failActiveTurn(new Error("Claude produced no activity for 90 seconds"), "timed_out");
 			void this.interrupt();
 		}, ACTIVE_TURN_TIMEOUT_MS);
 	}
@@ -551,8 +984,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		active?.resolve();
 	}
 
-	private failActiveTurn(error: Error): void {
+	private failActiveTurn(error: Error, phase: Exclude<ClaudeAgentTurnPhase, "running" | "completed">): void {
 		const active = this.detachActiveTurn();
+		this.finishLogicalTurn(phase, error.message);
 		active?.reject(error);
 	}
 
@@ -578,11 +1012,12 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		const failure = error instanceof Error ? error : new Error(String(error));
 		this.options.logSink?.logError("claude.sdk.failed", failure);
-		this.failActiveTurn(failure);
 		for (const pending of this.pendingTools.values()) {
+			this.finishToolStep(pending, "failed");
 			pending.reject(failure);
 		}
 		this.pendingTools.clear();
+		this.failActiveTurn(failure, "failed");
 	}
 }
 

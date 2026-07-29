@@ -21,8 +21,7 @@ import {
     DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEFAULT_SERVER_URL,
 } from "./constants";
-import { calculateContextBudget, estimateContextUsage } from "./context/context-budget";
-import { addCopilotCompactionLimit, isCopilotCompactionRequest } from "./context/copilot-compaction";
+import { calculateContextBudget, estimateContextUsage, selectContextCompaction } from "./context/context-budget";
 import { compactMessages } from "./context/message-compaction";
 import { resolveOutputTokenBudget } from "./context/output-budget";
 import { ServerTokenCounter } from "./context/server-token-counter";
@@ -41,7 +40,7 @@ import {
     type ProviderHealthReport,
     type ProviderHealthSourceReport,
 } from "./diagnostics/provider-health";
-import { convertMessages, convertTools, stableJsonStringify, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
+import { BoundedMap, convertMessages, convertTools, stableJsonStringify, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
 import { LlamaLogSink } from "./logger";
 import { buildMemoryQuery, injectSharedMemoryContext } from "./memory/prompt";
 import { getCurrentWorkspaceScopeId } from "./memory/scope";
@@ -103,25 +102,107 @@ interface RuntimeContextCacheEntry {
     contextLength: number;
 }
 
+export interface LlamaChatUsageSegmentMetrics {
+    index: number;
+    recordedAt: string;
+    inputTokens: number;
+    cachedInputTokens: number;
+    freshInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    outputTokens: number;
+    reasoningOutputTokens: number;
+    totalTokens: number;
+    cacheHitPercent?: number;
+}
+
+export interface LlamaChatTurnStepMetrics {
+    id: string;
+    index: number;
+    kind: "model" | "tool";
+    label: string;
+    status: "running" | "completed" | "failed" | "timed_out" | "cancelled";
+    toolCategory?: "vscode" | "catalog";
+    startedAt: string;
+    completedAt?: string;
+    durationMs?: number;
+    inputTokens?: number;
+    cachedInputTokens?: number;
+    cacheCreationInputTokens?: number;
+    outputTokens?: number;
+    reasoningOutputTokens?: number;
+    totalTokens?: number;
+    cacheHitPercent?: number;
+}
+
 export interface LlamaChatTurnMetrics {
     requestId: string;
     modelId: string;
+    providerKind?: "local" | "deepseek" | "codex" | "claude";
+    lifecyclePhase?: "running" | "completed" | "timed_out" | "interrupted" | "abandoned" | "failed";
+    terminalDetail?: string;
+    threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
+    sessionMode?: "new" | "warm" | "restored" | "rollover" | "resume-fallback";
+    threadReuseMissReason?: string;
+    conversationKey?: string;
     durationMs: number;
     queueWaitMs: number;
     firstTokenLatencyMs?: number;
+    /** Time until the first user-visible assistant text, when distinct from first model activity. */
+    firstVisibleLatencyMs?: number;
     emittedParts: number;
     outputChars: number;
     thinkingChars: number;
     estimatedOutputTokens: number;
     outputTokens?: number;
+    reasoningOutputTokens?: number;
     tokensPerSecond?: number;
     promptTokens: number;
     cachedPromptTokens?: number;
+    cacheWriteInputTokens?: number;
     promptCacheHitPercent?: number;
+    initialSegmentCacheHitPercent?: number;
+    continuationCacheHitPercent?: number;
+    finalSegmentInputTokens?: number;
+    finalSegmentCachedInputTokens?: number;
+    /** Classified reason when upstream prompt cache missed most of the prefix. */
+    cacheMissReason?: string;
+    /** Human-readable explanation for the cache miss. */
+    cacheMissDetail?: string;
+    /** Number of leading messages that matched the previous request byte-for-byte. */
+    prefixIdenticalMessageCount?: number;
+    /** Total message count in the previous request, for comparison. */
+    prefixPreviousMessageCount?: number;
+    /** Percentage of previous message characters that reappeared in the current prefix. */
+    prefixReusableMessagePercent?: number;
+    /** Whether static request fields (temperature, model, etc.) matched the previous turn. */
+    prefixStaticFieldsMatch?: boolean;
+    /** Whether the tool catalog was unchanged from the previous turn. */
+    prefixToolsMatch?: boolean;
+    /** True when this turn was executed by a subagent rather than the main conversation. */
+    isSubagent?: boolean;
+    parentRequestId?: string;
+    parentToolCallId?: string;
+    /** CloudFront/ELB `Via` header — identifies the backend edge node. */
+    backendVia?: string;
+    /** CloudFront `X-Amz-Cf-Pop` header — geographic edge location. */
+    backendCfPop?: string;
+    /** DeepSeek `x-ds-trace-id` header — internal request trace. */
+    backendTraceId?: string;
     modelTurns: number;
     usageEstimated: boolean;
     retriedAfterOverflow: boolean;
     toolCalls: number;
+    delegatedToolCalls?: number;
+    catalogToolCalls?: number;
+    toolDurationTotalMs?: number;
+    averageToolDurationMs?: number;
+    maximumToolDurationMs?: number;
+    p95ToolDurationMs?: number;
+    toolCallBreakdown?: Record<string, number>;
+    usageSegments?: LlamaChatUsageSegmentMetrics[];
+    usageSegmentsTruncated?: boolean;
+    steps?: LlamaChatTurnStepMetrics[];
+    metricsSource?: "rollout" | "live";
     repairedToolCalls: number;
     rejectedToolCalls: number;
     schemaRejectedToolCalls: number;
@@ -142,6 +223,8 @@ export interface LlamaChatContextUsageMetrics {
     messageCountBeforeCompact: number;
     messageCountAfterCompact: number;
     toolTokens: number;
+    /** Context tokens not attributed to compacted messages or tool schemas. */
+    otherTokens?: number;
     replyReserveTokens: number;
     cappedTools: number;
     autoCompacted: boolean;
@@ -150,6 +233,9 @@ export interface LlamaChatContextUsageMetrics {
     estimatedFreeTokens: number;
     estimatedUsagePercent: number;
     tokenCountSource: "server" | "heuristic";
+    rawMaxTokens?: number;
+    usableMaxTokens?: number;
+    categories?: Array<{ name: string; tokens: number }>;
 }
 
 interface PreparedMessagesForBudget {
@@ -176,6 +262,14 @@ interface StableToolCatalogSnapshot {
     tools: NonNullable<ReturnType<typeof convertTools>["tools"]>;
     toolChoice: ReturnType<typeof convertTools>["tool_choice"];
     fingerprint: string;
+    updatedAt: number;
+}
+
+interface ConversationMessageSnapshot {
+    messages: OpenAIChatMessage[];
+    tokenCount: number;
+    updatedAt: number;
+    migratedFromPrefix?: boolean;
 }
 
 const CACHE_CONTROL_MARKER = /"mimeType"\s*:\s*"cache_control"/g;
@@ -293,14 +387,23 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly modelListCache = new Map<string, ModelListCacheEntry>();
     private readonly modelListInflight = new Map<string, ModelListInflightEntry>();
     private readonly runtimeContextCache = new Map<string, RuntimeContextCacheEntry>();
-    private readonly cachePrefixSnapshots = new Map<string, CachePrefixSnapshot>();
-    private readonly stableToolCatalogs = new Map<string, StableToolCatalogSnapshot>();
+    private readonly cachePrefixSnapshots = new BoundedMap<string, CachePrefixSnapshot>(32);
+    private readonly stableToolCatalogs = new BoundedMap<string, StableToolCatalogSnapshot>(32);
+    private readonly conversationMessageSnapshots = new BoundedMap<string, ConversationMessageSnapshot>(4);
     private readonly chatRequestQueue: SerialRequestQueue;
     private reasoningMapLoaded = false;
     private readonly httpTransport = new OpenAIHttpTransport();
     private readonly serverTokenCounter = new ServerTokenCounter(
         (url, init, timeoutMs, cancellation) => this.httpTransport.request(url, init, timeoutMs, cancellation)
     );
+    /**
+     * Running calibration factor for the heuristic token counter.
+     * Updated after every turn with server-reported prompt_tokens so the
+     * heuristic converges toward the actual tokenizer even for tool-heavy
+     * conversations where chars/4 is inaccurate.
+     * 1.0 = no correction; <1.0 = heuristic over-estimates; >1.0 = under-estimates.
+     */
+    private heuristicCalibration = 1.0;
 
     /**
      * Creates a new Llama.cpp chat model provider.
@@ -321,6 +424,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const { type, ...data } = event;
             this.log(`chat.queue.${type}`, data);
         });
+        this.loadPersistedPrefixSnapshots();
+        this.loadPersistedContinuationState();
     }
 
     refreshLanguageModelChatInformation(): void {
@@ -672,7 +777,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
 
         const availableNames = new Set((options.tools ?? []).map(tool => tool.name));
-        const currentFingerprint = this.shortHash(stableJsonStringify(config.tools));
+        // Sort tools by name for stable fingerprinting — VS Code can change
+        // enumeration order between restarts.
+        const sortedTools = Array.isArray(config.tools)
+            ? [...config.tools].sort((a, b) => {
+                const na = a.function?.name ?? "";
+                const nb = b.function?.name ?? "";
+                return na < nb ? -1 : na > nb ? 1 : 0;
+            })
+            : config.tools;
+        const currentFingerprint = this.shortHash(stableJsonStringify(sortedTools));
         const previous = this.stableToolCatalogs.get(scope);
         const recentActivation = messages.slice(-8).some(message =>
             message.role === "assistant"
@@ -703,19 +817,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
 
         const next: StableToolCatalogSnapshot = {
-            tools: config.tools,
+            tools: (sortedTools ?? []) as NonNullable<ReturnType<typeof convertTools>["tools"]>,
             toolChoice: config.tool_choice,
             fingerprint: currentFingerprint,
+            updatedAt: Date.now(),
         };
-        this.stableToolCatalogs.delete(scope);
         this.stableToolCatalogs.set(scope, next);
-        while (this.stableToolCatalogs.size > 32) {
-            const oldest = this.stableToolCatalogs.keys().next().value as string | undefined;
-            if (!oldest) {
-                break;
-            }
-            this.stableToolCatalogs.delete(oldest);
-        }
         if (previous) {
             this.log("chat.tools.catalog_refreshed", {
                 requestId,
@@ -728,24 +835,45 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return config;
     }
 
-    private trackCachePrefix(
+    /**
+     * Pins the common prefix of consecutive requests so the upstream prompt cache
+     * stays warm even when VS Code rewrites historical message content between
+     * turns.
+     *
+     * Two strategies:
+     *
+     * 1. **Byte-level match (fast path).**  If the first N messages match the
+     *    previous snapshot byte-for-byte, N cached copies replace the current
+     *    prefix and only the tail is taken fresh.
+     *
+     * 2. **Aggressive fallback (VS Code rewrite).**  When VS Code rewrites the
+     *    entire history while keeping the message count and tool catalog
+     *    unchanged, every byte-level comparison after index 1 fails.  In that
+     *    case the *entire* previous snapshot is reused as the prefix (truncated
+     *    to `min(prev.length, cur.length)` so we never exceed the budget VS Code
+     *    already approved).  The previous messages were already sent to the API
+     *    and are guaranteed to be in the upstream disk cache, so reusing them
+     *    keeps the prefix warm without changing the conversation semantics.
+     *
+     * Also stores the current snapshot so the next turn can compare against it,
+     * and returns prefix telemetry for cache diagnostics.
+     */
+    private stabilizeMessagePrefix(
         requestId: string,
         modelId: string,
-        options: ProvideLanguageModelChatResponseOptions,
-        requestBody: Record<string, unknown>,
-        messages: readonly OpenAIChatMessage[]
-    ): Record<string, unknown> {
-        const scope = this.cachePrefixScope(modelId, options);
-        const staticFields = Object.fromEntries(
-            Object.entries(requestBody).filter(([key]) => key !== "messages" && key !== "tools")
-        );
-        const staticFieldsHash = this.shortHash(stableJsonStringify(staticFields));
-        const toolsHash = this.shortHash(stableJsonStringify(requestBody.tools ?? []));
+        scope: string | undefined,
+        messages: OpenAIChatMessage[],
+        staticFieldsHash: string,
+        toolsHash: string,
+    ): { messages: OpenAIChatMessage[]; stabilized: boolean; prefix: Record<string, unknown> } {
+        if (!scope) {
+            return { messages, stabilized: false, prefix: { scope: "unavailable" } };
+        }
+
         const messageParts = messages.map(message => stableJsonStringify(message));
         const messageChars = messageParts.reduce((total, part) => total + part.length, 0);
-        const systemHash = messages[0]?.role === "system"
-            ? this.shortHash(messageParts[0] ?? "")
-            : undefined;
+
+        // --- Store current snapshot for next turn's comparison ---
         const current: CachePrefixSnapshot = {
             requestId,
             staticFieldsHash,
@@ -753,29 +881,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             messageParts,
             messageChars,
         };
-
-        if (!scope) {
-            return {
-                scope: "unavailable",
-                staticFieldsHash,
-                toolsHash,
-                systemHash,
-                messageCount: messageParts.length,
-                messageChars,
-            };
-        }
-
         const previous = this.cachePrefixSnapshots.get(scope);
-        this.cachePrefixSnapshots.delete(scope);
         this.cachePrefixSnapshots.set(scope, current);
-        while (this.cachePrefixSnapshots.size > 32) {
-            const oldest = this.cachePrefixSnapshots.keys().next().value as string | undefined;
-            if (!oldest) {
-                break;
-            }
-            this.cachePrefixSnapshots.delete(oldest);
-        }
+        this.persistPrefixSnapshots();
 
+        // --- Compute prefix telemetry (for cache diagnostics) ---
         let identicalMessagePrefix = 0;
         let sharedMessagePrefixChars = 0;
         if (previous) {
@@ -804,11 +914,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const reusableMessagePercent = previous && staticFieldsMatch && toolsMatch && previous.messageChars > 0
             ? Number(((sharedMessagePrefixChars / previous.messageChars) * 100).toFixed(1))
             : previous ? 0 : undefined;
-        return {
+        const prefix = {
             scope: this.shortHash(scope),
             staticFieldsHash,
             toolsHash,
-            systemHash,
+            systemHash: messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined,
             messageCount: messageParts.length,
             messageChars,
             previousRequestId: previous?.requestId,
@@ -820,6 +930,67 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             sharedMessagePrefixChars,
             reusableMessagePercent,
         };
+
+        // --- Stabilization: reuse previous snapshot when possible ---
+        if (!previous || previous.staticFieldsHash !== staticFieldsHash || previous.toolsHash !== toolsHash) {
+            if (previous && (previous.staticFieldsHash !== staticFieldsHash || previous.toolsHash !== toolsHash)) {
+                this.log("chat.cache.prefix_hash_mismatch", {
+                    scope: this.shortHash(scope),
+                    staticFieldsMatch: previous.staticFieldsHash === staticFieldsHash,
+                    toolsMatch: previous.toolsHash === toolsHash,
+                });
+            }
+            return { messages, stabilized: false, prefix };
+        }
+
+        const comparable = Math.min(previous.messageParts.length, messageParts.length);
+        let match = 0;
+        while (
+            match < comparable
+            && previous.messageParts[match] === messageParts[match]
+        ) {
+            match += 1;
+        }
+
+        const strategy: "bytes" | "aggressive" | "none" =
+            match >= 3
+                ? "bytes"
+                : match >= 2 && previous.messageParts.length > 2 && comparable > 2
+                    ? "aggressive"
+                    : match >= 2
+                        ? "bytes"
+                        : "none";
+
+        if (strategy === "none") {
+            return { messages, stabilized: false, prefix };
+        }
+
+        const reuseCount = strategy === "bytes"
+            ? match
+            : Math.min(previous.messageParts.length, messages.length);
+
+        const stabilized: OpenAIChatMessage[] = [];
+        for (let index = 0; index < reuseCount; index += 1) {
+            try {
+                stabilized.push(JSON.parse(previous.messageParts[index]) as OpenAIChatMessage);
+            } catch {
+                stabilized.push(messages[index] ?? previous.messageParts[index] as unknown as OpenAIChatMessage);
+            }
+        }
+        for (let index = reuseCount; index < messages.length; index += 1) {
+            stabilized.push(messages[index]);
+        }
+
+        this.log("chat.cache.prefix_stabilized", {
+            scope: this.shortHash(scope),
+            strategy,
+            match,
+            reuseCount,
+            previousMessageCount: previous.messageParts.length,
+            currentMessageCount: messages.length,
+            stabilizedMessageCount: stabilized.length,
+        });
+        return { messages: stabilized, stabilized: true, prefix };
     }
 
     private summarizeRequestBodyForLog(requestBody: Record<string, unknown>): Record<string, unknown> {
@@ -1080,10 +1251,20 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const contextBound = Math.max(128, contextLength - 1024);
 
         if (family === "deepseek") {
-            return Math.min(
-                Math.max(configuredOutputCap, DEEPSEEK_MAX_OUTPUT_TOKENS),
-                contextBound
+            // The configured hard cap (maxOutputTokensCap) can be as high as
+            // 393216 — advertising that value makes Copilot Chat reserve 75%+
+            // of the context window for output and aggressively truncate input
+            // history, destroying the upstream prompt-cache prefix every turn.
+            // Use deepSeekDefaultMaxOutputTokens (65 536 by default) for the
+            // model picker so Copilot Chat sees a 12.5% output reservation
+            // while the full hard cap still applies to actual API requests.
+            const advertisedCap = this.clampInt(
+                this.getConfig().get("deepSeekDefaultMaxOutputTokens", 65536),
+                1024,
+                393216,
+                65536
             );
+            return Math.min(advertisedCap, configuredOutputCap, contextBound);
         }
 
         const localContextShareCap = Math.max(2048, Math.floor(contextLength * 0.25));
@@ -1401,6 +1582,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private static readonly REASONING_MAP_STATE_KEY = "llamacpp.deepseek_reasoning_map";
+    private static readonly PREFIX_STATE_KEY = "llamacpp.prefix_snapshots";
+    private static readonly PREFIX_STATE_VERSION_KEY = "llamacpp.prefix_snapshots.version";
+    private static readonly CONTINUATION_STATE_KEY = "llamacpp.continuation_snapshots.v1";
 
     private loadPersistedReasoningMap(): void {
         if (this.reasoningMapLoaded || !this.globalState) {
@@ -1465,6 +1649,225 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
     }
 
+    private loadPersistedPrefixSnapshots(): void {
+        if (!this.globalState) {
+            return;
+        }
+        try {
+            // Clear stale snapshots saved by an older extension version whose
+            // tool ordering or hash computation may have differed.
+            // Only clear on MAJOR or MINOR version bumps — patch upgrades
+            // (1.8.27 → 1.8.28) keep the snapshots intact.
+            const savedVersion = this.globalState.get<string>(
+                LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY
+            );
+            const extVersion = vscode.extensions.getExtension("mrlordcat.llama-vscode-chat")
+                ?.packageJSON?.version;
+            const savedMinor = savedVersion?.split(".").slice(0, 2).join(".") ?? "";
+            const extMinor = extVersion?.split(".").slice(0, 2).join(".") ?? "";
+            if (savedMinor !== extMinor) {
+                const reason = !savedVersion ? "first_install" : "minor_version_changed";
+                this.log("chat.cache.prefix_snapshots_version_changed", {
+                    reason,
+                    savedVersion: savedVersion ?? "none",
+                    currentVersion: extVersion ?? "unknown",
+                });
+                void this.globalState.update(LlamaCppChatModelProvider.PREFIX_STATE_KEY, undefined);
+                void this.globalState.update(
+                    LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY,
+                    extVersion
+                );
+                return;
+            }
+            const stored = this.globalState.get<Record<string, CachePrefixSnapshot>>(
+                LlamaCppChatModelProvider.PREFIX_STATE_KEY
+            );
+            if (!stored || typeof stored !== "object") {
+                return;
+            }
+            let loaded = 0;
+            for (const [scope, snapshot] of Object.entries(stored)) {
+                if (snapshot && typeof snapshot.staticFieldsHash === "string") {
+                    this.cachePrefixSnapshots.set(scope, snapshot);
+                    loaded += 1;
+                }
+            }
+            if (loaded > 0) {
+                this.log("chat.cache.prefix_snapshots_loaded", { loadedEntries: loaded });
+            }
+        } catch (error) {
+            this.logError("chat.cache.prefix_snapshots_load_failed", error);
+        }
+    }
+
+    private async persistPrefixSnapshots(): Promise<void> {
+        if (!this.globalState) {
+            return;
+        }
+        try {
+            const serializable: Record<string, CachePrefixSnapshot> = {};
+            for (const [scope, snapshot] of this.cachePrefixSnapshots) {
+                serializable[scope] = snapshot;
+            }
+            await this.globalState.update(
+                LlamaCppChatModelProvider.PREFIX_STATE_KEY,
+                serializable
+            );
+            const extVersion = vscode.extensions.getExtension("mrlordcat.llama-vscode-chat")
+                ?.packageJSON?.version;
+            if (extVersion) {
+                void this.globalState.update(
+                    LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY,
+                    extVersion
+                );
+            }
+        } catch (error) {
+            this.logError("chat.cache.prefix_snapshots_persist_failed", error);
+        }
+    }
+
+    private isOpenAIChatMessage(value: unknown): value is OpenAIChatMessage {
+        if (!value || typeof value !== "object") {
+            return false;
+        }
+        const role = (value as { role?: unknown }).role;
+        return role === "system" || role === "user" || role === "assistant" || role === "tool";
+    }
+
+    private getConversationMessageSnapshot(scope: string | undefined): ConversationMessageSnapshot | undefined {
+        if (!scope) {
+            return undefined;
+        }
+        const snapshot = this.conversationMessageSnapshots.get(scope);
+        if (snapshot) {
+            this.conversationMessageSnapshots.delete(scope);
+            this.conversationMessageSnapshots.set(scope, snapshot);
+        }
+        return snapshot;
+    }
+
+    private setConversationMessageSnapshot(
+        scope: string | undefined,
+        messages: OpenAIChatMessage[],
+        tokenCount: number
+    ): void {
+        if (!scope || messages.length === 0) {
+            return;
+        }
+        this.conversationMessageSnapshots.set(scope, {
+            messages: [...messages],
+            tokenCount: Math.max(0, Math.floor(tokenCount)),
+            updatedAt: Date.now(),
+        });
+    }
+
+    private deleteConversationMessageSnapshot(scope: string | undefined): void {
+        if (scope) {
+            this.conversationMessageSnapshots.delete(scope);
+        }
+    }
+
+    private loadPersistedContinuationState(): void {
+        if (!this.globalState) {
+            return;
+        }
+        try {
+            const stored = this.globalState.get<{
+                conversations?: Record<string, ConversationMessageSnapshot>;
+                toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
+            }>(LlamaCppChatModelProvider.CONTINUATION_STATE_KEY);
+            let loadedConversations = 0;
+            let loadedToolCatalogs = 0;
+            for (const [scope, snapshot] of Object.entries(stored?.conversations ?? {})) {
+                if (
+                    scope
+                    && snapshot
+                    && Array.isArray(snapshot.messages)
+                    && snapshot.messages.length > 0
+                    && snapshot.messages.every(message => this.isOpenAIChatMessage(message))
+                ) {
+                    this.conversationMessageSnapshots.set(scope, {
+                        messages: snapshot.messages,
+                        tokenCount: Number.isFinite(snapshot.tokenCount) ? Math.max(0, snapshot.tokenCount) : 0,
+                        updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : Date.now(),
+                    });
+                    loadedConversations += 1;
+                }
+            }
+            for (const [scope, snapshot] of Object.entries(stored?.toolCatalogs ?? {})) {
+                if (
+                    scope
+                    && snapshot
+                    && Array.isArray(snapshot.tools)
+                    && snapshot.tools.every(tool => typeof tool?.function?.name === "string")
+                    && typeof snapshot.fingerprint === "string"
+                ) {
+                    this.stableToolCatalogs.set(scope, {
+                        ...snapshot,
+                        updatedAt: Number.isFinite(snapshot.updatedAt) ? snapshot.updatedAt : Date.now(),
+                    });
+                    loadedToolCatalogs += 1;
+                }
+            }
+
+            // First upgrade from the in-memory implementation: the persisted
+            // prefix snapshot already contains the exact messages sent on the
+            // previous successful request, so use it as the continuation base.
+            if (loadedConversations === 0) {
+                for (const [scope, prefix] of this.cachePrefixSnapshots) {
+                    try {
+                        const messages = prefix.messageParts.map(part => JSON.parse(part) as unknown);
+                        if (messages.length > 0 && messages.every(message => this.isOpenAIChatMessage(message))) {
+                            const typedMessages = messages as OpenAIChatMessage[];
+                            this.conversationMessageSnapshots.set(scope, {
+                                messages: typedMessages,
+                                tokenCount: this.estimateOpenAiMessageTokens(typedMessages),
+                                updatedAt: Date.now(),
+                                migratedFromPrefix: true,
+                            });
+                            loadedConversations += 1;
+                        }
+                    } catch {
+                        // Ignore one malformed legacy prefix and continue loading others.
+                    }
+                }
+                if (loadedConversations > 0) {
+                    this.log("chat.messages.snapshot_migrated", { loadedEntries: loadedConversations });
+                }
+            }
+            if (loadedConversations > 0 || loadedToolCatalogs > 0) {
+                this.log("chat.continuation.state_loaded", {
+                    conversationEntries: loadedConversations,
+                    toolCatalogEntries: loadedToolCatalogs,
+                });
+            }
+        } catch (error) {
+            this.logError("chat.continuation.state_load_failed", error);
+        }
+    }
+
+    private async persistContinuationState(): Promise<void> {
+        if (!this.globalState) {
+            return;
+        }
+        try {
+            const conversations: Record<string, ConversationMessageSnapshot> = {};
+            const toolCatalogs: Record<string, StableToolCatalogSnapshot> = {};
+            for (const [scope, snapshot] of this.conversationMessageSnapshots) {
+                conversations[scope] = snapshot;
+            }
+            for (const [scope, snapshot] of this.stableToolCatalogs) {
+                toolCatalogs[scope] = snapshot;
+            }
+            await this.globalState.update(
+                LlamaCppChatModelProvider.CONTINUATION_STATE_KEY,
+                { conversations, toolCatalogs }
+            );
+        } catch (error) {
+            this.logError("chat.continuation.state_persist_failed", error);
+        }
+    }
+
     protected async processStreamingResponse(
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -1475,6 +1878,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         this.loadPersistedReasoningMap();
         const result = await super.processStreamingResponse(responseBody, progress, token);
         this.persistReasoningMap();
+        // Persist both the exact sent-message continuation and tool catalog.
+        // A fresh Extension Host can then resume the same prompt instead of
+        // compacting VS Code's much larger raw history on its first request.
+        await Promise.all([
+            this.persistPrefixSnapshots(),
+            this.persistContinuationState(),
+        ]);
         return result;
     }
 
@@ -1534,6 +1944,45 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             }
             return { ...message, reasoning_content: currentReasoning };
         });
+    }
+
+    /**
+     * Find messages in `source` that were added after `snapshot` was taken.
+     * Uses the last non-system message of the snapshot as a pivot to locate
+     * the cut point in the source.  If the pivot cannot be found the snapshot
+     * is considered stale and the entire source is returned.
+     */
+    private findNewMessagesAfterSnapshot(
+        source: OpenAIChatMessage[],
+        snapshot: OpenAIChatMessage[]
+    ): OpenAIChatMessage[] {
+        // Walk backwards through the snapshot to find a non-system pivot
+        let pivotIdx = snapshot.length - 1;
+        while (pivotIdx >= 0 && snapshot[pivotIdx].role === "system") {
+            pivotIdx--;
+        }
+        if (pivotIdx < 0) {
+            return [...source];
+        }
+
+        const pivot = snapshot[pivotIdx];
+        for (let srcIdx = source.length - 1; srcIdx >= 0; srcIdx--) {
+            if (source[srcIdx].role === pivot.role && this.messagesContentEqual(source[srcIdx], pivot)) {
+                return source.slice(srcIdx + 1);
+            }
+        }
+
+        // Snapshot pivot not found in source — snapshot is stale
+        return [...source];
+    }
+
+    private messagesContentEqual(a: OpenAIChatMessage, b: OpenAIChatMessage): boolean {
+        if (a.role !== b.role) {
+            return false;
+        }
+        const aContent = typeof a.content === "string" ? a.content : JSON.stringify(a.content);
+        const bContent = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
+        return aContent === bContent;
     }
 
     private compactOpenAiMessages(
@@ -2111,7 +2560,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const resolvedFamily = this.resolveModelFamily(requestModelId, source.familyOverride);
         // Reasoning must be looked up and stored per conversation so a parallel chat
         // cannot evict entries that this conversation's cached prefix depends on.
-        this.setReasoningScope(this.cachePrefixScope(requestModelId, options));
+        const conversationScope = this.cachePrefixScope(requestModelId, options);
+        this.setReasoningScope(conversationScope);
         const imageInputSupported = model.capabilities?.imageInput === true;
         const processedMessages = imageInputSupported
             ? messages
@@ -2122,7 +2572,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             toolResultMode: "user",
             supportsImageInput: imageInputSupported,
         });
-        const copilotCompactionRequest = isCopilotCompactionRequest(inspectionMessages);
 
         let firstOutputAt: number | undefined;
         let emittedParts = 0;
@@ -2143,20 +2592,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const hardKeepLastTurns = this.clampInt(cfg.get("hardCompactKeepLastTurns", 6), 1, 32, 6);
         const maxOutputCap = this.getConfiguredMaxOutputTokens();
         const minReplyReserve = this.clampInt(cfg.get("minReplyReserveTokens", 1536), 256, 32768, 1536);
+        const replyReservePercent = this.clampNumber(cfg.get("replyReservePercent", 0.07), 0.03, 0.25, 0.07);
         const maxTools = this.clampInt(cfg.get("maxToolsPerRequest", 128), 0, 128, 128);
         const requestTimeoutMs = this.clampInt(cfg.get("requestTimeoutMs", 1200000), 10000, 1200000, 1200000);
         const requestQueueTimeoutMs = this.getRequestQueueTimeoutMs();
         const transientRetryMaxAttempts = this.clampInt(cfg.get("transientRetryMaxAttempts", 2), 0, 3, 2);
         const transientRetryBaseDelayMs = this.clampInt(cfg.get("transientRetryBaseDelayMs", 500), 100, 10000, 500);
-        const copilotCompactionFastMode = cfg.get<boolean>("copilotCompactionFastMode", true) !== false;
-        const copilotCompactionMaxTokens = this.clampInt(
-            cfg.get("copilotCompactionMaxTokens", 2048),
-            512,
-            8192,
-            2048
-        );
-        const useCopilotCompactionProfile = copilotCompactionRequest && copilotCompactionFastMode;
-        const cachePrompt = this.getCachePromptEnabled() && !useCopilotCompactionProfile;
+        const cachePrompt = this.getCachePromptEnabled();
         const maxToolResultChars = this.getMaxToolResultChars();
         const autoCompact = cfg.get<boolean>("autoCompact", true) !== false;
         const accurateTokenCounting = cfg.get<boolean>("accurateTokenCounting", true) !== false;
@@ -2195,7 +2637,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             cfg.get("thinkingMode", "auto"),
             options.modelOptions
         );
-        const thinkingMode = useCopilotCompactionProfile ? "off" : requestedThinkingMode;
+        const thinkingMode = requestedThinkingMode;
         const configuredReasoningBudget = this.clampInt(
             cfg.get("reasoningBudget", DEFAULT_LOCAL_REASONING_BUDGET),
             256,
@@ -2203,8 +2645,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             DEFAULT_LOCAL_REASONING_BUDGET
         );
         const reasoningBudget = resolveReasoningBudget(thinkingMode, configuredReasoningBudget);
-        const preserveThinking = !useCopilotCompactionProfile
-            && resolvedFamily === "qwen"
+        const preserveThinking = resolvedFamily === "qwen"
             && /qwen3[._-]?6/i.test(requestModelId)
             && cfg.get<boolean>("preserveThinking", true) !== false;
         const toolResultModeConfig = this.normalizeToolResultMode(cfg.get("toolResultMode", "auto"));
@@ -2214,13 +2655,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const apiDirectToolTokenBudget = this.clampInt(cfg.get("apiDirectToolTokenBudget", 12000), 256, 65536, 12000);
         const knowledgeMode = normalizeKnowledgeMode(cfg.get("knowledgeMode", "adaptive"));
         const customSystemPrompt = String(cfg.get("customSystemPrompt", "") ?? "").trim().slice(0, 12000);
-        const knowledgeSystemPrompt = copilotCompactionRequest
-            ? undefined
-            : buildKnowledgeSystemPrompt({
-                mode: knowledgeMode,
-                currentDate: formatLocalDate(new Date()),
-                customPrompt: customSystemPrompt,
-            });
+        const knowledgeSystemPrompt = buildKnowledgeSystemPrompt({
+            mode: knowledgeMode,
+            currentDate: formatLocalDate(new Date()),
+            customPrompt: customSystemPrompt,
+        });
         const sharedMemoryEnabled = cfg.get<boolean>("memoryEnabled", true) !== false;
         const sharedMemoryAutoInject = cfg.get<boolean>("memoryAutoInject", true) !== false;
         const sharedMemoryMaxTokens = this.clampInt(cfg.get("memoryMaxTokens", 4096), 128, 32768, 4096);
@@ -2247,9 +2686,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 transientRetryMaxAttempts,
                 transientRetryBaseDelayMs,
                 cachePrompt,
-                copilotCompactionRequest,
-                copilotCompactionFastMode,
-                copilotCompactionMaxTokens,
                 maxToolResultChars,
                 runtimeContextLength,
                 autoCompact,
@@ -2305,7 +2741,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
 
         let sharedMemoryContext: SharedMemoryPromptContext | undefined;
-        if (sharedMemoryEnabled && sharedMemoryAutoInject && this.sharedMemory && !copilotCompactionRequest) {
+        if (sharedMemoryEnabled && sharedMemoryAutoInject && this.sharedMemory) {
             try {
                 sharedMemoryContext = await this.sharedMemory.buildPromptContext(
                     buildMemoryQuery(inspectionMessages),
@@ -2337,11 +2773,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const withKnowledge = injectKnowledgeSystemPrompt(withReasoning, knowledgeSystemPrompt);
             const withMemory = injectSharedMemoryContext(withKnowledge, sharedMemoryContext?.text);
             const withLoopGuard = injectToolLoopGuard(withMemory, toolLoopDetection);
-            const profiled = useCopilotCompactionProfile
-                ? addCopilotCompactionLimit(withLoopGuard, copilotCompactionMaxTokens)
-                : withLoopGuard;
             return this.truncateToolResultMessages(
-                profiled,
+                withLoopGuard,
                 maxToolResultChars,
                 requestId
             );
@@ -2386,13 +2819,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             deepSeekMaximum: DEEPSEEK_MAX_OUTPUT_TOKENS,
         });
         const { defaultMaxTokens: defaultMaxOutputTokens, requestedMaxTokens } = outputBudget;
-        const maxTokens = useCopilotCompactionProfile
-            ? Math.min(outputBudget.maxTokens, copilotCompactionMaxTokens)
-            : outputBudget.maxTokens;
+        const maxTokens = outputBudget.maxTokens;
         const temperatureDefault = resolvedFamily === "deepseek" ? 1.0 : resolvedFamily === "qwen" ? 0.6 : 0.7;
-        const temperature = useCopilotCompactionProfile
-            ? 0.2
-            : this.clampNumber(options.modelOptions?.temperature ?? temperatureDefault, 0, 2, temperatureDefault);
+        const temperature = this.clampNumber(options.modelOptions?.temperature ?? temperatureDefault, 0, 2, temperatureDefault);
         const rawModelOptions = options.modelOptions as Record<string, unknown> | undefined;
         const qwenTopP = resolvedFamily === "qwen" ? 0.95 : undefined;
         const qwenTopK = resolvedFamily === "qwen" ? 20 : undefined;
@@ -2404,6 +2833,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             hardContextUtilization: hardContextUtil,
             maxOutputTokens: maxTokens,
             minReplyReserveTokens: minReplyReserve,
+            replyReservePercent,
             toolTokens: toolTokenCount,
         });
         const {
@@ -2425,7 +2855,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             requestedMaxTokens,
             defaultMaxOutputTokens,
             requestProvidedOutputLimit: outputBudget.requestProvidedLimit,
-            requestKind: copilotCompactionRequest ? "copilot-compaction" : "chat",
+            requestKind: "chat",
             cappedTools: Array.isArray(cappedToolConfig.tools) ? cappedToolConfig.tools.length : 0,
         });
 
@@ -2531,7 +2961,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const countMessages = async (
             candidate: OpenAIChatMessage[]
         ): Promise<{ tokens: number; source: "server" | "heuristic"; promptTokens?: number }> => {
-            const heuristicTokens = this.estimateOpenAiMessageTokens(candidate);
+            const rawHeuristicTokens = this.estimateOpenAiMessageTokens(candidate);
+            const heuristicTokens = Math.max(1, Math.round(rawHeuristicTokens * this.heuristicCalibration));
             if (!accurateTokenCounting || this.isDeepSeekServer(serverUrl)) {
                 return { tokens: heuristicTokens, source: "heuristic" };
             }
@@ -2569,14 +3000,69 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         };
 
         const prepareMessagesForBudget = async (sourceMessages: OpenAIChatMessage[]): Promise<PreparedMessagesForBudget> => {
-            let preparedMessages = sourceMessages;
+            let autoCompacted = false;
+            const hardCompacted = false;
+            const hardTarget = hardInputTarget;
+
+            // Build the effective message set for token counting.
+            // Instead of counting the full VS Code source (which always grows
+            // and forces unnecessary re-compaction), we chain new messages onto
+            // the last successful compaction snapshot.  This means auto-compact
+            // only fires when the *actual* context usage approaches the limit,
+            // not when the raw source history is large.
+            let effectiveMessages: OpenAIChatMessage[];
+            let snapshotStale = false;
+            const conversationSnapshot = this.getConversationMessageSnapshot(conversationScope);
+            const snapshotMessages = conversationSnapshot?.messages;
+            const rebuildOverCompactedMigration = Boolean(
+                conversationSnapshot?.migratedFromPrefix
+                && snapshotMessages
+                && sourceMessages.length > snapshotMessages.length * 2
+                && conversationSnapshot.tokenCount < softInputTarget * 0.6
+            );
+            if (rebuildOverCompactedMigration) {
+                this.deleteConversationMessageSnapshot(conversationScope);
+                effectiveMessages = sourceMessages;
+                this.log("chat.messages.snapshot_migration_rebuild", {
+                    requestId,
+                    migratedMessages: snapshotMessages?.length ?? 0,
+                    migratedTokenEstimate: conversationSnapshot?.tokenCount ?? 0,
+                    sourceMessages: sourceMessages.length,
+                    softInputTarget,
+                });
+            } else if (snapshotMessages && snapshotMessages.length > 0) {
+                const newMessages = this.findNewMessagesAfterSnapshot(sourceMessages, snapshotMessages);
+                // When findNewMessagesAfterSnapshot returns all source messages
+                // (pivot not found), the snapshot is stale — for example a
+                // subagent injected tool messages between turns and reshuffled
+                // the history.  Discard the snapshot so we avoid double-counting
+                // messages and triggering an unnecessary compaction.
+                if (newMessages.length >= sourceMessages.length) {
+                    this.log("chat.messages.snapshot_stale", {
+                        requestId,
+                        reason: "pivot_not_found_after_subagent_or_injection",
+                        snapshotMessages: snapshotMessages.length,
+                        sourceMessages: sourceMessages.length,
+                    });
+                    this.deleteConversationMessageSnapshot(conversationScope);
+                    effectiveMessages = sourceMessages;
+                    // When the snapshot is stale we cannot trust the heuristic
+                    // token count — counting all source messages always
+                    // over-estimates.  Defer compaction until the server
+                    // actually reports an overflow.
+                    snapshotStale = true;
+                } else {
+                    effectiveMessages = [...snapshotMessages, ...newMessages];
+                }
+            } else {
+                effectiveMessages = sourceMessages;
+            }
+
+            let preparedMessages = effectiveMessages;
             let counted = await countMessages(preparedMessages);
             let messageTokenCount = counted.tokens;
-            const initialMessageCount = preparedMessages.length;
+            const initialMessageCount = sourceMessages.length;
             const initialTokenEstimate = messageTokenCount;
-            let autoCompacted = false;
-            let hardCompacted = false;
-            const hardTarget = hardInputTarget;
 
             this.log("chat.messages.initial", {
                 requestId,
@@ -2584,13 +3070,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 tokenCountSource: counted.source,
                 promptTokens: counted.promptTokens,
                 messageCount: preparedMessages.length,
+                sourceMessageCount: sourceMessages.length,
             });
 
-            if (autoCompact && messageTokenCount > softInputTarget) {
+            const compactionDecision = selectContextCompaction({
+                messageTokens: messageTokenCount,
+                autoCompact: autoCompact && !snapshotStale,
+                softInputTarget,
+                hardInputTarget,
+                overflowRetry: false,
+            });
+            if (compactionDecision.kind === "auto") {
                 const compactStartedAt = Date.now();
                 preparedMessages = this.compactOpenAiMessages(
                     preparedMessages,
-                    softInputTarget,
+                    compactionDecision.target,
                     keepLastTurns,
                     "Conversation summary (auto-compact)"
                 );
@@ -2603,40 +3097,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     tokenCountSource: counted.source,
                     promptTokens: counted.promptTokens,
                     messageCount: preparedMessages.length,
-                    target: softInputTarget,
+                    target: compactionDecision.target,
                     compactDurationMs: Date.now() - compactStartedAt,
                 });
-            }
-
-            if (messageTokenCount > softInputTarget) {
-                const compactStartedAt = Date.now();
-                preparedMessages = this.compactOpenAiMessages(
-                    preparedMessages,
-                    hardTarget,
-                    hardKeepLastTurns,
-                    "Conversation summary (hard compact)"
-                );
-                counted = await countMessages(preparedMessages);
-                messageTokenCount = counted.tokens;
-                hardCompacted = true;
-                this.log("chat.messages.hard_compact", {
+            } else if (snapshotStale) {
+                // Snapshot was stale — rebuild it from the current messages so
+                // the next turn can use incremental counting instead of falling
+                // back to the full source again.
+                this.log("chat.messages.snapshot_rebuilt", {
                     requestId,
-                    tokenEstimate: messageTokenCount,
-                    tokenCountSource: counted.source,
-                    promptTokens: counted.promptTokens,
                     messageCount: preparedMessages.length,
-                    target: hardTarget,
-                    compactDurationMs: Date.now() - compactStartedAt,
+                    tokenEstimate: messageTokenCount,
                 });
-                if (messageTokenCount > hardTarget) {
-                    this.log("chat.messages.compact_failed", {
-                        requestId,
-                        tokenEstimate: messageTokenCount,
-                        tokenCountSource: counted.source,
-                        hardTarget,
-                    });
-                    throw new Error("Conversation is still too large after compaction. Start a new chat or reduce history.");
-                }
             }
 
             return {
@@ -2666,11 +3138,48 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         let attemptCounter = 0;
         let latestContextUsage: LlamaChatContextUsageMetrics | undefined;
         let latestCachePrefix: CachePrefixTelemetry | undefined;
+        let latestAutoCompacted = false;
+        let latestBackendVia: string | undefined;
+        let latestBackendCfPop: string | undefined;
+        let latestBackendTraceId: string | undefined;
         const attemptRequest = async (sourceMessages: OpenAIChatMessage[]): Promise<AttemptResult> => {
             attemptCounter += 1;
             const attemptNo = attemptCounter;
             const prepared = await prepareMessagesForBudget(sourceMessages);
-            requestBody.messages = prepared.messages;
+            latestAutoCompacted = prepared.autoCompacted;
+
+            // Stabilise the prefix against the previous request of the same
+            // conversation so DeepSeek can serve it from its disk cache.  Without
+            // this VS Code's own history trimming (which drops varying numbers of
+            // middle messages between turns) would rewrite the prompt body and
+            // invalidate the entire upstream prefix every time.
+            const staticFields = Object.fromEntries(
+                Object.entries(requestBody).filter(([key]) => key !== "messages" && key !== "tools")
+            );
+            const staticFieldsHash = this.shortHash(stableJsonStringify(staticFields));
+            // Sort tools by name so the hash is order-independent — VS Code may
+            // change tool enumeration order between restarts, which would
+            // otherwise break the toolsHash match and skip prefix stabilization.
+            const toolsForHash = Array.isArray(requestBody.tools)
+                ? [...(requestBody.tools as Array<{ function?: { name?: string } }>)].sort(
+                    (a, b) => {
+                        const na = a.function?.name ?? "";
+                        const nb = b.function?.name ?? "";
+                        return na < nb ? -1 : na > nb ? 1 : 0;
+                    }
+                )
+                : (requestBody.tools ?? []);
+            const toolsHash = this.shortHash(stableJsonStringify(toolsForHash));
+            const stabilized = this.stabilizeMessagePrefix(
+                requestId, requestModelId, conversationScope, prepared.messages, staticFieldsHash, toolsHash
+            );
+            requestBody.messages = stabilized.messages;
+            this.setConversationMessageSnapshot(
+                conversationScope,
+                stabilized.messages,
+                prepared.finalTokenEstimate
+            );
+            latestCachePrefix = stabilized.prefix as CachePrefixTelemetry;
 
             const cappedTools = Array.isArray(cappedToolConfig.tools) ? cappedToolConfig.tools.length : 0;
             const {
@@ -2709,14 +3218,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             this.log("chat.context.usage", latestContextUsage);
             this._onDidUpdateContextUsage.fire(latestContextUsage);
 
-            const cachePrefix = this.trackCachePrefix(
-                requestId,
-                requestModelId,
-                options,
-                requestBody,
-                prepared.messages
-            );
-            latestCachePrefix = cachePrefix as CachePrefixTelemetry;
             this.log("chat.request.send", {
                 requestId,
                 attemptNo,
@@ -2725,7 +3226,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 toolResultMode: activeToolResultMode,
                 headers: this.redactHeaders(headers),
                 requestBody: this.summarizeRequestBodyForLog(requestBody),
-                cachePrefix,
+                cachePrefix: latestCachePrefix,
             });
 
             let response: Response;
@@ -2748,7 +3249,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 status: response.status,
                 statusText: response.statusText,
                 durationMs: Date.now() - requestStartedAt,
+                backendVia: response.headers.get("via") ?? undefined,
+                backendCfPop: response.headers.get("x-amz-cf-pop") ?? undefined,
+                backendTraceId: response.headers.get("x-ds-trace-id") ?? undefined,
             });
+
+            // Capture backend-identifying headers for session-quality diagnostics.
+            latestBackendVia = response.headers.get("via") ?? undefined;
+            latestBackendCfPop = response.headers.get("x-amz-cf-pop") ?? undefined;
+            latestBackendTraceId = response.headers.get("x-ds-trace-id") ?? undefined;
 
             let retriedAfterOverflow = false;
 
@@ -2762,7 +3271,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     errorText: errText,
                 });
                 if (this.isContextOverflowError(response.status, errText)) {
-                    const hardTarget = hardInputTarget;
+                    const overflowCompaction = selectContextCompaction({
+                        messageTokens: prepared.finalTokenEstimate,
+                        autoCompact,
+                        softInputTarget,
+                        hardInputTarget,
+                        overflowRetry: true,
+                    });
+                    const hardTarget = overflowCompaction.kind === "hard"
+                        ? overflowCompaction.target
+                        : hardInputTarget;
                     const compactStartedAt = Date.now();
                     const overflowMessages = this.compactOpenAiMessages(
                         prepared.messages,
@@ -2774,6 +3292,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
                     const overflowCount = await countMessages(overflowMessages);
                     const overflowMessageTokens = overflowCount.tokens;
+                    this.setConversationMessageSnapshot(
+                        conversationScope,
+                        overflowMessages,
+                        overflowMessageTokens
+                    );
                     const {
                         estimatedUsedTokens: overflowEstimatedUsedTokens,
                         estimatedFreeTokens: overflowEstimatedFreeTokens,
@@ -3173,6 +3696,29 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const usageSource = accumulatedServerUsage ? "server" : "estimate";
             const promptCacheUsage = calculatePromptCacheUsage(reportedUsage);
 
+            // Self-calibrate the heuristic token counter using server-reported
+            // prompt_tokens.  An exponential moving average (α=0.3) keeps the
+            // factor stable across turns while adapting to conversation drift.
+            if (accumulatedServerUsage && reportedUsage.prompt_tokens > 0) {
+                const messageTokens = latestContextUsage?.messageTokensAfterCompact ?? 0;
+                if (messageTokens > 0) {
+                    const toolTokens = latestContextUsage?.toolTokens ?? 0;
+                    const serverMessageTokens = Math.max(1, reportedUsage.prompt_tokens - toolTokens);
+                    const ratio = serverMessageTokens / Math.max(1, messageTokens);
+                    const clamped = Math.max(0.2, Math.min(3.0, ratio));
+                    const previousFactor = this.heuristicCalibration;
+                    this.heuristicCalibration = previousFactor * 0.7 + clamped * 0.3;
+                    this.log("chat.heuristic.calibrate", {
+                        requestId,
+                        previousFactor: +previousFactor.toFixed(3),
+                        newFactor: +this.heuristicCalibration.toFixed(3),
+                        ratio: +ratio.toFixed(3),
+                        serverTokens: reportedUsage.prompt_tokens,
+                        messageEstimate: messageTokens,
+                    });
+                }
+            }
+
             progress.report(vscode.LanguageModelDataPart.text(JSON.stringify(reportedUsage), "usage"));
             this.log("chat.response.usage", {
                 requestId,
@@ -3182,19 +3728,29 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 promptCache: promptCacheUsage,
             });
 
-            if (usageSource === "server") {
-                this.log("chat.cache.report", buildCacheDiagnostics({
+            const cacheDiagnostics = usageSource === "server"
+                ? buildCacheDiagnostics({
                     provider: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
                     modelId: requestModelId,
                     requestId,
                     usage: promptCacheUsage,
                     prefix: latestCachePrefix,
-                }));
+                    autoCompacted: latestAutoCompacted,
+                })
+                : undefined;
+
+            if (cacheDiagnostics) {
+                this.log("chat.cache.report", cacheDiagnostics);
             }
 
             const metrics: LlamaChatTurnMetrics = {
                 requestId,
                 modelId: model.id,
+                providerKind: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                lifecyclePhase: "completed",
+                conversationKey: typeof options.modelOptions?._copilotConversationId === "string"
+                    ? this.shortHash(options.modelOptions._copilotConversationId)
+                    : undefined,
                 durationMs: finishedAt - turnStartedAt,
                 queueWaitMs,
                 firstTokenLatencyMs,
@@ -3207,6 +3763,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 promptTokens: reportedUsage.prompt_tokens,
                 cachedPromptTokens: promptCacheUsage?.cachedTokens,
                 promptCacheHitPercent: promptCacheUsage?.hitPercent,
+                cacheMissReason: cacheDiagnostics?.reason,
+                cacheMissDetail: cacheDiagnostics?.detail,
+                prefixIdenticalMessageCount: latestCachePrefix?.identicalMessagePrefix,
+                prefixPreviousMessageCount: latestCachePrefix?.previousMessageCount,
+                prefixReusableMessagePercent: latestCachePrefix?.reusableMessagePercent,
+                prefixStaticFieldsMatch: latestCachePrefix?.staticFieldsMatch,
+                prefixToolsMatch: latestCachePrefix?.toolsMatch,
+                backendVia: latestBackendVia ?? undefined,
+                backendCfPop: latestBackendCfPop ?? undefined,
+                backendTraceId: latestBackendTraceId ?? undefined,
                 modelTurns,
                 usageEstimated: !accumulatedServerUsage,
                 retriedAfterOverflow: finalAttempt.retriedAfterOverflow,

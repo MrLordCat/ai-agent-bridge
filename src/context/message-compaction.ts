@@ -16,6 +16,15 @@ interface CompactMessagesOptions {
 	estimateTokens(messages: OpenAIChatMessage[]): number;
 }
 
+const SUMMARY_LABEL_PATTERN = /^Conversation summary \((?:auto-compact|hard compact(?:, keep \d+)?|overflow retry)\):/;
+
+function isCompactionSummary(message: OpenAIChatMessage): boolean {
+	if (message.role !== "system" || typeof message.content !== "string") {
+		return false;
+	}
+	return SUMMARY_LABEL_PATTERN.test(message.content);
+}
+
 interface SummaryCandidate {
 	index: number;
 	priority: number;
@@ -207,7 +216,19 @@ export function compactMessages(
 		return messages.map(cloneMessage);
 	}
 
-	const systems = messages.filter(message => message.role === "system").map(cloneMessage);
+	// Fast path: already fits within budget — no compaction needed.
+	// This prevents unnecessary summary creation that would invalidate the
+	// upstream prompt cache on every turn of a long conversation.
+	if (options.estimateTokens(messages) <= options.tokenBudget) {
+		return messages.map(cloneMessage);
+	}
+
+	// Keep original system messages but exclude previously generated compaction
+	// summaries.  Each compaction adds a new summary; stale ones would
+	// accumulate and waste context budget every cycle.
+	const systems = messages
+		.filter(message => message.role === "system" && !isCompactionSummary(message))
+		.map(cloneMessage);
 	const nonSystem = messages.filter(message => message.role !== "system");
 	if (nonSystem.length === 0) {
 		return systems;
@@ -215,34 +236,71 @@ export function compactMessages(
 
 	const turns = groupConversationTurns(nonSystem);
 	let keptMessageCount = 0;
-	let keepTurnIndex = turns.length - 1;
-	while (keepTurnIndex > 0 && keptMessageCount < Math.max(1, options.keepLastCount)) {
-		keptMessageCount += turns[keepTurnIndex].length;
-		keepTurnIndex -= 1;
+	let preferredKeepTurnIndex = turns.length - 1;
+	while (preferredKeepTurnIndex > 0 && keptMessageCount < Math.max(1, options.keepLastCount)) {
+		keptMessageCount += turns[preferredKeepTurnIndex].length;
+		preferredKeepTurnIndex -= 1;
 	}
 	if (keptMessageCount < Math.max(1, options.keepLastCount)) {
-		keepTurnIndex = 0;
+		preferredKeepTurnIndex = 0;
 	} else {
-		keepTurnIndex += 1;
+		preferredKeepTurnIndex += 1;
 	}
 
-	const head = turns.slice(0, keepTurnIndex).flat();
-	let tailTurns = turns.slice(keepTurnIndex).map(turn => turn.map(cloneMessage));
-	const summaryLines = selectSummaryLines(head);
-	const summaryMessages: OpenAIChatMessage[] = head.length > 0
-		? [{
-			role: "system",
-			content: summaryLines.length > 0
-				? `${options.label}:\n${summaryLines.join("\n")}`
-				: `${options.label}: prior turns were compacted to fit model context.`,
-		}]
-		: [];
-	const compacted: OpenAIChatMessage[] = [
-		...systems,
-		...summaryMessages,
-		...tailTurns.flat(),
-	];
-	const tailStart = systems.length + summaryMessages.length;
+	const buildCandidate = (keepTurnIndex: number): {
+		messages: OpenAIChatMessage[];
+		tailTurns: OpenAIChatMessage[][];
+		summaryCount: number;
+	} => {
+		const head = turns.slice(0, keepTurnIndex).flat();
+		const tailTurns = turns.slice(keepTurnIndex).map(turn => turn.map(cloneMessage));
+		const summaryLines = selectSummaryLines(head);
+		const summaryMessages: OpenAIChatMessage[] = head.length > 0
+			? [{
+				role: "system",
+				content: summaryLines.length > 0
+					? `${options.label}:\n${summaryLines.join("\n")}`
+					: `${options.label}: prior turns were compacted to fit model context.`,
+			}]
+			: [];
+		return {
+			messages: [...systems, ...summaryMessages, ...tailTurns.flat()],
+			tailTurns,
+			summaryCount: summaryMessages.length,
+		};
+	};
+
+	// Find the earliest turn boundary whose summary + recent suffix fits. This
+	// preserves as much useful recent context as the target allows. The previous
+	// implementation jumped directly to preferredKeepTurnIndex and therefore
+	// kept only a handful of messages even when most of the budget was free.
+	const lastKeepTurnIndex = Math.max(0, turns.length - 1);
+	const preferred = buildCandidate(preferredKeepTurnIndex);
+	let chosen = buildCandidate(lastKeepTurnIndex);
+	let low: number;
+	let high: number;
+	if (options.estimateTokens(preferred.messages) <= options.tokenBudget) {
+		chosen = preferred;
+		low = 1;
+		high = preferredKeepTurnIndex - 1;
+	} else {
+		low = Math.max(1, preferredKeepTurnIndex + 1);
+		high = lastKeepTurnIndex - 1;
+	}
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		const candidate = buildCandidate(middle);
+		if (options.estimateTokens(candidate.messages) <= options.tokenBudget) {
+			chosen = candidate;
+			high = middle - 1;
+		} else {
+			low = middle + 1;
+		}
+	}
+
+	const compacted = chosen.messages;
+	let tailTurns = chosen.tailTurns;
+	const tailStart = systems.length + chosen.summaryCount;
 
 	while (options.estimateTokens(compacted) > options.tokenBudget && tailTurns.length > 1) {
 		tailTurns = tailTurns.slice(1);

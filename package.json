@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
 	},
-	"version": "1.8.0",
+	"version": "1.9.0",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -109,6 +109,20 @@
 					"minimum": 32768,
 					"maximum": 1048576,
 					"description": "Context window advertised for Codex models. The default matches the context reported by the current Codex app-server runtime."
+				},
+				"llamacpp.codexContextUtilization": {
+					"type": "number",
+					"default": 0.75,
+					"minimum": 0.4,
+					"maximum": 0.95,
+					"description": "Fraction of the Codex context window considered usable when calculating the automatic conversation-compaction budget."
+				},
+				"llamacpp.codexCompactKeepLastTurns": {
+					"type": "number",
+					"default": 18,
+					"minimum": 2,
+					"maximum": 64,
+					"description": "Number of recent VS Code conversation entries preserved verbatim when older Codex history is compacted into a summary."
 				},
 				"llamacpp.codexMaxInputChars": {
 					"type": "number",
@@ -251,18 +265,6 @@
 					"default": true,
 					"description": "Automatically compact old chat history before sending requests when close to context limit."
 				},
-				"llamacpp.copilotCompactionFastMode": {
-					"type": "boolean",
-					"default": true,
-					"description": "Use a fast no-reasoning profile for Copilot Chat's internal conversation-summary requests. Normal chat requests are unaffected."
-				},
-				"llamacpp.copilotCompactionMaxTokens": {
-					"type": "number",
-					"default": 2048,
-					"minimum": 512,
-					"maximum": 8192,
-					"description": "Maximum output tokens for a recognized Copilot Chat internal conversation summary when copilotCompactionFastMode is enabled."
-				},
 				"llamacpp.accurateTokenCounting": {
 					"type": "boolean",
 					"default": true,
@@ -393,6 +395,13 @@
 					"minimum": 256,
 					"maximum": 32768,
 					"description": "Minimum tokens reserved for reply budget when calculating input context budget."
+				},
+				"llamacpp.replyReservePercent": {
+					"type": "number",
+					"default": 0.07,
+					"minimum": 0.03,
+					"maximum": 0.25,
+					"description": "Maximum fraction of total context window to reserve for model reply. Prevents over-reserving for models with large max_tokens. 0.07 = 7%."
 				},
 				"llamacpp.maxToolsPerRequest": {
 					"type": "number",

@@ -13,12 +13,14 @@ import {
 	type CodexDynamicToolRuntimeSignature,
 } from "./dynamic-tools";
 import {
+	compactCodexMessages,
 	estimateCodexInputTokens,
 	createCodexConversationAnchor,
 	convertCodexToolResult,
 	findCodexToolContinuations,
 	matchCodexConversationTail,
 	serializeCodexConversation,
+	type CodexCompactionResult,
 	type CodexConversationAnchor,
 } from "./message-adapter";
 import {
@@ -28,11 +30,19 @@ import {
 	resolveCodexReasoningEffort,
 } from "./model-adapter";
 import {
+	CodexInternalToolBlockedError,
 	CodexStaleTurnError,
 	CodexTurnBridge,
 	type CodexDelegatedToolCall,
 	type CodexTurnBoundary,
 } from "./turn-bridge";
+import {
+	readCodexRolloutMetrics,
+	type CodexRolloutTurnMetrics,
+	type CodexToolDurationMetrics,
+	type CodexTurnStepMetrics,
+	type CodexUsageSegmentMetrics,
+} from "./rollout-metrics";
 import type {
 	CodexAccountResponse,
 	CodexChatGptAccount,
@@ -41,6 +51,7 @@ import type {
 	CodexModel,
 	CodexModelListResponse,
 	CodexRateLimitsResponse,
+	CodexThreadReadResponse,
 	CodexThreadResumeResponse,
 	CodexThreadTokenUsage,
 	CodexThreadStartResponse,
@@ -63,6 +74,11 @@ const CODEX_FAILED_TOOL_TURN_RECOVERY_PROMPT = [
 	"The previous turn ended unexpectedly after native VS Code tool results were returned.",
 	"Reuse those results and do not repeat completed tool calls unless verification is necessary.",
 ].join(" ");
+const CODEX_BLOCKED_INTERNAL_TOOL_RECOVERY_PROMPT = [
+	"Continue the current task on this same thread.",
+	"The previous internal Codex action was denied by the host security boundary.",
+	"Use only the advertised dynamic VS Code tools for every action and do not repeat completed native tool calls unless verification is necessary.",
+].join(" ");
 const NON_RECOVERABLE_CODEX_TURN_FAILURE = /(?:auth|unauthori[sz]ed|forbidden|permission|quota|rate.?limit|too many requests|input exceeds|maximum length|context (?:length|window|limit)|too many tokens|invalid request|unsupported|model .*not found|cancel|interrupt)/i;
 const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"You are the Codex runtime behind a VS Code Copilot Chat model provider.",
@@ -73,7 +89,7 @@ const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"Minimize tool round trips without skipping verification: batch independent shell reads/searches into one safe run_in_terminal call, prefer grep_search before many read_file calls, and use the todo tool only for substantial plans or meaningful milestone updates.",
 	"Keep every native tool result small. Filter potentially large command output with rg, counts, head, or tail; never dump full logs, JSON/JSONL files, repository file lists, generated artifacts, or binary/base64 data into chat.",
 	"Some less common dynamic tools are loaded on demand. Use tool_search when the required outer tool is not already visible.",
-	"Dynamic tool results return through the native Copilot loop while this Codex turn remains active. Continue directly from each result without repeating the call.",
+	"Dynamic tool results return through native VS Code tool execution while this Codex turn remains active. Continue directly from each result without repeating the call.",
 	"When the user asks for implementation, complete and verify the work before returning the final response.",
 ].join("\n");
 
@@ -91,6 +107,51 @@ export interface CodexUsageRecord {
 	outputTokens: number;
 	cachedInputTokens: number;
 	reasoningOutputTokens: number;
+	/** Per-turn diagnostics — populated for session quality reporting. */
+	turnDiagnostics?: CodexTurnDiagnostics;
+}
+
+export type CodexTurnLifecyclePhase = "running" | "completed" | "timed_out" | "interrupted" | "abandoned" | "failed";
+export type CodexThreadMode = "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
+
+export interface CodexLiveTurnUpdate extends CodexUsageRecord {
+	phase: Exclude<CodexTurnLifecyclePhase, "completed">;
+}
+
+export interface CodexTurnDiagnostics {
+	requestId: string;
+	durationMs: number;
+	outputChars: number;
+	toolCalls: number;
+	toolNames: Record<string, number>;
+	toolDuration?: CodexToolDurationMetrics;
+	modelSegments: number;
+	usageSegments: CodexUsageSegmentMetrics[];
+	usageSegmentsTruncated: boolean;
+	steps?: CodexTurnStepMetrics[];
+	firstModelEventLatencyMs?: number;
+	firstVisibleMessageLatencyMs?: number;
+	messageCount: number;
+	compacted: boolean;
+	messageCountBeforeCompact?: number;
+	messageCountAfterCompact?: number;
+	tokenEstimateBeforeCompact?: number;
+	tokenEstimateAfterCompact?: number;
+	ephemeral: boolean;
+	continuation: boolean;
+	inputMode: string;
+	contextWindow: number | null;
+	contextUsedTokens: number;
+	compactionTokenBudget?: number;
+	hardInputTargetTokens: number;
+	toolSchemaTokens: number;
+	toolCount: number;
+	metricsSource: "rollout" | "live";
+	lifecyclePhase?: CodexTurnLifecyclePhase;
+	terminalDetail?: string;
+	threadMode?: CodexThreadMode;
+	threadReuseMissReason?: string;
+	conversationKey?: string;
 }
 
 export function diffCodexThreadUsage(
@@ -113,7 +174,7 @@ export function shouldRecoverCodexFailedToolTurn(errorMessage?: string): boolean
 }
 
 export function shouldRecoverCodexToolTurnException(error: unknown): boolean {
-	return error instanceof CodexStaleTurnError;
+	return error instanceof CodexStaleTurnError || error instanceof CodexInternalToolBlockedError;
 }
 
 interface ActiveDynamicToolContext {
@@ -132,6 +193,24 @@ interface ActiveCodexToolTurn {
 	toolSignatures: ReadonlyMap<string, string>;
 	createdAt: number;
 	processGeneration: number;
+	copilotConversationId?: string;
+	copilotTurnIndex?: number;
+}
+
+interface RecoverableInterruptedCodexThread {
+	threadId: string;
+	ephemeral: boolean;
+	modelId: string;
+	runtimeKey: string;
+	toolCatalogKey: string;
+	callableNames: ReadonlySet<string>;
+	toolNamespaces: ReadonlyMap<string, string>;
+	toolSignatures: ReadonlyMap<string, string>;
+	copilotConversationId: string;
+	copilotTurnIndex?: number;
+	processGeneration: number;
+	interruptedAt: number;
+	reason: "timed_out" | "interrupted" | "abandoned" | "failed";
 }
 
 interface CodexConversationThread {
@@ -370,6 +449,38 @@ function normalizeCopilotConversationId(value: unknown): string | undefined {
 	return normalized.length > 0 && normalized.length <= 256 ? normalized : undefined;
 }
 
+function codexConversationKey(value: string | undefined): string | undefined {
+	return value
+		? createHash("sha256").update(value).digest("hex").slice(0, 16)
+		: undefined;
+}
+
+export function findLatestCodexUserTail(
+	messages: readonly vscode.LanguageModelChatRequestMessage[]
+): readonly vscode.LanguageModelChatRequestMessage[] {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index].role === vscode.LanguageModelChatMessageRole.User) {
+			return messages.slice(index);
+		}
+	}
+	return messages.slice(-1);
+}
+
+export function mergeCodexTurnSteps(
+	...groups: ReadonlyArray<readonly CodexTurnStepMetrics[] | undefined>
+): CodexTurnStepMetrics[] {
+	const merged = new Map<string, CodexTurnStepMetrics>();
+	for (const group of groups) {
+		for (const step of group ?? []) {
+			const existing = merged.get(step.id);
+			merged.set(step.id, existing ? { ...existing, ...step } : { ...step });
+		}
+	}
+	return [...merged.values()]
+		.sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt))
+		.map((step, index) => ({ ...step, index: index + 1 }));
+}
+
 function normalizeCopilotTurnIndex(value: unknown): number | undefined {
 	const numeric = typeof value === "number" ? value : Number.NaN;
 	return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
@@ -382,10 +493,14 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	readonly onDidChangeStatus = this.statusChanges.event;
 	private readonly usageRecords = new vscode.EventEmitter<CodexUsageRecord>();
 	readonly onDidRecordUsage = this.usageRecords.event;
+	private readonly liveTurnUpdates = new vscode.EventEmitter<CodexLiveTurnUpdate>();
+	readonly onDidUpdateLiveTurn = this.liveTurnUpdates.event;
 
 	private readonly client: CodexAppServerClient;
 	private readonly dynamicToolContexts = new Map<string, ActiveDynamicToolContext>();
 	private readonly activeToolTurns = new Map<string, ActiveCodexToolTurn>();
+	private readonly interruptedToolThreads = new Map<string, RecoverableInterruptedCodexThread>();
+	private readonly staleToolCalls = new Map<string, { reason: string; expiresAt: number }>();
 	private readonly conversationThreads = new Map<string, CodexConversationThread>();
 	private pendingRollover: PendingCodexThreadRollover | undefined;
 	private readonly models = new Map<string, CodexModel>();
@@ -712,6 +827,20 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			sandbox,
 			dynamicTools: dynamicToolSet.runtimeSignatures,
 		});
+		this.pruneStaleToolCalls();
+		const staleContinuations = findCodexToolContinuations(messages, new Set(this.staleToolCalls.keys()));
+		if (staleContinuations.length > 0) {
+			for (const continuation of staleContinuations) {
+				const stale = this.staleToolCalls.get(continuation.callId);
+				this.logSink?.log("codex.chat.stale_tool_result_ignored", {
+					callId: continuation.callId,
+					reason: stale?.reason ?? "interrupted",
+				}, "warn");
+			}
+			throw new CodexStaleTurnError(
+				"This native VS Code tool result belongs to an interrupted Codex turn and was ignored."
+			);
+		}
 		const continuationMatches = findCodexToolContinuations(messages, new Set(this.activeToolTurns.keys()));
 		const continuationMatch = continuationMatches[0];
 		const storedActiveTurn = continuationMatch
@@ -744,7 +873,29 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			}
 		}
 		if (storedActiveTurn && !activeTurn) {
-			this.abandonActiveToolTurn(storedActiveTurn);
+			this.abandonActiveToolTurn(storedActiveTurn, "abandoned");
+		}
+		let interruptedContinuation: RecoverableInterruptedCodexThread | undefined;
+		if (!activeTurn && !continuationMatch && copilotConversationId) {
+			const superseded = [...new Set(this.activeToolTurns.values())]
+				.filter(candidate =>
+					candidate.copilotConversationId === copilotConversationId
+					&& (
+						copilotTurnIndex === undefined
+						|| candidate.copilotTurnIndex === undefined
+						|| copilotTurnIndex > candidate.copilotTurnIndex
+					)
+				)
+				.sort((left, right) => right.createdAt - left.createdAt)[0];
+			if (superseded) {
+				interruptedContinuation = await this.interruptActiveToolTurn(superseded, "interrupted");
+			}
+			interruptedContinuation ??= this.takeInterruptedToolThread(
+				model.id,
+				runtimeKey,
+				copilotConversationId,
+				copilotTurnIndex
+			);
 		}
 		let conversationContinuation: CodexConversationThread | undefined;
 		let conversationTail: readonly vscode.LanguageModelChatRequestMessage[] | undefined;
@@ -757,13 +908,13 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			reuseMissReasons.set(reason, (reuseMissReasons.get(reason) ?? 0) + 1);
 		};
 		const pendingRollover = this.getPendingRollover(model.id);
-		if (!activeTurn && pendingRollover && !copilotConversationId) {
+		if (!activeTurn && !interruptedContinuation && pendingRollover && !copilotConversationId) {
 			throw new Error(
 				"Codex rollover is armed, but VS Code did not provide a new conversation id. "
 				+ "Create a new chat and retry with the same Codex model."
 			);
 		}
-		if (!activeTurn && pendingRollover && copilotConversationId) {
+		if (!activeTurn && !interruptedContinuation && pendingRollover && copilotConversationId) {
 			const candidate = this.conversationThreads.get(pendingRollover.threadId);
 			if (!candidate) {
 				await this.clearPendingRollover();
@@ -789,7 +940,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				targetConversationId: copilotConversationId,
 			}, "warn");
 		}
-		if (!activeTurn && !conversationContinuation) {
+		let threadReuseMissReason: string | undefined;
+		if (!activeTurn && !interruptedContinuation && !conversationContinuation) {
 			for (const candidate of [...this.conversationThreads.values()].sort((left, right) => right.lastUsedAt - left.lastUsedAt)) {
 				if (useEphemeralThreads && !candidate.ephemeral) {
 					countReuseMiss("persistence-disabled");
@@ -845,6 +997,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				countReuseMiss(match.missReason ?? "conversation-changed");
 			}
 			if (!conversationContinuation) {
+				threadReuseMissReason = this.conversationThreads.size === 0
+					? "no-stored-thread"
+					: [...reuseMissReasons.entries()].sort((left, right) => right[1] - left[1])[0]?.[0]
+						?? "no-compatible-thread";
 				this.logSink?.log("codex.chat.thread_reuse_miss", {
 					storedThreadCount: this.conversationThreads.size,
 					messageCount: messages.length,
@@ -855,18 +1011,62 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		const inputMessages = activeTurn
 			? continuationMatch!.messages
-			: conversationTail ?? messages;
-		const inputMode = activeTurn ? "tool-result" : conversationContinuation ? "user-turn" : "full";
+			: interruptedContinuation ? findLatestCodexUserTail(messages) : conversationTail ?? messages;
+		const inputMode = activeTurn
+			? "tool-result"
+			: interruptedContinuation || conversationContinuation ? "user-turn" : "full";
 		this.requestCount++;
 		if (inputMode !== "full") {
 			this.threadReuseCount++;
 		}
 		this.statusChanges.fire(this.status);
-		const input = serializeCodexConversation(inputMessages, {
-			maxTextChars: config.get("codexMaxInputChars", 600_000),
+
+		// Auto-compact the conversation when the serialized history exceeds a
+		// reasonable fraction of the model context.  This prevents Codex from
+		// receiving the full serialised VS Code conversation (which can reach
+		// 600K+ chars / 150K+ tokens) and instead sends a summary + recent suffix.
+		let compactionResult: CodexCompactionResult | undefined;
+		let compactionTokenBudget: number | undefined;
+		if (inputMode === "full" && inputMessages.length > 12) {
+			const configuredContext = this.clampNumber(
+				config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
+				32_768,
+				1_048_576,
+				DEFAULT_CODEX_CONTEXT_LENGTH
+			);
+			const codexContextUtil = this.clampRatio(
+				config.get("codexContextUtilization", 0.75),
+				0.4,
+				0.95,
+				0.75
+			);
+			const compactKeepLastTurns = this.clampInt(
+				config.get("codexCompactKeepLastTurns", 18),
+				2,
+				64,
+				18
+			);
+			const tokenBudget = Math.max(1, Math.floor(configuredContext * codexContextUtil * 0.45));
+			compactionTokenBudget = tokenBudget;
+			compactionResult = compactCodexMessages(inputMessages, {
+				tokenBudget,
+				keepLastCount: compactKeepLastTurns,
+				label: "Conversation summary (Codex auto-compact)",
+			});
+		}
+
+		const serializedMessages = compactionResult?.compacted ?? inputMessages;
+		const maxInputChars = config.get("codexMaxInputChars", 600_000);
+		const input = serializeCodexConversation(serializedMessages, {
+			maxTextChars: maxInputChars,
 			maxToolResultChars: config.get("codexMaxToolResultChars", 12_000),
 		});
-		const reusedThread = activeTurn ?? conversationContinuation;
+		const reusedThread = activeTurn ?? interruptedContinuation ?? conversationContinuation;
+		const threadMode: CodexThreadMode = activeTurn
+			? "tool-resume"
+			: interruptedContinuation ? "interrupted-resume"
+				: conversationContinuation ? rolledOver ? "rollover" : "reused"
+					: "new";
 		const threadRuntimeKey = reusedThread?.runtimeKey ?? runtimeKey;
 		const threadToolCatalogKey = reusedThread?.toolCatalogKey ?? toolCatalogKey;
 		const threadCallableNames = reusedThread?.callableNames ?? dynamicToolSet.callableNames;
@@ -880,10 +1080,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			currentToolSignatures
 		);
 		const toolCatalogChanged = Boolean(reusedThread && threadToolCatalogKey !== toolCatalogKey);
+		const toolSchemaChars = JSON.stringify(dynamicToolSet.specs).length;
 
 		this.logSink?.log("codex.chat.start", {
 			model: model.id,
 			messageCount: messages.length,
+			inputMessageCount: serializedMessages.length,
 			inputChars: input.text.length,
 			originalInputChars: input.originalTextChars,
 			includedMessageCount: input.includedMessageCount,
@@ -896,6 +1098,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			vsCodeToolCount: dynamicToolSet.callableNames.size,
 			deferredVsCodeToolCount: dynamicToolSet.deferredNames.size,
 			skippedVsCodeToolCount: dynamicToolSet.skippedNames.length,
+			compacted: compactionResult?.wasCompacted ?? false,
+			messageCountAfterCompact: compactionResult?.messageCountAfter,
+			messageCountBeforeCompact: compactionResult?.messageCountBefore,
+			tokenEstimateAfterCompact: compactionResult?.tokenEstimateAfter,
+			tokenEstimateBeforeCompact: compactionResult?.tokenEstimateBefore,
 			modelOptionKeys: Object.keys(options.modelOptions ?? {}).sort(),
 			copilotConversationIdPresent: copilotConversationId !== undefined,
 			copilotTurnIndex,
@@ -911,9 +1118,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			requestedEphemeral: useEphemeralThreads,
 			continuation: Boolean(activeTurn),
 			rolledOver,
+			threadMode,
+			threadReuseMissReason,
 			continuationCallId: continuationMatch?.callId,
 			inputMode,
-			toolSchemaChars: JSON.stringify(dynamicToolSet.specs).length,
+			toolSchemaChars,
 			eagerToolSchemaChars: JSON.stringify(dynamicToolSet.specs.filter(tool => tool.type === "function")).length,
 		});
 
@@ -927,6 +1136,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				turnId: bridge.turnId,
 				callId: continuationMatch!.callId,
 			});
+		} else if (interruptedContinuation) {
+			threadId = interruptedContinuation.threadId;
+			this.logSink?.log("codex.chat.interrupted_thread_reused", {
+				threadId,
+				inputMode,
+				inputChars: input.text.length,
+				previousTurnIndex: interruptedContinuation.copilotTurnIndex,
+				currentTurnIndex: copilotTurnIndex,
+				reason: interruptedContinuation.reason,
+			}, "warn");
+			bridge = this.createTurnBridge(threadId, model.id, interruptedContinuation.ephemeral);
 		} else if (conversationContinuation) {
 			threadId = conversationContinuation.threadId;
 			this.logSink?.log("codex.chat.thread_reused", {
@@ -975,6 +1195,25 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			}
 			bridge = this.createTurnBridge(threadId, model.id, thread.thread.ephemeral);
 		}
+		if (!activeTurn) {
+			const tokenEstimateAfterCompact = compactionResult?.tokenEstimateAfter
+				?? estimateCodexInputTokens(input.text);
+			bridge.setInputDiagnostics({
+				inputMode: interruptedContinuation || conversationContinuation ? "user-turn" : "full",
+				messageCountBeforeCompact: compactionResult?.messageCountBefore ?? inputMessages.length,
+				messageCountAfterCompact: compactionResult?.messageCountAfter ?? serializedMessages.length,
+				tokenEstimateBeforeCompact: compactionResult?.tokenEstimateBefore ?? tokenEstimateAfterCompact,
+				tokenEstimateAfterCompact,
+				compacted: compactionResult?.wasCompacted ?? false,
+				compactionTokenBudget,
+				hardInputTargetTokens: Math.max(1, Math.ceil(maxInputChars / 4)),
+				toolSchemaTokens: Math.ceil(toolSchemaChars / 4),
+				toolCount: dynamicToolSet.specs.length,
+				threadMode,
+				threadReuseMissReason,
+				conversationKey: codexConversationKey(copilotConversationId),
+			});
+		}
 		if (!activeTurn && effectiveTools.callableNames.size > 0) {
 			this.dynamicToolContexts.set(threadId, {
 				callableNames: effectiveTools.callableNames,
@@ -987,25 +1226,31 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			model.id,
 			modelInfo,
 			input.text,
-			JSON.stringify(dynamicToolSet.specs).length,
+			toolSchemaChars,
 			bridge.tokenUsage ?? this.tokenUsageByThread.get(threadId)
 		);
 		const segmentStartedAt = Date.now();
 		let keepBridge = false;
 		try {
-			const recoveryTurnParams = {
-				threadId,
-				input: [{ type: "text", text: CODEX_FAILED_TOOL_TURN_RECOVERY_PROMPT, text_elements: [] }],
-				effort,
-				summary: ["auto", "concise", "detailed", "none"].includes(summary) ? summary : "auto",
-				...(serviceTier ? { serviceTier } : {}),
-			};
 			const recoverToolTurn = async (
-				trigger: "stale-boundary" | "terminal-failed",
+				trigger: "stale-boundary" | "blocked-internal-tool" | "terminal-failed",
 				failedTurnId: string | undefined,
 				error: Error,
 				interrupt: boolean
 			): Promise<CodexTurnBoundary> => {
+				const recoveryTurnParams = {
+					threadId,
+					input: [{
+						type: "text",
+						text: trigger === "blocked-internal-tool"
+							? CODEX_BLOCKED_INTERNAL_TOOL_RECOVERY_PROMPT
+							: CODEX_FAILED_TOOL_TURN_RECOVERY_PROMPT,
+						text_elements: [],
+					}],
+					effort,
+					summary: ["auto", "concise", "detailed", "none"].includes(summary) ? summary : "auto",
+					...(serviceTier ? { serviceTier } : {}),
+				};
 				this.logSink?.log("codex.chat.turn_recovery_started", {
 					threadId,
 					turnId: failedTurnId,
@@ -1066,12 +1311,21 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					}, progress, token);
 			} catch (error) {
 				const normalized = error instanceof Error ? error : new Error(String(error));
+				const blockedInternalTool = normalized instanceof CodexInternalToolBlockedError;
 				if (
-					activeTurn
-					&& !token.isCancellationRequested
+					!token.isCancellationRequested
+					&& (activeTurn || blockedInternalTool)
 					&& shouldRecoverCodexToolTurnException(normalized)
 				) {
-					outcome = await recoverToolTurn("stale-boundary", bridge.turnId, normalized, true);
+					if (blockedInternalTool) {
+						await bridge.waitForBlockedInternalToolInterrupt();
+					}
+					outcome = await recoverToolTurn(
+						blockedInternalTool ? "blocked-internal-tool" : "stale-boundary",
+						bridge.turnId,
+						normalized,
+						!blockedInternalTool
+					);
 				} else {
 					this.logSink?.logError("codex.chat.request_failed", normalized, {
 						threadId,
@@ -1104,6 +1358,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					toolSignatures: threadToolSignatures,
 					createdAt: Date.now(),
 					processGeneration: this.client.generation,
+					copilotConversationId,
+					copilotTurnIndex,
 				};
 				for (const call of bridge.reportedCalls) {
 					this.activeToolTurns.set(call.callId, active);
@@ -1139,7 +1395,53 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			}
 
 			if (bridge.tokenUsage) {
-				this.recordTokenUsage(threadId, model.id, bridge.tokenUsage, "completed");
+				const liveMetrics = bridge.liveMetrics;
+				const rolloutMetrics = await this.collectRolloutMetrics(
+					threadId,
+					bridge.turnId ?? completed.turn.id,
+					bridge.ephemeral
+				);
+				const directMetrics = rolloutMetrics ?? liveMetrics;
+				const inputDiagnostics = bridge.inputDiagnostics;
+				const usageSegments = rolloutMetrics?.usageSegments ?? liveMetrics.usageSegments;
+				const turnDiag: CodexTurnDiagnostics = {
+					requestId: bridge.turnId ?? threadId,
+					durationMs: Date.now() - bridge.startedAt,
+					outputChars: bridge.finalTextChars,
+					toolCalls: directMetrics.toolCalls,
+					toolNames: directMetrics.toolNames,
+					toolDuration: directMetrics.toolDuration,
+					modelSegments: directMetrics.modelSegments,
+					usageSegments,
+					usageSegmentsTruncated: directMetrics.usageSegmentsTruncated,
+					steps: mergeCodexTurnSteps(rolloutMetrics?.steps, liveMetrics.steps),
+					firstModelEventLatencyMs: liveMetrics.firstModelEventLatencyMs
+						?? rolloutMetrics?.firstModelEventLatencyMs,
+					firstVisibleMessageLatencyMs: liveMetrics.firstVisibleMessageLatencyMs
+						?? rolloutMetrics?.firstVisibleMessageLatencyMs,
+					messageCount: inputDiagnostics?.messageCountBeforeCompact ?? messages.length,
+					compacted: inputDiagnostics?.compacted ?? false,
+					messageCountBeforeCompact: inputDiagnostics?.messageCountBeforeCompact,
+					messageCountAfterCompact: inputDiagnostics?.messageCountAfterCompact,
+					tokenEstimateBeforeCompact: inputDiagnostics?.tokenEstimateBeforeCompact,
+					tokenEstimateAfterCompact: inputDiagnostics?.tokenEstimateAfterCompact,
+					ephemeral: bridge.ephemeral,
+					continuation: Boolean(activeTurn),
+					inputMode: inputDiagnostics?.inputMode ?? inputMode,
+					contextWindow: bridge.tokenUsage?.modelContextWindow ?? null,
+					contextUsedTokens: bridge.tokenUsage.last.totalTokens,
+					compactionTokenBudget: inputDiagnostics?.compactionTokenBudget,
+					hardInputTargetTokens: inputDiagnostics?.hardInputTargetTokens
+						?? Math.max(1, Math.ceil(maxInputChars / 4)),
+					toolSchemaTokens: inputDiagnostics?.toolSchemaTokens ?? Math.ceil(toolSchemaChars / 4),
+					toolCount: inputDiagnostics?.toolCount ?? dynamicToolSet.specs.length,
+					metricsSource: directMetrics.source,
+					lifecyclePhase: "completed",
+					threadMode: inputDiagnostics?.threadMode ?? threadMode,
+					threadReuseMissReason: inputDiagnostics?.threadReuseMissReason ?? threadReuseMissReason,
+					conversationKey: inputDiagnostics?.conversationKey ?? codexConversationKey(copilotConversationId),
+				};
+				this.recordTokenUsage(threadId, model.id, bridge.tokenUsage, "completed", turnDiag);
 				const usage = {
 					prompt_tokens: bridge.tokenUsage.last.inputTokens,
 					completion_tokens: bridge.tokenUsage.last.outputTokens,
@@ -1220,6 +1522,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			active.bridge.dispose();
 		}
 		this.activeToolTurns.clear();
+		this.interruptedToolThreads.clear();
+		this.staleToolCalls.clear();
 		this.dynamicToolContexts.clear();
 		this.conversationThreads.clear();
 		this.tokenUsageByThread.clear();
@@ -1232,6 +1536,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.modelChanges.dispose();
 		this.statusChanges.dispose();
 		this.usageRecords.dispose();
+		this.liveTurnUpdates.dispose();
 	}
 
 	private pruneActiveToolTurns(): void {
@@ -1239,7 +1544,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		for (const [callId, active] of this.activeToolTurns) {
 			if (active.createdAt < oldestAllowed || active.processGeneration !== this.client.generation) {
 				this.activeToolTurns.delete(callId);
-				this.abandonActiveToolTurn(active);
+				this.abandonActiveToolTurn(active, "abandoned", active.processGeneration === this.client.generation);
 			}
 		}
 		while (this.activeToolTurns.size > MAX_CODEX_CONTINUATIONS) {
@@ -1250,25 +1555,242 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			const active = this.activeToolTurns.get(oldestCallId);
 			this.activeToolTurns.delete(oldestCallId);
 			if (active) {
-				this.abandonActiveToolTurn(active);
+				this.abandonActiveToolTurn(active, "abandoned", true);
 			}
 		}
+		this.pruneInterruptedToolThreads();
 	}
 
-	private abandonActiveToolTurn(active: ActiveCodexToolTurn): void {
+	private removeActiveToolTurn(active: ActiveCodexToolTurn): void {
 		for (const [callId, candidate] of this.activeToolTurns) {
 			if (candidate === active) {
 				this.activeToolTurns.delete(callId);
 			}
 		}
 		this.dynamicToolContexts.delete(active.bridge.threadId);
+	}
+
+	private rememberStaleToolCalls(active: ActiveCodexToolTurn, reason: string): void {
+		const expiresAt = Date.now() + CODEX_CONTINUATION_TTL_MS;
+		for (const [callId, candidate] of this.activeToolTurns) {
+			if (candidate === active) {
+				this.staleToolCalls.set(callId, { reason, expiresAt });
+			}
+		}
+		for (const pending of active.bridge.pendingCalls) {
+			this.staleToolCalls.set(pending.callId, { reason, expiresAt });
+		}
+		this.pruneStaleToolCalls();
+	}
+
+	private pruneStaleToolCalls(): void {
+		const now = Date.now();
+		for (const [callId, stale] of this.staleToolCalls) {
+			if (stale.expiresAt <= now) {
+				this.staleToolCalls.delete(callId);
+			}
+		}
+		while (this.staleToolCalls.size > MAX_CODEX_CONTINUATIONS * 4) {
+			const oldestCallId = this.staleToolCalls.keys().next().value as string | undefined;
+			if (!oldestCallId) {
+				break;
+			}
+			this.staleToolCalls.delete(oldestCallId);
+		}
+	}
+
+	private toInterruptedToolThread(
+		active: ActiveCodexToolTurn,
+		reason: RecoverableInterruptedCodexThread["reason"]
+	): RecoverableInterruptedCodexThread | undefined {
+		if (!active.copilotConversationId || active.processGeneration !== this.client.generation) {
+			return undefined;
+		}
+		return {
+			threadId: active.bridge.threadId,
+			ephemeral: active.bridge.ephemeral,
+			modelId: active.modelId,
+			runtimeKey: active.runtimeKey,
+			toolCatalogKey: active.toolCatalogKey,
+			callableNames: active.callableNames,
+			toolNamespaces: active.toolNamespaces,
+			toolSignatures: active.toolSignatures,
+			copilotConversationId: active.copilotConversationId,
+			copilotTurnIndex: active.copilotTurnIndex,
+			processGeneration: active.processGeneration,
+			interruptedAt: Date.now(),
+			reason,
+		};
+	}
+
+	private rememberInterruptedToolThread(
+		active: ActiveCodexToolTurn,
+		reason: RecoverableInterruptedCodexThread["reason"]
+	): RecoverableInterruptedCodexThread | undefined {
+		const recoverable = this.toInterruptedToolThread(active, reason);
+		if (recoverable) {
+			this.interruptedToolThreads.set(recoverable.threadId, recoverable);
+			this.pruneInterruptedToolThreads();
+		}
+		return recoverable;
+	}
+
+	private abandonActiveToolTurn(
+		active: ActiveCodexToolTurn,
+		phase: Exclude<CodexTurnLifecyclePhase, "running" | "completed"> = "abandoned",
+		preserveThread = false
+	): void {
+		this.rememberStaleToolCalls(active, phase);
+		this.removeActiveToolTurn(active);
+		if (preserveThread) {
+			this.rememberInterruptedToolThread(active, phase === "timed_out" ? "timed_out" : "abandoned");
+		}
 		active.bridge.dispose();
+		this.emitLiveTurnUpdate(
+			active.bridge,
+			active.modelId,
+			phase,
+			phase === "timed_out"
+				? "Native VS Code tool execution timed out after 30 minutes."
+				: "The active native VS Code tool turn was abandoned before completion."
+		);
+		this.finishRuntimeMetrics(active.bridge.threadId);
 		void active.bridge.interrupt().catch(error => {
 			this.logSink?.logError("codex.chat.abandon_interrupt_failed", error, {
 				threadId: active.bridge.threadId,
 				turnId: active.bridge.turnId,
 			});
 		});
+	}
+
+	private async interruptActiveToolTurn(
+		active: ActiveCodexToolTurn,
+		reason: "interrupted"
+	): Promise<RecoverableInterruptedCodexThread | undefined> {
+		this.rememberStaleToolCalls(active, reason);
+		this.removeActiveToolTurn(active);
+		try {
+			await active.bridge.interrupt();
+			const recoverable = this.rememberInterruptedToolThread(active, reason);
+			active.bridge.dispose();
+			this.emitLiveTurnUpdate(
+				active.bridge,
+				active.modelId,
+				"interrupted",
+				"A newer user turn interrupted the pending native VS Code tool boundary."
+			);
+			this.finishRuntimeMetrics(active.bridge.threadId);
+			return recoverable;
+		} catch (error) {
+			active.bridge.dispose();
+			this.emitLiveTurnUpdate(
+				active.bridge,
+				active.modelId,
+				"failed",
+				"The pending tool turn could not be interrupted safely; a fresh thread is required."
+			);
+			this.finishRuntimeMetrics(active.bridge.threadId);
+			this.logSink?.logError("codex.chat.steering_interrupt_failed", error, {
+				threadId: active.bridge.threadId,
+				turnId: active.bridge.turnId,
+			});
+			return undefined;
+		}
+	}
+
+	private takeInterruptedToolThread(
+		modelId: string,
+		runtimeKey: string,
+		copilotConversationId: string,
+		copilotTurnIndex: number | undefined
+	): RecoverableInterruptedCodexThread | undefined {
+		this.pruneInterruptedToolThreads();
+		const candidate = [...this.interruptedToolThreads.values()]
+			.filter(entry =>
+				entry.modelId === modelId
+				&& entry.runtimeKey === runtimeKey
+				&& entry.copilotConversationId === copilotConversationId
+				&& entry.processGeneration === this.client.generation
+				&& (
+					copilotTurnIndex === undefined
+					|| entry.copilotTurnIndex === undefined
+					|| copilotTurnIndex > entry.copilotTurnIndex
+				)
+			)
+			.sort((left, right) => right.interruptedAt - left.interruptedAt)[0];
+		if (candidate) {
+			this.interruptedToolThreads.delete(candidate.threadId);
+		}
+		return candidate;
+	}
+
+	private pruneInterruptedToolThreads(): void {
+		const oldestAllowed = Date.now() - CODEX_CONTINUATION_TTL_MS;
+		for (const [threadId, entry] of this.interruptedToolThreads) {
+			if (entry.interruptedAt < oldestAllowed || entry.processGeneration !== this.client.generation) {
+				this.interruptedToolThreads.delete(threadId);
+			}
+		}
+		while (this.interruptedToolThreads.size > MAX_CODEX_CONTINUATIONS) {
+			const oldest = [...this.interruptedToolThreads.values()]
+				.sort((left, right) => left.interruptedAt - right.interruptedAt)[0];
+			if (!oldest) {
+				break;
+			}
+			this.interruptedToolThreads.delete(oldest.threadId);
+		}
+	}
+
+	private async collectRolloutMetrics(
+		threadId: string,
+		turnId: string,
+		ephemeral: boolean
+	): Promise<CodexRolloutTurnMetrics | undefined> {
+		if (ephemeral) {
+			return undefined;
+		}
+		try {
+			const response = await this.client.request<CodexThreadReadResponse>(
+				"thread/read",
+				{ threadId },
+				5_000
+			);
+			const rolloutPath = response.thread.path;
+			if (typeof rolloutPath !== "string" || !rolloutPath.trim()) {
+				return undefined;
+			}
+			let metrics: CodexRolloutTurnMetrics | undefined;
+			for (let attempt = 0; attempt < 3; attempt++) {
+				metrics = await readCodexRolloutMetrics(rolloutPath, turnId);
+				if (metrics?.completed) {
+					break;
+				}
+				if (attempt < 2) {
+					await new Promise<void>(resolve => setTimeout(resolve, 25 * (attempt + 1)));
+				}
+			}
+			if (metrics) {
+				this.logSink?.log("codex.chat.rollout_metrics", {
+					threadId,
+					turnId,
+					completed: metrics.completed,
+					modelSegments: metrics.modelSegments,
+					toolCalls: metrics.toolCalls,
+					toolOutputs: metrics.toolOutputs,
+					toolDurationMs: metrics.toolDuration,
+					firstModelEventLatencyMs: metrics.firstModelEventLatencyMs,
+					firstVisibleMessageLatencyMs: metrics.firstVisibleMessageLatencyMs,
+				});
+			}
+			return metrics?.completed ? metrics : undefined;
+		} catch (error) {
+			this.logSink?.log("codex.chat.rollout_metrics_unavailable", {
+				threadId,
+				turnId,
+				error: error instanceof Error ? error.message : String(error),
+			}, "debug");
+			return undefined;
+		}
 	}
 
 	private beginRuntimeMetrics(
@@ -1314,14 +1836,15 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		threadId: string,
 		modelId: string,
 		usage: CodexThreadTokenUsage,
-		phase: "running" | "completed"
+		phase: "running" | "completed",
+		turnDiagnostics?: CodexTurnDiagnostics
 	): void {
 		this.tokenUsageByThread.set(threadId, usage);
 		if (phase === "completed") {
 			const delta = diffCodexThreadUsage(usage, this.accountedTokenUsageByThread.get(threadId));
 			this.accountedTokenUsageByThread.set(threadId, usage);
 			if (delta) {
-				this.usageRecords.fire({ modelId, ...delta });
+				this.usageRecords.fire({ modelId, ...delta, turnDiagnostics });
 			}
 		}
 		this.lastTokenUsage = usage;
@@ -1376,21 +1899,111 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.runtimeRefreshTimer.unref?.();
 	}
 
-	private createTurnBridge(threadId: string, modelId: string, ephemeral: boolean): CodexTurnBridge {
-		return new CodexTurnBridge(this.client, threadId, this.logSink, bridge => {
+	private createTurnBridge(
+		threadId: string,
+		modelId: string,
+		ephemeral: boolean
+	): CodexTurnBridge {
+		return new CodexTurnBridge(this.client, threadId, this.logSink, (bridge, reason) => {
 			const active = [...this.activeToolTurns.values()].find(candidate => candidate.bridge === bridge);
 			if (active) {
-				this.logSink?.log("codex.chat.tool_timeout", {
+				const phase: Exclude<CodexTurnLifecyclePhase, "running" | "completed"> = reason === "timeout"
+					? "timed_out"
+					: "failed";
+				this.logSink?.log(reason === "timeout" ? "codex.chat.tool_timeout" : "codex.chat.client_stopped", {
 					threadId: bridge.threadId,
 					turnId: bridge.turnId,
 				}, "warn");
-				this.abandonActiveToolTurn(active);
+				this.abandonActiveToolTurn(active, phase, reason === "timeout");
 			}
 		}, (_bridge, usage) => {
 			this.recordTokenUsage(threadId, modelId, usage, "running");
 		}, (_bridge, estimatedOutputTokens) => {
 			this.recordOutputProgress(threadId, estimatedOutputTokens);
-		}, ephemeral, true);
+		}, ephemeral, true, bridge => {
+			this.emitLiveTurnUpdate(bridge, modelId);
+		});
+	}
+
+	private emitLiveTurnUpdate(
+		bridge: CodexTurnBridge,
+		modelId: string,
+		phase: CodexLiveTurnUpdate["phase"] = "running",
+		terminalDetail?: string
+	): void {
+		const usage = bridge.tokenUsage;
+		const inputDiagnostics = bridge.inputDiagnostics;
+		const liveMetrics = bridge.liveMetrics;
+		const contextWindow = usage?.modelContextWindow
+			?? this.clampNumber(
+				this.getConfig().get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
+				32_768,
+				1_048_576,
+				DEFAULT_CODEX_CONTEXT_LENGTH
+			);
+		const inputTokens = usage?.last.inputTokens
+			?? inputDiagnostics?.tokenEstimateAfterCompact
+			?? 0;
+		const outputTokens = usage?.last.outputTokens ?? 0;
+		const reasoningOutputTokens = usage?.last.reasoningOutputTokens ?? 0;
+		const cachedInputTokens = usage?.last.cachedInputTokens ?? 0;
+		const contextUsedTokens = usage?.last.totalTokens
+			?? inputTokens + outputTokens + reasoningOutputTokens;
+		const update: CodexLiveTurnUpdate = {
+			phase,
+			modelId,
+			inputTokens,
+			outputTokens,
+			cachedInputTokens,
+			reasoningOutputTokens,
+			turnDiagnostics: {
+				requestId: bridge.turnId ?? `${bridge.threadId}:starting`,
+				durationMs: Math.max(0, Date.now() - bridge.startedAt),
+				outputChars: bridge.finalTextChars,
+				toolCalls: liveMetrics.toolCalls,
+				toolNames: liveMetrics.toolNames,
+				toolDuration: liveMetrics.toolDuration,
+				modelSegments: liveMetrics.modelSegments,
+				usageSegments: liveMetrics.usageSegments,
+				usageSegmentsTruncated: liveMetrics.usageSegmentsTruncated,
+				steps: liveMetrics.steps,
+				firstModelEventLatencyMs: liveMetrics.firstModelEventLatencyMs,
+				firstVisibleMessageLatencyMs: liveMetrics.firstVisibleMessageLatencyMs,
+				messageCount: inputDiagnostics?.messageCountBeforeCompact ?? 1,
+				compacted: inputDiagnostics?.compacted ?? false,
+				messageCountBeforeCompact: inputDiagnostics?.messageCountBeforeCompact,
+				messageCountAfterCompact: inputDiagnostics?.messageCountAfterCompact,
+				tokenEstimateBeforeCompact: inputDiagnostics?.tokenEstimateBeforeCompact,
+				tokenEstimateAfterCompact: inputDiagnostics?.tokenEstimateAfterCompact,
+				ephemeral: bridge.ephemeral,
+				continuation: inputDiagnostics?.inputMode === "user-turn",
+				inputMode: inputDiagnostics?.inputMode ?? "full",
+				contextWindow,
+				contextUsedTokens,
+				compactionTokenBudget: inputDiagnostics?.compactionTokenBudget,
+				hardInputTargetTokens: inputDiagnostics?.hardInputTargetTokens ?? contextWindow,
+				toolSchemaTokens: inputDiagnostics?.toolSchemaTokens ?? 0,
+				toolCount: inputDiagnostics?.toolCount ?? 0,
+				metricsSource: "live",
+				lifecyclePhase: phase,
+				terminalDetail,
+				threadMode: inputDiagnostics?.threadMode,
+				threadReuseMissReason: inputDiagnostics?.threadReuseMissReason,
+				conversationKey: inputDiagnostics?.conversationKey,
+			},
+		};
+		this.liveTurnUpdates.fire(update);
+		if (phase !== "running" && usage) {
+			const delta = diffCodexThreadUsage(usage, this.accountedTokenUsageByThread.get(bridge.threadId));
+			this.accountedTokenUsageByThread.set(bridge.threadId, usage);
+			if (delta) {
+				this.usageRecords.fire({
+					modelId,
+					...delta,
+					turnDiagnostics: update.turnDiagnostics,
+				});
+			}
+		}
 	}
 
 	private async rememberConversationThread(conversation: CodexConversationThread): Promise<void> {
@@ -1771,6 +2384,18 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private clampNumber(value: unknown, min: number, max: number, fallback: number): number {
 		return typeof value === "number" && Number.isFinite(value)
 			? Math.max(min, Math.min(max, Math.floor(value)))
+			: fallback;
+	}
+
+
+	private clampRatio(value: unknown, min: number, max: number, fallback: number): number {
+		return typeof value === "number" && Number.isFinite(value)
+			? Math.max(min, Math.min(max, value))
+			: fallback;
+	}
+	private clampInt(value: unknown, min: number, max: number, fallback: number): number {
+		return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
+			? Math.max(min, Math.min(max, value))
 			: fallback;
 	}
 }

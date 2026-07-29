@@ -3,6 +3,39 @@ import { createHash } from "node:crypto";
 import { enhanceSubagentToolDescription } from "./subagent-guidance";
 import type { OpenAIChatMessage, OpenAIContentPart, OpenAIChatRole, OpenAIFunctionToolDef, OpenAIToolCall } from "./types";
 
+// --- Bounded LRU map (shared by caches that must not grow unbounded) ---
+
+/**
+ * A Map with a maximum capacity.  When the map would exceed `maxSize` after
+ * inserting a new key, the oldest entry (first in insertion order) is evicted
+ * — unless it is the freshly inserted key itself.
+ */
+export class BoundedMap<K, V> {
+	private readonly _map = new Map<K, V>();
+	constructor(private readonly maxSize: number) {}
+
+	get(key: K): V | undefined { return this._map.get(key); }
+	set(key: K, value: V): this {
+		this._map.delete(key);
+		this._map.set(key, value);
+		while (this._map.size > this.maxSize) {
+			const oldest = this._map.keys().next().value as K | undefined;
+			if (oldest === undefined || oldest === key) {
+				break;
+			}
+			this._map.delete(oldest);
+		}
+		return this;
+	}
+	delete(key: K): boolean { return this._map.delete(key); }
+	clear(): void { this._map.clear(); }
+	get size(): number { return this._map.size; }
+	keys(): IterableIterator<K> { return this._map.keys(); }
+
+	/** Iterate entries in insertion order (oldest first). */
+	[Symbol.iterator](): IterableIterator<[K, V]> { return this._map[Symbol.iterator](); }
+}
+
 // Tool calling sanitization helpers
 
 /**

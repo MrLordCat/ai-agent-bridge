@@ -1,3 +1,5 @@
+import { stableJsonStringify } from "../utils";
+
 export interface RequestCancellation {
 	readonly isCancellationRequested: boolean;
 	onCancellationRequested(listener: () => void): { dispose(): void };
@@ -85,7 +87,7 @@ export class OpenAIHttpTransport {
 			{
 				method: "POST",
 				headers,
-				body: JSON.stringify(requestBody),
+				body: stableJsonStringify(requestBody),
 			},
 			timeoutMs,
 			cancellation

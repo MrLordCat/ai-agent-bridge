@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
 import { isCacheControlPart } from "../utils";
+import { compactMessages } from "../context/message-compaction";
+import type { OpenAIChatMessage } from "../types";
 import type { CodexDynamicToolCallResponse } from "./dynamic-tools";
 
 interface SerializedConversationMessage {
@@ -608,4 +610,138 @@ export function estimateCodexInputTokens(value: string | vscode.LanguageModelCha
 		return Math.max(1, Math.ceil(value.length / 4));
 	}
 	return Math.max(1, Math.ceil(serializeCodexConversation([value]).text.length / 4));
+}
+
+export interface CodexCompactionOptions {
+	tokenBudget: number;
+	keepLastCount: number;
+	label: string;
+}
+
+export interface CodexCompactionResult {
+	compacted: vscode.LanguageModelChatRequestMessage[];
+	wasCompacted: boolean;
+	messageCountBefore: number;
+	messageCountAfter: number;
+	tokenEstimateBefore: number;
+	tokenEstimateAfter: number;
+}
+
+function vsCodeToOpenAiMessages(
+	messages: readonly vscode.LanguageModelChatRequestMessage[]
+): OpenAIChatMessage[] {
+	const raw: OpenAIChatMessage[] = [];
+	for (const message of messages) {
+		const contentParts: string[] = [];
+		for (const part of message.content) {
+			if (part instanceof vscode.LanguageModelTextPart) {
+				contentParts.push(part.value);
+			} else if (part instanceof vscode.LanguageModelToolCallPart) {
+				contentParts.push(`[tool call: ${part.name}, callId: ${part.callId}] ${JSON.stringify(part.input ?? {})}`);
+			} else if (part instanceof vscode.LanguageModelToolResultPart) {
+				const textParts: string[] = [];
+				for (const item of part.content) {
+					if (item instanceof vscode.LanguageModelTextPart) {
+						textParts.push(item.value);
+					}
+				}
+				contentParts.push(`[tool result, callId: ${part.callId}] ${textParts.join("\n")}`);
+			} else if (part instanceof vscode.LanguageModelDataPart) {
+				contentParts.push(`[data: ${part.mimeType}, ${part.data.byteLength} bytes]`);
+			}
+		}
+		raw.push({
+			role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user",
+			content: contentParts.join("\n"),
+			name: message.name,
+		});
+	}
+	return raw;
+}
+
+function openAiToVsCodeMessages(
+	messages: OpenAIChatMessage[]
+): vscode.LanguageModelChatRequestMessage[] {
+	return messages.map(message => {
+		const content = typeof message.content === "string"
+			? message.content
+			: Array.isArray(message.content)
+				? message.content
+					.filter(part => typeof (part as { text?: string }).text === "string")
+					.map(part => (part as { text: string }).text)
+					.join("\n")
+				: String(message.content ?? "");
+		const role = message.role === "assistant"
+			? vscode.LanguageModelChatMessageRole.Assistant
+			: vscode.LanguageModelChatMessageRole.User;
+		return {
+			role,
+			name: role === vscode.LanguageModelChatMessageRole.Assistant ? (message.name ?? "codex") : message.name ?? "user",
+			content: [new vscode.LanguageModelTextPart(content)],
+		} as vscode.LanguageModelChatRequestMessage;
+	});
+}
+
+export function compactCodexMessages(
+	messages: readonly vscode.LanguageModelChatRequestMessage[],
+	options: CodexCompactionOptions
+): CodexCompactionResult {
+	if (messages.length <= 2) {
+		const tokenEstimate = estimateCodexInputTokens(
+			messages.map(message => serializeCodexConversation([message]).text).join("\n")
+		);
+		return {
+			compacted: [...messages],
+			messageCountBefore: messages.length,
+			messageCountAfter: messages.length,
+			tokenEstimateBefore: tokenEstimate,
+			tokenEstimateAfter: tokenEstimate,
+			wasCompacted: false,
+		};
+	}
+
+	const openAiMessages = vsCodeToOpenAiMessages(messages);
+	const tokenEstimateBefore = estimateCodexInputTokens(
+		openAiMessages.map(message => message.content as string).join("\n")
+	);
+
+	if (tokenEstimateBefore <= options.tokenBudget) {
+		return {
+			compacted: [...messages],
+			messageCountBefore: messages.length,
+			messageCountAfter: messages.length,
+			tokenEstimateBefore,
+			tokenEstimateAfter: tokenEstimateBefore,
+			wasCompacted: false,
+		};
+	}
+
+	const compacted = compactMessages(openAiMessages, {
+		tokenBudget: options.tokenBudget,
+		keepLastCount: options.keepLastCount,
+		label: options.label,
+		estimateTokens: candidate => {
+			let total = 0;
+			for (const message of candidate) {
+				total += estimateCodexInputTokens(
+					typeof message.content === "string" ? message.content : JSON.stringify(message.content)
+				);
+			}
+			return total;
+		},
+	});
+
+	const compactedVsCode = openAiToVsCodeMessages(compacted);
+	const tokenEstimateAfter = estimateCodexInputTokens(
+		compacted.map(message => typeof message.content === "string" ? message.content : "").join("\n")
+	);
+
+	return {
+		compacted: compactedVsCode,
+		wasCompacted: true,
+		messageCountBefore: messages.length,
+		messageCountAfter: compactedVsCode.length,
+		tokenEstimateBefore,
+		tokenEstimateAfter,
+	};
 }

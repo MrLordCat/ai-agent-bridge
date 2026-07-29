@@ -16,6 +16,7 @@ export type CacheMissReason =
 	| "system_prompt_changed"
 	| "history_rewritten"
 	| "history_truncated"
+	| "history_summarized"
 	| "session_not_reused"
 	| "upstream_expired"
 	| "unknown";
@@ -46,6 +47,8 @@ export interface CacheDiagnosticsInput {
 	usage?: PromptCacheUsage;
 	prefix?: CachePrefixTelemetry;
 	session?: CacheSessionTelemetry;
+	/** True when auto-compaction ran this turn — always produces a cache miss. */
+	autoCompacted?: boolean;
 }
 
 export interface CacheDiagnosticsReport extends Record<string, unknown> {
@@ -61,8 +64,50 @@ export interface CacheDiagnosticsReport extends Record<string, unknown> {
 	detail: string;
 }
 
+export interface CodexTurnCacheClassificationInput {
+	threadMode?: string;
+	threadReuseMissReason?: string;
+	initialSegmentHitPercent?: number;
+	finalSegmentHitPercent?: number;
+	processedHitPercent?: number;
+}
+
+/** Separates a real cold first segment from the health of later Codex continuations. */
+export function classifyCodexTurnCache(
+	input: CodexTurnCacheClassificationInput
+): { reason?: CacheMissReason; detail?: string } {
+	const effectiveHit = input.finalSegmentHitPercent ?? input.processedHitPercent;
+	if (effectiveHit === undefined) {
+		return {};
+	}
+	const newThread = input.threadMode === "new";
+	if (effectiveHit >= HEALTHY_HIT_PERCENT) {
+		return {
+			reason: "healthy",
+			detail: newThread
+				? `A new Codex thread was required (${input.threadReuseMissReason ?? "no compatible completed thread"}). `
+					+ `Its first model segment was ${formatHit(input.initialSegmentHitPercent)}, then continuation recovered to ${formatHit(effectiveHit)}.`
+				: undefined,
+		};
+	}
+	if (newThread) {
+		return {
+			reason: "session_not_reused",
+			detail: `A new Codex thread was required (${input.threadReuseMissReason ?? "no compatible completed thread"}). Later model segments did not recover above ${HEALTHY_HIT_PERCENT}%.`,
+		};
+	}
+	return {
+		reason: "unknown",
+		detail: `The final Codex model segment cache hit was below ${HEALTHY_HIT_PERCENT}%.`,
+	};
+}
+
 /** Below this share of a reused prompt the miss is worth explaining. */
 const HEALTHY_HIT_PERCENT = 90;
+
+function formatHit(value: number | undefined): string {
+	return value === undefined ? "unreported" : `${value.toFixed(1)}% cache hit`;
+}
 
 function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; detail: string } {
 	const { usage, prefix, session } = input;
@@ -120,16 +165,65 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 			};
 		}
 		if (previousCount !== undefined && identical < previousCount) {
-			const reason: CacheMissReason = prefix.messageCount !== undefined
-				&& prefix.messageCount < previousCount
-				&& identical >= prefix.messageCount
+			const currentCount = prefix.messageCount ?? previousCount;
+			const changedCount = previousCount - identical;
+			const newCount = Math.max(0, currentCount - previousCount);
+			const totalChanged = changedCount + newCount;
+			const changedShare = previousCount > 0 ? totalChanged / previousCount : 1;
+			const uncachedShare = usage.promptTokens > 0
+				? usage.uncachedTokens / usage.promptTokens
+				: 0;
+
+			// Compaction replaced most of the history with a summary.
+			if (input.autoCompacted || currentCount < previousCount * 0.3) {
+				return {
+					reason: "history_summarized",
+					detail: `history was compacted from ${previousCount} to ${currentCount} messages ` +
+						`(${usage.hitPercent.toFixed(1)}% hit — expected after compaction)`,
+				};
+			}
+
+			// Few messages changed at the tail, but most tokens are uncached →
+			// the real cause is upstream cache eviction, not the rewrite.
+			if (changedShare < 0.3 && uncachedShare > changedShare * 2 + 0.15) {
+				return {
+					reason: "upstream_expired",
+					detail: `${identical} of ${previousCount} messages matched ` +
+						`(${(100 - changedShare * 100).toFixed(1)}% reusable), ` +
+						`but the upstream cache entry expired (only ${usage.hitPercent.toFixed(1)}% hit)`,
+				};
+			}
+
+			const reason: CacheMissReason = currentCount < previousCount
+				&& identical >= currentCount
 				? "history_truncated"
 				: "history_rewritten";
 			const detail = reason === "history_truncated"
-				? `history shrank from ${previousCount} to ${prefix.messageCount} messages`
+				? `history shrank from ${previousCount} to ${currentCount} messages`
 				: `history diverged at message ${identical} of ${previousCount}; `
 					+ "an already sent message was rewritten, so everything after it missed";
 			return { reason, detail };
+		}
+
+		// All prior messages matched byte-for-byte → the reused portion should be
+		// fully cached.  A hit% below 90% is expected when several new messages
+		// were appended this turn (they are uncached by definition).  Only flag a
+		// problem when the hit% is suspiciously low despite a perfect prefix match.
+		if (identical !== undefined && previousCount !== undefined && identical >= previousCount) {
+			if (usage.hitPercent >= 70) {
+				const newMsgs = (prefix.messageCount ?? previousCount) - previousCount;
+				return {
+					reason: "healthy",
+					detail: `all ${previousCount} prior messages matched; ` +
+						`${newMsgs} new message(s) added this turn`,
+				};
+			}
+			return {
+				reason: "upstream_expired",
+				detail: `all ${previousCount} prior messages matched ` +
+					`but only ${usage.hitPercent.toFixed(1)}% was cached — ` +
+					`upstream cache entry was evicted or expired`,
+			};
 		}
 	}
 

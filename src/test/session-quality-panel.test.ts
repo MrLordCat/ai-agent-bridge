@@ -1,0 +1,222 @@
+import * as assert from "node:assert";
+import { Script } from "node:vm";
+
+import { SessionQualityPanel } from "../ui/session-quality-panel";
+
+suite("session quality panel", () => {
+	test("renders the responsive live dashboard with valid embedded JavaScript", () => {
+		const data = {
+			generatedAt: "2026-07-28T08:58:45.592Z",
+			extensionVersion: "1.8.37",
+			vscodeVersion: "1.127.0",
+			summary: {
+				turns: 2,
+				totalModelTurns: 33,
+				promptTokens: 16_475_311,
+				cachedPromptTokens: 16_012_544,
+				cacheHitPercent: 97.2,
+				cacheAverageHitPercent: 57.6,
+				cacheWorstHitPercent: 18,
+				turnsWithCacheReport: 2,
+				cacheHealthyTurns: 1,
+				cacheStartupMissTurns: 1,
+				cacheMissBreakdown: [{ reason: "tool_catalog_changed", count: 1, percent: 100 }],
+				cacheByModel: [{
+					modelLabel: "deepseek (v4-pro)",
+					turns: 1,
+					modelSegments: 32,
+					promptTokens: 32_692,
+					cachedTokens: 5_888,
+					hitPercent: 18,
+					healthyTurns: 0,
+					missTurns: 1,
+					subagentTurns: 0,
+				}],
+				averageFirstTokenLatencyMs: 3304,
+				averageTokensPerSecond: 5.4,
+				totalToolCalls: 1,
+				repairedToolCalls: 0,
+				rejectedToolCalls: 0,
+				toolCallRepairRetries: 0,
+				toolLoopsDetected: 0,
+				compactedTurns: 1,
+				overflowRetries: 0,
+			},
+			records: [{
+				index: 1,
+				requestId: "request-1",
+				modelId: "deepseek::deepseek-v4-pro",
+				promptTokens: 32_692,
+				cachedPromptTokens: 5_888,
+				promptCacheHitPercent: 18,
+				cacheMissReason: "tool_catalog_changed",
+				cacheMissDetail: "catalog changed </script><script>bad()</script>",
+				firstTokenLatencyMs: 3304,
+				tokensPerSecond: 5.4,
+				toolCalls: 1,
+				modelTurns: 32,
+				firstVisibleLatencyMs: 5100,
+				reasoningOutputTokens: 4043,
+				toolDurationTotalMs: 3000,
+				averageToolDurationMs: 3000,
+				maximumToolDurationMs: 3000,
+				p95ToolDurationMs: 3000,
+				toolCallBreakdown: { read_file: 1 },
+				metricsSource: "rollout",
+				usageSegments: [{
+					index: 1,
+					recordedAt: "2026-07-28T08:58:40.000Z",
+					inputTokens: 1000,
+					cachedInputTokens: 900,
+					outputTokens: 100,
+					reasoningOutputTokens: 40,
+					totalTokens: 1100,
+					cacheHitPercent: 90,
+				}],
+				context: {
+					contextLength: 524_288,
+					inputBudget: 445_644,
+					messageTokensBeforeCompact: 521_884,
+					messageTokensAfterCompact: 401_000,
+					messageCountBeforeCompact: 1459,
+					messageCountAfterCompact: 1090,
+					replyReserveTokens: 36_700,
+					toolTokens: 7064,
+					cappedTools: 70,
+					softInputTarget: 401_880,
+					hardInputTarget: 333_723,
+					tokenCountSource: "heuristic",
+					estimatedUsedTokens: 444_764,
+					estimatedFreeTokens: 79_524,
+					estimatedUsagePercent: 84.8,
+					autoCompacted: true,
+					hardCompacted: false,
+				},
+			}, {
+				index: 2,
+				requestId: "codex-request",
+				modelId: "gpt-5.6-sol",
+				providerKind: "codex",
+				lifecyclePhase: "timed_out",
+				terminalDetail: "Native VS Code tool timed out.",
+				threadMode: "interrupted-resume",
+				threadReuseMissReason: "no-stored-thread",
+				promptTokens: 235_703,
+				cachedPromptTokens: 115_456,
+				promptCacheHitPercent: 49,
+				initialSegmentCacheHitPercent: 0,
+				continuationCacheHitPercent: 96.7,
+				finalSegmentInputTokens: 119_410,
+				finalSegmentCachedInputTokens: 115_456,
+				cacheMissReason: "healthy",
+				modelTurns: 2,
+				toolCalls: 1,
+				delegatedToolCalls: 1,
+				catalogToolCalls: 0,
+				steps: [{
+					id: "tool-call-subagent",
+					index: 1,
+					kind: "tool",
+					label: "runSubagent",
+					status: "timed_out",
+					toolCategory: "vscode",
+					startedAt: "2026-07-29T07:00:00.000Z",
+					durationMs: 1_800_000,
+				}],
+			}, {
+				index: 3,
+				requestId: "claude-request",
+				modelId: "claude-opus-5",
+				providerKind: "claude",
+				lifecyclePhase: "completed",
+				sessionMode: "warm",
+				promptTokens: 4920,
+				cachedPromptTokens: 4096,
+				cacheWriteInputTokens: 512,
+				promptCacheHitPercent: 83.3,
+				outputTokens: 120,
+				reasoningOutputTokens: 80,
+				modelTurns: 1,
+				toolCalls: 1,
+				delegatedToolCalls: 1,
+				metricsSource: "live",
+				steps: [{
+					id: "tool-claude-read",
+					index: 1,
+					kind: "tool",
+					label: "read_file",
+					status: "completed",
+					toolCategory: "vscode",
+					startedAt: "2026-07-29T08:00:00.000Z",
+					durationMs: 20,
+				}],
+				usageSegments: [{
+					index: 1,
+					recordedAt: "2026-07-29T08:00:01.000Z",
+					freshInputTokens: 312,
+					inputTokens: 4920,
+					cachedInputTokens: 4096,
+					cacheCreationInputTokens: 512,
+					outputTokens: 120,
+					reasoningOutputTokens: 80,
+					totalTokens: 5040,
+					cacheHitPercent: 83.3,
+				}],
+				context: {
+					contextLength: 258400,
+					inputBudget: 240000,
+					rawMaxTokens: 1000000,
+					usableMaxTokens: 240000,
+					categories: [{ name: "systemPrompt", tokens: 1200 }],
+					messageTokensBeforeCompact: 4500,
+					messageTokensAfterCompact: 4500,
+					messageCountBeforeCompact: 20,
+					messageCountAfterCompact: 20,
+					replyReserveTokens: 18400,
+					toolTokens: 420,
+					cappedTools: 12,
+					softInputTarget: 240000,
+					hardInputTarget: 240000,
+					tokenCountSource: "server",
+					estimatedUsedTokens: 4920,
+					estimatedFreeTokens: 235080,
+					estimatedUsagePercent: 1.9,
+					autoCompacted: false,
+					hardCompacted: false,
+				},
+			}],
+		};
+
+		const renderHtml = (SessionQualityPanel.prototype as unknown as {
+			renderHtml: (value: unknown) => string;
+		}).renderHtml;
+		const html = renderHtml.call(SessionQualityPanel.prototype, data);
+
+		assert.match(html, /class="metric-grid"/);
+		assert.match(html, /class="live-pill"/);
+		assert.match(html, /id="turn-search"/);
+		assert.match(html, /id="issues-filter"/);
+		assert.match(html, /class="detail-grid"/);
+		assert.match(html, /Model usage segments/);
+		assert.match(html, /Codex session &amp; cache/);
+		assert.match(html, /Processed blend/);
+		assert.match(html, /Final \/ continuation segment/);
+		assert.match(html, /Delegated VS Code tools/);
+		assert.match(html, /cold Codex startup/);
+		assert.match(html, /continuation cache health recovered above 90%/);
+		assert.match(html, /Claude session &amp; cache/);
+		assert.match(html, /Claude SDK context snapshot/);
+		assert.match(html, /Cache creation/);
+		assert.match(html, /cacheWriteInputTokens":512/);
+		assert.match(html, /Claude.*live steps/);
+		assert.match(html, /step.status === 'timed_out'/);
+		assert.match(html, /"toolCallBreakdown":\{"read_file":1\}/);
+		assert.match(html, /"metricsSource":"rollout"/);
+		assert.match(html, /aria-expanded="false"/);
+		assert.ok(!html.includes("</script><script>bad()"));
+
+		const scriptMatch = html.match(/<script>([\s\S]*)<\/script>/);
+		assert.ok(scriptMatch, "expected an embedded dashboard script");
+		assert.doesNotThrow(() => new Script(scriptMatch[1]));
+	});
+});

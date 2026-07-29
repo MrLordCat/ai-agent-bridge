@@ -60,18 +60,42 @@ configuration is active, and `INFO` records expected provider-specific behavior.
 
 ## Session Quality Report
 
-Run `Local LLM: Open Session Quality Report` to export metrics accumulated
-since extension activation or the last reset:
+Run `Local LLM: Open Session Quality Report` to open the live webview for
+metrics accumulated since extension activation or the last reset. It updates
+without replacing the webview document, preserving expanded rows and active
+model/search/issues-only filters.
 
 - prompt and cached prompt tokens with weighted cache-hit percentage;
-- first-token latency and generation throughput;
-- tool calls, deterministic repairs, rejections, and correction retries;
+- per-model cache health, miss classification, and best/worst turn visibility;
+- first-model-event, first-visible-text, and generation throughput metrics;
+- tool calls, native tool duration/breakdown, deterministic repairs,
+  rejections, and correction retries;
 - detected tool loops;
 - provider compaction and context-overflow retries;
-- per-turn model id and context estimate.
+- per-turn model id, transport, context budget, and exact/estimated source;
+- Codex and Claude model usage segments and ordered live model/tool step
+  timelines with running, completed, failed, timed-out, or cancelled status;
+- Codex thread mode and lifecycle, plus separate processed cache cost and final
+  continuation reuse. Catalog searches and delegated VS Code tools are counted
+  separately, recovered cold startup segments remain visible without making a
+  healthy continuation an issue, and eligible subagent turns link back to their
+  parent request.
+- Claude Agent SDK session mode, fresh/cache-read/cache-creation input, thinking
+  tokens, native tool round trips, and asynchronous SDK context categories.
 
 Reports contain metrics and model ids only. They do not retain message or tool
-result bodies. Use `Local LLM: Reset Session Metrics` before a controlled test.
+result bodies. Markdown and JSON snapshots are updated automatically under
+`<globalStorage>/reports/`, so a completed run remains inspectable outside the
+webview. Use `Local LLM: Reset Session Metrics` before a controlled test.
+
+## Usage Experiments
+
+Use `Local LLM: Start Baseline Usage Experiment` and `Local LLM: Start
+Delegated Usage Experiment` with the exact same task label to compare two
+routing strategies. Stop each run with `Local LLM: Stop and Export Usage
+Experiment`; the tracker records bounded provider usage samples and exports a
+Markdown/JSON comparison. This is intended for controlled repeated tasks, not
+for comparing unrelated prompts or different model/effort settings.
 
 ## Repeatable Agent Benchmark
 
@@ -81,7 +105,9 @@ result bodies. Use `Local LLM: Reset Session Metrics` before a controlled test.
 4. Start a new chat, select the same model and Thinking Effort used for the
    baseline, and submit the exact same audit prompt.
 5. Let the agent finish without manually compacting or changing models.
-6. Export the session quality report.
+6. Open the live report and retain its automatically written Markdown/JSON
+  snapshot. For an A/B routing comparison, also complete a matched Usage
+  Experiment pair.
 7. Compare evidence quality and task completion together with cache hit rate,
    first-token latency, tool retries/rejections, tool loops, compaction, and
    overflow recovery.

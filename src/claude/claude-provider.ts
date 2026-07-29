@@ -15,6 +15,8 @@ import {
 	ClaudeAgentSession,
 	hasPersistedClaudeSession,
 	resolveClaudeCodeBinary,
+	type ClaudeAgentTurnContext,
+	type ClaudeAgentTurnUpdate,
 	type ClaudeAgentUsage,
 	type ClaudeContextUsageSnapshot,
 	type ClaudeRateLimitInfo,
@@ -68,6 +70,12 @@ export interface ClaudeUsageRecord {
 	modelTurns: number;
 }
 
+export interface ClaudeLiveTurnUpdate extends ClaudeAgentTurnUpdate {
+	modelId: string;
+	contextUsage?: ClaudeContextUsageSnapshot;
+	contextWindowTokens?: number;
+}
+
 export function canonicalizeClaudeTools(
 	tools: readonly vscode.LanguageModelChatTool[]
 ): vscode.LanguageModelChatTool[] {
@@ -97,6 +105,7 @@ interface ClaudeConversationSession {
 	lastUsedAt: number;
 	sdkSessionId?: string;
 	restoredFromDisk?: boolean;
+	lastTurnUpdate?: ClaudeLiveTurnUpdate;
 }
 
 export interface PersistedClaudeConversationSession {
@@ -258,6 +267,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	readonly onDidChangeStatus = this.statusChanges.event;
 	private readonly usageRecords = new vscode.EventEmitter<ClaudeUsageRecord>();
 	readonly onDidRecordUsage = this.usageRecords.event;
+	private readonly liveTurnUpdates = new vscode.EventEmitter<ClaudeLiveTurnUpdate>();
+	readonly onDidUpdateLiveTurn = this.liveTurnUpdates.event;
 
 	private readonly sessions = new Map<string, ClaudeConversationSession>();
 	private readonly durableSessions = new Map<string, PersistedClaudeConversationSession>();
@@ -732,6 +743,22 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					|| DEFAULT_CLAUDE_MAX_INPUT_CHARS
 			)
 		);
+		const toolSchemaChars = JSON.stringify(nativeTools.map(tool => tool.inputSchema)).length;
+		const sessionMode: ClaudeAgentTurnContext["sessionMode"] = rolledOver
+			? "rollover"
+			: restored
+				? "restored"
+				: reused
+					? "warm"
+					: "new";
+		const turnContext: ClaudeAgentTurnContext = {
+			sessionMode,
+			inputMode: reused ? "user-turn" : "full",
+			conversationKey: conversationId ? fingerprint(conversationId).slice(0, 16) : undefined,
+			messageCount: messages.length,
+			toolCount: nativeTools.length,
+			toolSchemaTokens: Math.ceil(toolSchemaChars / 4),
+		};
 		let input: SDKUserMessage;
 		try {
 			input = reused
@@ -752,7 +779,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			maxInputChars,
 			conversationIdPresent: conversationId !== undefined,
 			toolCount: nativeTools.length,
-			toolSchemaChars: JSON.stringify(nativeTools.map(tool => tool.inputSchema)).length,
+			toolSchemaChars,
 			effort: effort ?? "auto",
 			warm: reused,
 			restored,
@@ -760,7 +787,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		});
 
 		try {
-			await session.client.runUserTurn(input, progress, token);
+			await session.client.runUserTurn(input, progress, token, turnContext);
 			session.lastUsedAt = Date.now();
 			session.restoredFromDisk = false;
 			this.reportCacheDiagnostics(modelId, session.key, reused, restored);
@@ -800,7 +827,12 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 						await fallback.client.runUserTurn(
 							createInitialUserMessage(messages, maxInputChars),
 							progress,
-							token
+							token,
+							{
+								...turnContext,
+								sessionMode: "resume-fallback",
+								inputMode: "full",
+							}
 						);
 						fallback.lastUsedAt = Date.now();
 						await this.rememberDurableSession(fallback);
@@ -835,6 +867,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.statusChanges.dispose();
 		this.modelChanges.dispose();
 		this.usageRecords.dispose();
+		this.liveTurnUpdates.dispose();
 	}
 
 	private createSession(value: {
@@ -874,9 +907,25 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			logSink: this.logSink,
 			callbacks: {
 				onUsage: usage => this.recordUsage(value.modelId, usage),
+				onTurnUpdate: update => {
+					const enriched = this.enrichLiveTurnUpdate(value.modelId, update);
+					session.lastTurnUpdate = enriched;
+					this.liveTurnUpdates.fire(enriched);
+				},
 				onRateLimit: info => this.recordRateLimit(info),
 				onUsageSnapshot: snapshot => this.recordUsageSnapshot(snapshot),
-				onContextUsage: snapshot => this.recordContextUsage(snapshot),
+				onContextUsage: snapshot => {
+					this.recordContextUsage(snapshot);
+					if (session.lastTurnUpdate && session.lastTurnUpdate.phase !== "running") {
+						const enriched = this.enrichLiveTurnUpdate(
+							value.modelId,
+							session.lastTurnUpdate,
+							snapshot
+						);
+						session.lastTurnUpdate = enriched;
+						this.liveTurnUpdates.fire(enriched);
+					}
+				},
 				onSessionId: sessionId => {
 					session.sdkSessionId = sessionId;
 				},
@@ -885,6 +934,23 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.sessions.set(key, session);
 		this.pruneSessions();
 		return session;
+	}
+
+	private enrichLiveTurnUpdate(
+		modelId: string,
+		update: ClaudeAgentTurnUpdate,
+		contextUsage?: ClaudeContextUsageSnapshot
+	): ClaudeLiveTurnUpdate {
+		const configuredContextLimit = vscode.workspace.getConfiguration("llamacpp")
+			.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH);
+		return {
+			...update,
+			modelId,
+			contextUsage,
+			contextWindowTokens: contextUsage
+				? resolveClaudeContextLength(configuredContextLimit, contextUsage.rawMaxTokens)
+				: undefined,
+		};
 	}
 
 	private findConversationSession(value: {

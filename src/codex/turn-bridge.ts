@@ -3,6 +3,12 @@ import * as vscode from "vscode";
 import type { LlamaLogSink } from "../logger";
 import type { CodexAppServerClient, CodexServerNotification } from "./app-server-client";
 import type { CodexDynamicToolCallResponse } from "./dynamic-tools";
+import {
+	summarizeCodexToolDurations,
+	type CodexLiveTurnMetrics,
+	type CodexTurnStepMetrics,
+	type CodexUsageSegmentMetrics,
+} from "./rollout-metrics";
 import type {
 	CodexAgentMessageDeltaParams,
 	CodexItemNotificationParams,
@@ -22,6 +28,22 @@ export interface CodexDelegatedToolCall {
 	turnId?: string;
 }
 
+export interface CodexTurnInputDiagnostics {
+	inputMode: "full" | "user-turn";
+	messageCountBeforeCompact: number;
+	messageCountAfterCompact: number;
+	tokenEstimateBeforeCompact: number;
+	tokenEstimateAfterCompact: number;
+	compacted: boolean;
+	compactionTokenBudget?: number;
+	hardInputTargetTokens: number;
+	toolSchemaTokens: number;
+	toolCount: number;
+	threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
+	threadReuseMissReason?: string;
+	conversationKey?: string;
+}
+
 export type CodexTurnBoundary =
 	| { kind: "delegated"; call: CodexDelegatedToolCall }
 	| { kind: "completed"; completed: CodexTurnCompletedParams };
@@ -35,6 +57,13 @@ interface Deferred<T> {
 interface PendingToolResponse {
 	call: CodexDelegatedToolCall;
 	resolve: (response: CodexDynamicToolCallResponse) => void;
+}
+
+interface DelegatedToolMetric {
+	tool: string;
+	startedAt: number;
+	completedAt?: number;
+	status: "running" | "completed" | "failed" | "timed_out" | "cancelled";
 }
 
 function deferred<T>(): Deferred<T> {
@@ -114,10 +143,18 @@ export class CodexTurnBridge implements vscode.Disposable {
 	private readonly itemPhases = new Map<string, string | null>();
 	private readonly emittedItemChars = new Map<string, number>();
 	private readonly finalTextChunks: string[] = [];
+	private readonly delegatedToolMetrics = new Map<string, DelegatedToolMetric>();
+	private readonly usageSegments: CodexUsageSegmentMetrics[] = [];
+	private usageSegmentCount = 0;
+	private lastUsageFingerprint: string | undefined;
+	private firstModelEventAt: number | undefined;
+	private firstVisibleMessageAt: number | undefined;
+	private inputDiagnosticsValue: CodexTurnInputDiagnostics | undefined;
 	private segmentTextChunks: string[] = [];
 	private segmentEstimatedOutputChars = 0;
 	private boundaryPending = true;
 	private reconcileTimer: NodeJS.Timeout | undefined;
+	private blockedInternalToolInterrupt: Promise<void> | undefined;
 	private reconcileInFlight = false;
 	private reconciliationActive = false;
 	private reconcileDeadlineAt = 0;
@@ -136,16 +173,19 @@ export class CodexTurnBridge implements vscode.Disposable {
 		private readonly client: CodexAppServerClient,
 		readonly threadId: string,
 		private readonly logSink?: LlamaLogSink,
-		private readonly onToolTimeout?: (bridge: CodexTurnBridge) => void,
+		private readonly onToolTimeout?: (bridge: CodexTurnBridge, reason: "timeout" | "client-stopped") => void,
 		private readonly onTokenUsage?: (bridge: CodexTurnBridge, usage: CodexThreadTokenUsage) => void,
 		private readonly onOutputProgress?: (bridge: CodexTurnBridge, estimatedOutputTokens: number) => void,
 		public ephemeral = false,
-		private readonly vsCodeToolsOnly = false
+		private readonly vsCodeToolsOnly = false,
+		private readonly onMetricsChanged?: (bridge: CodexTurnBridge) => void,
+		private readonly toolTimeoutMs = 30 * 60_000
 	) {
 		this.notificationDisposable = client.onNotification(notification => this.handleNotification(notification));
 		this.stopDisposable = client.onDidStop(error => {
 			this.rejectBoundary(error);
 			for (const pending of this.pendingTools.values()) {
+				this.finishToolMetric(pending.call.callId, "failed");
 				pending.resolve({
 					contentItems: [{ type: "inputText", text: "Codex app-server stopped before the tool completed." }],
 					success: false,
@@ -153,7 +193,8 @@ export class CodexTurnBridge implements vscode.Disposable {
 			}
 			this.pendingTools.clear();
 			this.reportedToolCallIds.clear();
-			this.onToolTimeout?.(this);
+			this.onMetricsChanged?.(this);
+			this.onToolTimeout?.(this, "client-stopped");
 		});
 	}
 
@@ -173,6 +214,39 @@ export class CodexTurnBridge implements vscode.Disposable {
 		return [...this.pendingTools.values()]
 			.filter(pending => this.reportedToolCallIds.has(pending.call.callId))
 			.map(pending => pending.call);
+	}
+
+	get inputDiagnostics(): CodexTurnInputDiagnostics | undefined {
+		return this.inputDiagnosticsValue ? { ...this.inputDiagnosticsValue } : undefined;
+	}
+
+	get liveMetrics(): CodexLiveTurnMetrics {
+		const toolNames = new Map<string, number>();
+		const durations: number[] = [];
+		for (const metric of this.delegatedToolMetrics.values()) {
+			toolNames.set(metric.tool, (toolNames.get(metric.tool) ?? 0) + 1);
+			if (metric.completedAt !== undefined && metric.completedAt >= metric.startedAt) {
+				durations.push(metric.completedAt - metric.startedAt);
+			}
+		}
+		return {
+			source: "live",
+			modelSegments: this.usageSegmentCount,
+			usageSegments: [...this.usageSegments],
+			usageSegmentsTruncated: this.usageSegmentCount > this.usageSegments.length,
+			steps: this.buildLiveSteps(),
+			firstModelEventLatencyMs: this.latencyFromStart(this.firstModelEventAt),
+			firstVisibleMessageLatencyMs: this.latencyFromStart(this.firstVisibleMessageAt),
+			toolCalls: this.delegatedToolMetrics.size,
+			toolNames: Object.fromEntries(
+				[...toolNames.entries()].sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+			),
+			toolDuration: summarizeCodexToolDurations(durations),
+		};
+	}
+
+	setInputDiagnostics(diagnostics: CodexTurnInputDiagnostics): void {
+		this.inputDiagnosticsValue ??= { ...diagnostics };
 	}
 
 	async start(
@@ -202,6 +276,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 			clearTimeout(this.reconcileTimer);
 			this.reconcileTimer = undefined;
 		}
+		this.blockedInternalToolInterrupt = undefined;
 		this.boundary = deferred<CodexTurnBoundary>();
 		this.boundaryPending = true;
 		this.reconciliationActive = false;
@@ -246,11 +321,17 @@ export class CodexTurnBridge implements vscode.Disposable {
 			const pending = this.pendingTools.get(callId);
 			const response = responses.get(callId);
 			if (pending && response) {
+				const metric = this.delegatedToolMetrics.get(callId);
+				if (metric && metric.completedAt === undefined) {
+					metric.completedAt = Date.now();
+					metric.status = response.success ? "completed" : "failed";
+				}
 				pending.resolve(response);
 				this.pendingTools.delete(callId);
 			}
 			this.reportedToolCallIds.delete(callId);
 		}
+		this.onMetricsChanged?.(this);
 		if (this.pendingTools.size > 0) {
 			this.reportPendingToolCalls();
 			this.scheduleDelegationBoundary();
@@ -279,12 +360,20 @@ export class CodexTurnBridge implements vscode.Disposable {
 		if (!this.progress && this.pendingTools.size === 0) {
 			return Promise.resolve(this.createUnavailableToolResponse(call, "detached-without-pending-turn"));
 		}
+		this.recordModelEvent();
+		this.delegatedToolMetrics.set(call.callId, {
+			tool: call.tool,
+			startedAt: Date.now(),
+			status: "running",
+		});
+		this.onMetricsChanged?.(this);
 		const response = new Promise<CodexDynamicToolCallResponse>(resolve => {
 			this.pendingTools.set(call.callId, { call, resolve });
 		});
 		if (!this.pendingToolTimer) {
 			this.pendingToolTimer = setTimeout(() => {
 				for (const pending of this.pendingTools.values()) {
+					this.finishToolMetric(pending.call.callId, "timed_out");
 					pending.resolve({
 						contentItems: [{ type: "inputText", text: "Native VS Code tool execution timed out." }],
 						success: false,
@@ -293,8 +382,9 @@ export class CodexTurnBridge implements vscode.Disposable {
 				this.pendingTools.clear();
 				this.reportedToolCallIds.clear();
 				this.pendingToolTimer = undefined;
-				this.onToolTimeout?.(this);
-			}, 30 * 60_000);
+				this.onMetricsChanged?.(this);
+				this.onToolTimeout?.(this, "timeout");
+			}, this.toolTimeoutMs);
 		}
 		if (!this.progress) {
 			this.logSink?.log("codex.chat.tool_delegation_queued", {
@@ -319,6 +409,11 @@ export class CodexTurnBridge implements vscode.Disposable {
 		await this.client.request("turn/interrupt", { threadId: this.threadId, turnId: this.turnId }, 10_000);
 	}
 
+	/** Waits until the fail-closed interrupt triggered by an internal action settles. */
+	waitForBlockedInternalToolInterrupt(): Promise<void> {
+		return this.blockedInternalToolInterrupt ?? Promise.resolve();
+	}
+
 	dispose(): void {
 		if (this.disposed) {
 			return;
@@ -335,7 +430,9 @@ export class CodexTurnBridge implements vscode.Disposable {
 			clearTimeout(this.reconcileTimer);
 			this.reconcileTimer = undefined;
 		}
+		const cancelledPendingTools = this.pendingTools.size > 0;
 		for (const pending of this.pendingTools.values()) {
+			this.finishToolMetric(pending.call.callId, "cancelled");
 			pending.resolve({
 				contentItems: [{ type: "inputText", text: "Native VS Code tool delegation was cancelled." }],
 				success: false,
@@ -343,6 +440,9 @@ export class CodexTurnBridge implements vscode.Disposable {
 		}
 		this.pendingTools.clear();
 		this.reportedToolCallIds.clear();
+		if (cancelledPendingTools) {
+			this.onMetricsChanged?.(this);
+		}
 	}
 
 	private reportPendingToolCalls(): void {
@@ -466,10 +566,12 @@ export class CodexTurnBridge implements vscode.Disposable {
 					break;
 				case "item/agentMessage/delta": {
 					const params = notification.params as CodexAgentMessageDeltaParams;
+					this.recordModelEvent();
 					this.recordOutputProgress(params.delta);
 					if (this.itemPhases.get(params.itemId) === "commentary") {
 						this.emitThinking(params.delta, params.itemId);
 					} else {
+						this.firstVisibleMessageAt ??= Date.now();
 						this.progress?.report(new vscode.LanguageModelTextPart(params.delta));
 						this.finalTextChars += params.delta.length;
 						this.finalTextChunks.push(params.delta);
@@ -480,6 +582,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 				}
 				case "item/reasoning/summaryTextDelta": {
 					const params = notification.params as CodexReasoningDeltaParams;
+					this.recordModelEvent();
 					this.recordOutputProgress(params.delta);
 					this.emitThinking(params.delta, params.itemId);
 					break;
@@ -489,6 +592,8 @@ export class CodexTurnBridge implements vscode.Disposable {
 					if (item.type === "agentMessage" && item.phase !== "commentary" && typeof item.text === "string") {
 						const emitted = this.emittedItemChars.get(String(item.id)) ?? 0;
 						if (emitted === 0 && item.text.length > 0) {
+							this.recordModelEvent();
+							this.firstVisibleMessageAt ??= Date.now();
 							this.recordOutputProgress(item.text);
 							this.progress?.report(new vscode.LanguageModelTextPart(item.text));
 							this.finalTextChars += item.text.length;
@@ -500,6 +605,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 				}
 				case "thread/tokenUsage/updated":
 					this.tokenUsage = (notification.params as CodexTokenUsageParams).tokenUsage;
+					this.recordUsageSegment(this.tokenUsage);
 					this.onTokenUsage?.(this, this.tokenUsage);
 					break;
 				case "turn/completed":
@@ -710,6 +816,8 @@ export class CodexTurnBridge implements vscode.Disposable {
 				continue;
 			}
 			const missing = item.text.slice(emitted);
+			this.recordModelEvent();
+			this.firstVisibleMessageAt ??= Date.now();
 			this.progress?.report(new vscode.LanguageModelTextPart(missing));
 			this.finalTextChars += missing.length;
 			this.finalTextChunks.push(missing);
@@ -721,6 +829,9 @@ export class CodexTurnBridge implements vscode.Disposable {
 	}
 
 	private handleItemStarted(item: Record<string, unknown>): void {
+		if (item.type === "agentMessage" || item.type === "reasoning") {
+			this.recordModelEvent();
+		}
 		if (this.vsCodeToolsOnly && isCodexInternalActionItem(item)) {
 			const itemType = String(item.type);
 			const error = new CodexInternalToolBlockedError(itemType);
@@ -730,7 +841,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 				itemType,
 			}, "error");
 			this.rejectBoundary(error);
-			void this.interrupt().catch(interruptError => {
+			this.blockedInternalToolInterrupt = this.interrupt().catch(interruptError => {
 				this.logSink?.logError("codex.internal_tool.block_interrupt_failed", interruptError, {
 					threadId: this.threadId,
 					turnId: this.turnId,
@@ -780,5 +891,95 @@ export class CodexTurnBridge implements vscode.Disposable {
 		}
 		this.segmentEstimatedOutputChars += text.length;
 		this.onOutputProgress?.(this, Math.max(1, Math.ceil(this.segmentEstimatedOutputChars / 4)));
+	}
+
+	private recordModelEvent(): void {
+		this.firstModelEventAt ??= Date.now();
+	}
+
+	private recordUsageSegment(usage: CodexThreadTokenUsage): void {
+		const fingerprint = [
+			usage.total.inputTokens,
+			usage.total.cachedInputTokens,
+			usage.total.outputTokens,
+			usage.total.reasoningOutputTokens,
+			usage.total.totalTokens,
+		].join(":");
+		if (fingerprint === this.lastUsageFingerprint) {
+			return;
+		}
+		this.lastUsageFingerprint = fingerprint;
+		this.usageSegmentCount += 1;
+		if (this.usageSegments.length >= 128) {
+			return;
+		}
+		const inputTokens = Math.max(0, usage.last.inputTokens);
+		const cachedInputTokens = Math.max(0, usage.last.cachedInputTokens);
+		this.usageSegments.push({
+			index: this.usageSegmentCount,
+			recordedAt: new Date().toISOString(),
+			inputTokens,
+			cachedInputTokens,
+			outputTokens: Math.max(0, usage.last.outputTokens),
+			reasoningOutputTokens: Math.max(0, usage.last.reasoningOutputTokens),
+			totalTokens: Math.max(0, usage.last.totalTokens),
+			cacheHitPercent: inputTokens > 0
+				? Number((cachedInputTokens / inputTokens * 100).toFixed(1))
+				: undefined,
+		});
+		this.onMetricsChanged?.(this);
+	}
+
+	private buildLiveSteps(): CodexTurnStepMetrics[] {
+		const steps: CodexTurnStepMetrics[] = this.usageSegments.map(segment => ({
+			id: `model-${segment.index}`,
+			index: 0,
+			kind: "model",
+			label: `Model segment ${segment.index}`,
+			status: "completed",
+			startedAt: segment.recordedAt,
+			inputTokens: segment.inputTokens,
+			cachedInputTokens: segment.cachedInputTokens,
+			outputTokens: segment.outputTokens,
+			reasoningOutputTokens: segment.reasoningOutputTokens,
+			totalTokens: segment.totalTokens,
+			cacheHitPercent: segment.cacheHitPercent,
+		}));
+		for (const [callId, metric] of this.delegatedToolMetrics) {
+			steps.push({
+				id: `tool-${callId}`,
+				index: 0,
+				kind: "tool",
+				label: metric.tool,
+				status: metric.status,
+				toolCategory: "vscode",
+				startedAt: new Date(metric.startedAt).toISOString(),
+				completedAt: metric.completedAt === undefined
+					? undefined
+					: new Date(metric.completedAt).toISOString(),
+				durationMs: metric.completedAt === undefined
+					? Math.max(0, Date.now() - metric.startedAt)
+					: Math.max(0, metric.completedAt - metric.startedAt),
+			});
+		}
+		return steps
+			.sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt))
+			.map((step, index) => ({ ...step, index: index + 1 }));
+	}
+
+	private finishToolMetric(
+		callId: string,
+		status: "completed" | "failed" | "timed_out" | "cancelled"
+	): void {
+		const metric = this.delegatedToolMetrics.get(callId);
+		if (!metric || metric.completedAt !== undefined) {
+			return;
+		}
+		metric.completedAt = Date.now();
+		metric.status = status;
+	}
+
+	private latencyFromStart(value: number | undefined): number | undefined {
+		return value === undefined ? undefined : Math.max(0, value - this.startedAt);
 	}
 }

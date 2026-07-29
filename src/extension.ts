@@ -25,8 +25,10 @@ import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
-import { CodexChatModelProvider } from "./codex/codex-provider";
-import { ClaudeChatModelProvider } from "./claude/claude-provider";
+import { SessionQualityPanel } from "./ui/session-quality-panel";
+import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
+import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
+import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
 import { parseProviderModelId } from "./model-sources/source-routing";
@@ -102,6 +104,298 @@ function formatContextUsage(metrics: LlamaChatContextUsageMetrics): ContextUsage
 		tooltip: tooltipLines.join("\n"),
 		tooltipLines,
 	};
+}
+
+function updateCodexSessionQuality(
+	tracker: SessionQualityTracker,
+	usage: CodexUsageRecord,
+	finalized: boolean
+): void {
+	const diag = usage.turnDiagnostics;
+	const segments = diag?.usageSegments ?? [];
+	const processedInputTokens = segments.length > 0
+		? segments.reduce((sum, segment) => sum + segment.inputTokens, 0)
+		: usage.inputTokens;
+	const processedCachedInputTokens = segments.length > 0
+		? segments.reduce((sum, segment) => sum + segment.cachedInputTokens, 0)
+		: usage.cachedInputTokens;
+	const processedOutputTokens = segments.length > 0
+		? segments.reduce((sum, segment) => sum + segment.outputTokens, 0)
+		: usage.outputTokens;
+	const processedReasoningTokens = segments.length > 0
+		? segments.reduce((sum, segment) => sum + segment.reasoningOutputTokens, 0)
+		: usage.reasoningOutputTokens;
+	const firstSegment = segments[0];
+	const finalSegment = segments.at(-1);
+	const hitPercent = processedInputTokens > 0
+		? Number(((processedCachedInputTokens / processedInputTokens) * 100).toFixed(1))
+		: undefined;
+	const requestId = diag?.requestId ?? `codex-${Date.now()}`;
+	if (diag?.contextWindow && diag.contextWindow > 0) {
+		const messageTokensAfterCompact = Math.max(
+			0,
+			diag.tokenEstimateAfterCompact ?? diag.contextUsedTokens - diag.toolSchemaTokens
+		);
+		const messageTokensBeforeCompact = Math.max(
+			messageTokensAfterCompact,
+			diag.tokenEstimateBeforeCompact ?? messageTokensAfterCompact
+		);
+		const otherTokens = Math.max(
+			0,
+			diag.contextUsedTokens - messageTokensAfterCompact - diag.toolSchemaTokens
+		);
+		tracker.recordContext({
+			requestId,
+			modelId: usage.modelId,
+			attemptNo: 1,
+			contextLength: diag.contextWindow,
+			inputBudget: diag.contextWindow,
+			softInputTarget: diag.compactionTokenBudget ?? diag.hardInputTargetTokens,
+			hardInputTarget: diag.hardInputTargetTokens,
+			messageTokensBeforeCompact,
+			messageTokensAfterCompact,
+			messageCountBeforeCompact: diag.messageCountBeforeCompact ?? diag.messageCount,
+			messageCountAfterCompact: diag.messageCountAfterCompact ?? diag.messageCount,
+			toolTokens: diag.toolSchemaTokens,
+			otherTokens,
+			replyReserveTokens: 0,
+			cappedTools: diag.toolCount,
+			autoCompacted: diag.compacted,
+			hardCompacted: false,
+			estimatedUsedTokens: diag.contextUsedTokens,
+			estimatedFreeTokens: Math.max(0, diag.contextWindow - diag.contextUsedTokens),
+			estimatedUsagePercent: Number((diag.contextUsedTokens / diag.contextWindow * 100).toFixed(1)),
+			tokenCountSource: segments.length > 0 ? "server" : "heuristic",
+		});
+	}
+	const finalSegmentHit = finalSegment?.cacheHitPercent;
+	const cacheClassification = classifyCodexTurnCache({
+		threadMode: diag?.threadMode,
+		threadReuseMissReason: diag?.threadReuseMissReason,
+		initialSegmentHitPercent: firstSegment?.cacheHitPercent,
+		finalSegmentHitPercent: finalSegmentHit,
+		processedHitPercent: hitPercent,
+	});
+	const cacheMissReason = cacheClassification.reason;
+	const lifecyclePhase = diag?.lifecyclePhase ?? (finalized ? "completed" : "running");
+	const catalogToolCalls = Object.entries(diag?.toolNames ?? {})
+		.filter(([name]) => name === "tool_search_call" || name === "tool_search")
+		.reduce((sum, [, count]) => sum + count, 0);
+	const delegatedToolCalls = new Set(
+		(diag?.steps ?? [])
+			.filter(step => step.kind === "tool" && step.toolCategory !== "catalog")
+			.map(step => step.id)
+	).size;
+	const turn: LlamaChatTurnMetrics = {
+		requestId,
+		modelId: usage.modelId,
+		providerKind: "codex",
+		lifecyclePhase,
+		terminalDetail: diag?.terminalDetail,
+		threadMode: diag?.threadMode,
+		threadReuseMissReason: diag?.threadReuseMissReason,
+		conversationKey: diag?.conversationKey,
+		durationMs: diag?.durationMs ?? 0,
+		queueWaitMs: 0,
+		firstTokenLatencyMs: diag?.firstModelEventLatencyMs,
+		firstVisibleLatencyMs: diag?.firstVisibleMessageLatencyMs,
+		emittedParts: 0,
+		outputChars: diag?.outputChars ?? 0,
+		thinkingChars: 0,
+		estimatedOutputTokens: processedOutputTokens,
+		outputTokens: processedOutputTokens,
+		reasoningOutputTokens: processedReasoningTokens,
+		promptTokens: processedInputTokens,
+		cachedPromptTokens: processedCachedInputTokens,
+		promptCacheHitPercent: hitPercent,
+		initialSegmentCacheHitPercent: firstSegment?.cacheHitPercent,
+		continuationCacheHitPercent: segments.length > 1 ? finalSegmentHit : undefined,
+		finalSegmentInputTokens: finalSegment?.inputTokens ?? usage.inputTokens,
+		finalSegmentCachedInputTokens: finalSegment?.cachedInputTokens ?? usage.cachedInputTokens,
+		cacheMissReason,
+		cacheMissDetail: cacheClassification.detail,
+		modelTurns: Math.max(1, diag?.modelSegments ?? 1),
+		usageEstimated: segments.length === 0,
+		retriedAfterOverflow: false,
+		toolCalls: diag?.toolCalls ?? 0,
+		delegatedToolCalls,
+		catalogToolCalls,
+		toolDurationTotalMs: diag?.toolDuration?.totalMs,
+		averageToolDurationMs: diag?.toolDuration?.averageMs,
+		maximumToolDurationMs: diag?.toolDuration?.maximumMs,
+		p95ToolDurationMs: diag?.toolDuration?.p95Ms,
+		toolCallBreakdown: diag?.toolNames,
+		usageSegments: diag?.usageSegments,
+		usageSegmentsTruncated: diag?.usageSegmentsTruncated,
+		steps: diag?.steps,
+		metricsSource: diag?.metricsSource,
+		repairedToolCalls: 0,
+		rejectedToolCalls: 0,
+		schemaRejectedToolCalls: 0,
+		toolCallRepairRetries: 0,
+		toolLoopDetected: false,
+	};
+	if (finalized) {
+		tracker.recordTurn(turn);
+	} else {
+		tracker.updateTurn(turn);
+	}
+}
+
+function updateClaudeSessionQuality(
+	tracker: SessionQualityTracker,
+	update: ClaudeLiveTurnUpdate
+): void {
+	const segments = update.usageSegments;
+	const aggregate = update.usage;
+	const freshInputTokens = aggregate?.inputTokens
+		?? segments.reduce((sum, segment) => sum + segment.freshInputTokens, 0);
+	const cachedInputTokens = aggregate?.cacheReadInputTokens
+		?? segments.reduce((sum, segment) => sum + segment.cacheReadInputTokens, 0);
+	const cacheWriteInputTokens = aggregate?.cacheCreationInputTokens
+		?? segments.reduce((sum, segment) => sum + segment.cacheCreationInputTokens, 0);
+	const promptTokens = freshInputTokens + cachedInputTokens + cacheWriteInputTokens;
+	const outputTokens = aggregate?.outputTokens
+		?? segments.reduce((sum, segment) => sum + segment.outputTokens, 0);
+	const reasoningOutputTokens = segments.reduce((sum, segment) => sum + segment.thinkingTokens, 0);
+	const cacheHitPercent = promptTokens > 0
+		? Number((cachedInputTokens / promptTokens * 100).toFixed(1))
+		: undefined;
+	const coldSession = update.context.sessionMode === "new"
+		|| update.context.sessionMode === "resume-fallback";
+	const cacheMissReason = cacheHitPercent === undefined
+		? undefined
+		: coldSession
+			? "session_not_reused"
+			: cacheHitPercent >= 90
+				? "healthy"
+				: "unknown";
+	const context = update.contextUsage;
+	const contextWindow = update.contextWindowTokens ?? context?.rawMaxTokens;
+	if (context && contextWindow && contextWindow > 0) {
+		const toolTokens = Math.min(context.totalTokens, update.context.toolSchemaTokens);
+		const messageTokens = Math.max(0, context.totalTokens - toolTokens);
+		tracker.recordContext({
+			requestId: update.requestId,
+			modelId: update.modelId,
+			attemptNo: 1,
+			contextLength: contextWindow,
+			inputBudget: context.maxTokens,
+			softInputTarget: context.maxTokens,
+			hardInputTarget: context.maxTokens,
+			messageTokensBeforeCompact: messageTokens,
+			messageTokensAfterCompact: messageTokens,
+			messageCountBeforeCompact: update.context.messageCount,
+			messageCountAfterCompact: update.context.messageCount,
+			toolTokens,
+			otherTokens: 0,
+			replyReserveTokens: Math.max(0, contextWindow - context.maxTokens),
+			cappedTools: update.context.toolCount,
+			autoCompacted: false,
+			hardCompacted: false,
+			estimatedUsedTokens: context.totalTokens,
+			estimatedFreeTokens: Math.max(0, context.maxTokens - context.totalTokens),
+			estimatedUsagePercent: Number((context.totalTokens / contextWindow * 100).toFixed(1)),
+			tokenCountSource: "server",
+			rawMaxTokens: context.rawMaxTokens,
+			usableMaxTokens: context.maxTokens,
+			categories: context.categories.map(category => ({
+				name: category.name,
+				tokens: category.tokens,
+			})),
+		});
+	}
+	const lifecyclePhase: LlamaChatTurnMetrics["lifecyclePhase"] = update.phase === "cancelled"
+		? "interrupted"
+		: update.phase;
+	const turn: LlamaChatTurnMetrics = {
+		requestId: update.requestId,
+		modelId: update.modelId,
+		providerKind: "claude",
+		lifecyclePhase,
+		terminalDetail: update.terminalDetail,
+		sessionMode: update.context.sessionMode,
+		conversationKey: update.context.conversationKey,
+		durationMs: update.durationMs,
+		queueWaitMs: 0,
+		firstTokenLatencyMs: update.firstModelEventLatencyMs,
+		firstVisibleLatencyMs: update.firstVisibleMessageLatencyMs,
+		emittedParts: 0,
+		outputChars: update.outputChars,
+		thinkingChars: update.thinkingChars,
+		estimatedOutputTokens: outputTokens,
+		outputTokens,
+		reasoningOutputTokens,
+		promptTokens,
+		cachedPromptTokens: cachedInputTokens,
+		cacheWriteInputTokens,
+		promptCacheHitPercent: cacheHitPercent,
+		initialSegmentCacheHitPercent: segments[0]?.cacheHitPercent,
+		continuationCacheHitPercent: segments.length > 1 ? segments.at(-1)?.cacheHitPercent : undefined,
+		finalSegmentInputTokens: segments.at(-1)?.inputTokens,
+		finalSegmentCachedInputTokens: segments.at(-1)?.cacheReadInputTokens,
+		cacheMissReason,
+		cacheMissDetail: coldSession
+			? update.context.sessionMode === "resume-fallback"
+				? "The persisted Claude session could not resume and the provider retried with full input."
+				: "No compatible warm Claude session was available; this turn started a new Agent SDK session."
+			: cacheMissReason === "unknown"
+				? "The Claude cache-read share was below 90%; cache creation is reported separately."
+				: undefined,
+		modelTurns: Math.max(segments.length, aggregate?.numTurns ?? 0, 1),
+		usageEstimated: !aggregate && segments.length === 0,
+		retriedAfterOverflow: false,
+		toolCalls: update.toolCalls,
+		delegatedToolCalls: update.toolCalls,
+		catalogToolCalls: 0,
+		toolDurationTotalMs: update.toolDuration.totalMs,
+		averageToolDurationMs: update.toolDuration.averageMs,
+		maximumToolDurationMs: update.toolDuration.maximumMs,
+		p95ToolDurationMs: update.toolDuration.p95Ms,
+		toolCallBreakdown: update.toolNames,
+		usageSegments: segments.map(segment => ({
+			index: segment.index,
+			recordedAt: segment.recordedAt,
+			inputTokens: segment.inputTokens,
+			cachedInputTokens: segment.cacheReadInputTokens,
+			freshInputTokens: segment.freshInputTokens,
+			cacheCreationInputTokens: segment.cacheCreationInputTokens,
+			outputTokens: segment.outputTokens,
+			reasoningOutputTokens: segment.thinkingTokens,
+			totalTokens: segment.totalTokens,
+			cacheHitPercent: segment.cacheHitPercent,
+		})),
+		usageSegmentsTruncated: false,
+		steps: update.steps.map(step => ({
+			id: step.id,
+			index: step.index,
+			kind: step.kind,
+			label: step.label,
+			status: step.status,
+			toolCategory: step.toolCategory,
+			startedAt: step.startedAt,
+			completedAt: step.completedAt,
+			durationMs: step.durationMs,
+			inputTokens: step.inputTokens,
+			cachedInputTokens: step.cacheReadInputTokens,
+			cacheCreationInputTokens: step.cacheCreationInputTokens,
+			outputTokens: step.outputTokens,
+			reasoningOutputTokens: step.thinkingTokens,
+			totalTokens: step.totalTokens,
+			cacheHitPercent: step.cacheHitPercent,
+		})),
+		metricsSource: "live",
+		repairedToolCalls: 0,
+		rejectedToolCalls: 0,
+		schemaRejectedToolCalls: 0,
+		toolCallRepairRetries: 0,
+		toolLoopDetected: false,
+	};
+	if (update.phase === "running") {
+		tracker.updateTurn(turn);
+	} else {
+		tracker.recordTurn(turn);
+	}
 }
 
 function getExplicitConfiguredServerUrl(config: vscode.WorkspaceConfiguration): string | undefined {
@@ -241,17 +535,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			cachedInputTokens: usage.cachedInputTokens,
 			reasoningOutputTokens: usage.reasoningOutputTokens,
 		}, usage.modelId);
+		updateCodexSessionQuality(sessionQuality, usage, true);
+	}));
+	context.subscriptions.push(codexProvider.onDidUpdateLiveTurn(usage => {
+		updateCodexSessionQuality(sessionQuality, usage, usage.phase !== "running");
 	}));
 	context.subscriptions.push(claudeProvider.onDidRecordUsage(usage => {
+		const totalInput = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
 		recordUsage({
 			provider: "claude",
-			inputTokens: usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens,
+			inputTokens: totalInput,
 			outputTokens: usage.outputTokens,
 			cachedInputTokens: usage.cacheReadInputTokens,
 			cacheWriteInputTokens: usage.cacheCreationInputTokens,
 			modelTurns: usage.modelTurns,
 			durationMs: usage.durationMs,
 		}, usage.modelId);
+	}));
+	context.subscriptions.push(claudeProvider.onDidUpdateLiveTurn(update => {
+		updateClaudeSessionQuality(sessionQuality, update);
 	}));
 	context.subscriptions.push(...registerModelBehaviorCommands(() => quickActionsProvider.refresh()));
 	llamaProvider.refreshLanguageModelChatInformation();
@@ -365,8 +667,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		})
 	);
 
+	const reportDirectory = path.join(context.globalStorageUri.fsPath, "reports");
+
 	const writeReport = async (baseName: string, markdown: string, json: unknown): Promise<string> => {
-		const reportDirectory = path.join(context.globalStorageUri.fsPath, "reports");
 		await fs.mkdir(reportDirectory, { recursive: true });
 		const stamp = new Date().toISOString().replace(/[.:]/g, "-");
 		const markdownPath = path.join(reportDirectory, `${baseName}-${stamp}.md`);
@@ -379,6 +682,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		await vscode.window.showTextDocument(document, { preview: false });
 		return markdownPath;
 	};
+
+	// Live-updating session quality report — single file, no timestamp spam.
+	const liveReportPath = path.join(reportDirectory, "session-quality-live.md");
+	const liveReportJsonPath = path.join(reportDirectory, "session-quality-live.json");
+
+	const writeLiveSessionReport = async (): Promise<void> => {
+		await fs.mkdir(reportDirectory, { recursive: true });
+		const markdown = sessionQuality.renderMarkdown(extVersion, vscodeVersion);
+		const json = sessionQuality.toJSON();
+		await Promise.all([
+			fs.writeFile(liveReportPath, markdown, "utf8"),
+			fs.writeFile(liveReportJsonPath, `${JSON.stringify(json, null, 2)}\n`, "utf8"),
+		]);
+	};
+
+	// Auto-refresh the live report and webview panel after every completed turn
+	// from any provider (Llama, Codex, Claude).
+	context.subscriptions.push(
+		sessionQuality.onDidChange(async () => {
+			SessionQualityPanel.refreshIfOpen();
+			try {
+				await writeLiveSessionReport();
+			} catch {
+				// Don't block the turn pipeline on a file write.
+			}
+		})
+	);
 
 	const startUsageExperiment = async (variant: ExperimentVariant): Promise<void> => {
 		const summary = usageExperiments.summary;
@@ -438,15 +768,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			}
 		}),
 		vscode.commands.registerCommand("llamacpp.openSessionReport", async () => {
-			const payload = sessionQuality.toJSON();
-			await writeReport(
-				"session-quality",
-				sessionQuality.renderMarkdown(extVersion, vscodeVersion),
-				payload
-			);
+			try {
+				SessionQualityPanel.createOrShow(context.extensionUri, sessionQuality, extVersion, vscodeVersion);
+			} catch (err: unknown) {
+				void vscode.window.showErrorMessage(
+					`Failed to open session quality report: ${err instanceof Error ? err.message : String(err)}`
+				);
+			}
 		}),
 		vscode.commands.registerCommand("llamacpp.resetSessionReport", async () => {
 			sessionQuality.clear();
+			await writeLiveSessionReport();
 			quickActionsProvider.refresh();
 			vscode.window.showInformationMessage("Local LLM session metrics reset.");
 		}),

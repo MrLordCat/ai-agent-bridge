@@ -4,12 +4,19 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v9";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v16";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v1";
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
 
 const LEGACY_PATCH_MARKERS = [
+	"/* llama-vscode-chat:copilot-native-model-controls:v15 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v14 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v13 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v12 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v11 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v10 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v9 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v8 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v7 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v6 */",
@@ -164,6 +171,23 @@ function replacePatternOnce(
 	}
 	const replaced = first[0].replace(new RegExp(pattern.source, flags), replacement);
 	return source.slice(0, first.index) + replaced + source.slice(first.index + first[0].length);
+}
+
+/** Like replaceOnce but returns source unchanged when the search string is not found. */
+function replaceOnceOptional(
+	source: string,
+	search: string,
+	replacement: string,
+	description: string
+): string {
+	const first = source.indexOf(search);
+	if (first < 0) {
+		return source;
+	}
+	if (source.indexOf(search, first + search.length) >= 0) {
+		throw new Error(`Copilot bundle shape changed: ${description} is not unique.`);
+	}
+	return source.slice(0, first) + replacement + source.slice(first + search.length);
 }
 
 function replacePatternOnceWith(
@@ -342,11 +366,74 @@ export function patchCopilotBundle(source: string): string {
 		'$1=$2($3,$4,$5.Advanced.SummarizeAgentConversationHistoryThreshold.id),$6=this.endpoint.modelProvider==="llamacpp"?$4:Math.min($1??$4,$4)',
 		"extension endpoint summarization threshold"
 	);
+	patched = replacePatternOnce(
+		patched,
+		/([A-Za-z_$][\w$]*)=_\?this\._getOrCreateBackgroundSummarizer\(t\.conversation\?\.sessionId\):void 0/,
+		'$1=_&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
+		"extension endpoint background compaction"
+	);
+	// Deterministic tool ordering — sort by name so the prefix cache survives Extension Host restarts.
+	// Without this, tool registration order varies across sessions, producing a different JSON
+	// serialization of the tools array and invalidating the server-side prompt prefix cache.
+	patched = replacePatternOnce(
+		patched,
+		/([A-Za-z_$][\w$]*)\.tools=([A-Za-z_$][\w$]*)\.tools\?\.map\(([A-Za-z_$][\w$]*)=>\(\{type:"function",function:\{name:\3\.name,description:\3\.description,parameters:\3\.inputSchema&&Object\.keys\(\3\.inputSchema\)\.length\?\3\.inputSchema:void 0\}\}\)\)/,
+		'$1.tools=$2.tools?.slice().sort((a,b)=>{let x=a.name,y=b.name;return x<y?-1:x>y?1:0}).map($3=>({type:"function",function:{name:$3.name,description:$3.description,parameters:$3.inputSchema&&Object.keys($3.inputSchema).length?$3.inputSchema:void 0}}))',
+		"deterministic tool ordering"
+	);
+	// Prevent auto-compaction after reload — Copilot restores full history and compacts it
+	// when message tokens exceed softInputTarget, invalidating both Copilot and upstream caches.
+	// For llama.cpp, set the render budget to unlimited so the trimming loop never executes.
+	patched = replacePatternOnce(
+		patched,
+		/([A-Za-z_$][\w$]*)=y\?Number\.MAX_SAFE_INTEGER:w,([A-Za-z_$][\w$]*)=p>0\?this\.endpoint\.cloneWithTokenOverride\(\1\):this\.endpoint/,
+		'$1=this.endpoint.modelProvider==="llamacpp"||y?Number.MAX_SAFE_INTEGER:w,$2=p>0?this.endpoint.cloneWithTokenOverride($1):this.endpoint',
+		"auto-compaction prevention for llama.cpp"
+	);
+	// Fix context window display — Copilot's WD()/jD() function sets max_prompt_tokens
+	// from maxInputTokens (contextLength - maxOutputTokens). For llama.cpp this
+	// disagrees with our v10 modelMaxPromptTokens patch. Use the full context
+	// window so the Copilot UI matches the actual budget.
+	// Two alternative patterns for different Copilot bundle versions.
+	const ctxPatched = replaceOnceOptional(
+		patched,
+		'max_prompt_tokens:o?.maxInputTokens||1e5',
+		'max_prompt_tokens:e==="llamacpp"&&o?o.maxInputTokens+o.maxOutputTokens:o?.maxInputTokens||1e5',
+		"context window display sync for llama.cpp"
+	);
+	if (ctxPatched !== patched) {
+		patched = ctxPatched;
+	} else {
+		// Fallback: older Copilot bundles use a different variable naming (s.maxInputTokens).
+		patched = replaceOnce(
+			patched,
+			'max_prompt_tokens:s.maxInputTokens,max_output_tokens:s.maxOutputTokens',
+			'max_prompt_tokens:e==="llamacpp"&&o?s.contextWindow:s.maxInputTokens,max_output_tokens:s.maxOutputTokens',
+			"context window display sync for llama.cpp (legacy bundle)"
+		);
+	}
+	// Fix the conversation history TokenLimit cap — Copilot sets truncateAt to
+	// ~50% of modelMaxPromptTokens. After reload this
+	// culls most messages, destroying the prefix cache.
+	// For llama.cpp, use the full context window. The multiplier's minified name
+	// changes between Copilot builds, but the complete assignment must be unique.
+	{
+		patched = replacePatternOnce(
+			patched,
+			/([A-Za-z_$][\w$]*)=Math\.floor\(this\.promptEndpoint\.modelMaxPromptTokens\*([A-Za-z_$][\w$]*)\)/,
+			'$1=this.promptEndpoint.modelProvider==="llamacpp"?this.promptEndpoint.modelMaxPromptTokens:Math.floor(this.promptEndpoint.modelMaxPromptTokens*$2)',
+			"conversation history truncation cap for llama.cpp"
+		);
+	}
+	// Wait for the actual advertised tool definitions to stabilise after reload.
+	// Cache the confirmed signature on the shared registry so ordinary turns use
+	// one immediate lookup; repeat the bounded wait only when names, descriptions,
+	// or schemas really change (for example after tool activation).
 	patched = replaceOnce(
 		patched,
-		'B=_?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
-		'B=_&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
-		"extension endpoint background compaction"
+		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[];if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==er._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}er._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		"tool catalog stabilisation after reload"
 	);
 	return patched;
 }

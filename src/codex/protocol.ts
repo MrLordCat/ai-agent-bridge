@@ -117,6 +117,7 @@ export interface CodexThreadTurnSnapshot {
 export interface CodexThreadReadResponse {
 	thread: {
 		id: string;
+		path?: string | null;
 		ephemeral?: boolean;
 		status?: { type?: string };
 		turns?: CodexThreadTurnSnapshot[];

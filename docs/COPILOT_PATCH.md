@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. `scripts/patch-copilot-chat.mjs` is a thin development
 CLI over that same implementation, so runtime and repository commands cannot
-drift apart. Patch v9 makes the following changes:
+drift apart. Patch v16 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -74,11 +74,16 @@ drift apart. Patch v9 makes the following changes:
   selected and compacted the tools it will actually send;
 - Copilot's temporary Agent renderer does not reject raw tool results before
   the provider can sanitize and budget them;
-- automatic background and foreground LLM summarization is disabled for this
-  provider. The explicit Compact Conversation command remains available.
+- automatic background and foreground LLM summarization and wrapper-owned
+  truncation are disabled for contributed `llamacpp` models. Provider-specific
+  compaction remains authoritative, while the explicit Compact Conversation
+  command remains available;
 - Copilot's stable conversation id is forwarded through provider-private
   `modelOptions` so completed Codex threads can be reused even when Copilot
   rewrites generated history. The id is never written to extension logs.
+- advertised tools and schema keys use deterministic ordering. Copilot waits for
+  tool definitions only after their cached signature actually changes, avoiding
+  an unnecessary tool-catalog cold start on every provider continuation;
 - native terminal output and textual tool results are capped before VS Code
   serializes them into persisted chat history;
 - binary and other non-text tool payloads are replaced by a compact history
@@ -101,7 +106,7 @@ that chat request.
 
 `llamacpp.autoPatchCopilot` defaults to `true`. On extension startup, the
 runtime checks only `vscode.env.appRoot`, which is the active VS Code build. It
-does not scan old extension or application directories. If patch v9 is already
+does not scan old extension or application directories. If patch v16 is already
 present, startup is silent. If the active bundle is changed, the extension asks
 for one window reload. A repeated compatibility failure is logged but shown at
 most once per VS Code build.
@@ -146,8 +151,8 @@ Before writing, the patcher:
 6. creates separate restorable backups beside both bundles;
 7. records original and patched SHA-256 hashes for both files.
 
-Applying patch v9 over patch v2 through v8 uses the preserved original backup
-rather than stacking edits on the already modified bundle.
+Applying patch v16 over an older supported patch marker uses the preserved
+original backup rather than stacking edits on the already modified bundle.
 
 The patch is deliberately fail-closed. If a Copilot update changes the bundle
 shape, the extension stops instead of applying a broad replacement and leaves

@@ -27,20 +27,16 @@ There are two independent compaction layers:
   input target. It does not run inference.
 - Copilot Chat can generate an LLM summary of its outer conversation history.
 
-Patch v6 makes Copilot use the complete `maxInputTokens + maxOutputTokens`
+Patch v16 makes Copilot use the complete `maxInputTokens + maxOutputTokens`
 window for this provider, ignores smaller stale session and global summary
 threshold overrides, and avoids reserving Copilot's full raw tool catalog
-before the provider selects its bounded API Direct subset. The temporary Agent
-renderer is allowed to pass raw tool results through to the provider, where
-they are sanitized, counted, and deterministically compacted. Automatic Copilot
-LLM summaries are disabled for `llamacpp`; the explicit Compact Conversation
-command remains available.
-
-Recognized Copilot summary requests use `thinking=off`, skip shared-memory
-injection and prompt caching, and cap output with
-`llamacpp.copilotCompactionMaxTokens` (2048 by default). This avoids spending a
-normal 16K reasoning budget on a service summary and avoids replacing the main
-chat's useful cache entry with a large one-off summarization prefix.
+before the provider selects its bounded subset. The temporary Agent renderer
+is allowed to pass raw tool results through to the provider, where they are
+sanitized, counted, and deterministically compacted. Copilot-owned automatic
+summarization and truncation are disabled for `llamacpp`; the explicit Compact
+Conversation command remains available. A stable conversation id and
+deterministic tool signatures let durable subscription sessions survive
+renderer history rewrites without weakening their validation rules.
 
 ## Thinking Mode Mapping
 
@@ -96,7 +92,6 @@ llama.cpp reuses only the identical prefix of a prompt. The extension preserves
 that prefix in several ways:
 
 - `cache_prompt=true` is sent only to local sources.
-- One-off Copilot compaction requests deliberately use `cache_prompt=false`.
 - Tool definitions are priority-sorted, compacted, count-limited, and bounded
   by `apiDirectToolTokenBudget` so the catalog remains stable and affordable.
 - Tool and JSON Schema key ordering is canonical across Local, DeepSeek, Codex,
@@ -142,6 +137,21 @@ record the same data under `chat.response.usage.promptCache`:
 llama.cpp reports standard `prompt_tokens_details.cached_tokens`. DeepSeek's
 `prompt_cache_hit_tokens` is normalized to the same shape. `n/a` means the
 server omitted cache counters, not necessarily that no cache was used.
+
+Codex reports cumulative and current-request usage through app-server token
+notifications. The extension records per-model-segment snapshots and computes
+billing deltas without double-counting a reused durable thread. When a
+persisted Codex rollout is available, exact segment/tool timing replaces the
+live-notification fallback in the final Session Quality record. These provider
+session counters are separate from local HTTP KV-cache reuse.
+
+Claude reports fresh input, cache reads, and cache creation as separate Agent
+SDK counters. Session Quality uses `cache read / (fresh + read + creation)` for
+the hit percentage and displays creation independently because those tokens are
+written for possible later reuse, not served from cache in the current model
+segment. Assistant usage also exposes per-segment thinking tokens; the terminal
+result supplies the authoritative aggregate and `getContextUsage()` adds the
+post-turn SDK context categories.
 
 ## Recommended Profiles
 

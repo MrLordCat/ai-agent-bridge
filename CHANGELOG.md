@@ -1,5 +1,150 @@
 # Changelog
 
+## 1.9.0 - 2026-07-29
+
+- Promoted the unified Local, DeepSeek, Codex, and Claude model-picker workflow
+  to a stable release after the full 1.8.x hardening cycle.
+- Stabilized durable Codex app-server threads and Claude Agent SDK sessions,
+  including reload/rollover recovery and same-turn continuation through native
+  VS Code tool cards.
+- Kept executable actions inside the visible VS Code tool and approval boundary,
+  with fail-closed handling and same-thread recovery when a subscription runtime
+  requests a prohibited internal action.
+- Added live Session Quality diagnostics for model/tool timelines, context,
+  compaction, cache reads and writes, reasoning, latency, lifecycle, and
+  provider-specific continuation health without retaining prompt bodies.
+- Normalized native and aggregate usage reporting so Codex and Claude current
+  context occupancy is not confused with multi-segment processed billing.
+- Hardened prompt stability, bounded tool results, deterministic compaction,
+  session compatibility checks, Copilot patch validation, and release
+  reproducibility; the stable gate contains 279 extension-host tests.
+
+## 1.8.47 - 2026-07-29
+
+- Kept the fail-closed Codex internal-action boundary while recovering on the
+  same app-server thread: after the prohibited turn is interrupted, a bounded
+  follow-up reminds Codex to use only native VS Code tools instead of replaying
+  the full visible transcript on a cold thread.
+- Split a real cold first segment from continuation health in Session Quality.
+  A new thread whose later model segments recover above 90% is now healthy,
+  while its paid cold-start segment remains visible in processed cache totals
+  and a separate `cold Codex startup` counter.
+- Added regression coverage for blocked-action interrupt settling, recoverable
+  exception classification, final-segment cache health, and report rendering.
+
+## 1.8.46 - 2026-07-29
+
+- Added Claude Agent SDK usage to native Copilot Chat Session Info through the
+  same `usage` response-data contract used by the other contributed providers.
+- Native Claude context occupancy now uses the final assistant model segment,
+  including fresh input, cache reads, cache creation, output, and cached-input
+  detail. This avoids treating aggregate multi-step billing as one oversized
+  context window.
+- Kept aggregate usage across every Claude model segment in Live Report and
+  usage history, while the native denominator continues to use the advertised
+  context window refreshed by the SDK context probe.
+
+## 1.8.45 - 2026-07-29
+
+- Added one live Claude logical-turn record across Agent SDK model segments and
+  native VS Code tool-result continuations, with stable request identity and
+  explicit `new`, `warm`, `restored`, `rollover`, or `resume-fallback` mode.
+- Added exact Anthropic fresh-input, cache-read, cache-creation, output, and
+  thinking-token segments; first-model/visible latency; native tool names and
+  duration; terminal lifecycle; and asynchronous SDK context categories to
+  Session Quality.
+- Added Claude-specific cache and context panels plus a live model/tool timeline
+  instead of rendering Agent SDK sessions as stateless prompt-prefix requests.
+- Extended subagent correlation to Claude parents and updated the guarded
+  Copilot patch anchors for the minified variable names in VS Code 1.131 while
+  retaining unique-match and syntax-validation safeguards.
+
+## 1.8.44 - 2026-07-29
+
+- Fixed a newer user turn arriving while Codex waits on a long native tool or
+  `runSubagent`: the pending app-server turn is interrupted and the next user
+  message continues on the same compatible thread instead of replaying a full
+  compacted transcript as a cold start.
+- Finalized abandoned, interrupted, failed, cancelled, and 30-minute tool
+  timeout records in Live Report. Timed-out native tools no longer remain
+  indefinitely `running`, and their server usage is accounted before reuse.
+- Split Codex cache analytics into processed input/cache across all model
+  segments and final/continuation cache reuse. A turn such as 0% then 96.7% now
+  shows both facts instead of presenting the 49% blended cost as continuation
+  health.
+- Merged rollout and live model/tool timelines, distinguished VS Code tool
+  execution from app-server catalog lookup, and correlated eligible local or
+  DeepSeek subagent turns with their parent `runSubagent` call.
+
+## 1.8.43 - 2026-07-28
+
+- Reworked the primary README around the extension's actual goals, supported
+  transports, native VS Code tool boundary, model-picker Codex flow, durable
+  sessions, cache/context controls, diagnostics, security, and known limits.
+- Updated the architecture, Codex subscription, Copilot patch, token/cache,
+  reliability, and release-audit documentation for patch v16 and the live
+  Codex model/tool timeline.
+- Documented the 1.8.43 release gates explicitly. Building and installing this
+  VSIX remains separate from the later reviewed commit, tag, and publish step.
+
+## 1.8.42 - 2026-07-28
+
+- Added running Codex turn upserts and a model/tool step timeline to Live
+  Report, including token/cache snapshots, tool status, and latency while a
+  model-picker Codex request is still active.
+- Kept tool completion metrics synchronized across native VS Code tool-result
+  continuations so the live timeline reflects the same app-server turn.
+
+## 1.8.41 - 2026-07-28
+
+- Added a direct, privacy-preserving Codex rollout collector. Live Report now
+  distinguishes one logical chat turn from its model segments and records exact
+  token/cache snapshots, tool calls/results, tool latency, first-model-event
+  latency, first-visible-response latency, and reasoning tokens.
+- Added live-notification fallback metrics when a persisted rollout is not yet
+  available, while retaining the original turn's compaction and context data
+  across native VS Code tool continuations.
+- Fixed fractional `codexContextUtilization` values being rounded down by the
+  integer configuration clamp and removed false subagent classification from
+  Codex tool continuations.
+
+## 1.8.40 - 2026-07-28
+
+- Added conversation compaction for Codex: full-turn messages are now compacted
+  (summary + recent suffix) before serialization, reducing input tokens from
+  ~170-193K to ~50-70K per turn when history exceeds 12 messages.
+- Enhanced Codex per-turn diagnostics: duration, tool calls, output chars,
+  compaction metrics, and context window are now reported to the live Session
+  Quality report instead of zeros.
+- Added `codexContextUtilization` and `codexCompactKeepLastTurns` config keys
+  to tune Codex compaction behaviour.
+
+## 1.8.39 - 2026-07-28
+
+- Persisted exact per-conversation DeepSeek message snapshots and stable tool
+  catalogs across Extension Host restarts, with one-time recovery from legacy
+  prefix snapshots.
+- Fixed normal auto-compaction so it stops at the soft target. The lower hard
+  target is now used only after a backend-confirmed context overflow instead of
+  rewriting the same prompt a second time before its first request.
+- Upgraded the native Copilot Chat patch to v16. It disables Copilot-owned
+  summarization/truncation for contributed llama models, forwards a stable
+  conversation id, uses deterministic tools, and waits for tool definitions
+  only after their cached signature actually changes.
+- Redesigned the live Session Quality report with cache diagnostics, filters,
+  issue highlighting, expandable detail cards, and state-preserving updates.
+
+## 1.8.1 - 2026-07-27
+
+- Added `stabilizeMessagePrefix`: when two consecutive requests share a common
+  message prefix AND the static parameters and tool catalog are unchanged, the
+  prefix messages are replaced with the exact byte-copy of the previous
+  request.  This keeps the DeepSeek prompt cache warm even when VS Code trims
+  different numbers of middle messages between turns — the common prefix never
+  drifts.
+- Added `chat.cache.prefix_stabilized` diagnostics so you can see when the
+  prefix was pinned and how many messages were reused.
+
 ## 1.8.0 - 2026-07-27
 
 - Fixed the root cause of long-session prompt-cache collapse. VS Code attaches

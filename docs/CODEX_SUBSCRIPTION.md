@@ -4,13 +4,18 @@ The extension can expose models from an existing ChatGPT/Codex subscription in
 the VS Code and Copilot Chat model picker. This is a separate provider from the
 local OpenAI-compatible and DeepSeek transports.
 
+This is a model-provider integration, not a separate `@codex` participant.
+Selecting a discovered Codex model in the normal picker, including a model with
+the native `xhigh` effort option, is the intended entry point.
+
 ## What Subscription Access Means
 
 ChatGPT subscription access is not an OpenAI API key. The extension launches
 the official `codex app-server --stdio` process and uses its JSON-RPC surface.
 Codex owns browser login, refresh tokens, model discovery, rate limits, and the
-inner agent loop. Native command, search, file, web, and memory tools remain
-owned by the outer Copilot session when delegation is enabled.
+inner reasoning/tool-selection loop. Native command, search, file, web, memory,
+MCP, and other registered actions remain owned by the outer VS Code Chat
+session.
 
 The extension never reads, copies, logs, or stores the contents of
 `~/.codex/auth.json`. It validates `account/read` and requires
@@ -32,7 +37,10 @@ Copilot Chat UI
      -> codex:: model routing
      -> local codex app-server over JSONL/stdin
         -> ChatGPT-managed Codex service
-        -> Codex shell, file edits, web, MCP, skills, and sandbox
+        -> dynamic tool selection
+           -> LanguageModelToolCallPart
+              -> native VS Code tool card and approval
+              -> tool result resumes the same app-server turn
 ```
 
 Copilot Chat owns the visible chat history. With `persistProviderSessions`
@@ -63,7 +71,8 @@ minutes if abandoned, and are never persisted as chat history. If VS Code adds
 or removes advertised tools while a call is running, the active turn keeps its
 original catalog until completion instead of restarting with the full history.
 
-Copilot can advertise a very large catalog (95 tools in the measured baseline).
+Copilot can advertise a large catalog whose size depends on the installed
+extensions, attached MCP servers, workspace policy, and current Chat mode.
 By default, the provider marks uncommon schemas with app-server
 `deferLoading` inside the `vscode_deferred` namespace, while keeping workspace
 reads, searches, terminal commands, edits, web verification, user input, and
@@ -76,7 +85,7 @@ built-ins while preserving native Copilot execution and tool cards.
 
 Completed conversation threads stay available in memory for up to four hours
 (maximum 16). Reuse first checks the complete SHA-256 history and answer
-digests. Copilot patch v9 additionally forwards a stable conversation id and
+digests. Copilot patch v16 additionally forwards a stable conversation id and
 turn index so the provider can tolerate rewritten service, tool, or rendered
 prompt history while still requiring an advancing turn and the exact prior
 answer. Without the patch, a conservative fallback ignores mutable tool
@@ -108,9 +117,56 @@ Approvals`. While delegation is active, internal Codex command and file approval
 requests are declined without an extra modal prompt so Codex can select the
 matching outer tool instead.
 
+If Codex nevertheless starts an internal action, the bridge rejects it and
+waits for the app-server interrupt to settle. The provider then starts one
+bounded recovery turn on the same thread with an explicit native-tool reminder.
+The prohibited action never executes, completed VS Code tool results are not
+repeated, and the visible transcript is not replayed into a cold replacement
+thread.
+
 Agent commentary and reasoning summaries are emitted through the native VS Code
 thinking stream when that API is available. Final answer text and server token
 usage are emitted through the normal language-model response stream.
+
+## Live Diagnostics
+
+`Local LLM: Open Session Quality Report` updates while a Codex turn is running.
+One logical user turn is upserted instead of duplicated across native tool
+result rounds. The report includes:
+
+- app-server model usage segments with input, cached input, output, reasoning,
+   total tokens, and cache-hit percentage;
+- ordered model/tool steps with running, completed, failed, timed-out, or
+   cancelled state and native tool duration;
+- separate processed cache cost across every model segment and final or
+   continuation-segment reuse, so an uncached first segment does not hide a
+   healthy cached continuation;
+- a separate cold Codex startup count, so a recovered 0% first segment remains
+   visible without marking the entire logical turn unhealthy;
+- thread mode, reuse-miss reason, lifecycle phase, and terminal detail;
+- first-model-event and first-visible-text latency;
+- context-window, compaction, serialized-message, and tool-schema budgets;
+- exact rollout-derived metrics when a durable rollout is available, with a
+   live-notification fallback for ephemeral or not-yet-persisted turns.
+
+Records contain metrics and request identifiers, not message or tool-result
+bodies. Markdown and JSON snapshots are written to extension global storage.
+
+### New user turn while a native tool is still running
+
+If Copilot forwards a newer user turn while the same conversation is waiting on
+a native VS Code tool (including `runSubagent`), the provider interrupts the
+pending Codex app-server turn and marks its Live Report record terminal. When
+the model, runtime, tool catalog, process generation, and conversation identity
+still match, the provider starts the new user turn on that same app-server
+thread and sends only the latest user tail. It does not serialize the whole VS
+Code transcript into a new cold thread.
+
+The extension cannot forcibly terminate the implementation behind a native VS
+Code tool card after ownership has passed to VS Code. It can stop waiting for
+that result, reject a late continuation, and unblock the Codex thread. A native
+tool that remains unresolved for 30 minutes is recorded as `timed_out` rather
+than staying `running` forever.
 
 ## Setup
 
@@ -183,10 +239,9 @@ path; the provider denied or interrupted it instead of executing invisibly.
 
 ### Native VS Code tool delegation is unavailable
 
-Version 1.5.28 fixes a hand-off race where a second dynamic tool call could
-arrive after the first native card detached but before its result resumed the
-turn. Such calls are now logged as `codex.chat.tool_delegation_queued` and
-shown in the next native tool segment. A remaining
+Dynamic calls arriving after one native card detaches but before its result
+resumes the turn are queued and logged as `codex.chat.tool_delegation_queued`.
+They are shown in the next native tool segment. A remaining
 `codex.chat.tool_delegation_unavailable` event includes an explicit reason;
 `detached-without-pending-turn` indicates an unrelated call with no valid
 Copilot result round to resume and is intentionally rejected.
@@ -210,7 +265,7 @@ protocol overhead. The `codex.chat.start` log event records original and final
 character counts plus omitted and truncated message and image counts. Images
 belonging to omitted history messages are not resent.
 
-Patch v9 additionally caps terminal and native tool data before VS Code writes
+Patch v16 additionally caps terminal and native tool data before VS Code writes
 it into its own chat-session snapshots. This prevents future transcript growth;
 it does not shrink sessions that were already persisted. Use the Codex rollover
 command above to leave an existing oversized chat while preserving the latest

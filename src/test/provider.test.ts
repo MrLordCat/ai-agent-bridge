@@ -168,7 +168,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 
                 const deepSeekInfo = infos.find(info => info.id === "deepseek::deepseek-v4-pro");
                 assert.ok(deepSeekInfo);
-                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 393216);
+                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 65536);
             } finally {
                 providerAny.getModelSources = originalGetModelSources;
                 providerAny.getRuntimeContextLengthWithCache = originalGetRuntimeContextLengthWithCache;
@@ -452,6 +452,8 @@ suite("Llama.cpp Chat Provider Extension", () => {
             };
 
             const longToolPayload = "tool-payload-very-long-1234567890".repeat(40);
+            // tokenBudget must be low enough that messages exceed it,
+            // otherwise compactMessages returns them as-is (no summary).
             const compacted = providerAny.compactOpenAiMessages(
                 [
                     { role: "system", content: "sys" },
@@ -467,7 +469,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                     },
                     { role: "user", content: "latest" },
                 ],
-                10000,
+                10,
                 1,
                 "Conversation summary (auto-compact)"
             );
@@ -1214,6 +1216,99 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 "request-2"
             );
             assert.deepStrictEqual(second.tools, first.tools);
+        });
+
+        test("restores the sent-message snapshot and tool catalog after provider restart", async () => {
+            const memento = new MockMemento();
+            const firstProvider = new LlamaCppChatModelProvider(
+                new MockSecretStorage(),
+                "test-user-agent",
+                undefined,
+                undefined,
+                memento
+            );
+            const firstProviderAny = firstProvider as unknown as {
+                setConversationMessageSnapshot: (
+                    scope: string,
+                    messages: OpenAIChatMessage[],
+                    tokenCount: number
+                ) => void;
+                persistContinuationState: () => Promise<void>;
+                stabilizeToolCatalog: (
+                    modelId: string,
+                    options: vscode.ProvideLanguageModelChatResponseOptions,
+                    config: ReturnType<typeof convertTools>,
+                    messages: readonly OpenAIChatMessage[],
+                    requestId: string
+                ) => ReturnType<typeof convertTools>;
+            };
+            const scope = "deepseek-v4-pro\0conversation-restart-1";
+            const sentMessages: OpenAIChatMessage[] = [
+                { role: "system", content: "stable instructions" },
+                { role: "user", content: "continue this long conversation" },
+                { role: "assistant", content: "continuation point" },
+            ];
+            firstProviderAny.setConversationMessageSnapshot(scope, sentMessages, 12345);
+
+            const tool = (name: string, description: string): vscode.LanguageModelChatTool => ({
+                name,
+                description,
+                inputSchema: { type: "object", properties: { value: { type: "string" } } },
+            });
+            const firstOptions = {
+                modelOptions: { _copilotConversationId: "conversation-restart-1" },
+                tools: [tool("read_file", "original read"), tool("grep_search", "original grep")],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            const firstCatalog = firstProviderAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                firstOptions,
+                convertTools(firstOptions, { mode: "apiDirect", apiDirectMaxTools: 2 }),
+                sentMessages,
+                "request-before-restart"
+            );
+            await firstProviderAny.persistContinuationState();
+
+            const restartedProvider = new LlamaCppChatModelProvider(
+                new MockSecretStorage(),
+                "test-user-agent",
+                undefined,
+                undefined,
+                memento
+            );
+            const restartedProviderAny = restartedProvider as unknown as {
+                getConversationMessageSnapshot: (scope: string) => {
+                    messages: OpenAIChatMessage[];
+                    tokenCount: number;
+                } | undefined;
+                stabilizeToolCatalog: (
+                    modelId: string,
+                    options: vscode.ProvideLanguageModelChatResponseOptions,
+                    config: ReturnType<typeof convertTools>,
+                    messages: readonly OpenAIChatMessage[],
+                    requestId: string
+                ) => ReturnType<typeof convertTools>;
+            };
+            const restoredSnapshot = restartedProviderAny.getConversationMessageSnapshot(scope);
+            assert.ok(restoredSnapshot);
+            assert.deepStrictEqual(restoredSnapshot.messages, sentMessages);
+            assert.strictEqual(restoredSnapshot.tokenCount, 12345);
+
+            const changedOptions = {
+                ...firstOptions,
+                tools: [tool("grep_search", "changed grep"), tool("read_file", "changed read")],
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            const restoredCatalog = restartedProviderAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                changedOptions,
+                convertTools(changedOptions, { mode: "apiDirect", apiDirectMaxTools: 2 }),
+                [{ role: "user", content: "after restart" }],
+                "request-after-restart"
+            );
+            const canonicalFirstCatalog = [...(firstCatalog.tools ?? [])].sort((left, right) =>
+                left.function.name.localeCompare(right.function.name)
+            );
+            assert.deepStrictEqual(restoredCatalog.tools, canonicalFirstCatalog);
         });
 
         test("returns exact usage from the final SSE usage chunk", async () => {
