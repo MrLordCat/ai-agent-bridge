@@ -28,10 +28,11 @@ suite("Copilot patch", () => {
 		);
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v16"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v17"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
-		assert.ok(patched.includes("er._llamaToolsSignature"));
-		assert.ok(patched.includes("if(__llamaToolCurrent!==er._llamaToolsSignature)"));
+		assert.ok(patched.includes("this._llamaToolsSignature"));
+		assert.ok(patched.includes("if(__llamaToolCurrent!==this._llamaToolsSignature)"));
+		assert.ok(!patched.includes("er._llamaToolsSignature"));
 		assert.ok(!patched.includes("er._toolsStable"));
 		assert.ok(patched.includes('this.endpoint.modelProvider!=="llamacpp"'));
 		assert.match(

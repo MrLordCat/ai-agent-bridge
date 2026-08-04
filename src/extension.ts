@@ -23,6 +23,7 @@ import { renderProviderHealthMarkdown } from "./diagnostics/provider-health";
 import { SessionQualityTracker } from "./diagnostics/session-report";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
+import { registerContextControlCommand } from "./ui/context-control";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
 import { SessionQualityPanel } from "./ui/session-quality-panel";
@@ -175,6 +176,7 @@ function updateCodexSessionQuality(
 		initialSegmentHitPercent: firstSegment?.cacheHitPercent,
 		finalSegmentHitPercent: finalSegmentHit,
 		processedHitPercent: hitPercent,
+		idleGapSeconds: diag?.idleGapSeconds,
 	});
 	const cacheMissReason = cacheClassification.reason;
 	const lifecyclePhase = diag?.lifecyclePhase ?? (finalized ? "completed" : "running");
@@ -193,6 +195,8 @@ function updateCodexSessionQuality(
 		lifecyclePhase,
 		terminalDetail: diag?.terminalDetail,
 		threadMode: diag?.threadMode,
+		inputMode: diag?.inputMode,
+		compacted: diag?.compacted,
 		threadReuseMissReason: diag?.threadReuseMissReason,
 		conversationKey: diag?.conversationKey,
 		durationMs: diag?.durationMs ?? 0,
@@ -261,15 +265,39 @@ function updateClaudeSessionQuality(
 	const cacheHitPercent = promptTokens > 0
 		? Number((cachedInputTokens / promptTokens * 100).toFixed(1))
 		: undefined;
-	const coldSession = update.context.sessionMode === "new"
-		|| update.context.sessionMode === "resume-fallback";
-	const cacheMissReason = cacheHitPercent === undefined
+	const fallbackSession = update.context.sessionMode === "resume-fallback";
+	const coldSession = update.context.sessionMode === "new" || fallbackSession;
+	const restoredSession = update.context.sessionMode === "restored"
+		|| update.context.sessionMode === "rollover";
+	const cacheMissReason = fallbackSession
+		? `resume_${update.context.resumeFailureReason ?? "failed"}`
+		: cacheHitPercent === undefined
 		? undefined
+		: restoredSession && cacheHitPercent < 90
+			? update.context.sessionMode === "rollover"
+				? "session_rollover"
+				: "session_restored"
+			: coldSession
+				? "session_not_reused"
+				: cacheHitPercent >= 90
+					? "healthy"
+					: "unknown";
+	const cacheMissDetail = fallbackSession
+		? `Durable Claude resume failed at ${update.context.resumeFailureStage ?? "unknown stage"}: `
+			+ `${update.context.resumeFailureDetail ?? "original SDK error unavailable"}. `
+			+ "The provider then retried with full input."
 		: coldSession
-			? "session_not_reused"
-			: cacheHitPercent >= 90
-				? "healthy"
-				: "unknown";
+		? "No compatible warm Claude session was available; this turn started a new Agent SDK session."
+		: restoredSession
+			? update.context.runtimeChanged
+				? "The session was restored from disk after a reload, but the runtime fingerprint changed "
+					+ "(model, context target, effort, or the advertised tool catalog), so the cached prefix "
+					+ "was rewritten instead of read."
+				: "The session was restored from disk after a reload/restart; the upstream prompt cache was "
+					+ "cold for the new process and the prefix was rewritten once."
+			: cacheMissReason === "unknown"
+				? "The Claude cache-read share was below 90%; cache creation is reported separately."
+				: undefined;
 	const context = update.contextUsage;
 	const contextWindow = update.contextWindowTokens ?? context?.rawMaxTokens;
 	if (context && contextWindow && contextWindow > 0) {
@@ -335,13 +363,17 @@ function updateClaudeSessionQuality(
 		finalSegmentInputTokens: segments.at(-1)?.inputTokens,
 		finalSegmentCachedInputTokens: segments.at(-1)?.cacheReadInputTokens,
 		cacheMissReason,
-		cacheMissDetail: coldSession
-			? update.context.sessionMode === "resume-fallback"
-				? "The persisted Claude session could not resume and the provider retried with full input."
-				: "No compatible warm Claude session was available; this turn started a new Agent SDK session."
-			: cacheMissReason === "unknown"
-				? "The Claude cache-read share was below 90%; cache creation is reported separately."
-				: undefined,
+		cacheMissDetail,
+		resumeFailureReason: update.context.resumeFailureReason,
+		resumeFailureStage: update.context.resumeFailureStage,
+		resumeFailureDetail: update.context.resumeFailureDetail,
+		resumeFallbackDecision: update.context.resumeFallbackDecision,
+		resumeFallbackEstimatedInputTokens: update.context.resumeFallbackEstimatedInputTokens,
+		resumeFallbackMaxInputTokens: update.context.resumeFallbackMaxInputTokens,
+		turnMaxModelSegments: update.context.turnMaxModelSegments,
+		turnMaxCumulativeInputTokens: update.context.turnMaxCumulativeInputTokens,
+		safetyStopReason: update.context.safetyStopReason,
+		safetyStopDetail: update.context.safetyStopDetail,
 		modelTurns: Math.max(segments.length, aggregate?.numTurns ?? 0, 1),
 		usageEstimated: !aggregate && segments.length === 0,
 		retriedAfterOverflow: false,
@@ -519,7 +551,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => codexProvider.subscriptionUsageSummary,
 		() => getSubagentModelProfiles(),
 		() => tokenUsageHistory.summary,
-		() => usageExperiments.summary
+		() => usageExperiments.summary,
+		() => llamaProvider.deepSeekBalanceSummary,
+		() => codexProvider.codexUsageLimitPercent,
+		() => codexProvider.codexUsageLimitResetLabel,
+		() => claudeProvider.claudeUsageLimitPercent,
+		() => claudeProvider.claudeUsageLimitResetLabel
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
@@ -527,6 +564,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(usageExperiments.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(codexProvider.onDidChangeStatus(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(claudeProvider.onDidChangeStatus(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(claudeProvider.onDidChangeCacheKeepAliveStatus(() => {
+		quickActionsProvider.refresh();
+		SessionQualityPanel.refreshIfOpen();
+	}));
 	context.subscriptions.push(codexProvider.onDidRecordUsage(usage => {
 		recordUsage({
 			provider: "codex",
@@ -555,12 +596,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(claudeProvider.onDidUpdateLiveTurn(update => {
 		updateClaudeSessionQuality(sessionQuality, update);
 	}));
+	context.subscriptions.push(registerContextControlCommand(
+		() => codexProvider.runtimeMetrics,
+		() => quickActionsProvider.refresh()
+	));
 	context.subscriptions.push(...registerModelBehaviorCommands(() => quickActionsProvider.refresh()));
 	llamaProvider.refreshLanguageModelChatInformation();
 	codexProvider.refreshLanguageModelChatInformation();
 	claudeProvider.refreshLanguageModelChatInformation();
 	void codexProvider.refreshStatus().catch(error => logService.logError("codex.initial_status.failed", error));
 	void claudeProvider.refreshStatus().catch(error => logService.logError("claude.initial_status.failed", error));
+	void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.balance.initial_failed", error));
+
+	// Auto-refresh provider usage limits and balances so Quick Access shows when
+	// a subscription window resets without requiring a manual refresh. Every
+	// provider refresh is internally TTL-guarded, so this stays lightweight.
+	const usageLimitRefreshTimer = setInterval(() => {
+		quickActionsProvider.refresh();
+		void codexProvider.refreshStatus().catch(error => logService.logError("codex.periodic_status.failed", error));
+		void claudeProvider.refreshSubscriptionUsage().catch(error => logService.logError("claude.periodic_usage.failed", error));
+		void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.periodic_balance.failed", error));
+	}, 60_000);
+	context.subscriptions.push(new vscode.Disposable(() => clearInterval(usageLimitRefreshTimer)));
 
 	const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 95);
 	performanceStatusBar.name = "Local LLM Throughput";
@@ -769,7 +826,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}),
 		vscode.commands.registerCommand("llamacpp.openSessionReport", async () => {
 			try {
-				SessionQualityPanel.createOrShow(context.extensionUri, sessionQuality, extVersion, vscodeVersion);
+				SessionQualityPanel.createOrShow(
+					context.extensionUri,
+					sessionQuality,
+					extVersion,
+					vscodeVersion,
+					() => claudeProvider.cacheKeepAliveStatus
+				);
 			} catch (err: unknown) {
 				void vscode.window.showErrorMessage(
 					`Failed to open session quality report: ${err instanceof Error ? err.message : String(err)}`
@@ -938,6 +1001,32 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleCodexCacheKeepAlive", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const next = config.get<boolean>("codexCacheKeepAliveEnabled", false) === false;
+			await config.update("codexCacheKeepAliveEnabled", next, vscode.ConfigurationTarget.Global);
+			quickActionsProvider.refresh();
+			codexProvider.refreshCodexCacheKeepAliveStatus();
+			vscode.window.showInformationMessage(
+				`Codex cache keep-alive ${next ? "enabled" : "disabled"}.`
+			);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleCodexCacheKeepAliveIgnoreUsageLimit", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const next = config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === false;
+			await config.update("codexCacheKeepAliveIgnoreUsageLimit", next, vscode.ConfigurationTarget.Global);
+			quickActionsProvider.refresh();
+			codexProvider.refreshCodexCacheKeepAliveStatus();
+			vscode.window.showInformationMessage(
+				`Codex cache keep-alive usage-limit pause ${next ? "ignored" : "respected"}.`
+			);
+		})
+	);
+
+	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.codexSignIn", async () => {
 			try {
 				await codexProvider.signIn();
@@ -1007,6 +1096,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			await claudeProvider.refreshStatus();
 			quickActionsProvider.refresh();
 			vscode.window.showInformationMessage(`Claude subscription source ${next ? "enabled" : "disabled"}.`);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleClaudeCacheKeepAlive", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const next = config.get<boolean>("claudeCacheKeepAliveEnabled", true) === false;
+			await config.update("claudeCacheKeepAliveEnabled", next, vscode.ConfigurationTarget.Global);
+			quickActionsProvider.refresh();
+			vscode.window.showInformationMessage(
+				`Claude cache keep-alive ${next ? "enabled" : "disabled"}.`
+			);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleClaudeCacheKeepAliveIgnoreUsageLimit", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const next = config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === false;
+			await config.update("claudeCacheKeepAliveIgnoreUsageLimit", next, vscode.ConfigurationTarget.Global);
+			quickActionsProvider.refresh();
+			claudeProvider.refreshCacheKeepAliveStatus();
+			vscode.window.showInformationMessage(
+				`Claude cache keep-alive usage-limit pause ${next ? "ignored" : "respected"}.`
+			);
 		})
 	);
 
@@ -1366,6 +1480,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				) {
 					claudeProvider.refreshLanguageModelChatInformation();
 					void claudeProvider.refreshStatus();
+				}
+				if (
+					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveEnabled") ||
+					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveMs") ||
+					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveIgnoreUsageLimit")
+				) {
+					quickActionsProvider.refresh();
+					claudeProvider.refreshCacheKeepAliveStatus();
+				}
+				if (
+					event.affectsConfiguration("llamacpp.codexCacheKeepAliveEnabled") ||
+					event.affectsConfiguration("llamacpp.codexCacheKeepAliveMs") ||
+					event.affectsConfiguration("llamacpp.codexCacheKeepAliveIgnoreUsageLimit")
+				) {
+					quickActionsProvider.refresh();
+					codexProvider.refreshCodexCacheKeepAliveStatus();
 				}
 				quickActionsProvider.refresh();
 			}

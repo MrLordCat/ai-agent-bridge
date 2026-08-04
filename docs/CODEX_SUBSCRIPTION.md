@@ -66,8 +66,8 @@ result and resolves the still-pending app-server dynamic tool request. Parallel
 requests are emitted together and resume only after every matching result is
 available. The original Codex turn continues directly: there is no interrupt,
 second `turn/start`, serialized continuation prompt, or full-history prefill.
-Continuations are matched by unique native tool call ids, time out after 30
-minutes if abandoned, and are never persisted as chat history. If VS Code adds
+Continuations are matched by unique native tool call ids, time out after 24
+hours if abandoned, and are never persisted as chat history. If VS Code adds
 or removes advertised tools while a call is running, the active turn keeps its
 original catalog until completion instead of restarting with the full history.
 
@@ -83,8 +83,16 @@ experimental app-server field. Outer tools named `apply_patch` and `view_image`
 use the eager `vscode_native` namespace to avoid colliding with the Codex
 built-ins while preserving native Copilot execution and tool cards.
 
-Completed conversation threads stay available in memory for up to four hours
-(maximum 16). Reuse first checks the complete SHA-256 history and answer
+Quick Access exposes a Codex working-context slider. It never claims to enlarge
+the physical model window: the selected target is capped to the latest
+`modelContextWindow` returned by app-server. For a cold full-history start, the
+provider subtracts explicit output, dynamic-tool-schema, developer-instruction,
+and safety reserves, then compacts semantic VS Code history only above the
+remaining budget. This replaces the former extra `0.45` multiplier that could
+shrink a 258.4k-window request to roughly 87k message tokens.
+
+Completed durable conversation threads stay available for up to seven days
+(maximum 16), matching Claude session retention. Reuse first checks the complete SHA-256 history and answer
 digests. Copilot patch v16 additionally forwards a stable conversation id and
 turn index so the provider can tolerate rewritten service, tool, or rendered
 prompt history while still requiring an advancing turn and the exact prior
@@ -105,7 +113,7 @@ conversation ids, text, or hashes.
 
 If the native VS Code transcript has already become too large, run
 `Local LLM: Continue Latest Codex Thread in New Chat`. The command arms the
-newest durable completed Codex thread for 30 minutes and opens a clean chat.
+newest durable completed Codex thread for 24 hours and opens a clean chat.
 Keep the same Codex model selected and send the next user message there. The
 provider resumes the inner Codex thread but does not serialize the old VS Code
 transcript again.
@@ -165,7 +173,7 @@ Code transcript into a new cold thread.
 The extension cannot forcibly terminate the implementation behind a native VS
 Code tool card after ownership has passed to VS Code. It can stop waiting for
 that result, reject a late continuation, and unblock the Codex thread. A native
-tool that remains unresolved for 30 minutes is recorded as `timed_out` rather
+tool that remains unresolved for 24 hours is recorded as `timed_out` rather
 than staying `running` forever.
 
 ## Setup
@@ -196,8 +204,9 @@ shown or written to extension logs.
 | `llamacpp.codexFastServiceTier` | `false` | Request priority service when offered; uses quota faster. |
 | `llamacpp.persistProviderSessions` | `true` | Resume completed Codex and Claude sessions across reloads. |
 | `llamacpp.codexEphemeralThreads` | `false` | Force Codex threads to stay in-memory and disable cross-reload resume. |
-| `llamacpp.codexContextLength` | `258400` | Context advertised to VS Code. |
-| `llamacpp.codexMaxInputChars` | `600000` | Serialized conversation limit below the app-server hard request limit. |
+| `llamacpp.codexContextLength` | `258400` | Pre-telemetry fallback window; server-reported model context takes precedence. |
+| `llamacpp.codexWorkingContextTarget` | `258400` | Cold-start target capped to the server window before explicit reserves are deducted. |
+| `llamacpp.codexMaxInputChars` | `900000` | Serialized conversation hard cap after token-aware compaction. |
 | `llamacpp.codexMaxToolResultChars` | `12000` | Per-result history cap that preserves more conversational turns. |
 | `llamacpp.codexDeferNonCoreTools` | `true` | Keep core coding tools eager and load uncommon schemas through Codex tool search. |
 | `llamacpp.codexMaxOutputTokens` | `32768` | Reply reserve advertised to VS Code. |
@@ -248,9 +257,10 @@ Copilot result round to resume and is intentionally rejected.
 
 ### Context display differs from the runtime
 
-The current runtime reports a 258400-token window. The advertised value is
-configurable because future models or Codex versions may differ. Actual usage
-from `thread/tokenUsage/updated` is returned after every completed turn.
+The current runtime reports a 258400-token window. Before telemetry arrives the
+provider uses `codexContextLength` as a fallback; afterwards the server-reported
+window is authoritative. Actual usage from `thread/tokenUsage/updated` is
+returned after every completed turn.
 
 ### Input exceeds 1048576 characters
 
@@ -260,9 +270,10 @@ model context window. The provider keeps the first and newest messages, omits
 older middle history, and truncates the newest message only as a last resort.
 Before dropping messages it bounds individual historical tool results, which
 usually keeps all user and assistant turns available.
-`llamacpp.codexMaxInputChars` defaults to `600000`, leaving room for app-server
-protocol overhead. The `codex.chat.start` log event records original and final
-character counts plus omitted and truncated message and image counts. Images
+`llamacpp.codexMaxInputChars` defaults to `900000` as a final hard character
+cap after token-aware compaction. The `codex.chat.start` log event records the
+model window, selected working target, message budget and every reserve, plus
+original/final character counts and omitted or truncated content. Images
 belonging to omitted history messages are not resent.
 
 Patch v16 additionally caps terminal and native tool data before VS Code writes

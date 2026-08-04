@@ -10,8 +10,8 @@ type KnowledgeMode = "off" | "adaptive" | "strict";
 
 const CONTEXT_LIMIT_PRESETS = [65_536, 131_072, 258_400, 524_288, 1_048_576];
 
-async function pickContextLimit(title: string, current: number, maximum: number): Promise<number | undefined> {
-	const presetValues = CONTEXT_LIMIT_PRESETS.filter(value => value <= maximum);
+async function pickContextLimit(title: string, current: number, minimum: number, maximum: number): Promise<number | undefined> {
+	const presetValues = CONTEXT_LIMIT_PRESETS.filter(value => value >= minimum && value <= maximum);
 	if (!presetValues.includes(current)) {
 		presetValues.push(current);
 		presetValues.sort((left, right) => left - right);
@@ -36,7 +36,7 @@ async function pickContextLimit(title: string, current: number, maximum: number)
 	}
 	const entered = await vscode.window.showInputBox({
 		title: `${title}: Custom Limit`,
-		prompt: `Enter a whole number from 32768 to ${maximum}`,
+		prompt: `Enter a whole number from ${minimum} to ${maximum}`,
 		value: String(current),
 		ignoreFocusOut: true,
 		validateInput: input => {
@@ -44,8 +44,8 @@ async function pickContextLimit(title: string, current: number, maximum: number)
 				return "Enter a whole number";
 			}
 			const parsed = Number(input);
-			return parsed < 32_768 || parsed > maximum
-				? `Value must be between 32768 and ${maximum}`
+			return parsed < minimum || parsed > maximum
+				? `Value must be between ${minimum} and ${maximum}`
 				: undefined;
 		},
 	});
@@ -57,6 +57,7 @@ function contextLimitCommand(
 	setting: string,
 	title: string,
 	fallback: number,
+	minimum: number,
 	maximum: number,
 	refresh: () => void
 ): vscode.Disposable {
@@ -64,7 +65,7 @@ function contextLimitCommand(
 		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 		const configured = Number(config.get(setting, fallback));
 		const current = Number.isFinite(configured) ? configured : fallback;
-		const next = await pickContextLimit(title, current, maximum);
+		const next = await pickContextLimit(title, current, minimum, maximum);
 		if (next === undefined) {
 			return;
 		}
@@ -137,15 +138,17 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			"deepSeekContextLength",
 			"DeepSeek Maximum Context",
 			258_400,
+			32_768,
 			1_048_576,
 			refresh
 		),
 		contextLimitCommand(
 			"llamacpp.setClaudeContextLength",
 			"claudeContextLength",
-			"Claude Maximum Context",
+			"Claude Working Context",
 			258_400,
-			1_048_576,
+			258_400,
+			967_000,
 			refresh
 		),
 		vscode.commands.registerCommand("llamacpp.setThinkingMode", async () => {

@@ -5,8 +5,9 @@ import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "res
 import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
+import { PROVIDER_ACTIVE_SESSION_IDLE_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
 import { setSubagentModelProfiles } from "../subagent-guidance";
-import { isCacheControlPart, stableJsonStringify } from "../utils";
+import { formatShortResetTime, isCacheControlPart, stableJsonStringify } from "../utils";
 import {
 	buildClaudeModelAvailability,
 	type ClaudeModelAvailability,
@@ -31,26 +32,55 @@ import {
 
 const DEFAULT_CLAUDE_CONTEXT_LENGTH = 258_400;
 const DEFAULT_CLAUDE_MAX_OUTPUT_TOKENS = 32_000;
-const DEFAULT_CLAUDE_MAX_INPUT_CHARS = 300_000;
-const MAX_CLAUDE_SESSIONS = 8;
-const CLAUDE_SESSION_IDLE_MS = 30 * 60_000;
-const CLAUDE_DURABLE_SESSION_TTL_MS = 7 * 24 * 60 * 60_000;
+const DEFAULT_CLAUDE_MAX_INPUT_CHARS = 4_000_000;
+export const CLAUDE_CONTEXT_TARGET_MIN = 258_400;
+export const CLAUDE_CONTEXT_TARGET_MAX = 967_000;
 const CLAUDE_DURABLE_SESSION_STATE_KEY = "llamacpp.claudeDurableSessions.v1";
 const CLAUDE_PENDING_ROLLOVER_STATE_KEY = "llamacpp.claudePendingRollover.v1";
-const CLAUDE_PENDING_ROLLOVER_TTL_MS = 30 * 60_000;
+const MAX_CLAUDE_SESSIONS = 8;
 const MAX_CLAUDE_DURABLE_SESSIONS = 24;
 const CLAUDE_USAGE_REFRESH_TTL_MS = 60_000;
 const CLAUDE_USAGE_REFRESH_TIMEOUT_MS = 20_000;
+/**
+ * The usage probe spawns a full Claude Code CLI agent (potentially a 1M-context
+ * model) just to read subscription/context usage. Probing every cycle while the
+ * user never uses Claude kept spawning that heavyweight CLI every ~2 minutes per
+ * VS Code window, loading the machine and slowing unrelated chats. Skip the
+ * probe entirely when Claude has not served a request for this long.
+ */
+const CLAUDE_USAGE_PROBE_IDLE_GRACE_MS = 10 * 60_000;
+const CLAUDE_KEEPALIVE_USAGE_MAX_AGE_MS = 2 * CLAUDE_USAGE_REFRESH_TTL_MS;
+const CLAUDE_KEEPALIVE_RETRY_DELAY_MS = 5 * 60_000;
+export const DEFAULT_CLAUDE_MAX_AGENT_TURNS = 0;
+export const DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS = 2_000_000;
+export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS = 64_000;
+export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT = 80;
+const CLAUDE_RESUME_FALLBACK_USAGE_MAX_AGE_MS = 2 * CLAUDE_USAGE_REFRESH_TTL_MS;
 
 export function resolveClaudeContextLength(configuredLimit: unknown, observedRawLimit?: number): number {
 	const configured = Math.max(
-		32_768,
-		Math.min(2_000_000, Number(configuredLimit) || DEFAULT_CLAUDE_CONTEXT_LENGTH)
+		CLAUDE_CONTEXT_TARGET_MIN,
+		Math.min(CLAUDE_CONTEXT_TARGET_MAX, Number(configuredLimit) || DEFAULT_CLAUDE_CONTEXT_LENGTH)
 	);
 	if (!Number.isFinite(observedRawLimit) || (observedRawLimit ?? 0) <= 0) {
 		return configured;
 	}
 	return Math.max(1_024, Math.min(configured, Math.floor(observedRawLimit!)));
+}
+
+export function resolveClaudeRuntimeModel(modelId: string): string {
+	return `${modelId.replace(/\[1m\]$/i, "")}[1m]`;
+}
+
+export function resolveClaudeInitialInputChars(configuredLimit: unknown, contextTarget: number): number {
+	const configured = Math.max(
+		32_768,
+		Math.min(4_000_000, Number(configuredLimit) || DEFAULT_CLAUDE_MAX_INPUT_CHARS)
+	);
+	const normalizedTarget = resolveClaudeContextLength(contextTarget);
+	const providerReserveTokens = Math.max(64_000, Math.floor(normalizedTarget * 0.08));
+	const contextBound = Math.max(32_768, normalizedTarget - providerReserveTokens) * 4;
+	return Math.floor(Math.min(configured, contextBound));
 }
 
 type ClaudeProviderState = "disabled" | "signedOut" | "connected" | "unavailable";
@@ -101,18 +131,189 @@ interface ClaudeConversationSession {
 	modelId: string;
 	runtimeKey: string;
 	conversationId?: string;
+	copilotTurnIndex?: number;
 	userSignatures: string[];
 	lastUsedAt: number;
 	sdkSessionId?: string;
+	/** Last completed assistant UUID safe for resume after an interrupted tail. */
+	resumeSessionAt?: string;
 	restoredFromDisk?: boolean;
 	lastTurnUpdate?: ClaudeLiveTurnUpdate;
+	/** Total prompt tokens of the last turn (fresh + cache read + cache write). */
+	lastInputTokens?: number;
+	/** When the last keep-alive turn completed, if any. */
+	lastKeepAliveAt?: number;
+	/** When the last keep-alive attempt started, including failed attempts. */
+	lastKeepAliveAttemptAt?: number;
+	/** Usage returned by the most recent maintenance turn. */
+	lastKeepAliveUsage?: ClaudeAgentUsage;
+}
+
+export type ClaudeCacheKeepAliveState =
+	| "checking"
+	| "disabled"
+	| "paused_usage_unknown"
+	| "paused_usage_stale"
+	| "paused_usage_limit"
+	| "no_eligible_session"
+	| "waiting"
+	| "running"
+	| "success"
+	| "failed";
+
+export interface ClaudeCacheKeepAliveStatus {
+	state: ClaudeCacheKeepAliveState;
+	reason: string;
+	enabled: boolean;
+	ignoreUsageLimit?: boolean;
+	updatedAt: number;
+	intervalMs: number;
+	usagePercent?: number;
+	usageSnapshotAgeMs?: number;
+	sessionCount: number;
+	eligibleSessionCount: number;
+	candidateModelId?: string;
+	candidatePrefixTokens?: number;
+	nextAttemptAt?: number;
+	lastAttemptAt?: number;
+	lastSuccessAt?: number;
+	lastFailureAt?: number;
+	lastFailure?: string;
+	lastResultCacheHitPercent?: number;
+	lastResultInputTokens?: number;
+	lastResultCacheWriteTokens?: number;
+}
+
+export interface ClaudeCacheKeepAliveSessionSnapshot {
+	healthy: boolean;
+	busy: boolean;
+	prefixTokens: number;
+	lastUsedAt: number;
+	lastKeepAliveAt?: number;
+	lastAttemptAt?: number;
+}
+
+export interface ClaudeCacheKeepAliveDecision {
+	state: "disabled" | "paused_usage_unknown" | "paused_usage_stale"
+		| "paused_usage_limit" | "no_eligible_session" | "waiting" | "ready";
+	reason: string;
+	eligibleSessionCount: number;
+	candidateIndex?: number;
+	nextAttemptAt?: number;
+}
+
+export function resolveClaudeCacheKeepAliveDecision(value: {
+	enabled: boolean;
+	now: number;
+	intervalMs: number;
+	usagePercent?: number;
+	usageSnapshotAgeMs?: number;
+	ignoreUsageLimit?: boolean;
+	sessions: readonly ClaudeCacheKeepAliveSessionSnapshot[];
+}): ClaudeCacheKeepAliveDecision {
+	const eligible = value.sessions
+		.map((session, index) => ({ session, index }))
+		.filter(({ session }) => session.healthy && !session.busy
+			&& session.prefixTokens >= MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS)
+		.sort((left, right) => right.session.prefixTokens - left.session.prefixTokens
+			|| right.session.lastUsedAt - left.session.lastUsedAt);
+	const candidateIndex = eligible[0]?.index;
+	if (!value.enabled) {
+		return {
+			state: "disabled",
+			reason: "Cache keep-alive is disabled in settings.",
+			eligibleSessionCount: eligible.length,
+			candidateIndex,
+		};
+	}
+	if (value.usagePercent === undefined) {
+		return {
+			state: "paused_usage_unknown",
+			reason: "Paused until the Claude 5-hour usage limit is available.",
+			eligibleSessionCount: eligible.length,
+			candidateIndex,
+		};
+	}
+	if (value.usageSnapshotAgeMs === undefined || value.usageSnapshotAgeMs > CLAUDE_KEEPALIVE_USAGE_MAX_AGE_MS) {
+		return {
+			state: "paused_usage_stale",
+			reason: "Paused because the Claude usage snapshot is stale.",
+			eligibleSessionCount: eligible.length,
+			candidateIndex,
+		};
+	}
+	if (value.usagePercent >= 90 && !value.ignoreUsageLimit) {
+		return {
+			state: "paused_usage_limit",
+			reason: `Paused to protect the 5-hour limit (${Math.round(value.usagePercent)}% used).`,
+			eligibleSessionCount: eligible.length,
+			candidateIndex,
+		};
+	}
+	if (eligible.length === 0) {
+		// Recoverable states → waiting, not broken.
+		if (value.sessions.some(session => session.busy)) {
+			const nextAttemptAt = value.now + 60_000;
+			return {
+				state: "waiting",
+				reason: `Claude turn is active; keep-alive will check again in ${Math.round((nextAttemptAt - value.now) / 1000)}s.`,
+				eligibleSessionCount: 0,
+				nextAttemptAt,
+			};
+		}
+		const tooSmallPrefix = value.sessions.some(session =>
+			session.healthy && session.prefixTokens > 0 && session.prefixTokens < MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS
+		);
+		if (tooSmallPrefix) {
+			return {
+				state: "waiting",
+				reason: `At least one live session has a ${MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS.toLocaleString("en-US")}-token prefix yet; keep-alive will wait until it grows.`,
+				eligibleSessionCount: 0,
+				nextAttemptAt: value.now + Math.min(value.intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS),
+			};
+		}
+		// Truly non-recoverable: no live sessions or all unhealthy.
+		const reason = value.sessions.length === 0
+			? "No live Claude session. Run one Claude turn after reload to create an eligible session."
+			: value.sessions.some(session => !session.healthy)
+				? "No healthy Claude stream is available for keep-alive."
+				: `No session has a ${MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS.toLocaleString("en-US")}-token prefix yet.`;
+		return { state: "no_eligible_session", reason, eligibleSessionCount: 0 };
+	}
+
+	const candidate = eligible[0];
+	const retryDelayMs = Math.min(value.intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS);
+	const nextAttemptAt = Math.max(
+		candidate.session.lastUsedAt + value.intervalMs * 0.8,
+		(candidate.session.lastKeepAliveAt ?? 0) + value.intervalMs,
+		(candidate.session.lastAttemptAt ?? 0) + retryDelayMs
+	);
+	if (value.now < nextAttemptAt) {
+		return {
+			state: "waiting",
+			reason: "Eligible Claude session is protected; waiting for the next maintenance window.",
+			eligibleSessionCount: eligible.length,
+			candidateIndex: candidate.index,
+			nextAttemptAt,
+		};
+	}
+	return {
+		state: "ready",
+		reason: "Eligible Claude session is due for a cache keep-alive turn.",
+		eligibleSessionCount: eligible.length,
+		candidateIndex: candidate.index,
+		nextAttemptAt: value.now,
+	};
 }
 
 export interface PersistedClaudeConversationSession {
 	conversationId: string;
 	sdkSessionId: string;
+	/** Last completed assistant UUID safe for resume after an interrupted tail. */
+	resumeSessionAt?: string;
 	modelId: string;
 	runtimeKey: string;
+	copilotTurnIndex?: number;
 	userSignatures: string[];
 	lastUsedAt: number;
 }
@@ -124,12 +325,139 @@ interface PendingClaudeSessionRollover {
 	armedAt: number;
 }
 
+export interface ClaudeResumeFailureInfo {
+	reason: "rate_limit" | "authentication" | "session_not_found" | "invalid_resume_boundary"
+		| "session_locked" | "timeout" | "stream_closed" | "interrupted_tail" | "unknown";
+	stage: "sdk_resume";
+	detail: string;
+}
+
+/** Preserve the actionable cause that would otherwise be hidden by full-input fallback. */
+export function classifyClaudeResumeFailure(error: unknown): ClaudeResumeFailureInfo {
+	const detail = (error instanceof Error ? error.message : String(error)).trim().slice(0, 1_000)
+		|| "Unknown Claude resume failure";
+	const normalized = detail.toLowerCase();
+	let reason: ClaudeResumeFailureInfo["reason"] = "unknown";
+	if (/rate[_ -]?limit|\b429\b/.test(normalized)) {
+		reason = "rate_limit";
+	} else if (/authentication|unauthorized|oauth|\b401\b/.test(normalized)) {
+		reason = "authentication";
+	} else if (/session.{0,32}(not found|missing)|no conversation|could not find.{0,16}session/.test(normalized)) {
+		reason = "session_not_found";
+	} else if (/resumesessionat|message.{0,16}uuid|invalid.{0,24}(session|resume)|parentuuid|conversation.{0,16}branch/.test(normalized)) {
+		reason = "invalid_resume_boundary";
+	} else if (/session.{0,24}(locked|in use|already active)|already has an active/.test(normalized)) {
+		reason = "session_locked";
+	} else if (/timed? out|timeout|no completed response/.test(normalized)) {
+		reason = "timeout";
+	} else if (/stream.{0,24}(closed|ended)|query.{0,24}(closed|ended)/.test(normalized)) {
+		reason = "stream_closed";
+	} else if (/interrupt|cancelled|canceled/.test(normalized)) {
+		reason = "interrupted_tail";
+	}
+	return { reason, stage: "sdk_resume", detail };
+}
+
+export type ClaudeResumeFallbackPolicy = "safe" | "never" | "always";
+
+export interface ClaudeSafetySettings {
+	maxAgentTurns: number;
+	maxCumulativeInputTokens: number;
+	resumeFallbackPolicy: ClaudeResumeFallbackPolicy;
+	resumeFallbackMaxInputTokens: number;
+	resumeFallbackMaxUsagePercent: number;
+}
+
+export function resolveClaudeSafetySettings(value: {
+	maxAgentTurns?: unknown;
+	maxCumulativeInputTokens?: unknown;
+	resumeFallbackPolicy?: unknown;
+	resumeFallbackMaxInputTokens?: unknown;
+	resumeFallbackMaxUsagePercent?: unknown;
+}): ClaudeSafetySettings {
+	const policy = value.resumeFallbackPolicy === "never" || value.resumeFallbackPolicy === "always"
+		? value.resumeFallbackPolicy
+		: "safe";
+	return {
+		maxAgentTurns: clampInteger(value.maxAgentTurns, 0, 0, 1_000),
+		maxCumulativeInputTokens: clampInteger(
+			value.maxCumulativeInputTokens,
+			DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS,
+			100_000,
+			50_000_000
+		),
+		resumeFallbackPolicy: policy,
+		resumeFallbackMaxInputTokens: clampInteger(
+			value.resumeFallbackMaxInputTokens,
+			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS,
+			0,
+			1_000_000
+		),
+		resumeFallbackMaxUsagePercent: clampInteger(
+			value.resumeFallbackMaxUsagePercent,
+			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT,
+			0,
+			100
+		),
+	};
+}
+
+export interface ClaudeResumeFallbackDecision {
+	allowed: boolean;
+	reason: "policy_always" | "policy_never" | "safe_limits" | "input_limit"
+		| "usage_unknown" | "usage_stale" | "usage_limit";
+	detail: string;
+}
+
+export function resolveClaudeResumeFallbackDecision(value: {
+	policy: ClaudeResumeFallbackPolicy;
+	estimatedInputTokens: number;
+	maxInputTokens: number;
+	usagePercent?: number;
+	usageSnapshotAgeMs?: number;
+	maxUsagePercent: number;
+}): ClaudeResumeFallbackDecision {
+	if (value.policy === "always") {
+		return { allowed: true, reason: "policy_always", detail: "Full replay explicitly allowed by configuration." };
+	}
+	if (value.policy === "never") {
+		return { allowed: false, reason: "policy_never", detail: "Automatic full replay is disabled." };
+	}
+	if (value.estimatedInputTokens > value.maxInputTokens) {
+		return {
+			allowed: false,
+			reason: "input_limit",
+			detail: `Estimated replay ${value.estimatedInputTokens} tokens exceeds safe limit ${value.maxInputTokens}.`,
+		};
+	}
+	if (value.usagePercent === undefined || value.usageSnapshotAgeMs === undefined) {
+		return { allowed: false, reason: "usage_unknown", detail: "Fresh Claude five-hour usage is unavailable." };
+	}
+	if (value.usageSnapshotAgeMs > CLAUDE_RESUME_FALLBACK_USAGE_MAX_AGE_MS) {
+		return { allowed: false, reason: "usage_stale", detail: "Claude five-hour usage snapshot is stale." };
+	}
+	if (value.usagePercent >= value.maxUsagePercent) {
+		return {
+			allowed: false,
+			reason: "usage_limit",
+			detail: `Claude five-hour usage ${value.usagePercent}% reached the replay guard ${value.maxUsagePercent}%.`,
+		};
+	}
+	return { allowed: true, reason: "safe_limits", detail: "Replay is within configured token and usage limits." };
+}
+
+function clampInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
+	const numeric = Number(value);
+	return Math.max(minimum, Math.min(maximum, Number.isFinite(numeric) ? Math.floor(numeric) : fallback));
+}
+
 export function findPersistedClaudeConversation(
 	entries: readonly PersistedClaudeConversationSession[],
 	value: {
 		conversationId: string;
 		modelId: string;
 		runtimeKey: string;
+		copilotTurnIndex?: number;
 		userSignatures: readonly string[];
 		now?: number;
 	}
@@ -139,11 +467,14 @@ export function findPersistedClaudeConversation(
 		.filter(entry =>
 			entry.conversationId === value.conversationId
 			&& entry.modelId === value.modelId
-			&& entry.runtimeKey === value.runtimeKey
-			&& now - entry.lastUsedAt <= CLAUDE_DURABLE_SESSION_TTL_MS
-			&& isSignaturePrefix(entry.userSignatures, value.userSignatures)
+			&& now - entry.lastUsedAt <= PROVIDER_DURABLE_SESSION_TTL_MS
+			&& hasAdvancedClaudeConversation(entry, value)
 		)
-		.sort((left, right) => right.lastUsedAt - left.lastUsedAt)[0];
+		.sort((left, right) =>
+			Number(right.runtimeKey === value.runtimeKey)
+				- Number(left.runtimeKey === value.runtimeKey)
+			|| right.lastUsedAt - left.lastUsedAt
+		)[0];
 }
 
 export function findLatestPersistedClaudeConversation(
@@ -151,7 +482,7 @@ export function findLatestPersistedClaudeConversation(
 	now = Date.now()
 ): PersistedClaudeConversationSession | undefined {
 	return entries
-		.filter(entry => now - entry.lastUsedAt <= CLAUDE_DURABLE_SESSION_TTL_MS)
+		.filter(entry => now - entry.lastUsedAt <= PROVIDER_DURABLE_SESSION_TTL_MS)
 		.sort((left, right) => right.lastUsedAt - left.lastUsedAt)[0];
 }
 
@@ -269,6 +600,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	readonly onDidRecordUsage = this.usageRecords.event;
 	private readonly liveTurnUpdates = new vscode.EventEmitter<ClaudeLiveTurnUpdate>();
 	readonly onDidUpdateLiveTurn = this.liveTurnUpdates.event;
+	private readonly cacheKeepAliveChanges = new vscode.EventEmitter<ClaudeCacheKeepAliveStatus>();
+	readonly onDidChangeCacheKeepAliveStatus = this.cacheKeepAliveChanges.event;
 
 	private readonly sessions = new Map<string, ClaudeConversationSession>();
 	private readonly durableSessions = new Map<string, PersistedClaudeConversationSession>();
@@ -283,6 +616,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	private sessionCacheCreationTokens = 0;
 	private lastRequestSummary: string | undefined;
 	private lastRequestMetrics: ClaudeAgentUsage | undefined;
+	private lastRequestAt = 0;
 	private lastRequestModelId: string | undefined;
 	private lastContextUsage: ClaudeContextUsageSnapshot | undefined;
 	private lastRateLimit: ClaudeRateLimitInfo | undefined;
@@ -291,6 +625,16 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	private lastSubscriptionUsageAt = 0;
 	private usageRefresh: Promise<void> | undefined;
 	private readonly usageRefreshTimer: NodeJS.Timeout;
+	private keepAliveInflight = false;
+	private cacheKeepAliveStatusValue: ClaudeCacheKeepAliveStatus = {
+		state: "checking",
+		reason: "Checking Claude usage and live sessions.",
+		enabled: true,
+		updatedAt: Date.now(),
+		intervalMs: 45 * 60_000,
+		sessionCount: 0,
+		eligibleSessionCount: 0,
+	};
 	private disposed = false;
 
 	constructor(
@@ -301,11 +645,18 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.loadDurableSessions();
 		this.loadPendingRollover();
 		this.usageRefreshTimer = setInterval(() => {
-			void this.refreshSubscriptionUsage().catch(error => {
-				this.logSink?.logError("claude.usage_periodic_refresh.failed", error);
-			});
+			void this.runCacheKeepAliveCycle();
 		}, CLAUDE_USAGE_REFRESH_TTL_MS);
 		this.usageRefreshTimer.unref?.();
+		void this.runCacheKeepAliveCycle();
+	}
+
+	get cacheKeepAliveStatus(): ClaudeCacheKeepAliveStatus {
+		return { ...this.cacheKeepAliveStatusValue };
+	}
+
+	refreshCacheKeepAliveStatus(): void {
+		void this.runCacheKeepAliveCycle();
 	}
 
 	get statusSummary(): string {
@@ -345,6 +696,195 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 
 	get subscriptionUsageLimits(): ClaudeUsageLimit[] {
 		return buildClaudeUsageLimits(this.lastSubscriptionUsage);
+	}
+
+	/** Percent (0-100) of the Claude 5-hour session window from the last refresh. */
+	get claudeUsageLimitPercent(): number | undefined {
+		const utilization = this.lastSubscriptionUsage?.rate_limits?.five_hour?.utilization;
+		if (utilization === null || utilization === undefined || !Number.isFinite(utilization)) {
+			return undefined;
+		}
+		return Math.round(Math.max(0, Math.min(100, utilization)));
+	}
+
+	/** Reset time of the Claude 5-hour session window (`D.MM HH:MM`), when reported. */
+	get claudeUsageLimitResetLabel(): string | undefined {
+		const resetsAt = this.lastSubscriptionUsage?.rate_limits?.five_hour?.resets_at;
+		if (!resetsAt) {
+			return undefined;
+		}
+		const reset = new Date(resetsAt);
+		return Number.isNaN(reset.getTime()) ? undefined : formatShortResetTime(reset);
+	}
+
+	/**
+	 * Smart cache keep-alive: while the user is idle (no session activity) and
+	 * the 5-hour usage window is below 90%, run a minimal turn on the largest
+	 * idle session to refresh the Anthropic prompt-cache TTL (1 hour for
+	 * subscription sessions). At >= 90% usage the keep-alive pauses
+	 * automatically and resumes when usage drops. Sessions with a small prefix
+	 * are skipped because a full rewrite there is cheaper than keep-alives.
+	 */
+	private async runCacheKeepAliveCycle(): Promise<void> {
+		try {
+			await this.refreshSubscriptionUsage();
+		} catch (error) {
+			this.logSink?.logError("claude.usage_periodic_refresh.failed", error);
+		}
+		await this.maybeRunCacheKeepAlive();
+	}
+
+	private async maybeRunCacheKeepAlive(): Promise<void> {
+		if (this.keepAliveInflight || this.disposed) {
+			return;
+		}
+		const config = vscode.workspace.getConfiguration("llamacpp");
+		const enabled = config.get<boolean>("claudeCacheKeepAliveEnabled", true) !== false;
+		const intervalMs = Math.max(
+			60_000,
+			Math.min(3_600_000, Number(config.get("claudeCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
+		);
+		const now = Date.now();
+		const sessions = [...this.sessions.values()];
+		const usagePercent = this.claudeUsageLimitPercent;
+		const usageSnapshotAgeMs = this.lastSubscriptionUsageAt > 0
+			? now - this.lastSubscriptionUsageAt
+			: undefined;
+		const decision = resolveClaudeCacheKeepAliveDecision({
+			enabled,
+			now,
+			intervalMs,
+			usagePercent,
+			usageSnapshotAgeMs,
+			ignoreUsageLimit: config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true,
+			sessions: sessions.map(session => ({
+				healthy: session.client.isStreamHealthy,
+				busy: session.client.hasActiveTurn,
+				prefixTokens: session.lastInputTokens ?? 0,
+				lastUsedAt: session.lastUsedAt,
+				lastKeepAliveAt: session.lastKeepAliveAt,
+				lastAttemptAt: session.lastKeepAliveAttemptAt,
+			})),
+		});
+		const candidate = decision.candidateIndex === undefined
+			? undefined
+			: sessions[decision.candidateIndex];
+		const common: Omit<ClaudeCacheKeepAliveStatus, "state" | "reason"> = {
+			...this.cacheKeepAliveStatusValue,
+			enabled,
+			updatedAt: now,
+			intervalMs,
+			usagePercent,
+			usageSnapshotAgeMs,
+			ignoreUsageLimit: config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true,
+			sessionCount: sessions.length,
+			eligibleSessionCount: decision.eligibleSessionCount,
+			candidateModelId: candidate?.modelId,
+			candidatePrefixTokens: candidate?.lastInputTokens,
+			nextAttemptAt: decision.nextAttemptAt,
+		};
+		if (decision.state !== "ready") {
+			this.updateCacheKeepAliveStatus({
+				...common,
+				state: decision.state,
+				reason: decision.reason,
+			});
+			return;
+		}
+		if (!candidate) {
+			this.updateCacheKeepAliveStatus({
+				...common,
+				state: "no_eligible_session",
+				reason: "The selected Claude session disappeared before keep-alive could start.",
+			});
+			return;
+		}
+
+		this.keepAliveInflight = true;
+		candidate.lastKeepAliveAttemptAt = now;
+		candidate.lastKeepAliveUsage = undefined;
+		this.updateCacheKeepAliveStatus({
+			...common,
+			state: "running",
+			reason: "Refreshing the Anthropic cache TTL for the selected Claude session.",
+			lastAttemptAt: now,
+			nextAttemptAt: undefined,
+		});
+		try {
+			const completed = await candidate.client.runKeepAliveTurn(createClaudeKeepAliveMessage());
+			if (completed) {
+				const completedAt = Date.now();
+				candidate.lastUsedAt = completedAt;
+				candidate.lastKeepAliveAt = completedAt;
+				const usage = candidate.lastKeepAliveUsage as ClaudeAgentUsage | undefined;
+				const totalInputTokens = usage
+					? usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens
+					: undefined;
+				const cacheHitPercent = usage && totalInputTokens && totalInputTokens > 0
+					? Number((usage.cacheReadInputTokens / totalInputTokens * 100).toFixed(1))
+					: undefined;
+				this.updateCacheKeepAliveStatus({
+					...common,
+					state: "success",
+					reason: cacheHitPercent === undefined
+						? "Keep-alive completed; the Claude session accepted the maintenance turn."
+						: `Keep-alive completed with ${cacheHitPercent}% cache read.`,
+					updatedAt: completedAt,
+					lastAttemptAt: now,
+					lastSuccessAt: completedAt,
+					lastFailure: undefined,
+					lastFailureAt: undefined,
+					lastResultCacheHitPercent: cacheHitPercent,
+					lastResultInputTokens: totalInputTokens,
+					lastResultCacheWriteTokens: usage?.cacheCreationInputTokens,
+					nextAttemptAt: completedAt + intervalMs,
+				});
+				this.logSink?.log("claude.cache_keepalive", {
+					sessionKey: candidate.key,
+					sdkSessionId: candidate.sdkSessionId,
+					usagePercent,
+					intervalMs,
+					cacheHitPercent,
+					inputTokens: totalInputTokens,
+					cacheWriteInputTokens: usage?.cacheCreationInputTokens,
+				});
+			} else {
+				const skippedAt = Date.now();
+				this.updateCacheKeepAliveStatus({
+					...common,
+					state: "waiting",
+					reason: "The selected session became busy or closed before keep-alive could start.",
+					updatedAt: skippedAt,
+					lastAttemptAt: now,
+					nextAttemptAt: skippedAt + Math.min(intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS),
+				});
+			}
+		} catch (error) {
+			const failedAt = Date.now();
+			const detail = error instanceof Error ? error.message : String(error);
+			this.updateCacheKeepAliveStatus({
+				...common,
+				state: "failed",
+				reason: "Claude cache keep-alive failed; the next attempt is throttled.",
+				updatedAt: failedAt,
+				lastAttemptAt: now,
+				lastFailureAt: failedAt,
+				lastFailure: detail,
+				nextAttemptAt: failedAt + Math.min(intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS),
+			});
+			this.logSink?.log("claude.cache_keepalive_failed", {
+				error: detail,
+				model: candidate.modelId,
+				prefixTokens: candidate.lastInputTokens,
+			});
+		} finally {
+			this.keepAliveInflight = false;
+		}
+	}
+
+	private updateCacheKeepAliveStatus(status: ClaudeCacheKeepAliveStatus): void {
+		this.cacheKeepAliveStatusValue = status;
+		this.cacheKeepAliveChanges.fire(this.cacheKeepAliveStatus);
 	}
 
 	get runtimeMetrics(): ProviderRuntimeMetrics | undefined {
@@ -466,7 +1006,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		}
 		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 		const candidates = [...this.durableSessions.values()]
-			.filter(entry => Date.now() - entry.lastUsedAt <= CLAUDE_DURABLE_SESSION_TTL_MS)
+			.filter(entry => Date.now() - entry.lastUsedAt <= PROVIDER_DURABLE_SESSION_TTL_MS)
 			.sort((left, right) => right.lastUsedAt - left.lastUsedAt);
 		let removedMissingSession = false;
 		for (const candidate of candidates) {
@@ -512,6 +1052,14 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		) {
 			return;
 		}
+		// Skip the heavyweight CLI probe while Claude is not in active use
+		// (lastRequestAt === 0 means it was never used this session).
+		if (
+			!force
+			&& Date.now() - this.lastRequestAt > CLAUDE_USAGE_PROBE_IDLE_GRACE_MS
+		) {
+			return;
+		}
 		if (this.usageRefresh) {
 			return this.usageRefresh;
 		}
@@ -519,13 +1067,18 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (!this.isEnabled() || !executable) {
 			return;
 		}
+		const config = vscode.workspace.getConfiguration("llamacpp");
+		const contextTarget = resolveClaudeContextLength(
+			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
+		);
 		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 		const probe = new ClaudeAgentSession({
-			model: CLAUDE_SUBSCRIPTION_MODELS[0].id,
+			model: resolveClaudeRuntimeModel(CLAUDE_SUBSCRIPTION_MODELS[0].id),
 			cwd,
 			executable,
 			extensionVersion: this.extensionVersion,
 			tools: [],
+			autoCompactTokenLimit: contextTarget,
 			effort: "low",
 			logSink: this.logSink,
 			callbacks: {
@@ -587,6 +1140,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 		token: vscode.CancellationToken
 	): Promise<void> {
+		this.lastRequestAt = Date.now();
 		const modelId = decodeClaudeModelId(modelInfo.id);
 		if (!modelId) {
 			throw new Error(`Invalid Claude model id: ${modelInfo.id}`);
@@ -602,18 +1156,38 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.pruneSessions();
 		const nativeTools = canonicalizeClaudeTools(options.tools ?? []);
 		const config = vscode.workspace.getConfiguration("llamacpp");
+		const safety = resolveClaudeSafetySettings({
+			maxAgentTurns: config.get("claudeMaxAgentTurns", DEFAULT_CLAUDE_MAX_AGENT_TURNS),
+			maxCumulativeInputTokens: config.get(
+				"claudeMaxCumulativeInputTokens",
+				DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS
+			),
+			resumeFallbackPolicy: config.get("claudeResumeFallbackPolicy", "safe"),
+			resumeFallbackMaxInputTokens: config.get(
+				"claudeResumeFallbackMaxInputTokens",
+				DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS
+			),
+			resumeFallbackMaxUsagePercent: config.get(
+				"claudeResumeFallbackMaxUsagePercent",
+				DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT
+			),
+		});
 		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+		const contextTarget = resolveClaudeContextLength(
+			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
+		);
+		const runtimeModelId = resolveClaudeRuntimeModel(modelId);
 		const effort = resolveEffort(
 			options.modelOptions?.reasoningEffort
 				?? options.modelOptions?.reasoning_effort
 				?? config.get("claudeReasoningEffort", "auto")
 		);
-		const toolCatalogKey = fingerprint(nativeTools.map(tool => ({
-			name: tool.name,
-			description: tool.description,
-			inputSchema: tool.inputSchema,
-		})));
-		const runtimeKey = fingerprint({ modelId, cwd, effort, toolCatalogKey });
+		// Exclude toolCatalogKey from runtimeKey: Claude's Agent SDK handles
+		// tool-catalog changes natively through forkSession, and VS Code's
+		// per-restart "Optimized tool selection" varies the set enough to
+		// flip runtimeChanged → session_restored → cold first segment.
+		// modelId, contextTarget, cwd, and effort are the material runtime pins.
+		const runtimeKey = fingerprint({ modelId, runtimeModelId, contextTarget, cwd, effort });
 		const continuation = this.findToolContinuation(messages);
 		if (!continuation) {
 			await this.refreshSubscriptionUsage().catch(error => {
@@ -647,6 +1221,9 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		}
 
 		const conversationId = normalizeConversationId(options.modelOptions?._copilotConversationId);
+		const copilotTurnIndex = normalizeCopilotTurnIndex(
+			options.modelOptions?._copilotTurnIndex ?? options.modelOptions?._telemetryTurn
+		);
 		const userSignatures = collectUserSignatures(messages);
 		let session = this.findConversationSession({
 			conversationId,
@@ -656,27 +1233,50 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		});
 		let restored = false;
 		let rolledOver = false;
+		let runtimeChanged: boolean | undefined;
 		if (!session && conversationId && this.durableSessionsEnabled()) {
 			const persisted = findPersistedClaudeConversation([...this.durableSessions.values()], {
 				conversationId,
 				modelId,
 				runtimeKey,
+				copilotTurnIndex,
 				userSignatures,
 			});
 			if (persisted) {
 				if (await hasPersistedClaudeSession(persisted.sdkSessionId, cwd)) {
+					runtimeChanged = persisted.runtimeKey !== runtimeKey;
 					session = this.createSession({
 						modelId,
+						runtimeModelId,
+						contextTarget,
 						runtimeKey,
 						conversationId,
+						copilotTurnIndex,
 						userSignatures,
 						cwd,
 						executable,
 						effort,
 						tools: nativeTools,
+						safety,
 						resumeSessionId: persisted.sdkSessionId,
+						resumeSessionAt: persisted.resumeSessionAt,
 					});
 					restored = true;
+					this.logSink?.log("claude.chat.persisted_session_selected", {
+						model: modelId,
+						runtimeChanged,
+						previousTurnIndex: persisted.copilotTurnIndex,
+						currentTurnIndex: copilotTurnIndex,
+						matchStrategy: persisted.copilotTurnIndex === undefined
+							&& copilotTurnIndex !== undefined
+							? "legacy-turn-migration"
+							: persisted.copilotTurnIndex !== undefined
+								&& copilotTurnIndex !== undefined
+								? "conversation-turn"
+							: isSignaturePrefix(persisted.userSignatures, userSignatures)
+								? "signature-prefix"
+								: "legacy-message-count",
+					});
 				} else {
 					this.durableSessions.delete(this.durableSessionKey(modelId, conversationId));
 					await this.persistDurableSessions();
@@ -697,51 +1297,57 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			}
 			session = this.createSession({
 				modelId,
+				runtimeModelId,
+				contextTarget,
 				runtimeKey,
 				conversationId,
+				copilotTurnIndex,
 				userSignatures,
 				cwd,
 				executable,
 				effort,
 				tools: nativeTools,
+				safety,
 				resumeSessionId: pendingRollover.sdkSessionId,
 			});
 			restored = true;
 			rolledOver = true;
+			runtimeChanged = this.durableSessions.get(
+				this.durableSessionKey(modelId, pendingRollover.sourceConversationId)
+			)?.runtimeKey !== runtimeKey;
 			this.logSink?.log("claude.chat.rollover_started", {
 				model: modelId,
 				sourceConversationId: pendingRollover.sourceConversationId,
 				targetConversationId: conversationId,
-				runtimeChanged: this.durableSessions.get(
-					this.durableSessionKey(modelId, pendingRollover.sourceConversationId)
-				)?.runtimeKey !== runtimeKey,
+				runtimeChanged,
 			}, "warn");
 		}
 		const reused = session !== undefined;
 		if (!session) {
 			session = this.createSession({
 				modelId,
+				runtimeModelId,
+				contextTarget,
 				runtimeKey,
 				conversationId,
+				copilotTurnIndex,
 				userSignatures,
 				cwd,
 				executable,
 				effort,
 				tools: nativeTools,
+				safety,
 			});
 		} else {
 			this.warmReuseCount++;
 			session.userSignatures = userSignatures;
+			session.copilotTurnIndex = copilotTurnIndex;
 			session.lastUsedAt = Date.now();
 		}
 
-		const maxInputChars = Math.max(
-			32_768,
-			Math.min(
-				900_000,
-				Number(config.get("claudeMaxInputChars", DEFAULT_CLAUDE_MAX_INPUT_CHARS))
-					|| DEFAULT_CLAUDE_MAX_INPUT_CHARS
-			)
+		const maxInputChars = resolveClaudeInitialInputChars(
+			config.get("claudeMaxInputChars", DEFAULT_CLAUDE_MAX_INPUT_CHARS),
+			contextTarget
 		);
 		const toolSchemaChars = JSON.stringify(nativeTools.map(tool => tool.inputSchema)).length;
 		const sessionMode: ClaudeAgentTurnContext["sessionMode"] = rolledOver
@@ -758,6 +1364,9 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			messageCount: messages.length,
 			toolCount: nativeTools.length,
 			toolSchemaTokens: Math.ceil(toolSchemaChars / 4),
+			runtimeChanged,
+			turnMaxModelSegments: safety.maxAgentTurns,
+			turnMaxCumulativeInputTokens: safety.maxCumulativeInputTokens,
 		};
 		let input: SDKUserMessage;
 		try {
@@ -772,12 +1381,15 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 
 		this.logSink?.log("claude.chat.start", {
 			model: modelId,
+			runtimeModel: runtimeModelId,
+			contextTarget,
 			sessionKey: session.key,
 			sdkSessionId: session.sdkSessionId,
 			messageCount: messages.length,
 			inputMode: reused ? "user-turn" : "full",
 			maxInputChars,
 			conversationIdPresent: conversationId !== undefined,
+			copilotTurnIndex,
 			toolCount: nativeTools.length,
 			toolSchemaChars,
 			effort: effort ?? "auto",
@@ -789,6 +1401,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		try {
 			await session.client.runUserTurn(input, progress, token, turnContext);
 			session.lastUsedAt = Date.now();
+			session.resumeSessionAt = session.client.stableAssistantMessageId ?? session.resumeSessionAt;
 			session.restoredFromDisk = false;
 			this.reportCacheDiagnostics(modelId, session.key, reused, restored);
 			await this.rememberDurableSession(session);
@@ -807,21 +1420,73 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 						this.removeSession(session.key);
 						throw error;
 					}
+					const resumeFailure = classifyClaudeResumeFailure(error);
+					this.logSink?.log("claude.chat.resume_failed", {
+						model: modelId,
+						reason: resumeFailure.reason,
+						stage: resumeFailure.stage,
+						detail: resumeFailure.detail,
+						resumeBoundaryPresent: session.resumeSessionAt !== undefined,
+					}, "error");
+					const replay = buildClaudeInitialConversationText(messages, maxInputChars);
+					const estimatedReplayTokens = estimateClaudeTokens(replay.text)
+						+ Math.ceil(toolSchemaChars / 4);
+					const fallbackDecision = resolveClaudeResumeFallbackDecision({
+						policy: safety.resumeFallbackPolicy,
+						estimatedInputTokens: estimatedReplayTokens,
+						maxInputTokens: safety.resumeFallbackMaxInputTokens,
+						usagePercent: this.claudeUsageLimitPercent,
+						usageSnapshotAgeMs: this.lastSubscriptionUsageAt > 0
+							? Date.now() - this.lastSubscriptionUsageAt
+							: undefined,
+						maxUsagePercent: safety.resumeFallbackMaxUsagePercent,
+					});
+					const fallbackContext: Partial<ClaudeAgentTurnContext> = {
+						resumeFailureReason: resumeFailure.reason,
+						resumeFailureStage: resumeFailure.stage,
+						resumeFailureDetail: resumeFailure.detail,
+						resumeFallbackDecision: fallbackDecision.reason,
+						resumeFallbackEstimatedInputTokens: estimatedReplayTokens,
+						resumeFallbackMaxInputTokens: safety.resumeFallbackMaxInputTokens,
+					};
+					session.client.annotateLastTurnContext(fallbackContext);
+					if (!fallbackDecision.allowed) {
+						this.logSink?.log("claude.chat.resume_fallback_blocked", {
+							model: modelId,
+							reason: fallbackDecision.reason,
+							detail: fallbackDecision.detail,
+							estimatedReplayTokens,
+							maxReplayTokens: safety.resumeFallbackMaxInputTokens,
+							usagePercent: this.claudeUsageLimitPercent,
+						}, "error");
+						this.removeSession(session.key);
+						throw new Error(
+							`Claude resume fallback blocked (${fallbackDecision.reason}): ${fallbackDecision.detail} `
+							+ `Original resume error: ${resumeFailure.detail}`
+						);
+					}
 					await this.forgetDurableSession(session);
 					this.removeSession(session.key);
 					const fallback = this.createSession({
 						modelId,
+						runtimeModelId,
+						contextTarget,
 						runtimeKey,
 						conversationId,
+						copilotTurnIndex,
 						userSignatures,
 						cwd,
 						executable,
 						effort,
 						tools: nativeTools,
+						safety,
 					});
 					this.logSink?.log("claude.chat.resume_fallback", {
 						model: modelId,
 						conversationIdPresent: conversationId !== undefined,
+						decision: fallbackDecision.reason,
+						estimatedReplayTokens,
+						usagePercent: this.claudeUsageLimitPercent,
 					}, "warn");
 					try {
 						await fallback.client.runUserTurn(
@@ -832,9 +1497,16 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 								...turnContext,
 								sessionMode: "resume-fallback",
 								inputMode: "full",
+								resumeFailureReason: resumeFailure.reason,
+								resumeFailureStage: resumeFailure.stage,
+								resumeFailureDetail: resumeFailure.detail,
+								resumeFallbackDecision: fallbackDecision.reason,
+								resumeFallbackEstimatedInputTokens: estimatedReplayTokens,
+								resumeFallbackMaxInputTokens: safety.resumeFallbackMaxInputTokens,
 							}
 						);
 						fallback.lastUsedAt = Date.now();
+						fallback.resumeSessionAt = fallback.client.stableAssistantMessageId;
 						await this.rememberDurableSession(fallback);
 						return;
 					} catch (fallbackError) {
@@ -844,6 +1516,14 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					}
 				}
 				this.removeSession(session.key);
+			}
+			// Even for a cancelled turn, preserve the last completed
+			// assistant message so the next durable restore can skip the
+			// orphan tail and the model reacts to the follow-up message.
+			if (error instanceof vscode.CancellationError) {
+				session.resumeSessionAt = session.client.stableAssistantMessageId
+					?? session.resumeSessionAt;
+				await this.rememberDurableSession(session);
 			}
 			throw error;
 		}
@@ -868,18 +1548,24 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.modelChanges.dispose();
 		this.usageRecords.dispose();
 		this.liveTurnUpdates.dispose();
+		this.cacheKeepAliveChanges.dispose();
 	}
 
 	private createSession(value: {
 		modelId: string;
+		runtimeModelId: string;
+		contextTarget: number;
 		runtimeKey: string;
 		conversationId?: string;
+		copilotTurnIndex?: number;
 		userSignatures: string[];
 		cwd: string;
 		executable: string;
 		effort?: "low" | "medium" | "high" | "xhigh" | "max";
 		tools: readonly vscode.LanguageModelChatTool[];
+		safety: ClaudeSafetySettings;
 		resumeSessionId?: string;
+		resumeSessionAt?: string;
 	}): ClaudeConversationSession {
 		const key = value.conversationId
 			? `${value.modelId}:${value.conversationId}:${randomUUID()}`
@@ -889,25 +1575,42 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			modelId: value.modelId,
 			runtimeKey: value.runtimeKey,
 			conversationId: value.conversationId,
+			copilotTurnIndex: value.copilotTurnIndex,
 			userSignatures: value.userSignatures,
 			lastUsedAt: Date.now(),
 			sdkSessionId: value.resumeSessionId,
+			resumeSessionAt: value.resumeSessionAt,
 			restoredFromDisk: value.resumeSessionId !== undefined,
 			client: undefined as unknown as ClaudeAgentSession,
 		};
 		session.client = new ClaudeAgentSession({
-			model: value.modelId,
+			model: value.runtimeModelId,
 			cwd: value.cwd,
 			executable: value.executable,
 			extensionVersion: this.extensionVersion,
 			tools: value.tools,
+			autoCompactTokenLimit: value.contextTarget,
 			effort: value.effort,
+			...(value.safety.maxAgentTurns > 0 ? { maxTurns: value.safety.maxAgentTurns } : {}),
+			maxCumulativeInputTokens: value.safety.maxCumulativeInputTokens,
 			persistSession: this.durableSessionsEnabled(),
 			resumeSessionId: value.resumeSessionId,
+			resumeSessionAt: value.resumeSessionAt,
 			logSink: this.logSink,
 			callbacks: {
-				onUsage: usage => this.recordUsage(value.modelId, usage),
+				onUsage: usage => {
+					session.lastInputTokens = usage.inputTokens
+						+ usage.cacheReadInputTokens
+						+ usage.cacheCreationInputTokens;
+					if (session.client.isKeepAliveTurnActive) {
+						session.lastKeepAliveUsage = usage;
+					}
+					this.recordUsage(value.modelId, usage);
+				},
 				onTurnUpdate: update => {
+					if (update.context.turnKind === "keep-alive") {
+						return;
+					}
 					const enriched = this.enrichLiveTurnUpdate(value.modelId, update);
 					session.lastTurnUpdate = enriched;
 					this.liveTurnUpdates.fire(enriched);
@@ -916,6 +1619,9 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				onUsageSnapshot: snapshot => this.recordUsageSnapshot(snapshot),
 				onContextUsage: snapshot => {
 					this.recordContextUsage(snapshot);
+					if (session.client.isKeepAliveTurnActive) {
+						return;
+					}
 					if (session.lastTurnUpdate && session.lastTurnUpdate.phase !== "running") {
 						const enriched = this.enrichLiveTurnUpdate(
 							value.modelId,
@@ -964,6 +1670,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				session.modelId === value.modelId
 				&& session.runtimeKey === value.runtimeKey
 				&& session.client.pendingCallIds.size === 0
+				&& session.client.isStreamHealthy
 			)
 			.sort((left, right) => right.lastUsedAt - left.lastUsedAt);
 
@@ -981,6 +1688,9 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	): ClaudeToolContinuation | undefined {
 		const sessions = [...this.sessions.values()].sort((left, right) => right.lastUsedAt - left.lastUsedAt);
 		for (const session of sessions) {
+			if (!session.client.isStreamHealthy) {
+				continue;
+			}
 			const results: vscode.LanguageModelToolResultPart[] = [];
 			for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
 				for (const part of messages[messageIndex].content) {
@@ -1126,12 +1836,15 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			if (
 				typeof entry.conversationId !== "string"
 				|| typeof entry.sdkSessionId !== "string"
+				|| (entry.resumeSessionAt !== undefined && typeof entry.resumeSessionAt !== "string")
 				|| typeof entry.modelId !== "string"
 				|| typeof entry.runtimeKey !== "string"
+				|| (entry.copilotTurnIndex !== undefined
+					&& (!Number.isSafeInteger(entry.copilotTurnIndex) || entry.copilotTurnIndex < 0))
 				|| !Array.isArray(entry.userSignatures)
 				|| !entry.userSignatures.every(value => typeof value === "string")
 				|| typeof entry.lastUsedAt !== "number"
-				|| now - entry.lastUsedAt > CLAUDE_DURABLE_SESSION_TTL_MS
+				|| now - entry.lastUsedAt > PROVIDER_DURABLE_SESSION_TTL_MS
 			) {
 				continue;
 			}
@@ -1154,7 +1867,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			|| typeof entry.sdkSessionId !== "string"
 			|| typeof entry.modelId !== "string"
 			|| typeof entry.armedAt !== "number"
-			|| Date.now() - entry.armedAt > CLAUDE_PENDING_ROLLOVER_TTL_MS
+			|| Date.now() - entry.armedAt > PROVIDER_PENDING_ROLLOVER_TTL_MS
 		) {
 			void Promise.resolve(
 				this.workspaceState?.update(CLAUDE_PENDING_ROLLOVER_STATE_KEY, undefined)
@@ -1168,7 +1881,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (!this.pendingRollover) {
 			return undefined;
 		}
-		if (Date.now() - this.pendingRollover.armedAt > CLAUDE_PENDING_ROLLOVER_TTL_MS) {
+		if (Date.now() - this.pendingRollover.armedAt > PROVIDER_PENDING_ROLLOVER_TTL_MS) {
 			void this.clearPendingRollover();
 			return undefined;
 		}
@@ -1190,7 +1903,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		}
 		const now = Date.now();
 		const entries = [...this.durableSessions.values()]
-			.filter(entry => now - entry.lastUsedAt <= CLAUDE_DURABLE_SESSION_TTL_MS)
+			.filter(entry => now - entry.lastUsedAt <= PROVIDER_DURABLE_SESSION_TTL_MS)
 			.sort((left, right) => right.lastUsedAt - left.lastUsedAt)
 			.slice(0, MAX_CLAUDE_DURABLE_SESSIONS);
 		this.durableSessions.clear();
@@ -1217,8 +1930,10 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		const entry: PersistedClaudeConversationSession = {
 			conversationId: session.conversationId,
 			sdkSessionId: session.sdkSessionId,
+			resumeSessionAt: session.client.stableAssistantMessageId ?? session.resumeSessionAt,
 			modelId: session.modelId,
 			runtimeKey: session.runtimeKey,
+			copilotTurnIndex: session.copilotTurnIndex,
 			userSignatures: [...session.userSignatures],
 			lastUsedAt: session.lastUsedAt,
 		};
@@ -1257,10 +1972,10 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	private pruneSessions(): void {
 		const now = Date.now();
 		for (const session of this.sessions.values()) {
-			if (
-				now - session.lastUsedAt > CLAUDE_SESSION_IDLE_MS
+			if (!session.client.isStreamHealthy || (
+				now - session.lastUsedAt > PROVIDER_ACTIVE_SESSION_IDLE_MS
 				&& session.client.pendingCallIds.size === 0
-			) {
+			)) {
 				this.removeSession(session.key);
 			}
 		}
@@ -1315,13 +2030,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 
 	private mapKnownModels(): vscode.LanguageModelChatInformation[] {
 		const config = vscode.workspace.getConfiguration("llamacpp");
-		const contextLength = Math.max(
-			32_768,
-			Math.min(
-				2_000_000,
-				Number(config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH))
-					|| DEFAULT_CLAUDE_CONTEXT_LENGTH
-			)
+		const contextLength = resolveClaudeContextLength(
+			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
 		);
 		const maxOutputTokens = Math.max(
 			1_024,
@@ -1384,6 +2094,11 @@ function normalizeConversationId(value: unknown): string | undefined {
 	return normalized.length > 0 && normalized.length <= 256 ? normalized : undefined;
 }
 
+function normalizeCopilotTurnIndex(value: unknown): number | undefined {
+	const numeric = typeof value === "number" ? value : Number.NaN;
+	return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
 function resolveEffort(value: unknown): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	return value === "low"
 		|| value === "medium"
@@ -1406,6 +2121,27 @@ function isSignaturePrefix(previous: readonly string[], current: readonly string
 	return previous.length > 0
 		&& current.length > previous.length
 		&& previous.every((signature, index) => current[index] === signature);
+}
+
+function hasAdvancedClaudeConversation(
+	previous: Pick<PersistedClaudeConversationSession, "copilotTurnIndex" | "userSignatures">,
+	current: { copilotTurnIndex?: number; userSignatures: readonly string[] }
+): boolean {
+	if (previous.copilotTurnIndex !== undefined && current.copilotTurnIndex !== undefined) {
+		return current.copilotTurnIndex > previous.copilotTurnIndex;
+	}
+	if (previous.copilotTurnIndex === undefined && current.copilotTurnIndex !== undefined) {
+		return current.copilotTurnIndex > 0
+			&& !areClaudeSignaturesEqual(previous.userSignatures, current.userSignatures);
+	}
+	return isSignaturePrefix(previous.userSignatures, current.userSignatures)
+		|| (previous.userSignatures.length > 0
+			&& current.userSignatures.length > previous.userSignatures.length);
+}
+
+function areClaudeSignaturesEqual(left: readonly string[], right: readonly string[]): boolean {
+	return left.length === right.length
+		&& left.every((signature, index) => signature === right[index]);
 }
 
 const CLAUDE_INITIAL_CONVERSATION_PREFIX = [
@@ -1534,6 +2270,19 @@ function createSdkUserMessage(content: Record<string, unknown>[]): SDKUserMessag
 			content,
 		},
 	} as unknown as SDKUserMessage;
+}
+
+/** Default interval between keep-alive turns (inside the 1h Anthropic cache TTL). */
+export const DEFAULT_CLAUDE_KEEPALIVE_MS = 45 * 60_000;
+
+/** Sessions with a smaller prefix are cheaper to rewrite than to keep warm. */
+export const MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS = 100_000;
+
+const CLAUDE_KEEPALIVE_TEXT =
+	"Silent cache keep-alive. Do not use any tools. Reply with exactly: ok";
+
+export function createClaudeKeepAliveMessage(): SDKUserMessage {
+	return createSdkUserMessage([{ type: "text", text: CLAUDE_KEEPALIVE_TEXT }]);
 }
 
 function appendImages(

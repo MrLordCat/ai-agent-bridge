@@ -145,14 +145,14 @@ SecretStorage, then refresh models.
 provide it), then run `Local LLM: Sign In to Codex Subscription`. API-key auth
 does not substitute for the required ChatGPT account mode.
 
-**Claude:** install the supported Claude Code runtime, sign in, then run
+**Claude:** the VSIX includes the supported platform runtime. Sign in, then run
 `Local LLM: Sign In to Claude Subscription`.
 
 ## Important Commands
 
 | Command | Purpose |
 |---|---|
-| `Local LLM: Open Sidebar` | Quick Access with connections, behavior, memory, diagnostics |
+| `Local LLM: Open Sidebar` | Quick Access with connections, provider context sliders, behavior, memory, diagnostics |
 | `Local LLM: Refresh Models` | Refresh every enabled source |
 | `Local LLM: Configure DeepSeek` | Store DeepSeek API key |
 | `Local LLM: Sign In to Codex Subscription` | Authenticate Codex app-server |
@@ -220,7 +220,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 npm install
 npm run compile
 npm run lint
-npm test              # 279 extension-host tests at the stable 1.9.0 release gate
+npm test              # 283 extension-host tests in the current 1.9.3 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

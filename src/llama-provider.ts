@@ -168,6 +168,26 @@ export interface LlamaChatTurnMetrics {
     cacheMissReason?: string;
     /** Human-readable explanation for the cache miss. */
     cacheMissDetail?: string;
+    /** Classified original error from a rejected Claude durable resume. */
+    resumeFailureReason?: string;
+    /** Lifecycle stage at which Claude durable resume failed. */
+    resumeFailureStage?: string;
+    /** Original truncated SDK error before Claude switched to full-input fallback. */
+    resumeFailureDetail?: string;
+    /** Policy decision made before a Claude full-input resume fallback. */
+    resumeFallbackDecision?: string;
+    /** Estimated cold replay size, including the advertised tool schema. */
+    resumeFallbackEstimatedInputTokens?: number;
+    /** Configured maximum estimated replay size for automatic fallback. */
+    resumeFallbackMaxInputTokens?: number;
+    /** Configured Agent SDK model-segment limit for this outer turn. */
+    turnMaxModelSegments?: number;
+    /** Configured cumulative processed-input limit for this outer turn. */
+    turnMaxCumulativeInputTokens?: number;
+    /** Safety guard that stopped an expensive Claude turn. */
+    safetyStopReason?: string;
+    /** Human-readable safety stop explanation. */
+    safetyStopDetail?: string;
     /** Number of leading messages that matched the previous request byte-for-byte. */
     prefixIdenticalMessageCount?: number;
     /** Total message count in the previous request, for comparison. */
@@ -180,6 +200,10 @@ export interface LlamaChatTurnMetrics {
     prefixToolsMatch?: boolean;
     /** True when this turn was executed by a subagent rather than the main conversation. */
     isSubagent?: boolean;
+    /** Codex input mode for this turn: full / user-turn / tool-result. */
+    inputMode?: string;
+    /** True when auto-compaction reduced the message count this turn. */
+    compacted?: boolean;
     parentRequestId?: string;
     parentToolCallId?: string;
     /** CloudFront/ELB `Via` header — identifies the backend edge node. */
@@ -254,6 +278,8 @@ interface CachePrefixSnapshot {
     requestId: string;
     staticFieldsHash: string;
     toolsHash: string;
+    toolsCount: number;
+    systemHash?: string;
     messageParts: string[];
     messageChars: number;
 }
@@ -406,6 +432,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private heuristicCalibration = 1.0;
 
     /**
+     * When a turn was sent with a compacted history, records when that request
+     * left this extension. DeepSeek materializes the new disk-cache prefix
+     * asynchronously, so the immediately following tool-result round may miss
+     * even with an identical prefix. The grace wait lets the write land first.
+     */
+    private readonly lastCompactionSentAtByScope = new Map<string, number>();
+    private readonly lastTurnCompactedByScope = new Map<string, boolean>();
+    private readonly lastResponseEndedAtByScope = new Map<string, number>();
+    private deepSeekBalance: { summary: string; fetchedAt: number } | undefined;
+    private deepSeekBalanceInflight: Promise<string | undefined> | undefined;
+
+    /**
      * Creates a new Llama.cpp chat model provider.
      * Initializes the provider with secret storage and user agent for API requests.
      *
@@ -431,7 +469,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     refreshLanguageModelChatInformation(): void {
         this.modelListCache.clear();
         this.runtimeContextCache.clear();
-        this.stableToolCatalogs.clear();
         this.serverTokenCounter.clear();
         this.log("models.refresh.requested");
         this._onDidChangeLanguageModelChatInformation.fire();
@@ -824,12 +861,25 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         };
         this.stableToolCatalogs.set(scope, next);
         if (previous) {
+            const previousNames = new Set(previous.tools.map(tool => tool.function.name));
+            const currentNames = new Set(sortedTools.map(tool => tool.function.name));
             this.log("chat.tools.catalog_refreshed", {
                 requestId,
                 modelId,
                 reason: recentActivation ? "activation" : "tool-unavailable",
+                previousToolCount: previous.tools.length,
+                currentToolCount: sortedTools.length,
+                removedTools: [...previousNames].filter(name => !currentNames.has(name)).sort(),
+                addedTools: [...currentNames].filter(name => !previousNames.has(name)).sort(),
                 previousFingerprint: previous.fingerprint,
                 currentFingerprint,
+            });
+        } else {
+            this.log("chat.tools.catalog_snapshot", {
+                requestId,
+                modelId,
+                toolCount: sortedTools.length,
+                fingerprint: currentFingerprint,
             });
         }
         return config;
@@ -865,6 +915,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         messages: OpenAIChatMessage[],
         staticFieldsHash: string,
         toolsHash: string,
+        toolsCount: number,
     ): { messages: OpenAIChatMessage[]; stabilized: boolean; prefix: Record<string, unknown> } {
         if (!scope) {
             return { messages, stabilized: false, prefix: { scope: "unavailable" } };
@@ -872,12 +923,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
         const messageParts = messages.map(message => stableJsonStringify(message));
         const messageChars = messageParts.reduce((total, part) => total + part.length, 0);
+        const systemHash = messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined;
 
         // --- Store current snapshot for next turn's comparison ---
         const current: CachePrefixSnapshot = {
             requestId,
             staticFieldsHash,
             toolsHash,
+            toolsCount,
+            systemHash,
             messageParts,
             messageChars,
         };
@@ -918,7 +972,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             scope: this.shortHash(scope),
             staticFieldsHash,
             toolsHash,
+            toolsCount,
+            previousToolsCount: previous?.toolsCount,
             systemHash: messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined,
+            systemChanged: previous !== undefined
+                && (previous.systemHash ?? undefined) !== systemHash,
             messageCount: messageParts.length,
             messageChars,
             previousRequestId: previous?.requestId,
@@ -1995,7 +2053,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             tokenBudget,
             keepLastCount,
             label,
-            estimateTokens: candidate => this.estimateOpenAiMessageTokens(candidate),
+            // Use the same calibrated estimate as the compaction trigger and the
+            // context-usage metrics. Without calibration the raw heuristic often
+            // stays under the budget while the calibrated count is already over
+            // it, so the fast path returns the messages unchanged and records a
+            // no-op "micro-compaction" on every turn.
+            estimateTokens: candidate => Math.max(
+                1,
+                Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
+            ),
         });
     }
 
@@ -2562,6 +2628,24 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // cannot evict entries that this conversation's cached prefix depends on.
         const conversationScope = this.cachePrefixScope(requestModelId, options);
         this.setReasoningScope(conversationScope);
+        // Large chats hand the provider hundreds of messages per request. The gap
+        // since this conversation's last completed response measures how much
+        // time VS Code (chat view rendering + request plumbing) adds between
+        // model steps — the usual suspect behind "each step gets slower".
+        const lastResponseEndedAt = conversationScope
+            ? this.lastResponseEndedAtByScope.get(conversationScope)
+            : undefined;
+        if (lastResponseEndedAt !== undefined) {
+            this.log("chat.request.arrived", {
+                requestId,
+                messageCount: messages.length,
+                gapSinceLastResponseMs: Date.now() - lastResponseEndedAt,
+                toolResultRound: messages.length > 0
+                    && messages[messages.length - 1].content.some(
+                        part => part instanceof vscode.LanguageModelToolResultPart
+                    ),
+            });
+        }
         const imageInputSupported = model.capabilities?.imageInput === true;
         const processedMessages = imageInputSupported
             ? messages
@@ -2598,6 +2682,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const requestQueueTimeoutMs = this.getRequestQueueTimeoutMs();
         const transientRetryMaxAttempts = this.clampInt(cfg.get("transientRetryMaxAttempts", 2), 0, 3, 2);
         const transientRetryBaseDelayMs = this.clampInt(cfg.get("transientRetryBaseDelayMs", 500), 100, 10000, 500);
+        const cacheWriteGraceMs = this.clampInt(
+            cfg.get("deepSeekCacheWriteGraceMs", 60_000),
+            0,
+            600_000,
+            60_000
+        );
         const cachePrompt = this.getCachePromptEnabled();
         const maxToolResultChars = this.getMaxToolResultChars();
         const autoCompact = cfg.get<boolean>("autoCompact", true) !== false;
@@ -2686,6 +2776,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 transientRetryMaxAttempts,
                 transientRetryBaseDelayMs,
                 cachePrompt,
+                cacheWriteGraceMs,
                 maxToolResultChars,
                 runtimeContextLength,
                 autoCompact,
@@ -3171,7 +3262,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 : (requestBody.tools ?? []);
             const toolsHash = this.shortHash(stableJsonStringify(toolsForHash));
             const stabilized = this.stabilizeMessagePrefix(
-                requestId, requestModelId, conversationScope, prepared.messages, staticFieldsHash, toolsHash
+                requestId, requestModelId, conversationScope, prepared.messages, staticFieldsHash, toolsHash,
+                Array.isArray(cappedToolConfig.tools) ? cappedToolConfig.tools.length : 0
             );
             requestBody.messages = stabilized.messages;
             this.setConversationMessageSnapshot(
@@ -3231,6 +3323,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
             let response: Response;
             const requestStartedAt = Date.now();
+            if ((prepared.autoCompacted || prepared.hardCompacted) && conversationScope) {
+                // The upstream disk-cache write for a freshly compacted prefix is
+                // asynchronous. Remember when this request left so the next round
+                // can wait for the write to become readable.
+                this.lastCompactionSentAtByScope.set(conversationScope, requestStartedAt);
+            }
             try {
                 response = await sendWithTransientRetry("initial");
             } catch (error) {
@@ -3413,6 +3511,36 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             throw error;
         }
         try {
+            // DeepSeek materializes a compacted prefix's disk-cache asynchronously.
+            // The first continuation round after a compaction would otherwise miss
+            // twice (history rewrite + write not yet readable). Wait out the
+            // remaining grace window so the tool-result round reuses the prefix.
+            const isToolResultRound = processedMessages.length > 0
+                && processedMessages[processedMessages.length - 1].content.some(
+                    part => part instanceof vscode.LanguageModelToolResultPart
+                );
+            if (
+                cacheWriteGraceMs > 0
+                && cachePrompt
+                && isDeepSeekEndpoint(serverUrl)
+                && isToolResultRound
+                && conversationScope
+            ) {
+                const compactionSentAt = this.lastCompactionSentAtByScope.get(conversationScope);
+                if (compactionSentAt !== undefined) {
+                    this.lastCompactionSentAtByScope.delete(conversationScope);
+                    const remaining = cacheWriteGraceMs - (Date.now() - compactionSentAt);
+                    if (remaining > 0) {
+                        this.log("chat.request.cache_write_grace", {
+                            requestId,
+                            waitMs: remaining,
+                            compactionAgeMs: Date.now() - compactionSentAt,
+                        });
+                        await waitForRetry(remaining);
+                    }
+                }
+            }
+
             const runAttemptWithToolCompatibility = async (
                 sourceMessages: OpenAIChatMessage[]
             ): Promise<{ attempt: Extract<AttemptResult, { ok: true }>; usedMessages: OpenAIChatMessage[] }> => {
@@ -3728,6 +3856,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 promptCache: promptCacheUsage,
             });
 
+            const previousTurnCompacted = conversationScope
+                ? this.lastTurnCompactedByScope.get(conversationScope) ?? false
+                : false;
+            if (conversationScope) {
+                this.lastTurnCompactedByScope.set(conversationScope, latestAutoCompacted);
+            }
             const cacheDiagnostics = usageSource === "server"
                 ? buildCacheDiagnostics({
                     provider: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
@@ -3736,6 +3870,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     usage: promptCacheUsage,
                     prefix: latestCachePrefix,
                     autoCompacted: latestAutoCompacted,
+                    previousTurnCompacted,
                 })
                 : undefined;
 
@@ -3797,6 +3932,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             });
 
             this._onDidCompleteChatTurn.fire(metrics);
+            if (conversationScope) {
+                this.lastResponseEndedAtByScope.set(conversationScope, Date.now());
+            }
         } catch (err) {
             const cancelled = token.isCancellationRequested || err instanceof vscode.CancellationError;
             if (cancelled) {
@@ -3845,6 +3983,80 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
     private async getDeepSeekApiKey(): Promise<string | undefined> {
         return (await this.secrets.get("llamacpp.deepSeekApiKey")) ?? (await this.getApiKey());
+    }
+
+    /**
+     * Live DeepSeek account balance from the official `GET /user/balance`
+     * endpoint. Cached for 60 seconds; fails silently when no API key is
+     * configured or the endpoint is unreachable.
+     */
+    get deepSeekBalanceSummary(): string | undefined {
+        return this.deepSeekBalance?.summary;
+    }
+
+    async refreshDeepSeekBalance(force = false): Promise<string | undefined> {
+        if (
+            !force
+            && this.deepSeekBalance
+            && Date.now() - this.deepSeekBalance.fetchedAt < 60_000
+        ) {
+            return this.deepSeekBalance.summary;
+        }
+        if (this.deepSeekBalanceInflight) {
+            return this.deepSeekBalanceInflight;
+        }
+        this.deepSeekBalanceInflight = (async () => {
+            const apiKey = await this.getDeepSeekApiKey();
+            if (!apiKey) {
+                return undefined;
+            }
+            try {
+                const config = this.getConfig();
+                const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
+                const endpoint = isDeepSeekEndpoint(serverUrl)
+                    ? `${serverUrl}/user/balance`
+                    : `${serverUrl}/user/balance`;
+                const response = await this.httpTransport.request(endpoint, {
+                    method: "GET",
+                    headers: {
+                        "User-Agent": this.userAgent,
+                        "Accept": "application/json",
+                        "Authorization": `Bearer ${apiKey}`,
+                    },
+                }, 10_000);
+                if (!response.ok) {
+                    return undefined;
+                }
+                const body = await response.json() as {
+                    is_available?: boolean;
+                    balance_infos?: Array<{
+                        currency?: string;
+                        total_balance?: string;
+                        granted_balance?: string;
+                        topped_up_balance?: string;
+                    }>;
+                };
+                const infos = Array.isArray(body.balance_infos) ? body.balance_infos : [];
+                if (infos.length === 0) {
+                    return undefined;
+                }
+                const summary = infos
+                    .map(info => `${info.total_balance ?? "0"} ${info.currency ?? ""}`.trim())
+                    .filter(Boolean)
+                    .join(" · ");
+                this.deepSeekBalance = { summary, fetchedAt: Date.now() };
+                this.log("deepseek.balance.refreshed", { summary });
+                return summary;
+            } catch (error) {
+                this.log("deepseek.balance.failed", {
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                return undefined;
+            } finally {
+                this.deepSeekBalanceInflight = undefined;
+            }
+        })();
+        return this.deepSeekBalanceInflight;
     }
 
     /**

@@ -217,6 +217,18 @@ function appendToolDescription(base: string, extra: string | undefined): string 
 }
 
 /**
+ * Short `D.MM HH:MM` reset label for subscription usage windows, e.g.
+ * `2.08 17:25` for August 2nd, 17:25 local time.
+ */
+export function formatShortResetTime(reset: Date): string {
+	const day = reset.getDate();
+	const month = String(reset.getMonth() + 1).padStart(2, "0");
+	const hours = String(reset.getHours()).padStart(2, "0");
+	const minutes = String(reset.getMinutes()).padStart(2, "0");
+	return `${day}.${month} ${hours}:${minutes}`;
+}
+
+/**
  * Produces stable JSON for semantically identical tool arguments and schemas.
  * Object key order is not meaningful in JSON, but it is part of llama.cpp's
  * exact prompt prefix and therefore affects prompt-cache reuse.
@@ -614,7 +626,50 @@ export function convertMessages(
 
 		merged.push(msg);
 	}
-	return merged;
+	return sanitizeOrphanToolCalls(merged);
+}
+
+/**
+ * Removes tool_calls from assistant messages that are not followed by
+ * enough tool-result messages. OpenAI-compatible servers reject such
+ * sequences with 400 "insufficient tool messages following tool_calls
+ * message". Orphans appear when a turn was interrupted/steered while a
+ * native tool card was still pending, or when a subagent context drops
+ * tool results while keeping the assistant tool_calls message.
+ */
+function sanitizeOrphanToolCalls(messages: OpenAIChatMessage[]): OpenAIChatMessage[] {
+	const isToolResultLike = (message: OpenAIChatMessage): boolean =>
+		message.role === "tool"
+		|| (message.role === "user" && typeof message.content === "string"
+			&& (message.content.includes("[tool_result") || message.content.includes("call_id=")));
+	let stripped = 0;
+	// Suffix counts avoid O(n²) slice+filter scans on large chats.
+	const suffixResultCounts = new Array<number>(messages.length + 1).fill(0);
+	for (let i = messages.length - 1; i >= 0; i--) {
+		suffixResultCounts[i] = suffixResultCounts[i + 1] + (isToolResultLike(messages[i]) ? 1 : 0);
+	}
+	const sanitized = messages.map((message, index) => {
+		if (
+			message.role !== "assistant"
+			|| !Array.isArray(message.tool_calls)
+			|| message.tool_calls.length === 0
+		) {
+			return message;
+		}
+		if (suffixResultCounts[index + 1] < message.tool_calls.length) {
+			stripped += 1;
+			const rest: OpenAIChatMessage = { role: message.role, content: message.content };
+			if (message.reasoning_content !== undefined) {
+				rest.reasoning_content = message.reasoning_content;
+			}
+			return rest;
+		}
+		return message;
+	});
+	if (stripped > 0 && typeof console !== "undefined") {
+		console.warn(`[Llama.cpp Provider] Stripped orphan tool_calls from ${stripped} assistant message(s)`);
+	}
+	return sanitized;
 }
 
 /**
@@ -841,30 +896,6 @@ export function convertTools(
 }
 
 /**
- * Validate tool names to ensure they contain only word chars, hyphens, or underscores.
- * @param tools Tools to validate.
- */
-/**
- * Validates an array of VS Code language model chat tools.
- * Ensures tool definitions are properly structured before use.
- *
- * @param tools - Array of tools to validate.
- */
-export function validateTools(tools: readonly vscode.LanguageModelChatTool[]): void {
-	for (const tool of tools) {
-		if (!tool.name.match(/^[\w-]+$/)) {
-            throw new Error(
-                `Invalid tool name "${tool.name}": only alphanumeric characters, hyphens, and underscores are allowed.`
-            );
-		}
-	}
-}
-
-/**
- * Validate the request message sequence for correct tool call/result pairing.
- * @param messages The full request message list.
- */
-/**
  * Validates an array of VS Code language model chat request messages.
  * Checks for proper message structure and content.
  *
@@ -999,29 +1030,3 @@ function collectToolResultContent(pr: { content?: ReadonlyArray<unknown> }): {
 	return { content: text, dataParts };
 }
 
-/**
- * Try to parse a JSON object from a string.
- * @param text The input string.
- * @returns Parsed object or ok:false.
- */
-/**
- * Attempts to parse a string as JSON object.
- * Safely parses JSON and returns success/failure result.
- *
- * @param text - The string to parse as JSON.
- * @returns Object with ok flag and parsed value if successful.
- */
-export function tryParseJSONObject(text: string): { ok: true; value: Record<string, unknown> } | { ok: false } {
-	try {
-		if (!text || !/[{]/.test(text)) {
-			return { ok: false };
-		}
-		const value = JSON.parse(text);
-		if (value && typeof value === "object" && !Array.isArray(value)) {
-			return { ok: true, value };
-		}
-		return { ok: false };
-	} catch {
-		return { ok: false };
-	}
-}

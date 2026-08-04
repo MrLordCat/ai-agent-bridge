@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { z, type ZodType } from "zod";
@@ -92,10 +93,27 @@ export type ClaudeAgentSessionMode = "new" | "warm" | "restored" | "rollover" | 
 export interface ClaudeAgentTurnContext {
 	sessionMode: ClaudeAgentSessionMode;
 	inputMode: "full" | "user-turn";
+	/** Distinguishes invisible maintenance turns from user-visible chat turns. */
+	turnKind?: "user" | "keep-alive";
 	conversationKey?: string;
 	messageCount: number;
 	toolCount: number;
 	toolSchemaTokens: number;
+	/** True when a restored/rolled-over session resumes with a different runtime fingerprint. */
+	runtimeChanged?: boolean;
+	/** Classified failure from the rejected durable resume that triggered a fallback. */
+	resumeFailureReason?: string;
+	/** Lifecycle stage at which the durable resume failed. */
+	resumeFailureStage?: string;
+	/** Original, truncated SDK error from the rejected durable resume. */
+	resumeFailureDetail?: string;
+	resumeFallbackDecision?: string;
+	resumeFallbackEstimatedInputTokens?: number;
+	resumeFallbackMaxInputTokens?: number;
+	turnMaxModelSegments?: number;
+	turnMaxCumulativeInputTokens?: number;
+	safetyStopReason?: string;
+	safetyStopDetail?: string;
 }
 
 export interface ClaudeAgentUsageSegment {
@@ -215,9 +233,14 @@ export interface ClaudeAgentSessionOptions {
 	executable: string;
 	extensionVersion: string;
 	tools: readonly vscode.LanguageModelChatTool[];
+	autoCompactTokenLimit?: number;
 	effort?: "low" | "medium" | "high" | "xhigh" | "max";
 	persistSession?: boolean;
 	resumeSessionId?: string;
+	/** Last confirmed assistant UUID to resume from, excluding an interrupted tail. */
+	resumeSessionAt?: string;
+	maxTurns?: number;
+	maxCumulativeInputTokens?: number;
 	logSink?: LlamaLogSink;
 	callbacks: ClaudeAgentSessionCallbacks;
 }
@@ -267,6 +290,8 @@ interface ClaudeLogicalTurn {
 	steps: Map<string, ClaudeAgentTurnStep>;
 	currentModelStepId?: string;
 	terminal: boolean;
+	terminalPhase?: Exclude<ClaudeAgentTurnPhase, "running">;
+	terminalDetail?: string;
 }
 
 class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
@@ -320,6 +345,18 @@ export function resolveClaudeCodeBinary(): string | undefined {
 		return configuredPath;
 	}
 
+	try {
+		const sdkEntry = createRequire(__filename).resolve("@anthropic-ai/claude-agent-sdk");
+		const packageName = `claude-agent-sdk-${process.platform}-${process.arch}`;
+		const executable = process.platform === "win32" ? "claude.exe" : "claude";
+		const bundled = path.join(path.dirname(path.dirname(sdkEntry)), packageName, executable);
+		if (existsSync(bundled)) {
+			return bundled;
+		}
+	} catch {
+		// Fall through to the official Claude Code extension.
+	}
+
 	const extension = vscode.extensions.getExtension("anthropic.claude-code");
 	if (!extension) {
 		return undefined;
@@ -338,17 +375,58 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	private activeTurn: ActiveTurn | undefined;
 	private logicalTurn: ClaudeLogicalTurn | undefined;
 	private sessionId: string | undefined;
+	private lastAssistantMessageId: string | undefined;
+	/** Last assistant message whose tool calls were fully resolved. */
+	private lastCompletedAssistantId: string | undefined;
 	private lastTurnProducedOutput = false;
+	private keepAliveMode = false;
+	/**
+	 * The SDK query stream ends permanently after `interrupt()` or when the
+	 * pump exits. A follow-up user message pushed afterwards would silently
+	 * disappear, so such sessions must be excluded from warm reuse and replaced
+	 * through the restore path instead.
+	 */
+	private streamClosed = false;
 	private disposed = false;
 
 	constructor(private readonly options: ClaudeAgentSessionOptions) {}
+
+	/** True while the SDK query stream can still accept and process input. */
+	get isStreamHealthy(): boolean {
+		return !this.streamClosed;
+	}
+
+	/** True when a VS Code turn or a keep-alive turn is currently running. */
+	get hasActiveTurn(): boolean {
+		return Boolean(this.activeTurn) || Boolean(this.logicalTurn && !this.logicalTurn.terminal);
+	}
+
+	/** True only while the invisible maintenance turn is executing. */
+	get isKeepAliveTurnActive(): boolean {
+		return this.keepAliveMode;
+	}
 
 	get pendingCallIds(): ReadonlySet<string> {
 		return new Set(this.pendingTools.keys());
 	}
 
+	/** Last assistant message durably observed from the SDK transcript. */
+	get stableAssistantMessageId(): string | undefined {
+		return this.lastCompletedAssistantId ?? this.lastAssistantMessageId;
+	}
+
 	get canRetryLastTurn(): boolean {
 		return !this.lastTurnProducedOutput && this.pendingTools.size === 0;
+	}
+
+	/** Amend an already-emitted terminal record with provider-level guard data. */
+	annotateLastTurnContext(patch: Partial<ClaudeAgentTurnContext>): void {
+		const turn = this.logicalTurn;
+		if (!turn) {
+			return;
+		}
+		Object.assign(turn.context, patch);
+		this.emitTurnUpdate(turn.terminalPhase ?? "running", turn.terminalDetail);
 	}
 
 	hasPendingCall(callId: string): boolean {
@@ -361,6 +439,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		token: vscode.CancellationToken,
 		context: ClaudeAgentTurnContext
 	): Promise<void> {
+		if (this.streamClosed) {
+			throw new Error("Claude session stream is closed; the session must be restarted");
+		}
 		if (this.logicalTurn && !this.logicalTurn.terminal) {
 			throw new Error("Claude session already has an active logical turn");
 		}
@@ -391,6 +472,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 		token: vscode.CancellationToken
 	): Promise<void> {
+		if (this.streamClosed) {
+			throw new Error("Claude session stream is closed; the session must be restarted");
+		}
 		if (!this.logicalTurn || this.logicalTurn.terminal) {
 			throw new Error("Claude tool continuation has no active logical turn");
 		}
@@ -420,6 +504,44 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			await this.query?.interrupt();
 		} catch (error) {
 			this.options.logSink?.logError("claude.sdk.interrupt_failed", error);
+		} finally {
+			// The SDK query stream ends after an interrupt; the session can no
+			// longer accept follow-up input and must be restored from disk.
+			this.streamClosed = true;
+		}
+	}
+
+	/**
+	 * Runs a minimal user turn that only keeps the Anthropic prompt-cache TTL
+	 * alive. Tool calls are denied inline (never delegated to VS Code) and no
+	 * VS Code progress is reported. Returns false when the session is busy or
+	 * the stream is already closed.
+	 */
+	async runKeepAliveTurn(message: SDKUserMessage): Promise<boolean> {
+		if (this.disposed || this.streamClosed) {
+			return false;
+		}
+		if (this.logicalTurn && !this.logicalTurn.terminal) {
+			return false;
+		}
+		this.keepAliveMode = true;
+		try {
+			await this.runUserTurn(
+				message,
+				{ report: () => undefined },
+				{ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) },
+				{
+					sessionMode: "warm",
+					inputMode: "user-turn",
+					turnKind: "keep-alive",
+					messageCount: 1,
+					toolCount: this.options.tools.length,
+					toolSchemaTokens: 0,
+				}
+			);
+			return true;
+		} finally {
+			this.keepAliveMode = false;
 		}
 	}
 
@@ -458,6 +580,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			return;
 		}
 		this.disposed = true;
+		this.streamClosed = true;
 		this.input.close();
 		this.query?.close();
 		for (const pending of this.pendingTools.values()) {
@@ -512,6 +635,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			persistSession: this.options.persistSession === true,
 			includePartialMessages: true,
 			permissionMode: "default",
+			...(this.options.maxTurns !== undefined ? { maxTurns: this.options.maxTurns } : {}),
 			canUseTool: async (toolName, input) => isClaudeVsCodeToolName(toolName)
 				? { behavior: "allow", updatedInput: input }
 				: { behavior: "deny", message: `Only VS Code-hosted tools are available; denied ${toolName}.` },
@@ -519,6 +643,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			env: {
 				...process.env,
 				CLAUDE_AGENT_SDK_CLIENT_APP: `llama-vscode-chat/${this.options.extensionVersion}`,
+				...(this.options.autoCompactTokenLimit !== undefined
+					? { CLAUDE_CODE_AUTO_COMPACT_WINDOW: String(this.options.autoCompactTokenLimit) }
+					: {}),
 			},
 			stderr: data => {
 				const message = data.trim();
@@ -527,7 +654,11 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				}
 			},
 			...(this.options.resumeSessionId
-				? { resume: this.options.resumeSessionId, forkSession: true }
+				? {
+					resume: this.options.resumeSessionId,
+					forkSession: true,
+					...(this.options.resumeSessionAt ? { resumeSessionAt: this.options.resumeSessionAt } : {}),
+				}
 				: {}),
 		};
 
@@ -536,6 +667,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		this.pump.catch(error => this.handlePumpFailure(error));
 		this.options.logSink?.log("claude.sdk.started", {
 			model: this.options.model,
+			autoCompactTokenLimit: this.options.autoCompactTokenLimit,
 			toolCount: this.options.tools.length,
 			executable: this.options.executable,
 			persistent: this.options.persistSession === true,
@@ -586,7 +718,15 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			this.touchActiveTurn();
 			this.handleMessage(message);
 		}
-		if (!this.disposed) {
+		// The Anthropic API stream closed naturally — the loop above already
+		// handled the final result.  If the logical turn already finished,
+		// don't mark the session as unhealthy; let warm reuse survive until
+		// the next request completes or the pump exits mid-turn.
+		const turnCompleted = this.logicalTurn?.terminal === true;
+		if (!turnCompleted) {
+			this.streamClosed = true;
+		}
+		if (!this.disposed && !turnCompleted) {
 			throw new Error("Claude Agent SDK stream closed unexpectedly");
 		}
 	}
@@ -603,6 +743,13 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				this.failActiveTurn(new Error(`Claude API error: ${message.error}`), "failed");
 				return;
 			}
+			// A new assistant message arrived — the previous one (if any) was
+			// fully resolved (its tool calls were completed).  Save it as the
+			// last checkpoint safe for resumeSessionAt after an interruption.
+			if (this.lastAssistantMessageId) {
+				this.lastCompletedAssistantId = this.lastAssistantMessageId;
+			}
+			this.lastAssistantMessageId = message.uuid;
 			this.handleAssistantMessage(message.message, message.uuid);
 			return;
 		}
@@ -680,8 +827,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				emitThinking(block.thinking, active.progress);
 			}
 		}
-		this.recordAssistantUsage(message, fallbackId);
-		this.emitTurnUpdate("running");
+		if (!this.recordAssistantUsage(message, fallbackId)) {
+			this.emitTurnUpdate("running");
+		}
 	}
 
 	private handleResult(message: Extract<SDKMessage, { type: "result" }>): void {
@@ -699,23 +847,6 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		this.options.callbacks.onUsage(aggregateUsage);
 		const active = this.activeTurn;
-		const finalSegment = this.logicalTurn
-			? [...this.logicalTurn.usageSegments.values()].sort((left, right) => left.index - right.index).at(-1)
-			: undefined;
-		const nativeUsage = createClaudeNativeContextUsage(
-			aggregateUsage,
-			this.logicalTurn ? [...this.logicalTurn.usageSegments.values()] : []
-		);
-		active?.progress.report(vscode.LanguageModelDataPart.text(
-			JSON.stringify(nativeUsage),
-			"usage"
-		));
-		this.options.logSink?.log("chat.response.usage", {
-			provider: "claude",
-			source: finalSegment ? "agent-sdk-final-segment" : "agent-sdk-aggregate-fallback",
-			emittedToNativeChat: active !== undefined,
-			usage: nativeUsage,
-		});
 		void Promise.allSettled([
 			this.refreshUsageSnapshot(),
 			this.refreshContextUsage(),
@@ -728,6 +859,16 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		});
 		if (message.subtype !== "success" || message.is_error) {
 			const errors = "errors" in message ? message.errors.join("; ") : "";
+			if (message.subtype === "error_max_turns" && this.logicalTurn) {
+				this.logicalTurn.context.safetyStopReason = "max_model_segments";
+				this.logicalTurn.context.safetyStopDetail = `Agent SDK stopped at maxTurns=${this.options.maxTurns ?? "unknown"}.`;
+				// The SDK stopped cleanly at the configured budget; end the
+				// turn without marking it failed so the warm session can be
+				// reused and the next turn starts with a cache hit.
+				this.finishLogicalTurn("completed");
+				this.completeActiveTurn();
+				return;
+			}
 			this.failActiveTurn(new Error(errors || `Claude request failed: ${message.subtype}`), "failed");
 			return;
 		}
@@ -745,6 +886,13 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	private delegateTool(name: string, input: Record<string, unknown>): Promise<CallToolResult> {
 		if (this.disposed) {
 			return Promise.reject(new Error("Claude session closed"));
+		}
+		if (this.keepAliveMode) {
+			// Keep-alive turns must never execute tools or wait on VS Code.
+			return Promise.resolve({
+				content: [{ type: "text", text: "Tool calls are not allowed during the cache keep-alive turn. Reply with exactly: ok" }],
+				is_error: true,
+			});
 		}
 		const callId = randomUUID();
 		return new Promise<CallToolResult>((resolve, reject) => {
@@ -817,10 +965,10 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		return step;
 	}
 
-	private recordAssistantUsage(message: unknown, fallbackId: string): void {
+	private recordAssistantUsage(message: unknown, fallbackId: string): boolean {
 		const turn = this.logicalTurn;
 		if (!turn || turn.terminal) {
-			return;
+			return false;
 		}
 		const provisionalId = typeof asRecord(message).id === "string"
 			? String(asRecord(message).id)
@@ -832,7 +980,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			existing?.index ?? turn.usageSegments.size + 1
 		);
 		if (!segment) {
-			return;
+			return false;
 		}
 		const step = this.beginModelStep(segment.id);
 		turn.usageSegments.set(segment.id, segment);
@@ -854,6 +1002,35 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		if (turn.currentModelStepId === step?.id) {
 			turn.currentModelStepId = undefined;
 		}
+		const maxProcessed = this.options.maxCumulativeInputTokens;
+		// Cache reads cost 0.1x and are re-counted on every model segment of a
+		// warm turn, so they must not count toward the cumulative limit at full
+		// weight — otherwise every large warm turn trips the guard, the session
+		// is torn down, and the next turn restores cold (first-segment miss).
+		const processed = [...turn.usageSegments.values()]
+			.reduce((sum, value) => sum
+				+ value.freshInputTokens
+				+ value.cacheCreationInputTokens
+				+ Math.round(value.cacheReadInputTokens * 0.1), 0);
+		if (maxProcessed !== undefined && processed > maxProcessed) {
+			const detail = `Cumulative Claude input ${processed} (cache reads weighted 0.1x) exceeded the local limit ${maxProcessed}.`;
+			turn.context.safetyStopReason = "max_cumulative_input_tokens";
+			turn.context.safetyStopDetail = detail;
+			this.options.logSink?.log("claude.chat.safety_stop", {
+				reason: turn.context.safetyStopReason,
+				processedInputTokens: processed,
+				limit: maxProcessed,
+				segments: [...turn.usageSegments.values()].map(segment => ({
+					fresh: segment.freshInputTokens,
+					cacheRead: segment.cacheReadInputTokens,
+					cacheWrite: segment.cacheCreationInputTokens,
+				})),
+			}, "warn");
+			this.failActiveTurn(new Error(`Claude safety guard: ${detail}`), "failed");
+			void this.interrupt();
+			return true;
+		}
+		return false;
 	}
 
 	private recordVisibleMessage(): boolean {
@@ -905,6 +1082,8 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			return;
 		}
 		turn.terminal = true;
+		turn.terminalPhase = phase;
+		turn.terminalDetail = terminalDetail;
 		for (const step of turn.steps.values()) {
 			if (step.status !== "running") {
 				continue;
@@ -980,8 +1159,50 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	}
 
 	private completeActiveTurn(): void {
+		const current = this.activeTurn;
+		if (current && !current.settled) {
+			this.reportNativeContextUsage(current);
+		}
 		const active = this.detachActiveTurn();
 		active?.resolve();
+	}
+
+	private reportNativeContextUsage(active: ActiveTurn): void {
+		const turn = this.logicalTurn;
+		const segments = turn
+			? [...turn.usageSegments.values()].sort((left, right) => left.index - right.index)
+			: [];
+		const finalSegment = segments.at(-1);
+		const aggregate = turn?.usage ?? (finalSegment
+			? {
+				inputTokens: finalSegment.freshInputTokens,
+				cacheReadInputTokens: finalSegment.cacheReadInputTokens,
+				cacheCreationInputTokens: finalSegment.cacheCreationInputTokens,
+				outputTokens: finalSegment.outputTokens,
+				durationMs: Math.max(0, Date.now() - turn!.startedAt),
+				numTurns: 1,
+			}
+			: undefined);
+		if (!aggregate) {
+			this.options.logSink?.log("chat.response.usage", {
+				provider: "claude",
+				source: "agent-sdk-boundary-no-usage",
+				emittedToNativeChat: false,
+			}, "warn");
+			return;
+		}
+		const nativeUsage = createClaudeNativeContextUsage(aggregate, segments);
+		active.progress.report(vscode.LanguageModelDataPart.text(
+			JSON.stringify(nativeUsage),
+			"usage"
+		));
+		this.options.logSink?.log("chat.response.usage", {
+			provider: "claude",
+			source: finalSegment ? "agent-sdk-boundary-segment" : "agent-sdk-aggregate-fallback",
+			boundary: turn?.terminal ? "terminal" : "tool",
+			emittedToNativeChat: true,
+			usage: nativeUsage,
+		});
 	}
 
 	private failActiveTurn(error: Error, phase: Exclude<ClaudeAgentTurnPhase, "running" | "completed">): void {
@@ -1012,6 +1233,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		const failure = error instanceof Error ? error : new Error(String(error));
 		this.options.logSink?.logError("claude.sdk.failed", failure);
+		this.streamClosed = true;
 		for (const pending of this.pendingTools.values()) {
 			this.finishToolStep(pending, "failed");
 			pending.reject(failure);

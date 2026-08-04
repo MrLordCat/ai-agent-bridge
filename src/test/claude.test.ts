@@ -11,13 +11,21 @@ import {
 	buildClaudeUsageLimits,
 	buildClaudeInitialConversationText,
 	canonicalizeClaudeTools,
+	classifyClaudeResumeFailure,
+	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
 	findLatestPersistedClaudeConversation,
 	findPersistedClaudeConversation,
+	resolveClaudeResumeFallbackDecision,
+	resolveClaudeSafetySettings,
+	resolveClaudeInitialInputChars,
 	resolveClaudeContextLength,
+	resolveClaudeCacheKeepAliveDecision,
+	resolveClaudeRuntimeModel,
 } from "../claude/claude-provider";
 import { buildClaudeModelAvailability } from "../claude/availability";
 import {
+	ClaudeAgentSession,
 	createClaudeNativeContextUsage,
 	createClaudeNativeUsage,
 	isClaudeVsCodeToolName,
@@ -40,11 +48,172 @@ function usageSnapshot(rateLimits: Record<string, unknown>): UsageSnapshot {
 }
 
 suite("Claude subscription provider", () => {
+	test("fails safe and explains why Claude cache keep-alive is paused", () => {
+		const now = Date.parse("2026-08-02T10:00:00Z");
+		const common = { enabled: true, now, intervalMs: 45 * 60_000, sessions: [] };
+		assert.strictEqual(resolveClaudeCacheKeepAliveDecision(common).state, "paused_usage_unknown");
+		assert.strictEqual(resolveClaudeCacheKeepAliveDecision({
+			...common, usagePercent: 20, usageSnapshotAgeMs: 121_000,
+		}).state, "paused_usage_stale");
+		assert.strictEqual(resolveClaudeCacheKeepAliveDecision({
+			...common, usagePercent: 90, usageSnapshotAgeMs: 1_000,
+		}).state, "paused_usage_limit");
+		const noSession = resolveClaudeCacheKeepAliveDecision({
+			...common, usagePercent: 20, usageSnapshotAgeMs: 1_000,
+		});
+		assert.strictEqual(noSession.state, "no_eligible_session");
+		assert.ok(noSession.reason.includes("Run one Claude turn after reload"));
+	});
+
+	test("schedules keep-alive and selects the largest eligible Claude prefix", () => {
+		const now = Date.parse("2026-08-02T10:00:00Z");
+		const intervalMs = 45 * 60_000;
+		const sessions = [{
+			healthy: true, busy: false, prefixTokens: 120_000, lastUsedAt: now - intervalMs,
+		}, {
+			healthy: true, busy: false, prefixTokens: 280_000, lastUsedAt: now - intervalMs,
+		}];
+		const ready = resolveClaudeCacheKeepAliveDecision({
+			enabled: true, now, intervalMs, usagePercent: 42, usageSnapshotAgeMs: 1_000, sessions,
+		});
+		assert.strictEqual(ready.state, "ready");
+		assert.strictEqual(ready.candidateIndex, 1);
+		assert.strictEqual(ready.eligibleSessionCount, 2);
+
+		const waiting = resolveClaudeCacheKeepAliveDecision({
+			enabled: true,
+			now,
+			intervalMs,
+			usagePercent: 42,
+			usageSnapshotAgeMs: 1_000,
+			sessions: [{ ...sessions[1], lastUsedAt: now - 60_000 }],
+		});
+		assert.strictEqual(waiting.state, "waiting");
+		assert.ok((waiting.nextAttemptAt ?? 0) > now);
+
+		const throttled = resolveClaudeCacheKeepAliveDecision({
+			enabled: true,
+			now,
+			intervalMs,
+			usagePercent: 42,
+			usageSnapshotAgeMs: 1_000,
+			sessions: [{ ...sessions[1], lastAttemptAt: now - 60_000 }],
+		});
+		assert.strictEqual(throttled.state, "waiting");
+	});
+
+	test("uses conservative Claude safety defaults and clamps invalid values", () => {
+		assert.deepStrictEqual(resolveClaudeSafetySettings({}), {
+			maxAgentTurns: 0,
+			maxCumulativeInputTokens: 2_000_000,
+			resumeFallbackPolicy: "safe",
+			resumeFallbackMaxInputTokens: 64_000,
+			resumeFallbackMaxUsagePercent: 80,
+		});
+		assert.deepStrictEqual(resolveClaudeSafetySettings({
+			maxAgentTurns: 0,
+			maxCumulativeInputTokens: 1,
+			resumeFallbackPolicy: "invalid",
+			resumeFallbackMaxInputTokens: -1,
+			resumeFallbackMaxUsagePercent: 101,
+		}), {
+			maxAgentTurns: 0,
+			maxCumulativeInputTokens: 100_000,
+			resumeFallbackPolicy: "safe",
+			resumeFallbackMaxInputTokens: 0,
+			resumeFallbackMaxUsagePercent: 100,
+		});
+	});
+
+	test("blocks unsafe Claude cold replay and allows only fresh low-cost fallback", () => {
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 71_666, maxInputTokens: 64_000,
+			usagePercent: 20, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80,
+		}).reason, "input_limit");
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,
+			maxUsagePercent: 80,
+		}).reason, "usage_unknown");
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,
+			usagePercent: 20, usageSnapshotAgeMs: 121_000, maxUsagePercent: 80,
+		}).reason, "usage_stale");
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,
+			usagePercent: 80, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80,
+		}).reason, "usage_limit");
+		assert.deepStrictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,
+			usagePercent: 50, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80,
+		}).allowed, true);
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "never", estimatedInputTokens: 1, maxInputTokens: 64_000,
+			usagePercent: 1, usageSnapshotAgeMs: 1, maxUsagePercent: 80,
+		}).reason, "policy_never");
+		assert.deepStrictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "always", estimatedInputTokens: 500_000, maxInputTokens: 64_000,
+			maxUsagePercent: 80,
+		}).allowed, true);
+	});
+
+	test("classifies the original durable resume failure for live diagnostics", () => {
+		assert.deepStrictEqual(
+			classifyClaudeResumeFailure(new Error("Claude Agent SDK stream closed unexpectedly")),
+			{
+				reason: "stream_closed",
+				stage: "sdk_resume",
+				detail: "Claude Agent SDK stream closed unexpectedly",
+			}
+		);
+		assert.strictEqual(
+			classifyClaudeResumeFailure(new Error("Invalid resumeSessionAt message UUID")).reason,
+			"invalid_resume_boundary"
+		);
+		assert.strictEqual(
+			classifyClaudeResumeFailure(new Error("Claude API error: rate_limit (429)")).reason,
+			"rate_limit"
+		);
+	});
+
 	test("allows only tools hosted by the native VS Code MCP server", () => {
 		assert.strictEqual(isClaudeVsCodeToolName("mcp__vscode__read_file"), true);
 		assert.strictEqual(isClaudeVsCodeToolName("Read"), false);
 		assert.strictEqual(isClaudeVsCodeToolName("Bash"), false);
 		assert.strictEqual(isClaudeVsCodeToolName("mcp__other__write_file"), false);
+	});
+
+	test("marks the session stream as closed after an interrupt", async () => {
+		const session = new ClaudeAgentSession({
+			model: "claude-opus-5[1m]",
+			cwd: ".",
+			executable: "claude",
+			extensionVersion: "test",
+			tools: [],
+			callbacks: {
+				onUsage: () => undefined,
+				onRateLimit: () => undefined,
+			},
+		});
+		assert.strictEqual(session.isStreamHealthy, true);
+		assert.strictEqual(session.hasActiveTurn, false);
+		await session.interrupt();
+		// Per the Agent SDK the query stream ends after an interrupt, so the
+		// session must never be warm-reused afterwards (follow-up bug).
+		assert.strictEqual(session.isStreamHealthy, false);
+		session.dispose();
+		assert.strictEqual(session.isStreamHealthy, false);
+	});
+
+	test("builds a minimal keep-alive message that forbids tool use", () => {
+		const message = createClaudeKeepAliveMessage();
+		const content = message.message.content as Array<{ type: string; text?: string }>;
+		assert.ok(Array.isArray(content));
+		const text = content
+			.filter(part => part.type === "text")
+			.map(part => part.text ?? "")
+			.join(" ");
+		assert.ok(/keep-alive/i.test(text));
+		assert.ok(/exactly: ok/.test(text));
 	});
 
 	test("parses exact Claude cache read, creation, and thinking usage", () => {
@@ -131,6 +300,87 @@ suite("Claude subscription provider", () => {
 		});
 	});
 
+	test("emits native Claude usage on every completed response boundary", () => {
+		const parts: vscode.LanguageModelResponsePart[] = [
+			new vscode.LanguageModelToolCallPart("call-1", "read_file", { path: "README.md" }),
+		];
+		let resolved = false;
+		const session = new ClaudeAgentSession({
+			model: "claude-opus-5",
+			cwd: process.cwd(),
+			executable: "claude",
+			extensionVersion: "1.9.1",
+			tools: [],
+			callbacks: {
+				onUsage: () => undefined,
+				onRateLimit: () => undefined,
+			},
+		});
+		const timeout = setTimeout(() => undefined, 10_000);
+		const internals = session as unknown as {
+			logicalTurn: unknown;
+			activeTurn: unknown;
+			completeActiveTurn(): void;
+		};
+		internals.logicalTurn = {
+			requestId: "request-1",
+			startedAt: Date.now() - 100,
+			context: {
+				sessionMode: "warm",
+				inputMode: "user-turn",
+				messageCount: 2,
+				toolCount: 1,
+				toolSchemaTokens: 10,
+			},
+			outputChars: 0,
+			thinkingChars: 0,
+			usageSegments: new Map([[
+				"segment-1",
+				{
+					id: "segment-1",
+					index: 1,
+					recordedAt: "2026-07-29T16:38:39.649Z",
+					freshInputTokens: 2,
+					cacheReadInputTokens: 65_987,
+					cacheCreationInputTokens: 5_804,
+					inputTokens: 71_793,
+					outputTokens: 4,
+					thinkingTokens: 0,
+					totalTokens: 71_797,
+					cacheHitPercent: 91.9,
+				},
+			]]),
+			steps: new Map(),
+			terminal: false,
+		};
+		internals.activeTurn = {
+			progress: { report: (part: vscode.LanguageModelResponsePart) => parts.push(part) },
+			resolve: () => { resolved = true; },
+			reject: () => undefined,
+			cancellation: new vscode.Disposable(() => undefined),
+			timeout,
+			settled: false,
+			partialTextSeen: false,
+			partialThinkingSeen: false,
+			reportedTextChars: 0,
+		};
+
+		internals.completeActiveTurn();
+
+		assert.strictEqual(resolved, true);
+		assert.ok(parts[0] instanceof vscode.LanguageModelToolCallPart);
+		assert.ok(parts[1] instanceof vscode.LanguageModelDataPart);
+		const usagePart = parts[1] as vscode.LanguageModelDataPart;
+		assert.strictEqual(usagePart.mimeType, "usage");
+		assert.deepStrictEqual(JSON.parse(new TextDecoder().decode(usagePart.data)), {
+			prompt_tokens: 71_793,
+			completion_tokens: 4,
+			total_tokens: 71_797,
+			prompt_tokens_details: { cached_tokens: 65_987 },
+		});
+		session.dispose();
+	});
+
 	test("canonicalizes Claude tool and schema order across Copilot reloads", () => {
 		const left = canonicalizeClaudeTools([
 			{ name: "zeta", description: "Z", inputSchema: { type: "object", properties: { b: { type: "string" }, a: { type: "number" } } } },
@@ -144,12 +394,13 @@ suite("Claude subscription provider", () => {
 		assert.deepStrictEqual(left.map(tool => tool.name), ["alpha", "zeta"]);
 	});
 
-	test("selects only a matching non-stale durable Claude session", () => {
+	test("restores an advanced Claude conversation across runtime drift", () => {
 		const entry = {
 			conversationId: "conversation-1",
 			sdkSessionId: "11111111-1111-4111-8111-111111111111",
 			modelId: "claude-opus-5",
 			runtimeKey: "runtime-a",
+			copilotTurnIndex: 10,
 			userSignatures: ["user-a"],
 			lastUsedAt: AVAILABILITY_NOW - 60_000,
 		};
@@ -157,6 +408,7 @@ suite("Claude subscription provider", () => {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
 			runtimeKey: "runtime-a",
+			copilotTurnIndex: 11,
 			userSignatures: ["user-a", "user-b"],
 			now: AVAILABILITY_NOW,
 		})?.sdkSessionId, entry.sdkSessionId);
@@ -164,6 +416,15 @@ suite("Claude subscription provider", () => {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
 			runtimeKey: "runtime-b",
+			copilotTurnIndex: 11,
+			userSignatures: ["user-a", "user-b"],
+			now: AVAILABILITY_NOW,
+		})?.sdkSessionId, entry.sdkSessionId);
+		assert.strictEqual(findPersistedClaudeConversation([entry], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-b",
+			copilotTurnIndex: 10,
 			userSignatures: ["user-a", "user-b"],
 			now: AVAILABILITY_NOW,
 		}), undefined);
@@ -171,7 +432,38 @@ suite("Claude subscription provider", () => {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
 			runtimeKey: "runtime-a",
+			copilotTurnIndex: 11,
 			userSignatures: ["user-a", "user-b"],
+			now: AVAILABILITY_NOW,
+		}), undefined);
+		assert.strictEqual(findPersistedClaudeConversation([{ ...entry, copilotTurnIndex: undefined }], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-b",
+			userSignatures: ["rewritten-a", "user-b"],
+			now: AVAILABILITY_NOW,
+		})?.sdkSessionId, entry.sdkSessionId);
+		assert.strictEqual(findPersistedClaudeConversation([{
+			...entry,
+			copilotTurnIndex: undefined,
+			userSignatures: ["old-a", "old-b", "old-c"],
+		}], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-b",
+			copilotTurnIndex: 20,
+			userSignatures: ["rewritten-a"],
+			now: AVAILABILITY_NOW,
+		})?.sdkSessionId, entry.sdkSessionId);
+		assert.strictEqual(findPersistedClaudeConversation([{
+			...entry,
+			copilotTurnIndex: undefined,
+		}], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-b",
+			copilotTurnIndex: 20,
+			userSignatures: ["user-a"],
 			now: AVAILABILITY_NOW,
 		}), undefined);
 	});
@@ -316,7 +608,16 @@ suite("Claude subscription provider", () => {
 	test("caps observed Claude context at the configured maximum", () => {
 		assert.strictEqual(resolveClaudeContextLength(258_400, 1_000_000), 258_400);
 		assert.strictEqual(resolveClaudeContextLength(524_288, 200_000), 200_000);
-		assert.strictEqual(resolveClaudeContextLength(131_072), 131_072);
+		assert.strictEqual(resolveClaudeContextLength(131_072), 258_400);
+		assert.strictEqual(resolveClaudeContextLength(1_048_576), 967_000);
+	});
+
+	test("selects the real Claude 1M runtime and scales cold-start history", () => {
+		assert.strictEqual(resolveClaudeRuntimeModel("claude-opus-5"), "claude-opus-5[1m]");
+		assert.strictEqual(resolveClaudeRuntimeModel("claude-opus-5[1m]"), "claude-opus-5[1m]");
+		assert.strictEqual(resolveClaudeInitialInputChars(4_000_000, 258_400), 777_600);
+		assert.strictEqual(resolveClaudeInitialInputChars(4_000_000, 967_000), 3_558_560);
+		assert.strictEqual(resolveClaudeInitialInputChars(300_000, 967_000), 300_000);
 	});
 
 	test("marks every Claude profile unavailable when the common 5-hour window is exhausted", () => {

@@ -3,10 +3,13 @@ import * as vscode from "vscode";
 
 import {
 	formatEndpointLabel,
+	formatProviderUsageLine,
 	LlamaQuickActionsProvider,
 	type QuickAccessItem,
 } from "../ui/quick-access";
+import { resolveContextControlState } from "../ui/context-control";
 import { emptyTokenUsageAggregate, emptyTokenUsageHistorySummary } from "../token-usage-history";
+import { emptyUsageExperimentSummary } from "../usage-experiment";
 
 function labelOf(item: QuickAccessItem): string {
 	return typeof item.label === "string" ? item.label : item.label?.label ?? "";
@@ -37,7 +40,7 @@ suite("quick access", () => {
 
 		assert.deepStrictEqual(
 			root.map(labelOf),
-			["Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics"]
+			["Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
 		);
 		assert.ok(root.every(item => item.collapsibleState === vscode.TreeItemCollapsibleState.Collapsed));
 		assert.ok(root.every(item => item.id?.startsWith("llamacpp.quickAccess.")));
@@ -131,21 +134,90 @@ suite("quick access", () => {
 		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Opus Limit")?.description, "12% used");
 	});
 
-	test("exposes independent Claude and DeepSeek maximum context controls", async () => {
+	test("opens provider context sliders from Claude and Codex quick access", async () => {
 		const provider = new LlamaQuickActionsProvider(() => undefined, () => undefined, () => 0);
 		const roots = await getItems(provider);
 		const deepSeek = roots.find(item => labelOf(item) === "DeepSeek");
 		const claude = roots.find(item => labelOf(item) === "Claude");
+		const codex = roots.find(item => labelOf(item) === "Codex");
 		const local = roots.find(item => labelOf(item) === "Local LLM");
-		assert.ok(deepSeek && claude && local);
+		assert.ok(deepSeek && claude && codex && local);
 
 		const deepSeekLimit = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Maximum Context");
 		const claudeLimit = (await getItems(provider, claude)).find(item => labelOf(item) === "Maximum Context");
 		assert.strictEqual(deepSeekLimit?.description, "258.4K");
 		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.setDeepSeekContextLength");
-		assert.strictEqual(claudeLimit?.description, "258.4K");
-		assert.strictEqual(claudeLimit?.command?.command, "llamacpp.setClaudeContextLength");
+		assert.strictEqual(claudeLimit?.description, "258.4K target / 1M max");
+		assert.strictEqual(claudeLimit?.command?.command, "llamacpp.openContextControl");
+		const codexTarget = (await getItems(provider, codex)).find(item => labelOf(item) === "Working Context");
+		assert.strictEqual(codexTarget?.description, "258.4K target");
+		assert.strictEqual(codexTarget?.command?.command, "llamacpp.openContextControl");
 		assert.ok(!(await getItems(provider, local)).some(item => labelOf(item) === "Maximum Context"));
+	});
+
+	test("shows live usage limits and DeepSeek balance near the providers", async () => {
+		const provider = new LlamaQuickActionsProvider(
+			() => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => undefined, () => 0,
+			() => "Connected (Max)", () => "Connected (Pro)",
+			() => undefined, () => undefined, () => [],
+			() => undefined, () => undefined, () => undefined, () => undefined,
+			() => "87% used / resets 2.08 14:00",
+			() => [], () => emptyTokenUsageHistorySummary(), () => emptyUsageExperimentSummary(),
+			() => "110.00 CNY",
+			() => 87,
+			() => "2.08 14:00",
+			() => 20,
+			() => "7.08 21:45"
+		);
+		const roots = await getItems(provider);
+		const deepSeek = roots.find(item => labelOf(item) === "DeepSeek");
+		const codex = roots.find(item => labelOf(item) === "Codex");
+		const claude = roots.find(item => labelOf(item) === "Claude");
+		assert.ok(deepSeek && codex && claude);
+
+		// The usage limit and reset time are visible directly on the provider row.
+		assert.strictEqual(codex.description, "Connected (Max): 87% R:2.08 14:00");
+		assert.strictEqual(claude.description, "Connected (Pro): 20% R:7.08 21:45");
+
+		const balance = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Balance");
+		assert.strictEqual(balance?.description, "110.00 CNY");
+
+		const usageLimit = (await getItems(provider, codex)).find(item => labelOf(item) === "Usage Limit");
+		assert.strictEqual(usageLimit?.description, "87% used · resets 2.08 14:00");
+
+		// Claude cache keep-alive toggle is visible and defaults to on.
+		const keepAlive = (await getItems(provider, claude)).find(item => labelOf(item) === "Cache Keep-Alive");
+		assert.strictEqual(keepAlive?.description, "On (45 min)");
+		assert.strictEqual(keepAlive?.command?.command, "llamacpp.toggleClaudeCacheKeepAlive");
+	});
+
+	test("formats provider usage lines with and without a reset time", () => {
+		assert.strictEqual(
+			formatProviderUsageLine("Connected (Plus)", 70, "2.08 17:25"),
+			"Connected (Plus): 70% R:2.08 17:25"
+		);
+		assert.strictEqual(formatProviderUsageLine("Connected (Plus)", 70, undefined), "Connected (Plus): 70%");
+		assert.strictEqual(formatProviderUsageLine("Connected", undefined, "2.08 17:25"), "Connected");
+	});
+
+	test("caps context control values to real provider bounds", () => {
+		const values = new Map<string, unknown>([
+			["claudeContextLength", 1_048_576],
+			["codexWorkingContextTarget", 500_000],
+			["codexContextLength", 400_000],
+		]);
+		const state = resolveContextControlState({
+			get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback,
+		}, {
+			modelId: "gpt-5.6-sol",
+			contextWindowTokens: 258_400,
+			updatedAt: Date.now(),
+		});
+		assert.strictEqual(state.claudeTarget, 967_000);
+		assert.strictEqual(state.codexTarget, 258_400);
+		assert.strictEqual(state.codexMaximum, 258_400);
+		assert.strictEqual(state.codexMaximumObserved, true);
 	});
 
 	test("moves the same last-request metrics into Token Usage for every provider", async () => {

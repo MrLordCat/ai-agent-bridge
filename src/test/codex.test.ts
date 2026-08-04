@@ -6,6 +6,7 @@ import { CodexAppServerClient, JsonLineBuffer, type CodexServerNotification } fr
 import { CompositeChatModelProvider } from "../composite-provider";
 import {
 	assertCodexThreadPersistence,
+	calculateCodexCompactionBudget,
 	canResumeCodexToolTurn,
 	CodexChatModelProvider,
 	createCodexRuntimeFingerprints,
@@ -15,6 +16,7 @@ import {
 	intersectCodexThreadTools,
 	mapCodexTokenUsageMetrics,
 	mergeCodexTurnSteps,
+	normalizeCodexRuntimeCwd,
 	resolveCodexSessionPersistence,
 	shouldRecoverCodexFailedToolTurn,
 	shouldRecoverCodexToolTurnException,
@@ -64,6 +66,30 @@ const model: CodexModel = {
 };
 
 suite("Codex subscription provider", () => {
+	test("uses the real Codex window without the former 0.45 compaction multiplier", () => {
+		const maximum = calculateCodexCompactionBudget({
+			modelContextWindow: 258_400,
+			workingContextTarget: 500_000,
+			maxOutputTokens: 32_768,
+			toolSchemaTokens: 20_000,
+			developerInstructionTokens: 1_000,
+		});
+		assert.deepStrictEqual(maximum, {
+			modelContextWindow: 258_400,
+			workingContextTarget: 258_400,
+			messageTokenBudget: 196_908,
+			outputReserveTokens: 32_300,
+			safetyReserveTokens: 8_192,
+		});
+		assert.strictEqual(calculateCodexCompactionBudget({
+			modelContextWindow: 258_400,
+			workingContextTarget: 131_072,
+			maxOutputTokens: 32_768,
+			toolSchemaTokens: 20_000,
+			developerInstructionTokens: 1_000,
+		}).messageTokenBudget, 69_580);
+	});
+
 	test("buffers split JSONL process chunks", () => {
 		const buffer = new JsonLineBuffer();
 		assert.deepStrictEqual(buffer.push('{"id":1'), []);
@@ -1114,6 +1140,12 @@ suite("Codex subscription provider", () => {
 		assert.notStrictEqual(after.runtimeKey, changedSandbox.runtimeKey);
 	});
 
+	test("normalizes Windows workspace spelling used in Codex thread settings", () => {
+		assert.strictEqual(normalizeCodexRuntimeCwd("D:/GitHub/Project", "win32"), "d:\\GitHub\\Project");
+		assert.strictEqual(normalizeCodexRuntimeCwd("d:\\GitHub\\Project", "win32"), "d:\\GitHub\\Project");
+		assert.strictEqual(normalizeCodexRuntimeCwd("/work/Project", "linux"), "/work/Project");
+	});
+
 	test("reuses only the safe intersection of stored and current thread tools", () => {
 		const effective = intersectCodexThreadTools(
 			new Set(["read_file", "apply_patch", "removed_tool", "changed_tool"]),
@@ -1363,7 +1395,7 @@ suite("Codex subscription provider", () => {
 		);
 	});
 
-	test("awaits and restores durable Codex thread metadata from workspace state", async () => {
+	test("restores durable Codex thread metadata beyond the former four-hour TTL", async () => {
 		const values = new Map<string, unknown>();
 		let updateCompleted = false;
 		const workspaceState = {
@@ -1389,7 +1421,7 @@ suite("Codex subscription provider", () => {
 			copilotConversationId: "conversation-1",
 			copilotTurnIndex: 1,
 			anchor: createCodexConversationAnchor([vscode.LanguageModelChatMessage.User("request")], "answer"),
-			lastUsedAt: Date.now(),
+			lastUsedAt: Date.now() - 5 * 60 * 60_000,
 			processGeneration: 0,
 		});
 		assert.strictEqual(updateCompleted, true);
@@ -1480,11 +1512,26 @@ suite("Codex subscription provider", () => {
 			processGeneration: -1,
 		};
 		assert.strictEqual(await internals.reattachDurableThread(conversation), true);
-		assert.deepStrictEqual(calls, [{
-			method: "thread/resume",
-			params: { threadId: "thread-durable-1", excludeTurns: true },
-			timeoutMs: 15_000,
-		}]);
+		const policy = createCodexVsCodeOnlyPolicy();
+		assert.strictEqual(calls.length, 1);
+		const resumeCall = calls[0];
+		assert.strictEqual(resumeCall.method, "thread/resume");
+		assert.strictEqual(resumeCall.timeoutMs, 15_000);
+		const resumeParams = resumeCall.params as Record<string, unknown>;
+		assert.strictEqual(typeof resumeParams.developerInstructions, "string");
+		assert.ok(String(resumeParams.developerInstructions).length > 100);
+		assert.deepStrictEqual({ ...resumeParams, developerInstructions: undefined }, {
+			developerInstructions: undefined,
+			threadId: "thread-durable-1",
+			excludeTurns: true,
+			model: "gpt-5.6-terra",
+			cwd: normalizeCodexRuntimeCwd(
+				vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
+			),
+			approvalPolicy: policy.approvalPolicy,
+			sandbox: policy.sandbox,
+			config: policy.config,
+		});
 		assert.strictEqual(conversation.processGeneration, 7);
 		provider.dispose();
 	});

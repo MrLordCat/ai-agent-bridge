@@ -5,7 +5,9 @@ import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
+import { PROVIDER_CONTINUATION_TTL_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
 import { setSubagentModelProfiles } from "../subagent-guidance";
+import { formatShortResetTime } from "../utils";
 import { CodexAppServerClient, CodexAppServerError, type CodexServerRequest } from "./app-server-client";
 import {
 	buildCodexDynamicTools,
@@ -35,9 +37,11 @@ import {
 	CodexTurnBridge,
 	type CodexDelegatedToolCall,
 	type CodexTurnBoundary,
+	type CodexTurnInputDiagnostics,
 } from "./turn-bridge";
 import {
 	readCodexRolloutMetrics,
+	type CodexLiveTurnMetrics,
 	type CodexRolloutTurnMetrics,
 	type CodexToolDurationMetrics,
 	type CodexTurnStepMetrics,
@@ -50,6 +54,7 @@ import type {
 	CodexLoginStartResponse,
 	CodexModel,
 	CodexModelListResponse,
+	CodexRateLimitSnapshot,
 	CodexRateLimitsResponse,
 	CodexThreadReadResponse,
 	CodexThreadResumeResponse,
@@ -59,13 +64,14 @@ import type {
 
 const DEFAULT_CODEX_CONTEXT_LENGTH = 258_400;
 const DEFAULT_CODEX_MAX_OUTPUT_TOKENS = 32_768;
-const CODEX_CONTINUATION_TTL_MS = 30 * 60_000;
+const DEFAULT_CODEX_MAX_INPUT_CHARS = 900_000;
+export const CODEX_WORKING_CONTEXT_MIN = 131_072;
+const CODEX_CONTINUATION_TTL_MS = PROVIDER_CONTINUATION_TTL_MS;
 const MAX_CODEX_CONTINUATIONS = 64;
-const CODEX_CONVERSATION_TTL_MS = 4 * 60 * 60_000;
 const MAX_CODEX_CONVERSATIONS = 16;
 const CODEX_DURABLE_CONVERSATION_STATE_KEY = "llamacpp.codexDurableConversations.v1";
 const CODEX_PENDING_ROLLOVER_STATE_KEY = "llamacpp.codexPendingRollover.v1";
-const CODEX_PENDING_ROLLOVER_TTL_MS = 30 * 60_000;
+const CODEX_PENDING_ROLLOVER_TTL_MS = PROVIDER_PENDING_ROLLOVER_TTL_MS;
 const CODEX_ACCOUNT_CACHE_TTL_MS = 5 * 60_000;
 const CODEX_STATUS_REFRESH_INTERVAL_MS = 60_000;
 const CODEX_MODEL_CATALOG_TTL_MS = 30_000;
@@ -152,6 +158,7 @@ export interface CodexTurnDiagnostics {
 	threadMode?: CodexThreadMode;
 	threadReuseMissReason?: string;
 	conversationKey?: string;
+	idleGapSeconds?: number;
 }
 
 export function diffCodexThreadUsage(
@@ -321,6 +328,14 @@ export function createCodexRuntimeFingerprints(value: {
 	};
 }
 
+/** Stable spelling for workspace paths that appear in Codex thread settings. */
+export function normalizeCodexRuntimeCwd(value: string, platform = process.platform): string {
+	const normalized = platform === "win32" ? value.replace(/\//g, "\\") : value;
+	return platform === "win32"
+		? normalized.replace(/^([A-Z]):/, (_match, drive: string) => `${drive.toLowerCase()}:`)
+		: normalized;
+}
+
 export interface CodexVsCodeOnlyPolicy {
 	approvalPolicy: "on-request";
 	sandbox: "read-only";
@@ -441,6 +456,49 @@ export function mapCodexTokenUsageMetrics(
 	};
 }
 
+export interface CodexCompactionBudgetInput {
+	modelContextWindow: number;
+	workingContextTarget: number;
+	maxOutputTokens: number;
+	toolSchemaTokens: number;
+	developerInstructionTokens: number;
+}
+
+export interface CodexCompactionBudget {
+	modelContextWindow: number;
+	workingContextTarget: number;
+	messageTokenBudget: number;
+	outputReserveTokens: number;
+	safetyReserveTokens: number;
+}
+
+export function calculateCodexCompactionBudget(
+	input: CodexCompactionBudgetInput
+): CodexCompactionBudget {
+	const modelContextWindow = Math.max(32_768, Math.floor(input.modelContextWindow));
+	const workingContextTarget = Math.min(
+		modelContextWindow,
+		Math.max(CODEX_WORKING_CONTEXT_MIN, Math.floor(input.workingContextTarget))
+	);
+	const outputReserveTokens = Math.max(
+		8_192,
+		Math.min(Math.floor(input.maxOutputTokens), Math.floor(modelContextWindow * 0.125))
+	);
+	const safetyReserveTokens = Math.max(8_192, Math.floor(modelContextWindow * 0.03));
+	const fixedInputTokens = Math.max(0, Math.floor(input.toolSchemaTokens))
+		+ Math.max(0, Math.floor(input.developerInstructionTokens));
+	return {
+		modelContextWindow,
+		workingContextTarget,
+		messageTokenBudget: Math.max(
+			32_768,
+			workingContextTarget - outputReserveTokens - safetyReserveTokens - fixedInputTokens
+		),
+		outputReserveTokens,
+		safetyReserveTokens,
+	};
+}
+
 function normalizeCopilotConversationId(value: unknown): string | undefined {
 	if (typeof value !== "string") {
 		return undefined;
@@ -502,6 +560,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private readonly interruptedToolThreads = new Map<string, RecoverableInterruptedCodexThread>();
 	private readonly staleToolCalls = new Map<string, { reason: string; expiresAt: number }>();
 	private readonly conversationThreads = new Map<string, CodexConversationThread>();
+	private readonly lastResponseEndedAtByConversation = new Map<string, number>();
 	private pendingRollover: PendingCodexThreadRollover | undefined;
 	private readonly models = new Map<string, CodexModel>();
 	private status: CodexProviderStatus = { state: "signedOut", summary: "Checking..." };
@@ -510,6 +569,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private lastCacheHitPercent: number | undefined;
 	private lastTokenUsage: CodexThreadTokenUsage | undefined;
 	private lastModelId: string | undefined;
+	private readonly observedContextWindows = new Map<string, number>();
 	private readonly tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
 	private readonly accountedTokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
 	private liveRuntimeMetrics: ProviderRuntimeMetrics | undefined;
@@ -517,8 +577,13 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private runtimeRefreshTimer: NodeJS.Timeout | undefined;
 	private accountCache: { account: CodexChatGptAccount; generation: number; expiresAt: number } | undefined;
 	private lastStatusRefreshAt = 0;
+	private lastRateLimitSnapshot: CodexRateLimitSnapshot | undefined;
+	private lastRateLimitReached = false;
 	private modelCatalogGeneration = -1;
 	private modelCatalogExpiresAt = 0;
+	private codexKeepAliveInflight = false;
+	private codexKeepAliveTimer: NodeJS.Timeout | undefined;
+	private codexCacheKeepAliveStatusValue = "";
 	private disposed = false;
 
 	constructor(
@@ -530,6 +595,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.client.setServerRequestHandler(request => this.handleServerRequest(request));
 		this.loadDurableConversationThreads();
 		this.loadPendingRollover();
+		this.codexKeepAliveTimer = setInterval(() => void this.runCodexCacheKeepAliveCycle(), 60_000);
 	}
 
 	get statusSummary(): string {
@@ -550,6 +616,28 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	get subscriptionUsageSummary(): string | undefined {
 		return this.status.usage;
+	}
+
+	/** Primary ChatGPT subscription window utilization in percent (0-100). */
+	get codexUsageLimitPercent(): number | undefined {
+		const used = this.lastRateLimitSnapshot?.primary?.usedPercent;
+		return used === null || used === undefined ? undefined : Math.max(0, Math.min(100, Math.round(used)));
+	}
+
+	/** Human-readable reset time of the primary subscription window (`D.MM HH:MM`). */
+	get codexUsageLimitResetLabel(): string | undefined {
+		const resetsAt = this.lastRateLimitSnapshot?.primary?.resetsAt;
+		return resetsAt ? formatShortResetTime(new Date(resetsAt * 1000)) : undefined;
+	}
+
+	/** True when the ChatGPT subscription window is fully consumed. */
+	isCodexRateLimitReached(): boolean {
+		const window = this.lastRateLimitSnapshot?.primary;
+		return Boolean(
+			(window && window.usedPercent >= 100)
+			|| this.lastRateLimitSnapshot?.rateLimitReachedType
+			|| this.lastRateLimitReached
+		);
 	}
 
 	get runtimeMetrics(): ProviderRuntimeMetrics | undefined {
@@ -591,7 +679,15 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			let usage: string | undefined;
 			try {
 				const limits = await this.client.request<CodexRateLimitsResponse>("account/rateLimits/read", undefined);
-				usage = formatCodexRateLimit(this.selectRateLimit(limits));
+				this.lastRateLimitSnapshot = this.selectRateLimit(limits);
+				usage = formatCodexRateLimit(this.lastRateLimitSnapshot);
+				const reached = this.isCodexRateLimitReached();
+				if (reached !== this.lastRateLimitReached) {
+					this.lastRateLimitReached = reached;
+					// Rate-limit state changes subagent availability and the usage
+					// row; refresh model metadata so guidance picks it up.
+					this.modelChanges.fire();
+				}
 			} catch (error) {
 				this.logSink?.logError("codex.rate_limits.failed", error);
 			}
@@ -790,7 +886,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 
 		const config = this.getConfig();
-		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
+		const cwd = normalizeCodexRuntimeCwd(
+			vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
+		);
 		const vsCodeOnlyPolicy = createCodexVsCodeOnlyPolicy();
 		const { approvalPolicy, sandbox } = vsCodeOnlyPolicy;
 		const effort = resolveCodexReasoningEffort(
@@ -802,6 +900,26 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const copilotConversationId = normalizeCopilotConversationId(
 			options.modelOptions?._copilotConversationId
 		);
+		// Diagnostics for "big chat" slowdowns: the gap between our last completed
+		// response and this request arriving at the provider is time spent in
+		// VS Code (tool execution, chat-view rendering, request plumbing) — the
+		// usual suspect when every model step appears to get slower.
+		{
+			const lastEndedAt = copilotConversationId
+				? this.lastResponseEndedAtByConversation.get(copilotConversationId)
+				: undefined;
+			if (lastEndedAt !== undefined) {
+				this.logSink?.log("codex.chat.request_arrived", {
+					conversationKey: codexConversationKey(copilotConversationId as string),
+					messageCount: messages.length,
+					gapSinceLastResponseMs: Date.now() - lastEndedAt,
+					toolResultRound: messages.length > 0
+						&& messages[messages.length - 1].content.some(
+							part => part instanceof vscode.LanguageModelToolResultPart
+						),
+				});
+			}
+		}
 		const copilotTurnIndex = normalizeCopilotTurnIndex(
 			options.modelOptions?._copilotTurnIndex ?? options.modelOptions?._telemetryTurn
 		);
@@ -877,13 +995,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		let interruptedContinuation: RecoverableInterruptedCodexThread | undefined;
 		if (!activeTurn && !continuationMatch && copilotConversationId) {
+			// A follow-up user message often arrives with the SAME Copilot turn
+			// index as the turn it interrupts (VS Code does not always bump it),
+			// so supersede on `>=` rather than a strict `>` — otherwise the old
+			// turn keeps running and the follow-up never gets a reaction.
 			const superseded = [...new Set(this.activeToolTurns.values())]
 				.filter(candidate =>
 					candidate.copilotConversationId === copilotConversationId
 					&& (
 						copilotTurnIndex === undefined
 						|| candidate.copilotTurnIndex === undefined
-						|| copilotTurnIndex > candidate.copilotTurnIndex
+						|| copilotTurnIndex >= candidate.copilotTurnIndex
 					)
 				)
 				.sort((left, right) => right.createdAt - left.createdAt)[0];
@@ -1021,42 +1143,57 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		this.statusChanges.fire(this.status);
 
-		// Auto-compact the conversation when the serialized history exceeds a
-		// reasonable fraction of the model context.  This prevents Codex from
-		// receiving the full serialised VS Code conversation (which can reach
-		// 600K+ chars / 150K+ tokens) and instead sends a summary + recent suffix.
+		const toolSchemaChars = JSON.stringify(dynamicToolSet.specs).length;
+		const toolSchemaTokens = Math.ceil(toolSchemaChars / 4);
+		const configuredContextWindow = this.clampNumber(
+			config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
+			32_768,
+			1_048_576,
+			DEFAULT_CODEX_CONTEXT_LENGTH
+		);
+		const modelContextWindow = this.observedContextWindows.get(model.id)
+			?? configuredContextWindow;
+		const workingContextTarget = this.clampNumber(
+			config.get("codexWorkingContextTarget", modelContextWindow),
+			CODEX_WORKING_CONTEXT_MIN,
+			1_048_576,
+			modelContextWindow
+		);
+		const maxOutputTokens = this.clampNumber(
+			config.get("codexMaxOutputTokens", DEFAULT_CODEX_MAX_OUTPUT_TOKENS),
+			1_024,
+			131_072,
+			DEFAULT_CODEX_MAX_OUTPUT_TOKENS
+		);
+		const compactionBudget = calculateCodexCompactionBudget({
+			modelContextWindow,
+			workingContextTarget,
+			maxOutputTokens,
+			toolSchemaTokens,
+			developerInstructionTokens: estimateCodexInputTokens(CODEX_DEVELOPER_INSTRUCTIONS),
+		});
+
+		// Auto-compact only when the semantic VS Code history would exceed the
+		// selected working target after real tool, output, instruction, and safety
+		// reserves. The former extra 0.45 multiplier discarded usable context.
 		let compactionResult: CodexCompactionResult | undefined;
-		let compactionTokenBudget: number | undefined;
+		const compactionTokenBudget = compactionBudget.messageTokenBudget;
 		if (inputMode === "full" && inputMessages.length > 12) {
-			const configuredContext = this.clampNumber(
-				config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
-				32_768,
-				1_048_576,
-				DEFAULT_CODEX_CONTEXT_LENGTH
-			);
-			const codexContextUtil = this.clampRatio(
-				config.get("codexContextUtilization", 0.75),
-				0.4,
-				0.95,
-				0.75
-			);
 			const compactKeepLastTurns = this.clampInt(
 				config.get("codexCompactKeepLastTurns", 18),
 				2,
 				64,
 				18
 			);
-			const tokenBudget = Math.max(1, Math.floor(configuredContext * codexContextUtil * 0.45));
-			compactionTokenBudget = tokenBudget;
 			compactionResult = compactCodexMessages(inputMessages, {
-				tokenBudget,
+				tokenBudget: compactionTokenBudget,
 				keepLastCount: compactKeepLastTurns,
 				label: "Conversation summary (Codex auto-compact)",
 			});
 		}
 
 		const serializedMessages = compactionResult?.compacted ?? inputMessages;
-		const maxInputChars = config.get("codexMaxInputChars", 600_000);
+		const maxInputChars = config.get("codexMaxInputChars", DEFAULT_CODEX_MAX_INPUT_CHARS);
 		const input = serializeCodexConversation(serializedMessages, {
 			maxTextChars: maxInputChars,
 			maxToolResultChars: config.get("codexMaxToolResultChars", 12_000),
@@ -1080,7 +1217,6 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			currentToolSignatures
 		);
 		const toolCatalogChanged = Boolean(reusedThread && threadToolCatalogKey !== toolCatalogKey);
-		const toolSchemaChars = JSON.stringify(dynamicToolSet.specs).length;
 
 		this.logSink?.log("codex.chat.start", {
 			model: model.id,
@@ -1099,6 +1235,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			deferredVsCodeToolCount: dynamicToolSet.deferredNames.size,
 			skippedVsCodeToolCount: dynamicToolSet.skippedNames.length,
 			compacted: compactionResult?.wasCompacted ?? false,
+			modelContextWindow: compactionBudget.modelContextWindow,
+			workingContextTarget: compactionBudget.workingContextTarget,
+			compactionTokenBudget,
+			outputReserveTokens: compactionBudget.outputReserveTokens,
+			safetyReserveTokens: compactionBudget.safetyReserveTokens,
 			messageCountAfterCompact: compactionResult?.messageCountAfter,
 			messageCountBeforeCompact: compactionResult?.messageCountBefore,
 			tokenEstimateAfterCompact: compactionResult?.tokenEstimateAfter,
@@ -1206,12 +1347,15 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				tokenEstimateAfterCompact,
 				compacted: compactionResult?.wasCompacted ?? false,
 				compactionTokenBudget,
-				hardInputTargetTokens: Math.max(1, Math.ceil(maxInputChars / 4)),
-				toolSchemaTokens: Math.ceil(toolSchemaChars / 4),
+				hardInputTargetTokens: compactionBudget.messageTokenBudget,
+				toolSchemaTokens,
 				toolCount: dynamicToolSet.specs.length,
 				threadMode,
 				threadReuseMissReason,
 				conversationKey: codexConversationKey(copilotConversationId),
+				idleGapSeconds: conversationContinuation && !activeTurn && !interruptedContinuation
+					? Math.max(0, Math.round((Date.now() - conversationContinuation.lastUsedAt) / 1000))
+					: undefined,
 			});
 		}
 		if (!activeTurn && effectiveTools.callableNames.size > 0) {
@@ -1440,6 +1584,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					threadMode: inputDiagnostics?.threadMode ?? threadMode,
 					threadReuseMissReason: inputDiagnostics?.threadReuseMissReason ?? threadReuseMissReason,
 					conversationKey: inputDiagnostics?.conversationKey ?? codexConversationKey(copilotConversationId),
+				idleGapSeconds: inputDiagnostics?.idleGapSeconds,
 				};
 				this.recordTokenUsage(threadId, model.id, bridge.tokenUsage, "completed", turnDiag);
 				const usage = {
@@ -1497,6 +1642,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			this.statusChanges.fire(this.status);
 			this.refreshStatusIfStale();
 		} finally {
+			if (copilotConversationId) {
+				this.lastResponseEndedAtByConversation.set(copilotConversationId, Date.now());
+			}
 			if (!keepBridge) {
 				this.finishRuntimeMetrics(threadId);
 				this.dynamicToolContexts.delete(threadId);
@@ -1840,6 +1988,16 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		turnDiagnostics?: CodexTurnDiagnostics
 	): void {
 		this.tokenUsageByThread.set(threadId, usage);
+		const observedContextWindow = usage.modelContextWindow;
+		if (
+			observedContextWindow !== null
+			&& observedContextWindow !== undefined
+			&& observedContextWindow > 0
+			&& this.observedContextWindows.get(modelId) !== observedContextWindow
+		) {
+			this.observedContextWindows.set(modelId, observedContextWindow);
+			this.modelChanges.fire();
+		}
 		if (phase === "completed") {
 			const delta = diffCodexThreadUsage(usage, this.accountedTokenUsageByThread.get(threadId));
 			this.accountedTokenUsageByThread.set(threadId, usage);
@@ -1925,6 +2083,54 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		});
 	}
 
+	private readonly coldSegmentLoggedBridges = new Set<CodexTurnBridge>();
+
+	/**
+	 * Diagnoses an unexplained cold first segment on a reused thread.  Codex's
+	 * server-side prompt cache occasionally misses on a fresh turn even though
+	 * the previous turn ended moments earlier with a warm segment; this logs
+	 * the idle gap and prefix delta so the cause (TTL expiry vs. eviction /
+	 * backend routing) can be told apart.
+	 */
+	private diagnoseColdFirstSegment(
+		bridge: CodexTurnBridge,
+		modelId: string,
+		inputDiagnostics: CodexTurnInputDiagnostics | undefined,
+		liveMetrics: CodexLiveTurnMetrics
+	): void {
+		const segments = liveMetrics.usageSegments;
+		if (
+			this.coldSegmentLoggedBridges.has(bridge)
+			|| segments.length !== 1
+			|| segments[0].cachedInputTokens > 0
+			|| (inputDiagnostics?.threadMode !== "reused"
+				&& inputDiagnostics?.threadMode !== "interrupted-resume"
+				&& inputDiagnostics?.threadMode !== "rollover")
+		) {
+			return;
+		}
+		this.coldSegmentLoggedBridges.add(bridge);
+		const thread = [...this.conversationThreads.values()]
+			.find(candidate => candidate.threadId === bridge.threadId);
+		const previousUsage = this.tokenUsageByThread.get(bridge.threadId);
+		this.logSink?.log("codex.chat.cold_first_segment", {
+			modelId,
+			threadId: bridge.threadId,
+			turnId: bridge.turnId,
+			threadMode: inputDiagnostics?.threadMode,
+			conversationKey: inputDiagnostics?.conversationKey,
+			compacted: inputDiagnostics?.compacted ?? false,
+			idleGapSeconds: inputDiagnostics?.idleGapSeconds
+				?? (thread ? Math.max(0, Math.round((Date.now() - thread.lastUsedAt) / 1000)) : undefined),
+			firstInputTokens: segments[0].inputTokens,
+			previousLastInputTokens: previousUsage?.last.inputTokens,
+			previousSegmentRecordedAt: thread?.lastUsedAt
+				? new Date(thread.lastUsedAt).toISOString()
+				: undefined,
+			firstSegmentRecordedAt: segments[0].recordedAt,
+		}, "warn");
+	}
+
 	private emitLiveTurnUpdate(
 		bridge: CodexTurnBridge,
 		modelId: string,
@@ -1934,6 +2140,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const usage = bridge.tokenUsage;
 		const inputDiagnostics = bridge.inputDiagnostics;
 		const liveMetrics = bridge.liveMetrics;
+		this.diagnoseColdFirstSegment(bridge, modelId, inputDiagnostics, liveMetrics);
 		const contextWindow = usage?.modelContextWindow
 			?? this.clampNumber(
 				this.getConfig().get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
@@ -1990,6 +2197,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				threadMode: inputDiagnostics?.threadMode,
 				threadReuseMissReason: inputDiagnostics?.threadReuseMissReason,
 				conversationKey: inputDiagnostics?.conversationKey,
+				idleGapSeconds: inputDiagnostics?.idleGapSeconds,
 			},
 		};
 		this.liveTurnUpdates.fire(update);
@@ -2013,7 +2221,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	}
 
 	private pruneConversationThreads(): void {
-		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		const oldestAllowed = Date.now() - PROVIDER_DURABLE_SESSION_TTL_MS;
 		let changed = false;
 		for (const [threadId, conversation] of this.conversationThreads) {
 			if (
@@ -2051,7 +2259,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		if (!Array.isArray(stored)) {
 			return;
 		}
-		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		const oldestAllowed = Date.now() - PROVIDER_DURABLE_SESSION_TTL_MS;
 		for (const candidate of stored) {
 			if (!candidate || typeof candidate !== "object") {
 				continue;
@@ -2141,7 +2349,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		if (!this.workspaceState || !this.durableSessionsEnabled()) {
 			return;
 		}
-		const oldestAllowed = Date.now() - CODEX_CONVERSATION_TTL_MS;
+		const oldestAllowed = Date.now() - PROVIDER_DURABLE_SESSION_TTL_MS;
 		const entries: PersistedCodexConversationThread[] = [...this.conversationThreads.values()]
 			.filter(conversation => !conversation.ephemeral && conversation.lastUsedAt >= oldestAllowed)
 			.sort((left, right) => right.lastUsedAt - left.lastUsedAt)
@@ -2172,9 +2380,20 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	private async reattachDurableThread(conversation: CodexConversationThread): Promise<boolean> {
 		try {
+			const policy = createCodexVsCodeOnlyPolicy();
+			const cwd = normalizeCodexRuntimeCwd(
+				vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
+			);
+			const model = this.models.get(conversation.modelId);
 			const resumed = await this.client.request<CodexThreadResumeResponse>("thread/resume", {
 				threadId: conversation.threadId,
 				excludeTurns: true,
+				model: model?.model || conversation.modelId,
+				cwd,
+				approvalPolicy: policy.approvalPolicy,
+				sandbox: policy.sandbox,
+				config: policy.config,
+				developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
 			}, 15_000);
 			if (resumed.thread.id !== conversation.threadId) {
 				throw new Error(
@@ -2187,6 +2406,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				threadId: conversation.threadId,
 				historyMode: resumed.thread.historyMode,
 				conversationIdPresent: conversation.copilotConversationId !== undefined,
+				settingsReapplied: true,
+				cwd,
+				approvalPolicy: policy.approvalPolicy,
+				sandbox: policy.sandbox,
 			});
 			return true;
 		} catch (error) {
@@ -2214,17 +2437,27 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			DEFAULT_CODEX_MAX_OUTPUT_TOKENS
 		);
 		const models = [...this.models.values()];
+		const rateLimitReached = this.isCodexRateLimitReached();
 		setSubagentModelProfiles("codex", models.map(model => ({
 			id: model.id,
-			label: model.displayName,
+			// Match the model-picker label exactly (`${displayName} (Codex)`) so a
+			// subagent model= value resolves in the picker instead of being
+			// rejected or silently falling back to Auto.
+			label: `${model.displayName} (Codex)`,
 			provider: "codex",
 			defaultEffort: "high",
-			availability: "available",
-			availabilityReason: "Model is present in the current ChatGPT subscription catalog",
+			availability: rateLimitReached ? "unavailable" : "available",
+			availabilityReason: rateLimitReached
+				? `ChatGPT subscription rate limit reached (${this.codexUsageLimitPercent ?? "unknown"}%)`
+				: "Model is present in the current ChatGPT subscription catalog",
 			availabilityCheckedAt: Date.now(),
 			useWhen: "Use for repository-wide, multi-step coding or high-confidence verification",
 		})));
-		return models.map(model => mapCodexModelInformation(model, contextLength, maxOutputTokens));
+		return models.map(model => mapCodexModelInformation(
+			model,
+			this.observedContextWindows.get(model.id) ?? contextLength,
+			maxOutputTokens
+		));
 	}
 
 	private async requireSubscriptionAccount(): Promise<CodexChatGptAccount> {
@@ -2282,6 +2515,189 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			return;
 		}
 		void this.refreshStatus().catch(error => this.logSink?.logError("codex.status.background_failed", error));
+	}
+
+	get codexCacheKeepAliveStatus(): string {
+		return this.codexCacheKeepAliveStatusValue;
+	}
+
+	/** Forces the next keep-alive cycle to re-evaluate immediately (used by the Quick Access toggle). */
+	refreshCodexCacheKeepAliveStatus(): void {
+		void this.runCodexCacheKeepAliveCycle().catch(error => {
+			this.logSink?.logError("codex.cache_keepalive.cycle_failed", error);
+		});
+	}
+
+	private async runCodexCacheKeepAliveCycle(): Promise<void> {
+		try {
+			await this.refreshStatus();
+		} catch (error) {
+			this.logSink?.logError("codex.usage_periodic_refresh.failed", error);
+		}
+		await this.maybeRunCodexCacheKeepAlive();
+	}
+
+	/**
+	 * Smart Codex cache keep-alive, mirroring the Claude implementation.
+	 * While the user is idle and the ChatGPT subscription window is below
+	 * 90%, a minimal turn on the largest eligible thread refreshes the
+	 * server-side prompt-prefix cache. Disabled by default because Codex is
+	 * billed per token; opt in via codexCacheKeepAliveEnabled.
+	 */
+	private async maybeRunCodexCacheKeepAlive(): Promise<void> {
+		if (this.codexKeepAliveInflight || this.disposed) {
+			return;
+		}
+		const config = vscode.workspace.getConfiguration("llamacpp");
+		const enabled = config.get<boolean>("codexCacheKeepAliveEnabled", false) === true;
+		const intervalMs = Math.max(
+			60_000,
+			Math.min(3_600_000, Number(config.get("codexCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
+		);
+		const ignoreUsageLimit = config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === true;
+		const now = Date.now();
+		const usagePercent = this.codexUsageLimitPercent;
+		const usageSnapshotAgeMs = this.lastStatusRefreshAt > 0
+			? now - this.lastStatusRefreshAt
+			: undefined;
+		if (!enabled) {
+			this.codexCacheKeepAliveStatusValue = "Disabled";
+			return;
+		}
+		if (usagePercent === undefined) {
+			this.codexCacheKeepAliveStatusValue = "Usage unknown — paused";
+			return;
+		}
+		if (usageSnapshotAgeMs === undefined || usageSnapshotAgeMs > 10 * 60_000) {
+			this.codexCacheKeepAliveStatusValue = "Usage snapshot stale — paused";
+			return;
+		}
+		if (usagePercent >= 90 && !ignoreUsageLimit) {
+			this.codexCacheKeepAliveStatusValue =
+				`Paused to protect the subscription limit (${usagePercent}% used)`;
+			return;
+		}
+
+		// Candidate threads: durable (non-ephemeral), current generation,
+		// not busy with an active turn, not recently used.
+		const busyThreadIds = new Set(
+			[...this.activeToolTurns.values()].map(turn => turn.bridge.threadId)
+		);
+		const candidates = [...this.conversationThreads.values()]
+			.filter(thread => !thread.ephemeral)
+			.filter(thread => thread.processGeneration === this.client.generation)
+			.filter(thread => !busyThreadIds.has(thread.threadId))
+			.map(thread => ({
+				thread,
+				prefixTokens: this.tokenUsageByThread.get(thread.threadId)?.last.totalTokens
+					?? this.accountedTokenUsageByThread.get(thread.threadId)?.last.totalTokens
+					?? 0,
+				lastUsedAt: thread.lastUsedAt,
+			}))
+			.filter(candidate => candidate.prefixTokens >= 100_000)
+			.sort((left, right) => right.prefixTokens - left.prefixTokens
+				|| right.lastUsedAt - left.lastUsedAt);
+		if (candidates.length === 0) {
+			this.codexCacheKeepAliveStatusValue = "No eligible thread (prefix >= 100k tokens)";
+			return;
+		}
+		const candidate = candidates[0];
+		const lastAttemptAt = this.lastCodexKeepAliveAttemptAt;
+		const nextAttemptAt = Math.max(
+			candidate.lastUsedAt + intervalMs * 0.8,
+			(lastAttemptAt ?? 0) + Math.min(intervalMs, 5 * 60_000)
+		);
+		if (now < nextAttemptAt) {
+			this.codexCacheKeepAliveStatusValue =
+				`Waiting — next attempt in ${Math.round((nextAttemptAt - now) / 60_000)} min`;
+			return;
+		}
+
+		this.codexKeepAliveInflight = true;
+		this.lastCodexKeepAliveAttemptAt = now;
+		try {
+			const completed = await this.runCodexKeepAliveTurn(candidate.thread, candidate.prefixTokens);
+			this.codexCacheKeepAliveStatusValue = completed
+				? `OK — refreshed ${candidate.prefixTokens.toLocaleString("en-US")}-token prefix`
+				: "Turn rejected (busy/closed)";
+			if (completed) {
+				this.lastCodexKeepAliveAt = Date.now();
+			}
+		} catch (error) {
+			const detail = error instanceof Error ? error.message : String(error);
+			this.codexCacheKeepAliveStatusValue = `Failed — ${truncate(detail, 160)}`;
+			this.logSink?.logError("codex.cache_keepalive_failed", error, {
+				threadId: candidate.thread.threadId,
+				prefixTokens: candidate.prefixTokens,
+			});
+		} finally {
+			this.codexKeepAliveInflight = false;
+		}
+	}
+
+	private lastCodexKeepAliveAt: number | undefined;
+	private lastCodexKeepAliveAttemptAt: number | undefined;
+
+	private async runCodexKeepAliveTurn(
+		thread: CodexConversationThread,
+		prefixTokens: number
+	): Promise<boolean> {
+		if (this.disposed) {
+			return false;
+		}
+		if (thread.processGeneration !== this.client.generation) {
+			await this.reattachDurableThread(thread);
+		}
+		const bridge = this.createTurnBridge(thread.threadId, thread.modelId, thread.ephemeral);
+		let interrupted = false;
+		const cacheReadSeen = new Promise<void>(resolve => {
+			const timer = setTimeout(() => resolve(), 45_000);
+			const probe = setInterval(() => {
+				const usage = bridge.tokenUsage;
+				if (usage && usage.last.cachedInputTokens > 0) {
+					clearTimeout(timer);
+					clearInterval(probe);
+					resolve();
+				}
+			}, 1_000);
+			void timer;
+		});
+		try {
+			const outcome = await bridge.start(
+				{
+					threadId: thread.threadId,
+					input: [{ type: "text", text: "Silent cache keep-alive. Do not use any tools. Reply with exactly: ok", text_elements: [] }],
+					effort: "low",
+					summary: "none",
+				},
+				{ report: () => undefined },
+				{ isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) }
+			);
+			interrupted = true;
+			await bridge.interrupt();
+			await cacheReadSeen;
+			this.logSink?.log("codex.cache_keepalive", {
+				threadId: thread.threadId,
+				turnId: bridge.turnId,
+				prefixTokens,
+				outcome: outcome.kind,
+			});
+			return outcome.kind === "completed" || outcome.kind === "delegated";
+		} catch (error) {
+			if (!interrupted) {
+				try {
+					await bridge.interrupt();
+				} catch {
+					// ignore — the turn may already be gone
+				}
+			}
+			this.logSink?.logError("codex.cache_keepalive_turn_failed", error, {
+				threadId: thread.threadId,
+			});
+			return false;
+		} finally {
+			bridge.dispose();
+		}
 	}
 
 	private async handleServerRequest(request: CodexServerRequest): Promise<unknown> {

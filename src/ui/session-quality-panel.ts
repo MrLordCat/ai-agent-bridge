@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { ClaudeCacheKeepAliveStatus } from "../claude/claude-provider";
 import type { SessionQualityTracker } from "../diagnostics/session-report";
 
 export class SessionQualityPanel {
@@ -9,17 +10,20 @@ export class SessionQualityPanel {
 	private readonly _tracker: SessionQualityTracker;
 	private readonly _extensionVersion: string;
 	private readonly _vscodeVersion: string;
+	private readonly _getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus;
 
 	private constructor(
 		panel: vscode.WebviewPanel,
 		tracker: SessionQualityTracker,
 		extensionVersion: string,
 		vscodeVersion: string,
+		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
 	) {
 		this._panel = panel;
 		this._tracker = tracker;
 		this._extensionVersion = extensionVersion;
 		this._vscodeVersion = vscodeVersion;
+		this._getClaudeCacheKeepAliveStatus = getClaudeCacheKeepAliveStatus;
 
 		this._panel.onDidDispose(() => {
 			SessionQualityPanel.current = undefined;
@@ -38,6 +42,7 @@ export class SessionQualityPanel {
 		tracker: SessionQualityTracker,
 		extensionVersion: string,
 		vscodeVersion: string,
+		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
 	): void {
 		if (SessionQualityPanel.current) {
 			SessionQualityPanel.current._panel.reveal(vscode.ViewColumn.Beside);
@@ -62,6 +67,7 @@ export class SessionQualityPanel {
 				tracker,
 				extensionVersion,
 				vscodeVersion,
+				getClaudeCacheKeepAliveStatus,
 			);
 		} catch (err: unknown) {
 			panel.dispose();
@@ -95,6 +101,9 @@ export class SessionQualityPanel {
 			generatedAt: new Date().toISOString(),
 			extensionVersion: this._extensionVersion,
 			vscodeVersion: this._vscodeVersion,
+			providerHealth: {
+				claudeCacheKeepAlive: this._getClaudeCacheKeepAliveStatus(),
+			},
 			summary: {
 				turns: summary.turns,
 					totalModelTurns: summary.totalModelTurns,
@@ -194,6 +203,17 @@ h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
 .diagnostic-icon { width: 22px; height: 22px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; background: var(--track); color: var(--diag-color, var(--good)); font-weight: 800; }
 .diagnostic-title { font-weight: 650; }
 .diagnostic-copy { margin-top: 1px; color: var(--dim); font-size: 11px; }
+.keepalive-card { margin-top: 10px; padding: 12px 13px; border: 1px solid var(--border); border-left: 3px solid var(--keepalive-color, var(--info)); border-radius: 7px; background: var(--surface); }
+.keepalive-card.good { --keepalive-color: var(--good); }
+.keepalive-card.warn { --keepalive-color: var(--warn); }
+.keepalive-card.bad { --keepalive-color: var(--bad); }
+.keepalive-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.keepalive-state { color: var(--keepalive-color, var(--info)); font-size: 12px; font-weight: 700; text-transform: uppercase; }
+.keepalive-reason { margin-top: 4px; color: var(--dim); font-size: 11px; }
+.keepalive-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(175px, 1fr)); gap: 7px 14px; margin-top: 11px; }
+.keepalive-kv { min-width: 0; }
+.keepalive-k { color: var(--dim); font-size: 9px; font-weight: 700; letter-spacing: .055em; text-transform: uppercase; }
+.keepalive-v { margin-top: 2px; overflow-wrap: anywhere; font-size: 11px; font-weight: 600; }
 .model-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 10px; }
 .model-card { padding: 12px 13px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .model-head, .model-stats { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
@@ -242,6 +262,7 @@ tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,12
 .reason-badge { display: inline-flex; align-items: center; max-width: 220px; padding: 2px 7px; border-radius: 999px; font-size: 10px; font-weight: 650; line-height: 1.5; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .reason-cold_start { background: rgba(148,163,184,.16); color: #cbd5e1; }
 .reason-upstream_expired { background: rgba(245,158,11,.16); color: #f6c45f; }
+.reason-upstream_cache_pending { background: rgba(245,158,11,.16); color: #f6c45f; }
 .reason-healthy { background: rgba(70,201,111,.14); color: var(--good); }
 .reason-history_rewritten, .reason-history_truncated, .reason-history_summarized { background: rgba(181,138,240,.15); color: #c9a7f6; }
 .reason-session_not_reused { background: rgba(239,98,98,.15); color: #ff8d8d; }
@@ -283,6 +304,7 @@ const FMT1 = (v, d) => typeof v === "number" ? v.toFixed(1) : (d ?? "n/a");
 const FMT_SHORT = (v) => typeof v === "number" ? new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 }).format(v) : "n/a";
 const PCT = (v) => typeof v === "number" ? v.toFixed(1) + "%" : "n/a";
 const DURATION = (v) => typeof v !== "number" ? "n/a" : v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 2) + " s" : Math.round(v) + " ms";
+const CLOCK = (v) => typeof v === "number" ? new Date(v).toLocaleTimeString() : "never";
 const YESNO = (v) => v === true ? "✅" : v === false ? "❌" : "—";
 const HIT_COLOR = (v) => v >= 90 ? "hit-good" : v >= 50 ? "hit-warn" : "hit-bad";
 const HIT_TONE = (v) => v >= 90 ? "tone-good" : v >= 50 ? "tone-warn" : "tone-bad";
@@ -292,7 +314,7 @@ const MODEL_LABEL = (id) => String(id || "—").replace(/^.*::/, "");
 const IS_CODEX = (r) => r && (r.providerKind === "codex" || typeof r.threadMode === "string");
 const IS_CLAUDE = (r) => r && (r.providerKind === "claude" || typeof r.sessionMode === "string");
 const IS_STATEFUL = (r) => IS_CODEX(r) || IS_CLAUDE(r);
-const EFFECTIVE_HIT = (r) => IS_CODEX(r) && typeof r.continuationCacheHitPercent === "number"
+const EFFECTIVE_HIT = (r) => IS_STATEFUL(r) && typeof r.continuationCacheHitPercent === "number"
 	? r.continuationCacheHitPercent
 	: r.promptCacheHitPercent;
 const LIFECYCLE_TONE = (phase) => phase === "failed" || phase === "timed_out"
@@ -301,6 +323,78 @@ const LIFECYCLE_TONE = (phase) => phase === "failed" || phase === "timed_out"
 const escAttr = (s) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 // Safe JSON stringify — returns a fallback object if serialization fails.
 var safeStringify = function(obj) { try { return escAttr(JSON.stringify(obj)); } catch(e) { return escAttr(JSON.stringify({_error: "serialization_failed", _detail: String(e && e.message ? e.message : e)})); } };
+var compactTurnRecord = function(r) {
+	const segments = Array.isArray(r.usageSegments) ? r.usageSegments : [];
+	const first = segments[0];
+	const final = segments.length ? segments[segments.length - 1] : undefined;
+	return {
+		index: r.index,
+		requestId: r.requestId,
+		modelId: r.modelId,
+		providerKind: r.providerKind,
+		lifecyclePhase: r.lifecyclePhase,
+		terminalDetail: r.terminalDetail,
+		sessionMode: r.sessionMode,
+		threadMode: r.threadMode,
+		inputMode: r.inputMode,
+		compacted: r.compacted,
+		conversationKey: r.conversationKey,
+		cause: {
+			classification: r.cacheMissReason,
+			detail: r.cacheMissDetail,
+			resumeFailureReason: r.resumeFailureReason,
+			resumeFailureStage: r.resumeFailureStage,
+			resumeFailureDetail: r.resumeFailureDetail,
+		},
+		guard: {
+			resumeFallbackDecision: r.resumeFallbackDecision,
+			estimatedReplayTokens: r.resumeFallbackEstimatedInputTokens,
+			maxReplayTokens: r.resumeFallbackMaxInputTokens,
+			maxModelSegments: r.turnMaxModelSegments,
+			maxCumulativeInputTokens: r.turnMaxCumulativeInputTokens,
+			stopReason: r.safetyStopReason,
+			stopDetail: r.safetyStopDetail,
+		},
+		cache: {
+			initialHitPercent: r.initialSegmentCacheHitPercent,
+			continuationHitPercent: r.continuationCacheHitPercent,
+			processedBlendPercent: r.promptCacheHitPercent,
+			coldRewriteTokens: first && first.cacheHitPercent === 0 ? first.cacheCreationInputTokens : 0,
+			finalInputTokens: final ? final.inputTokens : r.finalSegmentInputTokens,
+			finalCachedInputTokens: final ? final.cachedInputTokens : r.finalSegmentCachedInputTokens,
+			cumulativeProcessedInputTokens: r.promptTokens,
+			cumulativeCacheReadTokens: r.cachedPromptTokens,
+			cumulativeCacheWriteTokens: r.cacheWriteInputTokens,
+			modelSegments: r.modelTurns,
+		},
+		performance: {
+			durationMs: r.durationMs,
+			firstModelEventLatencyMs: r.firstTokenLatencyMs,
+			firstVisibleLatencyMs: r.firstVisibleLatencyMs,
+			outputTokens: r.outputTokens,
+			outputChars: r.outputChars,
+		},
+		tools: {
+			calls: r.toolCalls,
+			delegatedCalls: r.delegatedToolCalls,
+			totalDurationMs: r.toolDurationTotalMs,
+			breakdown: r.toolCallBreakdown,
+		},
+		context: r.context ? {
+			usedTokens: r.context.estimatedUsedTokens,
+			freeTokens: r.context.estimatedFreeTokens,
+			usagePercent: r.context.estimatedUsagePercent,
+			advertisedTools: r.context.cappedTools,
+			autoCompacted: r.context.autoCompacted,
+			hardCompacted: r.context.hardCompacted,
+			tokenCountSource: r.context.tokenCountSource,
+		} : undefined,
+		metricsSource: r.metricsSource,
+	};
+};
+const DISPLAY_SERIES = (items) => !Array.isArray(items) || items.length <= 12
+	? items || []
+	: [...items.slice(0, 3), ...items.slice(-5)];
 
 function render() {
 	const d = DATA;
@@ -355,6 +449,49 @@ function render() {
 				: s.turns > 0 ? 'No server-reported cache or tool reliability problems.' : 'Start a model turn and this dashboard will update automatically.';
 	h += '<div class="diagnostic ' + diagnosticClass + '"><div class="diagnostic-icon">' + diagnosticIcon + '</div><div><div class="diagnostic-title">' + diagnosticTitle + '</div><div class="diagnostic-copy">' + diagnosticCopy + '</div></div></div>';
 
+	// Provider health stays visible even when there are no Claude user turns.
+	const keepAlive = d.providerHealth && d.providerHealth.claudeCacheKeepAlive;
+	if (keepAlive) {
+		const stateLabels = {
+			checking: 'Checking', disabled: 'Disabled', paused_usage_unknown: 'Paused · usage unknown',
+			paused_usage_stale: 'Paused · usage stale', paused_usage_limit: 'Paused · limit protection',
+			no_eligible_session: 'No eligible session', waiting: 'Waiting', running: 'Running',
+			success: 'Success', failed: 'Failed',
+		};
+		const keepAliveTone = keepAlive.state === 'failed'
+			? 'bad'
+			: keepAlive.state === 'success' || keepAlive.state === 'waiting'
+				? 'good'
+				: keepAlive.state.startsWith('paused_') || keepAlive.state === 'disabled'
+					? 'warn'
+					: '';
+		const kv = (label, value) => '<div class="keepalive-kv"><div class="keepalive-k">' + label + '</div><div class="keepalive-v">' + esc(String(value)) + '</div></div>';
+		const usageLabel = typeof keepAlive.usagePercent === 'number'
+			? FMT1(keepAlive.usagePercent) + '% · snapshot ' + DURATION(keepAlive.usageSnapshotAgeMs) + ' old'
+			: 'unknown';
+		const nextLabel = typeof keepAlive.nextAttemptAt === 'number'
+			? CLOCK(keepAlive.nextAttemptAt) + (keepAlive.nextAttemptAt > Date.now() ? ' · in ' + DURATION(keepAlive.nextAttemptAt - Date.now()) : ' · due')
+			: 'not scheduled';
+		const candidateLabel = keepAlive.candidateModelId
+			? MODEL_LABEL(keepAlive.candidateModelId) + ' · ' + FMT_SHORT(keepAlive.candidatePrefixTokens) + ' prefix'
+			: 'none';
+		const resultLabel = typeof keepAlive.lastResultCacheHitPercent === 'number'
+			? PCT(keepAlive.lastResultCacheHitPercent) + ' cache read · ' + FMT_SHORT(keepAlive.lastResultCacheWriteTokens) + ' written'
+			: 'no completed sample';
+		h += '<section class="keepalive-card ' + keepAliveTone + '" aria-label="Claude cache keep-alive status">';
+		h += '<div class="keepalive-head"><div><div class="metric-label">Claude cache keep-alive</div><div class="keepalive-state">' + esc(stateLabels[keepAlive.state] || keepAlive.state) + '</div></div><span class="section-note">Updated ' + CLOCK(keepAlive.updatedAt) + '</span></div>';
+		h += '<div class="keepalive-reason">' + esc(keepAlive.reason) + '</div><div class="keepalive-grid">';
+		h += kv('5-hour usage', usageLabel);
+		h += kv('Live sessions', FMT(keepAlive.eligibleSessionCount) + ' eligible of ' + FMT(keepAlive.sessionCount));
+		h += kv('Protected session', candidateLabel);
+		h += kv('Next attempt', nextLabel);
+		h += kv('Last attempt', CLOCK(keepAlive.lastAttemptAt));
+		h += kv('Last success', CLOCK(keepAlive.lastSuccessAt));
+		h += kv('Last result', resultLabel);
+		h += kv('Last failure', keepAlive.lastFailure ? CLOCK(keepAlive.lastFailureAt) + ' · ' + keepAlive.lastFailure : 'none');
+		h += '</div></section>';
+	}
+
 	// Cache by Model
 	if (s.cacheByModel && s.cacheByModel.length) {
 		h += '<section class="section"><div class="section-heading"><h2>Cache by model</h2><span class="section-note">Token-weighted cache efficiency</span></div><div class="model-grid">';
@@ -408,7 +545,9 @@ function render() {
 			const hit = EFFECTIVE_HIT(r);
 			const detailId = "detail-" + i;
 			const cacheIssue = typeof hit === "number" && hit < 90;
-			const critical = Boolean(r.rejectedToolCalls || r.toolLoopDetected || r.retriedAfterOverflow);
+			const critical = Boolean(
+				r.rejectedToolCalls || r.toolLoopDetected || r.retriedAfterOverflow || r.safetyStopReason
+			);
 			const reasonIssue = Boolean(r.cacheMissReason && r.cacheMissReason !== "healthy" && r.cacheMissReason !== "cold_start");
 			const issue = critical || cacheIssue || reasonIssue;
 			const searchable = [r.modelId, r.cacheMissReason, r.requestId].filter(Boolean).join(" ").toLowerCase();
@@ -448,9 +587,10 @@ function render() {
 			h += '<td>' + (r.toolCalls ?? 0) + (r.repairedToolCalls ? " (" + r.repairedToolCalls + "r)" : "") + (r.rejectedToolCalls ? " (" + r.rejectedToolCalls + "x)" : "") + '</td>';
 			h += '<td>' + (r.context?.estimatedUsagePercent !== undefined ? FMT1(r.context.estimatedUsagePercent) + "%" : "n/a") + '</td>';
 			h += '<td>' + (r.context?.hardCompacted ? "hard" : r.context?.autoCompacted ? "auto" : "—") + '</td>';
-			// Copy button — stores full turn JSON for clipboard
-			const turnJson = safeStringify(r);
-			h += '<td><span class="copy-btn" role="button" tabindex="0" data-json="' + turnJson + '" title="Click: copy JSON · Shift+click: formatted text">Copy</span></td>';
+			// Default clipboard payload is compact. Full diagnostics remain available
+			// from DATA by record index without duplicating the large JSON in the DOM.
+			const turnJson = safeStringify(compactTurnRecord(r));
+			h += '<td><span class="copy-btn" role="button" tabindex="0" data-index="' + i + '" data-json="' + turnJson + '" title="Click: compact JSON · Shift+click: formatted text · Alt+click: full JSON">Copy</span></td>';
 			h += '</tr>';
 
 			// Detail row ...
@@ -476,6 +616,14 @@ function render() {
 				h += '<section class="detail-card wide"><h3>Claude session &amp; cache</h3>';
 				h += '<div class="kv"><span class="k">Lifecycle</span><span class="v ' + LIFECYCLE_TONE(r.lifecyclePhase) + '">' + esc(r.lifecyclePhase || 'unknown') + '</span></div>';
 				h += '<div class="kv"><span class="k">Session mode</span><span class="v">' + esc(r.sessionMode || 'unknown') + '</span></div>';
+				if (r.resumeFailureReason) h += '<div class="kv"><span class="k">Resume failure</span><span class="v bad">' + esc(r.resumeFailureReason) + '</span></div>';
+				if (r.resumeFailureStage) h += '<div class="kv"><span class="k">Failure stage</span><span class="v">' + esc(r.resumeFailureStage) + '</span></div>';
+				if (r.resumeFailureDetail) h += '<div class="kv"><span class="k">Original SDK error</span><span class="v">' + esc(r.resumeFailureDetail) + '</span></div>';
+				if (r.resumeFallbackDecision) h += '<div class="kv"><span class="k">Fallback decision</span><span class="v">' + esc(r.resumeFallbackDecision) + '</span></div>';
+				if (r.resumeFallbackEstimatedInputTokens !== undefined) h += '<div class="kv"><span class="k">Estimated cold replay</span><span class="v">' + FMT(r.resumeFallbackEstimatedInputTokens) + ' / ' + FMT(r.resumeFallbackMaxInputTokens) + ' tokens</span></div>';
+				if (r.turnMaxModelSegments !== undefined) h += '<div class="kv"><span class="k">Turn guard</span><span class="v">' + FMT(r.turnMaxModelSegments) + ' model segments · ' + FMT(r.turnMaxCumulativeInputTokens) + ' cumulative input tokens</span></div>';
+				if (r.safetyStopReason) h += '<div class="kv"><span class="k">Safety stop</span><span class="v bad">' + esc(r.safetyStopReason) + '</span></div>';
+				if (r.safetyStopDetail) h += '<div class="kv"><span class="k">Safety detail</span><span class="v">' + esc(r.safetyStopDetail) + '</span></div>';
 				h += '<div class="kv"><span class="k">Fresh input</span><span class="v">' + FMT(Math.max(0, (r.promptTokens ?? 0) - (r.cachedPromptTokens ?? 0) - (r.cacheWriteInputTokens ?? 0))) + '</span></div>';
 				h += '<div class="kv"><span class="k">Cache read</span><span class="v ' + HIT_COLOR(r.promptCacheHitPercent) + '">' + FMT(r.cachedPromptTokens) + ' · ' + PCT(r.promptCacheHitPercent) + '</span></div>';
 				h += '<div class="kv"><span class="k">Cache creation</span><span class="v">' + FMT(r.cacheWriteInputTokens ?? 0) + '</span></div>';
@@ -623,22 +771,24 @@ function render() {
 			if (Array.isArray(r.steps) && r.steps.length) {
 				h += '<section class="detail-card wide"><h3>' + (IS_CLAUDE(r) ? 'Claude' : IS_CODEX(r) ? 'Codex' : 'Provider') + ' live steps (' + FMT(r.steps.length) + ')</h3>';
 				h += '<div class="table-shell" style="max-height:340px"><table><thead><tr><th>#</th><th>Kind</th><th>Step</th><th>Status</th><th>At</th><th>Duration</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>';
-				for (const step of r.steps) {
+				for (const step of DISPLAY_SERIES(r.steps)) {
 					const statusClass = step.status === 'failed' || step.status === 'timed_out' ? 'bad' : step.status === 'running' || step.status === 'cancelled' ? 'warn' : 'good';
 					const kindLabel = step.kind === 'tool' && step.toolCategory ? 'tool · ' + step.toolCategory : step.kind;
 					h += '<tr><td>' + FMT(step.index) + '</td><td>' + esc(kindLabel) + '</td><td>' + esc(step.label) + '</td><td class="' + statusClass + '">' + esc(step.status) + '</td><td>' + esc(step.startedAt ? new Date(step.startedAt).toLocaleTimeString() : 'n/a') + '</td><td>' + DURATION(step.durationMs) + '</td><td>' + FMT(step.inputTokens) + '</td><td class="' + HIT_COLOR(step.cacheHitPercent) + '">' + FMT(step.cachedInputTokens) + ' · ' + PCT(step.cacheHitPercent) + '</td><td>' + FMT(step.cacheCreationInputTokens) + '</td><td>' + FMT(step.outputTokens) + '</td></tr>';
 				}
 				h += '</tbody></table></div>';
+				if (r.steps.length > 12) h += '<div class="section-note" style="margin-top:6px">Showing the first 3 and last 5 steps. Use Alt+Copy for the full JSON.</div>';
 				h += '</section>';
 			}
 
 			if (Array.isArray(r.usageSegments) && r.usageSegments.length) {
 				h += '<section class="detail-card wide"><h3>Model usage segments (' + FMT(r.modelTurns ?? r.usageSegments.length) + ')</h3>';
 				h += '<div class="table-shell" style="max-height:300px"><table><thead><tr><th>#</th><th>At</th>' + (IS_CLAUDE(r) ? '<th>Fresh</th>' : '') + '<th>Input</th><th>Cache read</th>' + (IS_CLAUDE(r) ? '<th>Cache write</th>' : '') + '<th>Hit</th><th>Output</th><th>Reasoning</th><th>Total</th></tr></thead><tbody>';
-				for (const segment of r.usageSegments) {
+				for (const segment of DISPLAY_SERIES(r.usageSegments)) {
 					h += '<tr><td>' + FMT(segment.index) + '</td><td>' + esc(segment.recordedAt ? new Date(segment.recordedAt).toLocaleTimeString() : 'n/a') + '</td>' + (IS_CLAUDE(r) ? '<td>' + FMT(segment.freshInputTokens) + '</td>' : '') + '<td>' + FMT(segment.inputTokens) + '</td><td>' + FMT(segment.cachedInputTokens) + '</td>' + (IS_CLAUDE(r) ? '<td>' + FMT(segment.cacheCreationInputTokens) + '</td>' : '') + '<td class="' + HIT_COLOR(segment.cacheHitPercent) + '">' + PCT(segment.cacheHitPercent) + '</td><td>' + FMT(segment.outputTokens) + '</td><td>' + FMT(segment.reasoningOutputTokens) + '</td><td>' + FMT(segment.totalTokens) + '</td></tr>';
 				}
 				h += '</tbody></table></div>';
+				if (r.usageSegments.length > 12) h += '<div class="section-note" style="margin-top:6px">Showing the first 3 and last 5 usage segments. Use Alt+Copy for the full JSON.</div>';
 				if (r.usageSegmentsTruncated) h += '<div class="section-note" style="margin-top:6px">Only the first retained segment snapshots are shown.</div>';
 				h += '</section>';
 			}
@@ -693,10 +843,16 @@ document.addEventListener("click", function(e) {
 	const copyBtn = e.target.closest(".copy-btn");
 	if (copyBtn) {
 		e.stopPropagation();
-		const json = copyBtn.getAttribute("data-json");
+		const index = Number(copyBtn.getAttribute("data-index"));
+		const fullRecord = Number.isInteger(index) ? DATA.records[index] : undefined;
+		const json = e.altKey && fullRecord
+			? JSON.stringify(fullRecord)
+			: copyBtn.getAttribute("data-json");
 		if (!json) return;
 		const asText = e.shiftKey;
-		const content = asText ? formatTurnText(JSON.parse(json)) : JSON.stringify(JSON.parse(json), null, 2);
+		const content = asText && fullRecord
+			? formatTurnText(fullRecord)
+			: JSON.stringify(JSON.parse(json), null, 2);
 		navigator.clipboard.writeText(content).then(function() {
 			copyBtn.textContent = "Copied";
 			copyBtn.classList.add("copied");

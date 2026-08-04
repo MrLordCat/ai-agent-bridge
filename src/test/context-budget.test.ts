@@ -78,7 +78,7 @@ suite("context budget", () => {
 			softInputTarget: 101171,
 			hardInputTarget: 84131,
 			overflowRetry: false,
-		}), { kind: "auto", target: 101171 });
+		}), { kind: "auto", target: 75878 });
 
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 101000,
@@ -87,6 +87,23 @@ suite("context budget", () => {
 			hardInputTarget: 84131,
 			overflowRetry: false,
 		}), { kind: "none" });
+	});
+
+	test("auto-compaction lands below the trigger to avoid micro-compactions", () => {
+		// Compacting exactly to the soft target re-triggers on the next turn.
+		// The 0.75 ratio leaves headroom so a single compaction lasts for many turns.
+		const decision = selectContextCompaction({
+			messageTokens: 450000,
+			autoCompact: true,
+			softInputTarget: 402100,
+			hardInputTarget: 333943,
+			overflowRetry: false,
+		});
+		assert.strictEqual(decision.kind, "auto");
+		if (decision.kind === "auto") {
+			assert.strictEqual(decision.target, 301575);
+			assert.ok(decision.target < 402100 * 0.8);
+		}
 	});
 
 	test("reserves the hard target for a confirmed overflow retry", () => {

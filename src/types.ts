@@ -80,28 +80,6 @@ export interface OpenAIChatMessage {
 	tool_call_id?: string;
 }
 
-
-
-/**
- * Buffer used to accumulate streamed tool call parts until arguments are valid JSON.
- * Helps in assembling incomplete tool call data from streaming responses.
- *
- */
-export interface ToolCallBuffer {
-	/**
-	 * Optional unique identifier for the tool call.
-	 */
-	id?: string;
-	/**
-	 * Optional name of the tool being called.
-	 */
-	name?: string;
-	/**
-	 * Accumulated arguments string for the tool call.
-	 */
-	args: string;
-}
-
 /**
  * OpenAI-style chat roles.
  * Defines the possible roles for messages in a chat conversation.

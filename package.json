@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
 	},
-	"version": "1.9.0",
+	"version": "1.10.0",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -108,14 +108,14 @@
 					"default": 258400,
 					"minimum": 32768,
 					"maximum": 1048576,
-					"description": "Context window advertised for Codex models. The default matches the context reported by the current Codex app-server runtime."
+					"description": "Fallback Codex model window before app-server reports the real value. Server telemetry takes precedence; changing this value cannot enlarge the provider limit."
 				},
-				"llamacpp.codexContextUtilization": {
+				"llamacpp.codexWorkingContextTarget": {
 					"type": "number",
-					"default": 0.75,
-					"minimum": 0.4,
-					"maximum": 0.95,
-					"description": "Fraction of the Codex context window considered usable when calculating the automatic conversation-compaction budget."
+					"default": 258400,
+					"minimum": 131072,
+					"maximum": 1048576,
+					"description": "Total Codex working-context target used for cold-start compaction. It is capped to the server-reported model window, then output, tool-schema, developer-instruction, and safety reserves are subtracted."
 				},
 				"llamacpp.codexCompactKeepLastTurns": {
 					"type": "number",
@@ -126,9 +126,9 @@
 				},
 				"llamacpp.codexMaxInputChars": {
 					"type": "number",
-					"default": 600000,
+					"default": 900000,
 					"minimum": 65536,
-					"maximum": 950000,
+					"maximum": 4000000,
 					"description": "Maximum serialized VS Code conversation characters sent in one Codex turn. Older middle messages are omitted first, leaving headroom below the Codex app-server hard input limit."
 				},
 				"llamacpp.codexMaxToolResultChars": {
@@ -198,9 +198,9 @@
 				"llamacpp.claudeContextLength": {
 					"type": "number",
 					"default": 258400,
-					"minimum": 32768,
-					"maximum": 2000000,
-					"description": "Maximum Claude context window advertised to VS Code. When the Agent SDK reports a larger raw model window, this value remains the effective cap."
+					"minimum": 258400,
+					"maximum": 967000,
+					"description": "Claude Opus 5 working-context target. The provider selects the real 1M runtime and sets Claude Code auto-compaction to this value; 967k leaves provider headroom below the raw 1M window."
 				},
 				"llamacpp.claudeMaxOutputTokens": {
 					"type": "number",
@@ -211,10 +211,10 @@
 				},
 				"llamacpp.claudeMaxInputChars": {
 					"type": "number",
-					"default": 300000,
+					"default": 4000000,
 					"minimum": 32768,
-					"maximum": 900000,
-					"description": "Maximum serialized VS Code conversation characters used to initialize a new Claude session. Warm turns send only the latest user message."
+					"maximum": 4000000,
+					"description": "Hard character cap for initializing a new Claude session. The provider also derives a lower safe cap from the selected working-context target; warm turns send only the latest user message."
 				},
 				"llamacpp.claudeReasoningEffort": {
 					"type": "string",
@@ -233,6 +233,78 @@
 					"type": "string",
 					"default": "",
 					"description": "Absolute path to the Claude Code CLI binary. Leave empty to use the binary bundled with the official 'anthropic.claude-code' extension."
+				},
+				"llamacpp.claudeCacheKeepAliveEnabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Keep the Anthropic prompt cache warm while you are idle. A minimal turn refreshes the largest eligible prefix above 100k tokens. Pauses when the 5-hour usage snapshot is unknown, stale, or at least 90% used. Runtime state and the last result are visible in Session Quality."
+				},
+				"llamacpp.claudeCacheKeepAliveMs": {
+					"type": "number",
+					"default": 2700000,
+					"minimum": 60000,
+					"maximum": 3600000,
+					"description": "Interval between Claude cache keep-alive turns (45 minutes by default, inside the 1-hour Anthropic cache TTL)."
+				},
+				"llamacpp.claudeCacheKeepAliveIgnoreUsageLimit": {
+					"type": "boolean",
+					"default": false,
+					"description": "When enabled, the cache keep-alive continues even when the 5-hour usage limit reaches the 90% auto-pause threshold. Use when you need the prefix cache to survive across the usage-limit reset."
+				},
+				"llamacpp.codexCacheKeepAliveEnabled": {
+					"type": "boolean",
+					"default": false,
+					"description": "Keep the Codex server-side prompt cache warm while you are idle. A minimal turn refreshes the largest eligible thread prefix. Pauses when the ChatGPT subscription usage snapshot is unknown, stale, or at least 90% used, and when any Codex turn is active. Disabled by default because Codex is billed per token."
+				},
+				"llamacpp.codexCacheKeepAliveMs": {
+					"type": "number",
+					"default": 2700000,
+					"minimum": 60000,
+					"maximum": 3600000,
+					"description": "Interval between Codex cache keep-alive turns (45 minutes by default)."
+				},
+				"llamacpp.codexCacheKeepAliveIgnoreUsageLimit": {
+					"type": "boolean",
+					"default": false,
+					"description": "When enabled, the Codex cache keep-alive continues even when the subscription usage limit reaches the 90% auto-pause threshold."
+				},
+				"llamacpp.claudeResumeFallbackPolicy": {
+					"type": "string",
+					"enum": [
+						"safe",
+						"never",
+						"always"
+					],
+					"default": "safe",
+					"description": "Controls automatic full-input replay after a durable Claude resume fails. Safe requires a small replay and a fresh low five-hour usage snapshot; never blocks all automatic cold replays; always disables these protections."
+				},
+				"llamacpp.claudeResumeFallbackMaxInputTokens": {
+					"type": "number",
+					"default": 64000,
+					"minimum": 0,
+					"maximum": 1000000,
+					"description": "Maximum estimated input tokens, including tool schemas, that safe mode may automatically cold-replay after Claude resume failure."
+				},
+				"llamacpp.claudeResumeFallbackMaxUsagePercent": {
+					"type": "number",
+					"default": 80,
+					"minimum": 0,
+					"maximum": 100,
+					"description": "Maximum fresh Claude five-hour usage percentage below which safe mode may automatically cold-replay after resume failure."
+				},
+				"llamacpp.claudeMaxAgentTurns": {
+					"type": "number",
+					"default": 24,
+					"minimum": 1,
+					"maximum": 200,
+					"description": "Maximum Claude Agent SDK model segments in one outer VS Code turn. Stops runaway tool loops before they exhaust the subscription window."
+				},
+				"llamacpp.claudeMaxCumulativeInputTokens": {
+					"type": "number",
+					"default": 2000000,
+					"minimum": 100000,
+					"maximum": 50000000,
+					"description": "Maximum cumulative Claude input tokens processed across all model segments in one outer VS Code turn."
 				},
 				"llamacpp.contextLength": {
 					"type": "number",
@@ -442,6 +514,13 @@
 					"type": "boolean",
 					"default": true,
 					"description": "Send cache_prompt=true to llama.cpp so repeated prompt prefixes can reuse the server-side KV cache when supported."
+				},
+				"llamacpp.deepSeekCacheWriteGraceMs": {
+					"type": "number",
+					"default": 60000,
+					"minimum": 0,
+					"maximum": 600000,
+					"description": "After a DeepSeek auto-compaction, wait up to this long before sending the next tool-result continuation. DeepSeek materializes the new disk-cache prefix asynchronously, so an immediate continuation misses even with an identical prefix. Lower values trade a rare extra uncached rewrite for less idle time. 0 disables the wait."
 				},
 				"llamacpp.maxToolResultChars": {
 					"type": "number",
@@ -827,7 +906,11 @@
 			},
 			{
 				"command": "llamacpp.setClaudeContextLength",
-				"title": "Local LLM: Set Claude Maximum Context"
+				"title": "Local LLM: Set Claude Working Context"
+			},
+			{
+				"command": "llamacpp.openContextControl",
+				"title": "Local LLM: Open Provider Context Control"
 			},
 			{
 				"command": "llamacpp.setApiKey",
@@ -951,6 +1034,11 @@
 			{
 				"command": "llamacpp.toggleContextUsageStatusBar",
 				"title": "Local LLM: Toggle Context Usage Status Bar"
+			},
+			{
+				"command": "llamacpp.toggleClaudeCacheKeepAlive",
+				"title": "Local LLM: Toggle Claude Cache Keep-Alive",
+				"category": "Local LLM"
 			}
 		],
 		"menus": {
@@ -1012,7 +1100,7 @@
 	},
 	"packageManager": "npm@10.9.8",
 	"dependencies": {
-		"@anthropic-ai/claude-agent-sdk": "0.3.212",
+		"@anthropic-ai/claude-agent-sdk": "0.3.220",
 		"zod": "^4.4.3"
 	}
 }

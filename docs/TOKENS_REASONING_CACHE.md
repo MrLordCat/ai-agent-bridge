@@ -102,6 +102,31 @@ that prefix in several ways:
 - Raw tool results are sanitized and capped before budgeting.
 - Compaction copies messages, runs only near the configured soft target, and
   removes whole conversation turns instead of breaking tool-call/result pairs.
+- Auto-compaction lands at 75% of the soft input target
+  (`COMPACTION_TARGET_RATIO`), not exactly at the trigger threshold. Compacting
+  to the threshold would re-trigger on the very next turn (a micro-compaction),
+  and each real compaction rewrites the prefix and loses the upstream prompt
+  cache. Landing below the trigger leaves real headroom: one compaction buys
+  roughly 30% context reduction and dozens of turns before the next one.
+- Compaction and trigger use the same calibrated token estimate, so a turn is
+  never recorded as "auto-compacted" when the history was returned unchanged.
+- Claude keeps the Anthropic prompt-cache TTL warm while you are idle:
+  `claudeCacheKeepAliveEnabled` (toggle in Quick Access > Claude) runs a
+  minimal "reply ok" turn every `claudeCacheKeepAliveMs` (45 min default) on
+  the largest idle session whose last prefix was at least 100k tokens. The
+  keep-alive denies tool calls inline, never runs while a turn is active, and
+  pauses automatically at 90% usage limit (resuming when usage drops).
+- Follow-up messages sent while a turn is in flight are handled safely: a
+  Claude session whose SDK query was interrupted is marked unhealthy and is
+  never warm-reused — the follow-up resumes the transcript from disk instead
+  of being pushed into a dead stream. Codex supersedes an active tool turn
+  even when the follow-up arrives with the same Copilot turn index.
+- A restored Claude session (after a VS Code reload) legitimately rewrites the
+  cache once: the new Agent SDK process builds its system prompt from the
+  current runtime fingerprint (model, context target, effort, and the
+  advertised tool catalog), which often differs from the pre-reload session.
+  The live report now classifies this as `session_restored` /
+  `session_rollover` with the runtime-change reason instead of `unknown`.
 - Old assistant turns retain bounded code edges, decisions, paths, diagnostics,
   and next steps without an additional LLM request.
 
@@ -109,6 +134,16 @@ Compaction necessarily changes the prefix once because old turns are replaced
 by a summary. Later turns can reuse that new compacted prefix. Switching models,
 changing system instructions, changing tool catalogs, or alternating multiple
 independent chats on a single llama.cpp slot can also lower cache reuse.
+
+DeepSeek materializes the disk cache for a freshly compacted prefix
+asynchronously. The immediate tool-result continuation can therefore miss even
+when every prior message matches byte-for-byte. With
+`llamacpp.deepSeekCacheWriteGraceMs` (default 180000) the provider waits out
+the remaining write window before sending that continuation, turning the second
+miss into a cache hit. The wait is skipped for new user turns, non-DeepSeek
+sources, and when `cachePrompt` is disabled. A miss caused by this race is
+reported as `upstream_cache_pending`; an entry that is genuinely gone is
+`upstream_expired`.
 
 Local and DeepSeek remain stateless HTTP providers and must include tools in
 each request, but an unchanged canonical prefix can still be served from the

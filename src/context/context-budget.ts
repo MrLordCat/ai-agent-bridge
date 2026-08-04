@@ -36,12 +36,22 @@ interface ContextCompactionDecisionInput {
 }
 
 /**
+ * How far below the soft trigger an auto-compaction should land. Compacting to
+ * exactly the trigger threshold would re-trigger on the very next turn (a
+ * micro-compaction), and every real compaction rewrites the prefix and loses
+ * the upstream prompt cache. Landing at 75% of the soft target leaves real
+ * headroom: one compaction buys ~30% context reduction and dozens of turns
+ * before the next one.
+ */
+export const COMPACTION_TARGET_RATIO = 0.75;
+
+/**
  * Chooses one compaction tier for a request.
  *
- * Normal requests may compact to the soft target. The lower hard target is
- * deliberately reserved for a retry after the backend confirms an overflow;
- * applying both tiers to one normal request needlessly rewrites the prompt and
- * destroys an otherwise reusable DeepSeek cache prefix.
+ * Normal requests may compact to 75% of the soft target (COMPACTION_TARGET_RATIO).
+ * The lower hard target is deliberately reserved for a retry after the backend
+ * confirms an overflow; applying both tiers to one normal request needlessly
+ * rewrites the prompt and destroys an otherwise reusable DeepSeek cache prefix.
  */
 export function selectContextCompaction(
 	input: ContextCompactionDecisionInput
@@ -50,7 +60,10 @@ export function selectContextCompaction(
 		return { kind: "hard", target: Math.max(1, Math.floor(input.hardInputTarget)) };
 	}
 	if (input.autoCompact && input.messageTokens > input.softInputTarget) {
-		return { kind: "auto", target: Math.max(1, Math.floor(input.softInputTarget)) };
+		return {
+			kind: "auto",
+			target: Math.max(1, Math.floor(input.softInputTarget * COMPACTION_TARGET_RATIO)),
+		};
 	}
 	return { kind: "none" };
 }

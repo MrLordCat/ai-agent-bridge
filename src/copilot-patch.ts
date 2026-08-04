@@ -4,12 +4,13 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v16";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v17";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v1";
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
 
 const LEGACY_PATCH_MARKERS = [
+	"/* llama-vscode-chat:copilot-native-model-controls:v16 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v15 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v14 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v13 */",
@@ -426,13 +427,13 @@ export function patchCopilotBundle(source: string): string {
 		);
 	}
 	// Wait for the actual advertised tool definitions to stabilise after reload.
-	// Cache the confirmed signature on the shared registry so ordinary turns use
+	// Cache the confirmed signature on the tool provider instance so ordinary turns use
 	// one immediate lookup; repeat the bounded wait only when names, descriptions,
 	// or schemas really change (for example after tool activation).
 	patched = replaceOnce(
 		patched,
 		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[];if(this.options.invocation.endpoint.supportsToolSearch)return o;',
-		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==er._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}er._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==this._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
 		"tool catalog stabilisation after reload"
 	);
 	return patched;

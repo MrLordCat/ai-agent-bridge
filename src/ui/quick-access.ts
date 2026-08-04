@@ -2,6 +2,10 @@ import * as vscode from "vscode";
 
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
 import {
+	getCopilotPatchStatus,
+	findCopilotBundle,
+} from "../copilot-patch";
+import {
 	formatProviderCache,
 	formatCompactTokenCount,
 	formatProviderContext,
@@ -289,6 +293,24 @@ export function formatEndpointLabel(value: string): string {
 	}
 }
 
+/**
+ * One-line provider status with the live usage limit, e.g.
+ * `Connected (Plus): 70% R:2.08 17:25`. The `R` is the window reset time in
+ * `D.MM HH:MM` form so reset moments are visible without expanding the group.
+ */
+export function formatProviderUsageLine(
+	status: string,
+	percent: number | undefined,
+	resetLabel: string | undefined
+): string {
+	if (percent === undefined) {
+		return status;
+	}
+	return resetLabel
+		? `${status}: ${percent}% R:${resetLabel}`
+		: `${status}: ${percent}%`;
+}
+
 export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickAccessItem> {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -313,7 +335,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getCodexSubscriptionUsage: () => string | undefined = () => undefined,
 		private readonly getSubagentProfiles: () => readonly SubagentModelProfile[] = () => [],
 		private readonly getTokenUsageHistory: () => TokenUsageHistorySummary = emptyTokenUsageHistorySummary,
-		private readonly getUsageExperiments: () => ExperimentSummary = emptyUsageExperimentSummary
+		private readonly getUsageExperiments: () => ExperimentSummary = emptyUsageExperimentSummary,
+		private readonly getDeepSeekBalance: () => string | undefined = () => undefined,
+		private readonly getCodexUsageLimitPercent: () => number | undefined = () => undefined,
+		private readonly getCodexUsageLimitReset: () => string | undefined = () => undefined,
+		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
+		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined
 	) {}
 
 	refresh(): void {
@@ -340,6 +367,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const deepSeekContextLength = Number(config.get("deepSeekContextLength", 258_400)) || 258_400;
 		const codexEnabled = config.get<boolean>("enableCodexSubscription", true) !== false;
 		const codexDeferredToolsEnabled = config.get<boolean>("codexDeferNonCoreTools", true) !== false;
+		const codexCacheKeepAliveEnabled = config.get<boolean>("codexCacheKeepAliveEnabled", false) === true;
+		const codexCacheKeepAliveMs = Math.max(
+			60_000,
+			Math.min(3_600_000, Number(config.get("codexCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
+		);
+		const codexWorkingContextTarget = Number(config.get("codexWorkingContextTarget", 258_400)) || 258_400;
 		const claudeEnabled = config.get<boolean>("enableClaudeSubscription", true) !== false;
 		const claudeContextLength = Number(config.get("claudeContextLength", 258_400)) || 258_400;
 		const thinkingMode = String(config.get("thinkingMode", "auto"));
@@ -368,6 +401,15 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const healthStatus = this.getHealthStatus();
 		const codexStatus = this.getCodexStatus();
 		const claudeStatus = this.getClaudeStatus();
+		const codexUsageLimitPercent = this.getCodexUsageLimitPercent();
+		const codexUsageLimitReset = this.getCodexUsageLimitReset();
+		const claudeUsageLimitPercent = this.getClaudeUsageLimitPercent();
+		const claudeUsageLimitReset = this.getClaudeUsageLimitReset();
+		const claudeCacheKeepAliveEnabled = config.get<boolean>("claudeCacheKeepAliveEnabled", true) !== false;
+		const claudeCacheKeepAliveMs = Math.max(
+			60_000,
+			Math.min(3_600_000, Number(config.get("claudeCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
+		);
 		const claudeUsage = this.getClaudeUsage();
 		const claudeLastRequest = this.getClaudeLastRequest();
 		const claudeUsageLimits = this.getClaudeUsageLimits();
@@ -415,6 +457,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: toggleIcon(deepSeekEnabled),
 					command: command("llamacpp.toggleDeepSeek", "Toggle DeepSeek Source"),
 				}),
+				new QuickAccessItem("deepseek.balance", "Balance", {
+					description: this.getDeepSeekBalance() ?? "n/a",
+					tooltip: "DeepSeek account balance from the official /user/balance endpoint. Refreshes automatically every minute.",
+					icon: new vscode.ThemeIcon("credit-card"),
+					command: command("llamacpp.openSettings", "Open Settings"),
+				}),
 				new QuickAccessItem("deepseek.contextLimit", "Maximum Context", {
 					description: formatCompactTokenCount(deepSeekContextLength),
 					tooltip: "Upper context limit advertised to VS Code for DeepSeek. Applies to new requests; local Qwen remains server-controlled.",
@@ -441,7 +489,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		});
 
 		const codex = new QuickAccessItem("codex", "Codex", {
-			description: codexEnabled ? codexStatus ?? "Checking..." : "Off",
+			description: codexEnabled
+				? formatProviderUsageLine(codexStatus ?? "Checking...", codexUsageLimitPercent, codexUsageLimitReset)
+				: "Off",
 			icon: new vscode.ThemeIcon("hubot"),
 			children: [
 				new QuickAccessItem("codex.status", "Account", {
@@ -452,6 +502,20 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				}),
 				new QuickAccessItem("codex.subscription", "Subscription Window", {
 					description: codexSubscriptionUsage ?? "Usage unavailable",
+					icon: new vscode.ThemeIcon("dashboard"),
+					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+				}),
+				new QuickAccessItem("codex.contextTarget", "Working Context", {
+					description: `${formatCompactTokenCount(codexWorkingContextTarget)} target${codexMetrics?.contextWindowTokens ? ` / ${formatCompactTokenCount(codexMetrics.contextWindowTokens)} max` : ""}`,
+					tooltip: "Open the provider context sliders. Codex is capped to its server-reported model window and reserves output, tool-schema, instruction, and safety tokens.",
+					icon: new vscode.ThemeIcon("settings"),
+					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
+				}),
+				new QuickAccessItem("codex.usageLimit", "Usage Limit", {
+					description: this.getCodexUsageLimitPercent() !== undefined
+						? `${this.getCodexUsageLimitPercent()}% used${this.getCodexUsageLimitReset() ? ` · resets ${this.getCodexUsageLimitReset()}` : ""}`
+						: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
+					tooltip: "ChatGPT subscription usage window. Refreshes automatically every minute so you can see when the limit resets.",
 					icon: new vscode.ThemeIcon("dashboard"),
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
 				}),
@@ -474,6 +538,22 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 							icon: toggleIcon(codexDeferredToolsEnabled),
 							command: command("llamacpp.toggleCodexDeferredTools", "Toggle Codex Deferred Tools"),
 						}),
+						new QuickAccessItem("codex.cacheKeepAlive", "Cache Keep-Alive", {
+							description: codexCacheKeepAliveEnabled
+								? `On (${Math.round(codexCacheKeepAliveMs / 60_000)} min)`
+								: "Off",
+							tooltip: "Refreshes the Codex server-side prompt cache while idle so the next turn after a pause stays warm. Billed per token, so disabled by default. Pauses at 90% subscription usage.",
+							icon: toggleIcon(codexCacheKeepAliveEnabled),
+							command: command("llamacpp.toggleCodexCacheKeepAlive", "Toggle Codex Cache Keep-Alive"),
+						}),
+						new QuickAccessItem("codex.cacheKeepAliveIgnoreUsage", "Ignore usage-limit pause", {
+							description: config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === true
+								? "On"
+								: "Off",
+							tooltip: "When on, the Codex keep-alive continues even when the subscription usage limit reaches 90%.",
+							icon: toggleIcon(config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === true),
+							command: command("llamacpp.toggleCodexCacheKeepAliveIgnoreUsageLimit", "Toggle Codex Ignore Usage-Limit Pause"),
+						}),
 						new QuickAccessItem("codex.signIn", "Sign In", {
 							icon: new vscode.ThemeIcon("sign-in"),
 							command: command("llamacpp.codexSignIn", "Sign In to Codex Subscription"),
@@ -484,7 +564,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		});
 
 		const claude = new QuickAccessItem("claude", "Claude", {
-			description: claudeEnabled ? claudeStatus ?? "Checking..." : "Off",
+			description: claudeEnabled
+				? formatProviderUsageLine(claudeStatus ?? "Checking...", claudeUsageLimitPercent, claudeUsageLimitReset)
+				: "Off",
 			icon: new vscode.ThemeIcon("sparkle"),
 			children: [
 				new QuickAccessItem("claude.status", "Account", {
@@ -492,6 +574,22 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					tooltip: "Read the Claude subscription status, session usage, and rate-limit state",
 					icon: new vscode.ThemeIcon("account"),
 					command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
+				}),
+				new QuickAccessItem("claude.cacheKeepAlive", "Cache Keep-Alive", {
+					description: claudeCacheKeepAliveEnabled
+						? `On (${Math.round(claudeCacheKeepAliveMs / 60_000)} min)`
+						: "Off",
+					tooltip: "Refreshes the Anthropic prompt cache while you are idle so the next turn after a pause stays warm. Runs only when no turn is active and pauses automatically at 90% usage limit.",
+					icon: toggleIcon(claudeCacheKeepAliveEnabled),
+					command: command("llamacpp.toggleClaudeCacheKeepAlive", "Toggle Claude Cache Keep-Alive"),
+				}),
+				new QuickAccessItem("claude.cacheKeepAliveIgnoreUsage", "Ignore usage-limit pause", {
+					description: config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true
+						? "On"
+						: "Off",
+					tooltip: "When on, keep-alive continues even when the 5-hour usage limit reaches 90%. Useful when you need the prefix cache to survive across the usage-limit window.",
+					icon: toggleIcon(config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true),
+					command: command("llamacpp.toggleClaudeCacheKeepAliveIgnoreUsageLimit", "Toggle Ignore Usage-Limit Pause"),
 				}),
 				new QuickAccessItem("claude.limits", "Subscription Limits", {
 					description: claudeUsageLimits.length > 0
@@ -516,10 +614,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 						],
 				}),
 				new QuickAccessItem("claude.contextLimit", "Maximum Context", {
-					description: formatCompactTokenCount(claudeContextLength),
-					tooltip: "Upper context limit advertised to VS Code for Claude, capped below the raw provider window when configured.",
-					icon: new vscode.ThemeIcon("symbol-numeric"),
-					command: command("llamacpp.setClaudeContextLength", "Set Claude Maximum Context"),
+					description: `${formatCompactTokenCount(claudeContextLength)} target / 1M max`,
+					tooltip: "Open the provider context sliders. Claude uses the real Opus 5 1M runtime and this value as its auto-compaction threshold.",
+					icon: new vscode.ThemeIcon("settings"),
+					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
 				new QuickAccessItem("claude.settings", "Account Controls", {
 					description: claudeEnabled ? "On" : "Off",
@@ -798,6 +896,23 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			],
 		});
 
-		return [local, deepSeek, codex, claude, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics];
+		const patchStatus = getCopilotPatchStatus(findCopilotBundle(vscode.env.appRoot));
+		const patches = new QuickAccessItem("patches", "Copilot Patches", {
+			description: `${patchStatus.applied ? "controls \u2713" : "controls \u2717"} \u00b7 ${patchStatus.workbenchApplied ? "bounds \u2713" : "bounds \u2717"}`,
+			icon: new vscode.ThemeIcon("pinned"),
+			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. Click to open the detailed status log.`,
+			children: [
+				new QuickAccessItem("patches.status", "Show Patch Status", {
+					icon: new vscode.ThemeIcon("info"),
+					command: command("llamacpp.copilotPatchStatus", "Show Copilot Patch Status"),
+				}),
+				new QuickAccessItem("patches.apply", "Apply Patch", {
+					icon: new vscode.ThemeIcon("wrench"),
+					command: command("llamacpp.applyCopilotPatch", "Apply Copilot Patch"),
+				}),
+			],
+		});
+
+		return [local, deepSeek, codex, claude, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
 	}
 }

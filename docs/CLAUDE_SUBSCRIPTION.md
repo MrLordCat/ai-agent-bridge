@@ -42,6 +42,21 @@ the Agent SDK while keeping executable actions visible and controlled by VS
 Code. A tool step marked `completed` means that the matching VS Code tool result
 returned to the SDK; Session Quality does not inspect or retain its body.
 
+## Extended Context
+
+The provider ships the platform-specific Agent SDK runtime and starts Opus 5
+with the official `[1m]` model suffix. `llamacpp.claudeContextLength` is a real
+working-context target from 258,400 through 967,000 tokens, not only VS Code
+metadata: it is also passed to Claude Code as
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW`. The upper bound leaves provider headroom
+below the raw one-million-token model window.
+
+Open **Quick Access > Claude > Maximum Context** to use the Provider Context
+range slider. A changed value applies to a new SDK session; durable transcripts
+remain eligible for restore. The cold-start serializer scales up to the chosen
+target while retaining a provider/tool reserve. Live context details show both
+the selected target and the raw limit returned by `getContextUsage()`.
+
 ## Session Reuse
 
 Every logical turn records one of these modes:
@@ -54,10 +69,20 @@ Every logical turn records one of these modes:
 | `rollover` | The explicit Continue Latest command attaches the saved SDK transcript to a clean VS Code chat. |
 | `resume-fallback` | Persisted resume failed before usable output; a fresh query retries with bounded full input. |
 
-Durable mappings contain session ids, hashes, conversation fingerprints, and
-timestamps in VS Code workspace state. Claude message transcripts remain in the
-official Agent SDK session store. Model, workspace, runtime, conversation, and
-canonical tool fingerprints must remain compatible before reuse.
+In-memory SDK sessions stay alive for 24 hours without user activity, and
+armed rollover intents stay valid for 24 hours, so a pause or reload within a
+day does not drop the live session.
+
+Durable mappings contain session ids, hashes, Copilot conversation identity and
+turn index, conversation fingerprints, and timestamps in VS Code workspace
+state. Claude message transcripts remain in the official Agent SDK session
+store. The model, workspace, on-disk SDK transcript, and advanced Copilot
+conversation must remain compatible before reuse. A changed current tool
+catalog or reasoning profile does not by itself force a cold start: the Agent
+SDK resumes with the current request's allowlisted tools and configuration.
+Completed mappings remain eligible for seven days. Mappings written before
+Copilot turn indices were available migrate on the next advancing turn even if
+Copilot compacted or rewrote the visible history during reload.
 
 An unfinished JavaScript tool promise cannot survive Extension Host shutdown.
 Reload at that boundary uses the validated fallback rather than pretending the
@@ -65,7 +90,7 @@ old tool call is still executable.
 
 ## Live Session Quality Metrics
 
-Version 1.9.0 emits a stable request id when a logical Claude turn starts and
+Version 1.9.1 emits a stable request id when a logical Claude turn starts and
 upserts that same Session Quality row until it reaches `completed`, `failed`,
 `timed_out`, or `interrupted`. Native tool-result provider re-entry does not
 create a second logical turn.
@@ -95,9 +120,11 @@ bodies.
 
 ### Native Copilot context usage
 
-On the terminal Agent SDK result, the provider emits a
-`LanguageModelDataPart` with MIME type `usage`. Copilot Chat uses it as the
-native Session Info numerator. The payload follows the OpenAI-compatible shape:
+After the visible text or native tool call on every completed provider response
+boundary, the provider emits a `LanguageModelDataPart` with MIME type `usage`.
+This includes each native-tool boundary and the terminal Agent SDK result, so
+Copilot Chat can update its native Session Info numerator throughout the turn.
+The payload follows the OpenAI-compatible shape:
 
 - `prompt_tokens` is fresh input plus cache-read and cache-creation input from
   the final assistant model segment;

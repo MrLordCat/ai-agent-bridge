@@ -42,6 +42,8 @@ export interface CodexTurnInputDiagnostics {
 	threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
 	threadReuseMissReason?: string;
 	conversationKey?: string;
+	/** Seconds since the reused thread's last request (diagnostics for cold starts). */
+	idleGapSeconds?: number;
 }
 
 export type CodexTurnBoundary =
@@ -179,7 +181,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 		public ephemeral = false,
 		private readonly vsCodeToolsOnly = false,
 		private readonly onMetricsChanged?: (bridge: CodexTurnBridge) => void,
-		private readonly toolTimeoutMs = 30 * 60_000
+		private readonly toolTimeoutMs = 24 * 60 * 60_000
 	) {
 		this.notificationDisposable = client.onNotification(notification => this.handleNotification(notification));
 		this.stopDisposable = client.onDidStop(error => {
@@ -607,6 +609,14 @@ export class CodexTurnBridge implements vscode.Disposable {
 					this.tokenUsage = (notification.params as CodexTokenUsageParams).tokenUsage;
 					this.recordUsageSegment(this.tokenUsage);
 					this.onTokenUsage?.(this, this.tokenUsage);
+					this.logSink?.log("codex.chat.token_usage_updated", {
+						threadId: this.threadId,
+						turnId: this.turnId,
+						segmentCount: this.usageSegmentCount,
+						inputTokens: this.tokenUsage.last.inputTokens,
+						cachedInputTokens: this.tokenUsage.last.cachedInputTokens,
+						totalInputTokens: this.tokenUsage.total.inputTokens,
+					});
 					break;
 				case "turn/completed":
 					this.completedTurn = notification.params as CodexTurnCompletedParams;

@@ -132,6 +132,24 @@ suite("prompt cache diagnostics", () => {
 		assert.strictEqual(report.reason, "upstream_expired");
 	});
 
+	test("names the async cache-write race when the previous turn compacted", () => {
+		const report = buildCacheDiagnostics({
+			...base,
+			usage: usage(1000, 10),
+			prefix: {
+				previousRequestId: "req-0",
+				staticFieldsMatch: true,
+				toolsMatch: true,
+				identicalMessagePrefix: 20,
+				messageCount: 22,
+				previousMessageCount: 20,
+			},
+			previousTurnCompacted: true,
+		});
+		assert.strictEqual(report.reason, "upstream_cache_pending");
+		assert.ok(report.detail.includes("write race"));
+	});
+
 	test("reports session reuse for subscription runtimes", () => {
 		assert.strictEqual(buildCacheDiagnostics({
 			provider: "codex",

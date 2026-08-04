@@ -19,6 +19,7 @@ export type CacheMissReason =
 	| "history_summarized"
 	| "session_not_reused"
 	| "upstream_expired"
+	| "upstream_cache_pending"
 	| "unknown";
 
 /** Prompt-prefix comparison against the previous request of the same conversation. */
@@ -26,6 +27,14 @@ export interface CachePrefixTelemetry {
 	previousRequestId?: string;
 	staticFieldsMatch?: boolean;
 	toolsMatch?: boolean;
+	/** Advertised tool count of this request (0 = no tools). */
+	toolsCount?: number;
+	/** Advertised tool count of the previous request, when known. */
+	previousToolsCount?: number;
+	/** Hash of the first (system) message; undefined when no system message. */
+	systemHash?: string;
+	/** True when the system message changed since the previous request. */
+	systemChanged?: boolean;
 	identicalMessagePrefix?: number;
 	messageCount?: number;
 	previousMessageCount?: number;
@@ -49,6 +58,8 @@ export interface CacheDiagnosticsInput {
 	session?: CacheSessionTelemetry;
 	/** True when auto-compaction ran this turn — always produces a cache miss. */
 	autoCompacted?: boolean;
+	/** True when the previous turn of this conversation compacted its history. */
+	previousTurnCompacted?: boolean;
 }
 
 export interface CacheDiagnosticsReport extends Record<string, unknown> {
@@ -70,6 +81,8 @@ export interface CodexTurnCacheClassificationInput {
 	initialSegmentHitPercent?: number;
 	finalSegmentHitPercent?: number;
 	processedHitPercent?: number;
+	/** Seconds since the reused thread's last request (idle gap). */
+	idleGapSeconds?: number;
 }
 
 /** Separates a real cold first segment from the health of later Codex continuations. */
@@ -81,13 +94,23 @@ export function classifyCodexTurnCache(
 		return {};
 	}
 	const newThread = input.threadMode === "new";
+	// A cold first segment is expected on a brand-new thread (nothing cached);
+	// it only signals a problem when the thread was REUSED — the upstream
+	// server-side cache entry expired between turns (idle TTL).
+	const initialCold = !newThread && input.initialSegmentHitPercent !== undefined
+		&& input.initialSegmentHitPercent <= 10;
 	if (effectiveHit >= HEALTHY_HIT_PERCENT) {
+		const coldStartDetail = initialCold
+			? `The first segment was cold at ${formatHit(input.initialSegmentHitPercent)} — ` +
+			  coldFirstSegmentCause(input.idleGapSeconds) +
+			  ` Continuation recovered to ${formatHit(effectiveHit)}.`
+			: undefined;
 		return {
-			reason: "healthy",
+			reason: initialCold ? "upstream_expired" : "healthy",
 			detail: newThread
-				? `A new Codex thread was required (${input.threadReuseMissReason ?? "no compatible completed thread"}). `
-					+ `Its first model segment was ${formatHit(input.initialSegmentHitPercent)}, then continuation recovered to ${formatHit(effectiveHit)}.`
-				: undefined,
+				? `A new Codex thread was required (${input.threadReuseMissReason ?? "no compatible completed thread"}). ` +
+				  (coldStartDetail ?? `Its first model segment was ${formatHit(input.initialSegmentHitPercent)}, then continuation recovered to ${formatHit(effectiveHit)}.`)
+				: coldStartDetail,
 		};
 	}
 	if (newThread) {
@@ -96,9 +119,18 @@ export function classifyCodexTurnCache(
 			detail: `A new Codex thread was required (${input.threadReuseMissReason ?? "no compatible completed thread"}). Later model segments did not recover above ${HEALTHY_HIT_PERCENT}%.`,
 		};
 	}
+	// Thread was reused: the upstream cache served little of the prompt.
+	// This is either an expired long-lived thread with an accumulated large
+	// delta, or the server compacted the context between turns.
+	const initialNote = input.initialSegmentHitPercent !== undefined
+		&& input.initialSegmentHitPercent <= 10
+		? "initial segment " + formatHit(input.initialSegmentHitPercent) + "; "
+		: "";
 	return {
-		reason: "unknown",
-		detail: `The final Codex model segment cache hit was below ${HEALTHY_HIT_PERCENT}%.`,
+		reason: "upstream_expired",
+		detail: initialNote
+			+ "the thread was reused but the upstream cache entry expired "
+			+ "or the server compacted the context between turns",
 	};
 }
 
@@ -149,9 +181,12 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 		};
 	}
 	if (prefix.toolsMatch === false) {
+		const toolDelta = prefix.toolsCount !== undefined && prefix.previousToolsCount !== undefined
+			? ` (${prefix.previousToolsCount} → ${prefix.toolsCount} tools)`
+			: "";
 		return {
 			reason: "tool_catalog_changed",
-			detail: "the advertised tool catalog changed, which rewrites the prompt before any message",
+			detail: `the advertised tool catalog changed${toolDelta}, which rewrites the prompt before any message`,
 		};
 	}
 
@@ -161,7 +196,10 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 		if (identical === 0) {
 			return {
 				reason: "system_prompt_changed",
-				detail: "the first message already differs from the previous request",
+				detail: prefix.systemChanged
+					? "the first (system) message changed since the previous request — "
+						+ "usually VS Code rewrites system instructions or history (e.g. after an interruption)"
+					: "the first message already differs from the previous request",
 			};
 		}
 		if (previousCount !== undefined && identical < previousCount) {
@@ -216,6 +254,15 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 					reason: "healthy",
 					detail: `all ${previousCount} prior messages matched; ` +
 						`${newMsgs} new message(s) added this turn`,
+				};
+			}
+			if (input.previousTurnCompacted) {
+				return {
+					reason: "upstream_cache_pending",
+					detail: `all ${previousCount} prior messages matched ` +
+						`but only ${usage.hitPercent.toFixed(1)}% was cached — ` +
+						`the previous turn compacted the history and the upstream disk-cache ` +
+						`write was not yet readable (async write race)`,
 				};
 			}
 			return {
@@ -276,4 +323,29 @@ export function promptCacheUsageFromCacheReads(
 		uncachedTokens: promptTokens - cachedTokens,
 		hitPercent: Number(((cachedTokens / promptTokens) * 100).toFixed(1)),
 	};
+}
+/**
+ * Explains an unexplained cold first segment on a reused Codex thread.
+ * A short idle gap (< 15 min) rules out TTL expiry and points to cache
+ * eviction or a different backend instance serving the request.
+ */
+function coldFirstSegmentCause(idleGapSeconds: number | undefined): string {
+        if (idleGapSeconds === undefined) {
+                return "the upstream cache did not serve the prefix (TTL expiry, eviction, or a different backend).";
+        }
+        if (idleGapSeconds < 15 * 60) {
+                return `the thread was idle only ${formatIdleGap(idleGapSeconds)}, so TTL expiry is unlikely — ` +
+                        "the cache entry was evicted or the request was routed to a different backend.";
+        }
+        return `the thread was idle ${formatIdleGap(idleGapSeconds)} — consistent with server-side TTL expiry.`;
+}
+
+function formatIdleGap(seconds: number): string {
+        if (seconds < 90) {
+                return `${Math.max(1, Math.round(seconds))}s`;
+        }
+        if (seconds < 3600) {
+                return `${Math.round(seconds / 60)}min`;
+        }
+        return `${(seconds / 3600).toFixed(1)}h`;
 }

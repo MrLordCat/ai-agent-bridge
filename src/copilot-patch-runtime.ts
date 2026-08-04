@@ -64,7 +64,14 @@ async function applyPatch(
 
 		const failureSignature = `${vscode.version}:${message}`;
 		if (context.globalState.get<string>(LAST_FAILURE_KEY) === failureSignature) {
-			return;
+			// Permission errors (EPERM, EACCES, EBUSY) are transient — the file
+			// may be locked by a concurrent process or Windows Defender, and a
+			// subsequent restart often resolves the lock.  Don't suppress the
+			// next auto-patch attempt for these.
+			const transient = /eperm|eacces|ebusy/i.test(message);
+			if (!transient) {
+				return;
+			}
 		}
 		await context.globalState.update(LAST_FAILURE_KEY, failureSignature);
 		const choice = await vscode.window.showWarningMessage(

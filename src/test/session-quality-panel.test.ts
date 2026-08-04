@@ -9,6 +9,27 @@ suite("session quality panel", () => {
 			generatedAt: "2026-07-28T08:58:45.592Z",
 			extensionVersion: "1.8.37",
 			vscodeVersion: "1.127.0",
+			providerHealth: {
+				claudeCacheKeepAlive: {
+					state: "success",
+					reason: "Keep-alive completed with 99.4% cache read.",
+					enabled: true,
+					updatedAt: Date.parse("2026-07-28T08:55:00Z"),
+					intervalMs: 2_700_000,
+					usagePercent: 42,
+					usageSnapshotAgeMs: 5_000,
+					sessionCount: 2,
+					eligibleSessionCount: 1,
+					candidateModelId: "claude-opus-5",
+					candidatePrefixTokens: 190_481,
+					nextAttemptAt: Date.parse("2026-07-28T09:40:00Z"),
+					lastAttemptAt: Date.parse("2026-07-28T08:54:55Z"),
+					lastSuccessAt: Date.parse("2026-07-28T08:55:00Z"),
+					lastResultCacheHitPercent: 99.4,
+					lastResultInputTokens: 190_481,
+					lastResultCacheWriteTokens: 1_136,
+				},
+			},
 			summary: {
 				turns: 2,
 				totalModelTurns: 33,
@@ -129,7 +150,19 @@ suite("session quality panel", () => {
 				modelId: "claude-opus-5",
 				providerKind: "claude",
 				lifecyclePhase: "completed",
-				sessionMode: "warm",
+				sessionMode: "resume-fallback",
+				cacheMissReason: "resume_invalid_resume_boundary",
+				cacheMissDetail: "Durable Claude resume failed at sdk_resume: invalid branch.",
+				resumeFailureReason: "invalid_resume_boundary",
+				resumeFailureStage: "sdk_resume",
+				resumeFailureDetail: "Invalid resumeSessionAt message UUID",
+				resumeFallbackDecision: "input_limit",
+				resumeFallbackEstimatedInputTokens: 71_666,
+				resumeFallbackMaxInputTokens: 64_000,
+				turnMaxModelSegments: 24,
+				turnMaxCumulativeInputTokens: 2_000_000,
+				safetyStopReason: "max_model_segments",
+				safetyStopDetail: "Agent SDK stopped at maxTurns=24.",
 				promptTokens: 4920,
 				cachedPromptTokens: 4096,
 				cacheWriteInputTokens: 512,
@@ -194,6 +227,10 @@ suite("session quality panel", () => {
 
 		assert.match(html, /class="metric-grid"/);
 		assert.match(html, /class="live-pill"/);
+		assert.match(html, /Claude cache keep-alive/);
+		assert.match(html, /Last success/);
+		assert.match(html, /Protected session/);
+		assert.match(html, /lastResultCacheHitPercent/);
 		assert.match(html, /id="turn-search"/);
 		assert.match(html, /id="issues-filter"/);
 		assert.match(html, /class="detail-grid"/);
@@ -205,6 +242,14 @@ suite("session quality panel", () => {
 		assert.match(html, /cold Codex startup/);
 		assert.match(html, /continuation cache health recovered above 90%/);
 		assert.match(html, /Claude session &amp; cache/);
+		assert.match(html, /Resume failure/);
+		assert.match(html, /Failure stage/);
+		assert.match(html, /Original SDK error/);
+		assert.match(html, /Fallback decision/);
+		assert.match(html, /Estimated cold replay/);
+		assert.match(html, /Turn guard/);
+		assert.match(html, /Safety stop/);
+		assert.match(html, /resumeFallbackDecision: r\.resumeFallbackDecision/);
 		assert.match(html, /Claude SDK context snapshot/);
 		assert.match(html, /Cache creation/);
 		assert.match(html, /cacheWriteInputTokens":512/);
@@ -212,6 +257,8 @@ suite("session quality panel", () => {
 		assert.match(html, /step.status === 'timed_out'/);
 		assert.match(html, /"toolCallBreakdown":\{"read_file":1\}/);
 		assert.match(html, /"metricsSource":"rollout"/);
+		assert.match(html, /compactTurnRecord/);
+		assert.match(html, /Alt\+click: full JSON/);
 		assert.match(html, /aria-expanded="false"/);
 		assert.ok(!html.includes("</script><script>bad()"));
 

@@ -1,5 +1,376 @@
 # Changelog
 
+## 1.10.0 - 2026-08-04
+
+Stable release after the 1.9.x dev-patch series. Highlights:
+
+### Performance & diagnostics
+
+- Claude usage probes no longer spawn a full Claude Code CLI agent every
+  ~2 minutes per window when Claude is not in active use — this heavyweight
+  polling was loading the machine and slowing unrelated chats. Probes now
+  only run within 10 minutes of real Claude activity (or on explicit
+  refresh); Claude keep-alive behavior is unchanged.
+- DeepSeek compaction grace (`deepSeekCacheWriteGraceMs`) reduced from 3
+  minutes to 1 minute: after an auto-compaction the provider waits less
+  before the next tool-result continuation, cutting idle "agent is silent"
+  stretches from ~13 minutes/day to ~4. A rare extra uncached rewrite
+  (~$0.05) is the only cost.
+- New `chat.request.arrived` / `codex.chat.request_arrived` diagnostics log
+  the gap between our last completed response and the next request arrival,
+  splitting "VS Code-side pause" (tool execution, chat-view rendering,
+  request plumbing) from model latency when investigating slow big chats.
+- `sanitizeOrphanToolCalls` rewritten from O(n²) to O(n) via suffix counts —
+  large-chat conversion no longer rescans the whole history per message.
+- Codex cache diagnostics now record `idleGapSeconds` on reused threads and
+  classify a cold first segment as TTL expiry vs. eviction/backend routing;
+  a `codex.chat.cold_first_segment` event captures the exact idle gap and
+  prefix delta when a fresh turn starts cold.
+
+### Reliability fixes
+
+- Fixed DeepSeek/subagent 400 errors: "An assistant message with 'tool_calls'
+  must be followed by tool messages responding to each 'tool_call_id'".
+  Orphan tool calls (from interrupted turns or subagent contexts that drop
+  tool results) are now stripped before the request is sent, in both tool
+  and user tool-result modes.
+- Codex: interrupted/resumed turns and turn-boundary handling hardened
+  (`turn-bridge`, `codex-provider`), rollout metrics and token usage
+  accounting fixes across live and rollout sources.
+- Copilot patch runtime: keep-alive and tool-catalog stability fixes.
+
+## 1.9.25 - 2026-08-04
+
+- Claude cache keep-alive now has an "Ignore usage-limit pause" toggle in
+  Quick Access. When enabled, keep-alive continues even when the 5-hour
+  usage limit exceeds the 90% auto-pause threshold so the prefix cache
+  survives across the usage-limit window.
+
+## 1.9.24 - 2026-08-04
+
+- Fixed an intermittent Claude warm-session loss after large turns. The
+  Anthropic API stream closes naturally after every turn, but the pump
+  handler unconditionally marked the session unhealthy, which caused the
+  next request to fall through to a durable restore with a stale runtimeKey
+  and a cold first segment. Natural stream closure after a completed turn
+  now leaves the session healthy so warm reuse survives.
+
+## 1.9.23 - 2026-08-04
+
+- Claude steering (sending a follow-up message mid-turn) now works. The root
+  cause was that a cancelled turn never persisted its stableAssistantMessageId;
+  the next durable restore replayed the orphan tail with incomplete tool calls
+  and the model continued the old task instead of reacting to the follow-up.
+  Cancelled turns now update the resume boundary before re-throwing, so the
+  restored transcript ends at the last completed assistant message.
+
+## 1.9.22 - 2026-08-04
+
+- Claude runtime fingerprint no longer includes the tool catalog. VS Code's
+  per-restart tool-selection optimization changes the advertised tool set,
+  which flipped runtimeChanged on every reload and forced a cold session_restored
+  with a full cache miss. The runtime key now only tracks model, context target,
+  cwd, and effort — Claude SDK handles tool-catalog changes natively through
+  forkSession.
+- A restored Claude session with 90%+ cache hit is now classified as healthy
+  instead of session_restored. The restored label is only used when the hit
+  rate is below the threshold.
+
+## 1.9.21 - 2026-08-04
+
+- Removed the default Claude maxTurns limit (was 24). The Agent SDK no
+  longer receives a turn budget, so long-running agent turns with many tool
+  rounds run until the cumulative-input circuit breaker or Anthropic API
+  rate-limit stops them. Set the claudeMaxAgentTurns setting to a positive
+  value to re-enable a per-turn segment cap.
+
+## 1.9.20 - 2026-08-04
+
+- Claude turns that hit the configured maxTurns segment budget (default 24)
+  now end gracefully instead of failing. The SDK stops cleanly, the turn
+  completes with a max_model_segments safety-stop reason in the live report,
+  and the warm session survives. Previously the guard called failActiveTurn,
+  which tore the session down and forced the next turn into a cold
+  session_restored with a full cache miss and a compacted prefix.
+- The default remains conservative (24); raise claudeMaxAgentTurns for
+  long-running agent turns with many tool rounds.
+
+## 1.9.19 - 2026-08-03
+
+- Claude cache keep-alive no longer shows "No eligible session" while a
+  Claude turn is running. The health card now reports `Waiting` with a clear
+  explanation: "Claude turn is active; keep-alive will check again in 60s."
+  Sessions with a prefix below the 100k-token threshold also show `Waiting`
+  instead of a dead-end status.
+
+
+## 1.9.18 - 2026-08-03
+
+- Codex context usage in the live report now reflects the full cumulative thread
+  total instead of the last model segment's delta. A reused `user-turn` showed
+  ~87k when the model actually saw ~340k. Context above the window (e.g. 333k
+  in a 258k window) signals server-side compaction between turns, previously
+  invisible.
+- Codex turns in the live report now include `inputMode` and `compacted`
+  fields, so a switch from `full` (whole history, large) to `user-turn` (delta,
+  smaller) is no longer misread as data loss.
+- A reused Codex thread with low cache hit is now classified `upstream_expired`
+  rather than the unactionable `unknown`.
+- The dev gate now contains 297 tests.
+
+## 1.9.17 - 2026-08-03
+
+- Fixed the "first DeepSeek turn after a window reload always misses" bug.
+  `refreshLanguageModelChatInformation()` cleared the persisted stable tool
+  catalog on every activation, so the first request after a reload could not
+  compare against the previous catalog even when VS Code advertised the exact
+  same tools. The persisted catalog is now retained, and the same tool set
+  keeps its prefix-cache hash across reloads.
+- Root cause was confirmed from state: the persisted catalog fingerprint
+  (`c0fbc0dc…`) exactly matched the post-reload request fingerprint, yet the
+  in-memory catalog had been wiped, so the request was treated as a catalog
+  change and the full 400k-token prompt was rewritten.
+
+## 1.9.16 - 2026-08-02
+
+- Cache diagnostics now record the advertised tool count and system-message
+  hash of every request and its predecessor. A `tool_catalog_changed` miss
+  reports the actual `N → M` tool delta, and `system_prompt_changed` states
+  that VS Code rewrote system instructions/history (typically after an
+  interruption). Tool-catalog refresh/snapshot events log the exact removed and
+  added tool names, so a reload-driven catalog change (for example VS Code's
+  own "Optimized tool selection") is visible instead of appearing as an
+  unexplained full miss.
+- Fixed a corrupted prefix-snapshot block and completed the `toolsCount`
+  plumbing so the enriched diagnostics survive TypeScript strictness.
+
+## 1.9.15 - 2026-08-02
+
+- The cumulative-input circuit breaker now counts cache reads at 0.1x weight
+  instead of full size. A warm turn re-processes the whole prefix on every
+  model segment, so the unweighted 2M limit fired on every large turn, failed
+  it, tore down the SDK session, and forced the next turn into a cold restore
+  (first-segment miss, smaller first segment, and no eligible keep-alive
+  sessions). Weighted counting only trips the breaker on genuinely large fresh
+  input.
+- Session Quality now has an independent Claude Cache Keep-Alive health card,
+  visible even when no Claude user turn is running. It reports the current
+  state and reason, usage-snapshot age, eligible/live sessions, protected model
+  and prefix size, next attempt, last attempt/success/failure, and the latest
+  maintenance turn's cache-read/cache-write result.
+- Keep-alive is fail-safe: unknown or stale five-hour usage pauses background
+  requests instead of treating the limit as 0%. Usage refresh and maintenance
+  now run sequentially, failures are preserved, and retries are throttled.
+- Maintenance turns are tagged separately and no longer create or overwrite
+  ordinary Claude turn rows in the live report. The largest eligible prefix is
+  selected first so the most expensive cache receives priority.
+- The dev gate now contains 297 tests.
+
+## 1.9.14 - 2026-08-02
+
+- Durable Codex `thread/resume` now reapplies the same model, normalized cwd,
+  approval policy, read-only sandbox, developer instructions, and restricted
+  app-server config used by `thread/start`. Previously resume sent only the
+  thread id, allowing a restarted process to inherit a different managed
+  permission profile and invalidate the exact prompt-cache prefix.
+- Windows workspace cwd spelling is stable across reload (`D:/...` and
+  `d:\\...` resolve to the same lower-case drive form in Codex thread settings).
+- The dev gate now contains 295 tests.
+
+## 1.9.13 - 2026-08-02
+
+- Claude durable-resume fallback is fail-safe by default. Before any full-input
+  replay, the provider estimates conversation plus tool-schema tokens and
+  requires both a replay below 64k tokens and a fresh five-hour usage snapshot
+  below 80%. Unknown/stale usage, larger replays, or policy `never` stop before
+  the API call; `always` remains an explicit escape hatch.
+- Claude Agent SDK turns now have two independent circuit breakers: at most 24
+  model segments and 2M cumulative processed input tokens by default. This
+  prevents the 48-segment/6.6M-token incident pattern from running until an
+  upstream `rate_limit` failure.
+- The compact live report includes the exact fallback decision, estimated and
+  allowed replay size, configured turn limits, and any safety-stop reason.
+- The dev gate now contains 294 tests.
+
+## 1.9.12 - 2026-08-02
+
+- Fixed the observed Claude cold-fallback trigger after an interrupted turn.
+  Durable sessions now persist the last confirmed assistant message UUID and
+  resume with Agent SDK `resumeSessionAt`, excluding orphan user/interruption
+  messages from the resumed transcript tail.
+- Claude fallback diagnostics now preserve the original resume failure reason,
+  stage, and SDK error in the live turn record and in the session-quality UI.
+- Session Quality now copies a compact, cost-oriented turn report by default;
+  Shift+Copy produces formatted text and Alt+Copy retains the full JSON. Large
+  step and usage tables show only their first 3 and last 5 entries.
+- Claude cache health in the turn table now uses the final continuation segment
+  while retaining the cumulative processed blend in the detailed report.
+- The dev gate now contains 292 tests.
+
+## 1.9.11 - 2026-08-01
+
+- Live report now explains Claude cache misses after a reload: restored and
+  rollover sessions are classified as `session_restored` / `session_rollover`
+  instead of `unknown`. When the restored session's runtime fingerprint
+  changed (model, context target, effort, or the advertised tool catalog —
+  which happens after every VS Code reload), the detail states that the cached
+  prefix was rewritten because the system prompt differs.
+- The dev gate now contains 291 tests.
+
+## 1.9.10 - 2026-08-01
+
+- Fixed follow-up messages being ignored while Claude or Codex is mid-turn.
+  - Claude: the Agent SDK query stream ends after an interrupt, so a session
+    with a dead stream is now marked unhealthy, excluded from warm reuse, and
+    replaced through the durable restore path. Previously a follow-up was
+    pushed into the dead stream and never produced a reaction.
+  - Codex: an active tool turn is now superseded even when the follow-up
+    arrives with the same Copilot turn index (`>=` instead of `>`), so the new
+    user message interrupts the old work instead of being queued forever.
+- Smart Claude cache keep-alive: while idle and below 90% usage limit, a
+  minimal "reply ok" turn refreshes the Anthropic prompt-cache TTL every
+  45 minutes on the largest idle session with a prefix over 100k tokens.
+  Tool calls are denied inline, it never runs during an active turn, pauses
+  automatically at 90% usage, and is toggled from Quick Access > Claude >
+  Cache Keep-Alive (`llamacpp.claudeCacheKeepAliveEnabled` /
+  `llamacpp.claudeCacheKeepAliveMs`).
+- The dev gate now contains 291 tests.
+
+## 1.9.9 - 2026-08-01
+
+- Extension audit: removed dead code found by a full repository pass.
+  - `CLAUDE_EXTENDED_CONTEXT_WINDOW` — never referenced (the context-control
+    slider already caps at `CLAUDE_CONTEXT_TARGET_MAX`).
+  - `ToolCallBuffer` type, `validateTools()`, and `tryParseJSONObject()` —
+    exported but never used, not even in tests.
+- Verified consistency: all 50 manifest commands are registered in code (two
+  are registered dynamically through `contextLimitCommand`), all 83 manifest
+  settings are read or written by code, package scripts match AGENTS.md, and
+  the only source file without importers is the `extension.ts` entry point.
+- The dev gate now contains 289 tests.
+
+## 1.9.8 - 2026-08-01
+
+- Quick Access now shows the live usage limit directly on the provider row
+  without expanding the group: `Codex Connected (Plus): 70% R:2.08 17:25` and
+  `Claude Connected (Pro): 20% R:7.08 21:45`. `R` is the window reset time in
+  `D.MM HH:MM`; Claude uses the 5-hour session window, Codex uses its
+  subscription window (a Codex 5-hour window is shown automatically if the
+  runtime reports it in the future).
+- Codex subagent routing is restricted to the GPT-5.6 family (Sol still
+  excluded): `gpt-5.4-mini` and other non-5.6 models are no longer advertised
+  in the `runSubagent` model enum, so agents cannot select them as subagents.
+- The dev gate now contains 289 tests.
+
+## 1.9.7 - 2026-08-01
+
+- Fixed "micro-compactions": every turn near the limit was recorded as
+  auto-compacted while the history was returned unchanged. The compaction
+  estimator used the uncalibrated heuristic while the trigger used the
+  calibrated count, so the fast path no-opped whenever the calibration factor
+  drifted above 1. Compaction now shares the calibrated estimate.
+- Auto-compaction now lands at 75% of the soft input target
+  (`COMPACTION_TARGET_RATIO`) instead of exactly at the trigger threshold.
+  Compacting to the threshold re-triggered on the very next turn; the new
+  target leaves real headroom (roughly 30% reduction) so one compaction lasts
+  for dozens of turns and the upstream prompt cache is rewritten much less
+  often.
+- The dev gate now contains 287 tests.
+
+## 1.9.6 - 2026-07-31
+
+- Subagent routing is now enforced at schema level: `runSubagent.model` accepts
+  only the advertised catalog labels (`enum`), so `model="Auto"` or unknown
+  values are rejected instead of silently inheriting the expensive parent
+  model. The tool description explains the rejection.
+- Fixed Codex subagent labels to match the model picker exactly
+  (`GPT-5.6 Terra (Codex)` / `GPT-5.6 Luna (Codex)`), which is why Luna and
+  Terra were never actually selected before. Codex subagent availability now
+  reflects the ChatGPT subscription rate-limit state, and Terra is preferred
+  over Luna in the guidance ordering.
+- Subagent budget policy now states an explicit order: local (unlimited) →
+  DeepSeek (when no vision is needed; DeepSeek cannot process images) → Codex
+  Terra → Codex Luna → Claude Opus 5 (last resort).
+- Quick Access now shows a live `Usage Limit` row for Codex (percent used and
+  reset time) and a `Balance` row for DeepSeek from the official
+  `GET /user/balance` endpoint. All provider usage rows auto-refresh every
+  minute so reset times are visible without manual refresh; Claude limits
+  already showed per-window percentages.
+- The dev gate now contains 286 tests.
+
+## 1.9.5 - 2026-07-31
+
+- Fixed the DeepSeek double-miss after compaction. DeepSeek materializes the
+  disk cache for a newly compacted prefix asynchronously, so the immediate
+  tool-result continuation missed even with a byte-identical prefix (~490k
+  tokens wasted twice). The provider now waits out the remaining
+  `llamacpp.deepSeekCacheWriteGraceMs` window (default 3 minutes) before the
+  first continuation after a compaction; the wait is skipped for new user
+  turns, non-DeepSeek sources, and disabled `cachePrompt`.
+- Renamed the misleading `upstream_expired` classification for this race to
+  `upstream_cache_pending` with an explicit write-race detail when the previous
+  turn compacted the history; genuine eviction still reports
+  `upstream_expired`.
+- The dev gate now contains 284 tests.
+
+## 1.9.4 - 2026-07-31
+
+- Raised provider session retention to 24 hours: Claude in-memory SDK sessions,
+  Codex native-tool continuations and tool timeouts, and both armed rollover
+  intents no longer expire after the former 30 minutes. A pause or reload
+  within a day keeps the live session and its durable mapping instead of
+  starting a cold transcript.
+- Durable Claude transcripts and Codex threads remain eligible for seven days,
+  so a 24-hour gap still restores the session. Prompt-cache warmth remains
+  bounded by the provider's own cache TTL (5 minutes or 1 hour) and still needs
+  a keep-alive turn to be guaranteed across a long pause.
+
+## 1.9.3 - 2026-07-30
+
+- Added a Provider Context panel with real range sliders in Quick Access.
+  Claude can select a 258.4k-967k working target inside the Opus 5 1M window;
+  Codex can select a cold-start target capped to the latest server-reported
+  model window.
+- Updated the Claude Agent SDK and bundled platform runtime to `0.3.220` /
+  Claude Code `2.1.220`. Claude sessions now use the actual `opus[1m]` model
+  variant and pass the selected target through
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; cold-start history scales with the target.
+- Removed the extra Codex `0.45` history multiplier. Cold-start compaction now
+  subtracts explicit output, tool-schema, developer-instruction, and safety
+  reserves from the selected working target, raising the representative
+  semantic-message budget from about 87k to about 197k inside a 258.4k window.
+- Made Codex server telemetry authoritative for advertised context size, kept
+  manual `codexContextLength` as a pre-telemetry fallback only, and added
+  regressions for 1M Claude selection, context slider bounds, and exact Codex
+  budget calculations. The dev gate now contains 283 tests.
+
+## 1.9.2 - 2026-07-30
+
+- Unified completed Codex thread and Claude Agent SDK session retention at
+  seven days. Overnight or post-limit-window reloads no longer discard a valid
+  Codex thread after the former four-hour TTL.
+- Migrated legacy Claude durable mappings that predate Copilot turn indices.
+  The same advancing Copilot conversation can now resume its validated SDK
+  transcript after reload even when Copilot has compacted or rewritten the
+  visible message history.
+- Kept same-turn retry protection, model/workspace validation, transcript
+  existence checks, and seven-day stale-entry pruning, with regression coverage
+  for a five-hour Codex restore and a shortened legacy Claude history.
+
+## 1.9.1 - 2026-07-29
+
+- Restored durable Claude Agent SDK sessions after Extension Host reload even
+  when the current VS Code tool catalog changes. A matching model and advanced
+  Copilot conversation can resume its validated on-disk session with the
+  current tools instead of paying for a cold full-transcript start.
+- Emitted Claude native `usage` after the visible text or tool call on every
+  completed provider response boundary. Copilot Chat Session Info can now
+  observe the latest model segment throughout a native-tool loop as well as on
+  the terminal response.
+- Added privacy-safe restore diagnostics and regression coverage for runtime
+  drift, stale or non-advanced conversations, legacy persisted mappings, and
+  ordered per-boundary usage emission. The dev gate now contains 280 tests.
+
 ## 1.9.0 - 2026-07-29
 
 - Promoted the unified Local, DeepSeek, Codex, and Claude model-picker workflow
