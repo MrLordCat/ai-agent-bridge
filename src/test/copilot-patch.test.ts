@@ -11,6 +11,7 @@ import {
 	COPILOT_PATCH_MARKER,
 	findCopilotBundle,
 	patchCopilotBundle,
+	patchExtensionTokenizerCache,
 	patchVsCodeWorkbenchBundle,
 	VSCODE_CHAT_HISTORY_PATCH_MARKER,
 } from "../copilot-patch";
@@ -28,8 +29,16 @@ suite("Copilot patch", () => {
 		);
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v17"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v21"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
+		assert.ok(patched.includes("this.__llamaTokenCache"));
+		assert.ok(patched.includes("this.__llamaTokenHash"));
+		assert.ok(patched.includes("__llamaRounds"));
+		assert.ok(patched.includes("__llamaAgentHistoryRounds"));
+		assert.ok(patched.includes("__llamaAgentHistoryTurns"));
+		assert.ok(patched.includes("extension model agent history turn cap"));
+		assert.ok(patched.includes("agent history element cap"));
+		assert.ok(!patched.includes("async _textTokenLength(e){return e?this.languageModel.countTokens(e):0}"));
 		assert.ok(patched.includes("this._llamaToolsSignature"));
 		assert.ok(patched.includes("if(__llamaToolCurrent!==this._llamaToolsSignature)"));
 		assert.ok(!patched.includes("er._llamaToolsSignature"));
@@ -51,6 +60,8 @@ suite("Copilot patch", () => {
 		assert.ok(patchedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER));
 		assert.ok(patchedWorkbench.includes("__llamaBoundToolText"));
 		assert.ok(patchedWorkbench.includes("__llamaBoundToolPayload"));
+		assert.ok(patchedWorkbench.includes("replace(/\\x1b\\[[\\d;]*R/g"));
+		assert.ok(!patchedWorkbench.includes("vscode-chat-history-bounds:v1 */"));
 
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-copilot-patch-test-"));
 		const workbenchModule = path.join(tempDir, "workbench.mjs");
@@ -60,5 +71,44 @@ suite("Copilot patch", () => {
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
+	});
+
+	test("memoises extension model token counts across tokenizer instances", async () => {
+		const synthetic =
+			"function toRawMessages(list){return list}function breakpointsFor(){return false}const BASE=3;" +
+			"var Tokenizer=class{constructor(languageModel){this.languageModel=languageModel}" +
+			"async _textTokenLength(e){return e?this.languageModel.countTokens(e):0}" +
+			"async countMessageTokens(e){let t=toRawMessages([e],{emitCacheBreakpoints:breakpointsFor(this.languageModel.vendor)});" +
+			"if(t.length===0)return 0;let r=await this.languageModel.countTokens(t[0]);return BASE+r}};" +
+			"globalThis.__test={Tokenizer};";
+		const context: Record<string, unknown> = { console };
+		context.globalThis = context;
+		new Script(patchExtensionTokenizerCache(synthetic)).runInNewContext(context);
+		const { Tokenizer } = context.__test as { Tokenizer: new (model: unknown) => {
+			_textTokenLength(text: string): Promise<number>;
+			countMessageTokens(message: unknown): Promise<number>;
+		} };
+
+		let upstreamCalls = 0;
+		const languageModel = {
+			vendor: "llamacpp",
+			id: "deepseek::deepseek-v4-flash",
+			async countTokens(value: unknown) {
+				upstreamCalls += 1;
+				return typeof value === "string" ? value.length : 42;
+			},
+		};
+
+		for (let i = 0; i < 5; i++) {
+			const tokenizer = new Tokenizer(languageModel);
+			assert.strictEqual(await tokenizer._textTokenLength("description"), "description".length);
+			await tokenizer._textTokenLength("a".repeat(500));
+			assert.strictEqual(await tokenizer.countMessageTokens({ role: "user", content: "hello" }), 45);
+		}
+		assert.strictEqual(upstreamCalls, 3);
+
+		const builtIn = new Tokenizer({ ...languageModel, vendor: "copilot" });
+		await builtIn._textTokenLength("description");
+		assert.strictEqual(upstreamCalls, 4);
 	});
 });

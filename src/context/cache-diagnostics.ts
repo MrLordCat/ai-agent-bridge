@@ -31,6 +31,10 @@ export interface CachePrefixTelemetry {
 	toolsCount?: number;
 	/** Advertised tool count of the previous request, when known. */
 	previousToolsCount?: number;
+	/** Tool names removed since the previous request (when the catalog changed). */
+	removedTools?: string[];
+	/** Tool names added since the previous request (when the catalog changed). */
+	addedTools?: string[];
 	/** Hash of the first (system) message; undefined when no system message. */
 	systemHash?: string;
 	/** True when the system message changed since the previous request. */
@@ -184,9 +188,20 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 		const toolDelta = prefix.toolsCount !== undefined && prefix.previousToolsCount !== undefined
 			? ` (${prefix.previousToolsCount} → ${prefix.toolsCount} tools)`
 			: "";
+		// A same-count catalog change (e.g. an MCP server swapped its tool set
+		// between restarts) is invisible in the count — surface the actual diff.
+		const removed = Array.isArray(prefix.removedTools) && prefix.removedTools.length > 0
+			? prefix.removedTools.join(", ")
+			: "";
+		const added = Array.isArray(prefix.addedTools) && prefix.addedTools.length > 0
+			? prefix.addedTools.join(", ")
+			: "";
+		const toolDiff = removed || added
+			? ` — removed: ${removed || "none"}, added: ${added || "none"}`
+			: "";
 		return {
 			reason: "tool_catalog_changed",
-			detail: `the advertised tool catalog changed${toolDelta}, which rewrites the prompt before any message`,
+			detail: `the advertised tool catalog changed${toolDelta}${toolDiff}, which rewrites the prompt before any message`,
 		};
 	}
 

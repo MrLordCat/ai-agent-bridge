@@ -26,7 +26,7 @@ export function resolveOutputTokenBudget(input: OutputTokenBudgetInput): OutputT
 	const isDeepSeek = input.family.toLowerCase() === "deepseek";
 	const defaultMaximum = isDeepSeek ? input.deepSeekMaximum : 131072;
 	const configuredDefault = isDeepSeek ? input.deepSeekDefault : input.localDefault;
-	const defaultMaxTokens = clampInteger(configuredDefault, 1024, defaultMaximum, isDeepSeek ? 65536 : 32768);
+	const defaultMaxTokens = clampInteger(configuredDefault, 1024, defaultMaximum, isDeepSeek ? 131072 : 32768);
 	const requestProvidedLimit = typeof input.requestedMaxTokens === "number" && Number.isFinite(input.requestedMaxTokens);
 	const requestedMaxTokens = clampInteger(
 		requestProvidedLimit ? input.requestedMaxTokens as number : defaultMaxTokens,

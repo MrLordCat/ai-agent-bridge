@@ -19,7 +19,10 @@ interface CompactMessagesOptions {
 const SUMMARY_LABEL_PATTERN = /^Conversation summary \((?:auto-compact|hard compact(?:, keep \d+)?|overflow retry)\):/;
 
 function isCompactionSummary(message: OpenAIChatMessage): boolean {
-	if (message.role !== "system" || typeof message.content !== "string") {
+	if (message.role !== "system" && message.role !== "user") {
+		return false;
+	}
+	if (typeof message.content !== "string") {
 		return false;
 	}
 	return SUMMARY_LABEL_PATTERN.test(message.content);
@@ -229,7 +232,9 @@ export function compactMessages(
 	const systems = messages
 		.filter(message => message.role === "system" && !isCompactionSummary(message))
 		.map(cloneMessage);
-	const nonSystem = messages.filter(message => message.role !== "system");
+	const nonSystem = messages.filter(message =>
+		message.role !== "system" && !isCompactionSummary(message)
+	);
 	if (nonSystem.length === 0) {
 		return systems;
 	}
@@ -255,9 +260,18 @@ export function compactMessages(
 		const head = turns.slice(0, keepTurnIndex).flat();
 		const tailTurns = turns.slice(keepTurnIndex).map(turn => turn.map(cloneMessage));
 		const summaryLines = selectSummaryLines(head);
+		// The summary intentionally uses the user role (not system):
+		// OpenAI-style prompts keep system messages and the tools block
+		// before the conversation, and the upstream prompt cache covers
+		// a byte-identical prefix. A system-role summary sits before
+		// tools and changes on every compaction, so the changed summary
+		// invalidated the cache for tools and every message after it.
+		// As a user message it lands after the tools block, so a
+		// compaction keeps system + tools cached and only the messages
+		// block rewrites.
 		const summaryMessages: OpenAIChatMessage[] = head.length > 0
 			? [{
-				role: "system",
+				role: "user",
 				content: summaryLines.length > 0
 					? `${options.label}:\n${summaryLines.join("\n")}`
 					: `${options.label}: prior turns were compacted to fit model context.`,

@@ -101,6 +101,8 @@ export interface ClaudeAgentTurnContext {
 	toolSchemaTokens: number;
 	/** True when a restored/rolled-over session resumes with a different runtime fingerprint. */
 	runtimeChanged?: boolean;
+	/** Why a fresh SDK session was created instead of reusing a live one. */
+	sessionMissReason?: string;
 	/** Classified failure from the rejected durable resume that triggered a fallback. */
 	resumeFailureReason?: string;
 	/** Lifecycle stage at which the durable resume failed. */

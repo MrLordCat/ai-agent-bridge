@@ -1,6 +1,87 @@
 import * as vscode from "vscode";
 import type { ClaudeCacheKeepAliveStatus } from "../claude/claude-provider";
-import type { SessionQualityTracker } from "../diagnostics/session-report";
+import type { SessionQualityTracker, SessionTurnRecord } from "../diagnostics/session-report";
+
+/**
+ * Collects agent/tool/API failures from turn records so the dashboard can show
+ * exactly which turn, chat and tool were involved. Failed llama/deepseek turns
+ * now land in the tracker as lifecyclePhase "failed" records; Claude/Codex
+ * already report their failures through lifecyclePhase, resume/safety stops
+ * and repair counters.
+ */
+function collectTurnErrors(records: readonly SessionTurnRecord[] | undefined): Array<{
+	index: number;
+	conversationKey?: string;
+	modelId?: string;
+	startedAtMs?: number;
+	kind: string;
+	detail: string;
+	count: number;
+}> {
+	const errors: Array<{
+		index: number;
+		conversationKey?: string;
+		modelId?: string;
+		startedAtMs?: number;
+		kind: string;
+		detail: string;
+		count: number;
+	}> = [];
+	if (!records) {
+		return errors;
+	}
+	const push = (
+		index: number,
+		turn: { conversationKey?: string; modelId?: string; startedAtMs?: number },
+		kind: string,
+		detail: string,
+		count = 1
+	) => {
+		errors.push({
+			index,
+			conversationKey: turn.conversationKey,
+			modelId: turn.modelId,
+			startedAtMs: turn.startedAtMs,
+			kind,
+			detail,
+			count,
+		});
+	};
+	records.forEach((record, index) => {
+		const turn = record.turn;
+		const turnIndex = index + 1;
+		const phase = turn.lifecyclePhase;
+		if (phase === "failed" || phase === "timed_out") {
+			push(turnIndex, turn, phase === "failed" ? "turn_failed" : "turn_timed_out",
+				(turn.terminalDetail || turn.resumeFailureDetail || "").slice(0, 400) || "turn ended with an error");
+		}
+		if (typeof turn.rejectedToolCalls === "number" && turn.rejectedToolCalls > 0) {
+			const schemaPart = turn.schemaRejectedToolCalls ? ` (schema: ${turn.schemaRejectedToolCalls})` : "";
+			push(turnIndex, turn, "tool_rejected",
+				`${turn.rejectedToolCalls} tool call(s) rejected before execution${schemaPart} — the model called an unavailable tool or produced an invalid argument object`,
+				turn.rejectedToolCalls);
+		}
+		if (typeof turn.toolCallRepairRetries === "number" && turn.toolCallRepairRetries > 0) {
+			push(turnIndex, turn, "tool_repair_retry",
+				`${turn.toolCallRepairRetries} repair retr${turn.toolCallRepairRetries === 1 ? "y" : "ies"} after a rejected tool call`);
+		}
+		if (turn.toolLoopDetected) {
+			push(turnIndex, turn, "tool_loop", "tool call loop detected — repeated identical calls were stopped");
+		}
+		if (turn.retriedAfterOverflow) {
+			push(turnIndex, turn, "api_overflow_retry", "the API rejected the prompt as too long; the turn was retried with a hard-compacted context");
+		}
+		if (turn.resumeFailureReason) {
+			push(turnIndex, turn, "resume_failed",
+				`${turn.resumeFailureReason}${turn.resumeFailureDetail ? `: ${turn.resumeFailureDetail}` : ""}`.slice(0, 400));
+		}
+		if (turn.safetyStopReason) {
+			push(turnIndex, turn, "safety_stop",
+				`${turn.safetyStopReason}${turn.safetyStopDetail ? `: ${turn.safetyStopDetail}` : ""}`.slice(0, 400));
+		}
+	});
+	return errors;
+}
 
 export class SessionQualityPanel {
 	public static readonly viewType = "llamacpp.sessionQuality";
@@ -132,6 +213,7 @@ export class SessionQualityPanel {
 				...record.turn,
 				context: record.context,
 			})) ?? [],
+			errors: collectTurnErrors(rawRecords),
 		};
 	}
 
@@ -280,6 +362,44 @@ tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,12
 .copy-btn:hover { color: var(--fg); border-color: var(--border); background: var(--row-hover); }
 .copy-btn.copied { color: var(--good); }
 .hidden-row { display: none !important; }
+/* Tabs */
+.tabs { display: flex; gap: 4px; margin: 14px 0 4px; border-bottom: 1px solid var(--border); }
+.tab-btn { padding: 7px 14px; border: 1px solid transparent; border-bottom: 0; border-radius: 6px 6px 0 0; background: transparent; color: var(--dim); font-size: 12px; font-weight: 650; cursor: pointer; }
+.tab-btn:hover { color: var(--fg); background: var(--row-hover); }
+.tab-btn.active { color: var(--accent); background: var(--surface); border-color: var(--border); margin-bottom: -1px; }
+.tab-btn.tab-has-issues { color: var(--warn); }
+.error-detail { max-width: 520px; white-space: normal; word-break: break-word; }
+.tab-panel[hidden] { display: none; }
+/* Performance tab */
+.gap-hist { display: flex; align-items: flex-end; gap: 12px; padding: 14px 16px 10px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
+.gap-hist-col { display: flex; flex-direction: column; align-items: center; gap: 3px; flex: 1; min-width: 0; }
+.gap-hist-bar { width: 100%; max-width: 56px; background: linear-gradient(180deg, var(--accent), rgba(85, 150, 245, .45)); border-radius: 3px 3px 0 0; min-height: 2px; }
+.gap-hist-count { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.gap-hist-label { color: var(--dim); font-size: 9px; letter-spacing: .03em; white-space: nowrap; }
+.spark { display: flex; align-items: flex-end; gap: 2px; min-height: 52px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); overflow-x: auto; }
+.spark-bar { width: 10px; flex: 0 0 auto; border-radius: 2px 2px 0 0; min-height: 3px; }
+.spark-good { background: var(--good); opacity: .8; }
+.spark-warn { background: var(--warn); }
+.spark-bad { background: var(--bad); }
+.perf-row.perf-slow td { box-shadow: inset 3px 0 0 var(--warn); }
+.perf-row.perf-bad td { box-shadow: inset 3px 0 0 var(--bad); }
+.gap-user { color: var(--dim); font-style: italic; }
+/* Input structure bar (system → tools → messages cache coverage) */
+.struct-bar { display: flex; width: 100%; height: 14px; border-radius: 3px; overflow: hidden; border: 1px solid var(--border); background: rgba(255,255,255,.05); }
+.struct-bar .bar { height: 100%; border-radius: 0; }
+.struct-system, .struct-tools, .struct-msg, .struct-other { box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); }
+.struct-block { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.struct-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.struct-bar .bar-cached.struct-system { background: #2f8f4e; }
+.struct-bar .bar-cached.struct-tools { background: #2e7d32; }
+.struct-bar .bar-cached.struct-other { background: #3a8f6e; }
+.struct-bar .bar-cached.struct-msg { background: #46c96f; }
+.struct-bar .bar-uncached.struct-system { background: #7a2e2e; }
+.struct-bar .bar-uncached.struct-tools { background: #a33b3b; }
+.struct-bar .bar-uncached.struct-other { background: #a3663b; }
+.struct-bar .bar-uncached.struct-msg { background: #ef6262; }
+.struct-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
+.gap-user { color: var(--dim); opacity: .75; font-style: italic; }
 @media (max-width: 1180px) {
 	.metric-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
 	.detail-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
@@ -369,6 +489,8 @@ var compactTurnRecord = function(r) {
 		},
 		performance: {
 			durationMs: r.durationMs,
+			startedAtMs: r.startedAtMs,
+			gapSinceLastResponseMs: r.gapSinceLastResponseMs,
 			firstModelEventLatencyMs: r.firstTokenLatencyMs,
 			firstVisibleLatencyMs: r.firstVisibleLatencyMs,
 			outputTokens: r.outputTokens,
@@ -418,6 +540,12 @@ function render() {
 	h += '<div class="title-row"><h1>Session Quality</h1><span class="live-pill">Live</span></div>';
 	h += '<div class="sub">Updated ' + new Date(d.generatedAt).toLocaleTimeString() + ' &middot; Extension ' + d.extensionVersion + ' &middot; VS Code ' + d.vscodeVersion + '</div>';
 	h += '</div><div class="header-actions"><span class="section-note">' + s.turns + ' logical turn' + (s.turns === 1 ? '' : 's') + ' · ' + FMT(s.totalModelTurns ?? s.turns) + ' model segment' + ((s.totalModelTurns ?? s.turns) === 1 ? '' : 's') + '</span></div></header>';
+	h += '<nav class="tabs" role="tablist" aria-label="Dashboard sections">';
+	h += '<button id="tab-btn-cache" class="tab-btn active" role="tab" aria-selected="true" data-tab="cache">Cache &amp; models</button>';
+	h += '<button id="tab-btn-perf" class="tab-btn" role="tab" aria-selected="false" data-tab="perf">Performance</button>';
+	h += '<button id="tab-btn-errors" class="tab-btn' + (d.errors && d.errors.length ? ' tab-has-issues' : '') + '" role="tab" aria-selected="false" data-tab="errors">Errors' + (d.errors && d.errors.length ? ' (' + d.errors.length + ')' : '') + '</button>';
+	h += '</nav>';
+	h += '<div id="tab-cache" class="tab-panel" data-panel="cache">';
 
 	// Primary health metrics
 	h += '<section class="metric-grid" aria-label="Session summary">';
@@ -518,30 +646,49 @@ function render() {
 	if (d.records && d.records.length) {
 		const hasPrefix = d.records.some(r => r.cacheMissReason !== undefined || r.prefixIdenticalMessageCount !== undefined);
 		const models = [...new Set(d.records.map(r => r.modelId).filter(Boolean))];
-		h += '<section class="section turns-section"><div class="section-heading"><h2>Turns</h2><span class="section-note">Select a row for cache, context, tools and backend details</span></div>';
+		const chats = [...new Set(d.records.map(r => r.conversationKey).filter(Boolean))];
+		const chatCount = chats.length;
+		// Keep the dashboard bounded: render only the most recent turns, but let
+		// the filters/search see the full history via DATA.
+		const MAX_DISPLAY_TURNS = 40;
+		const allRecords = d.records || [];
+		const displayRecords = allRecords.length > MAX_DISPLAY_TURNS
+			? allRecords.slice(-MAX_DISPLAY_TURNS)
+			: allRecords;
+		h += '<section class="section turns-section"><div class="section-heading"><h2>Turns</h2><span class="section-note">' + (chatCount > 1 ? chatCount + ' chats · ' : '') + 'Showing last ' + Math.min(displayRecords.length, MAX_DISPLAY_TURNS) + ' of ' + allRecords.length + ' · Select a row for cache, context, tools and backend details</span></div>';
 		h += '<div class="turn-toolbar"><div class="turn-filters">';
 		h += '<input id="turn-search" class="search" type="search" placeholder="Search model, reason or request ID" aria-label="Search turns">';
 		h += '<select id="model-filter" class="select" aria-label="Filter by model"><option value="">All models</option>';
 		for (const model of models) h += '<option value="' + escAttr(String(model)) + '">' + esc(MODEL_LABEL(model)) + '</option>';
-		h += '</select><button id="issues-filter" class="btn" type="button" aria-pressed="false">Issues only</button></div>';
+		h += '</select>';
+		if (chatCount > 1) {
+			h += '<select id="chat-filter" class="select" aria-label="Filter by chat"><option value="">All chats</option>';
+			for (const chat of chats) h += '<option value="' + escAttr(chat) + '">' + esc(chat.slice(0, 8)) + '</option>';
+			h += '</select>';
+		}
+		h += '<button id="issues-filter" class="btn" type="button" aria-pressed="false">Issues only</button></div>';
 		h += '<button id="expand-all" class="btn" type="button">Expand all</button></div>';
 		h += '<div class="table-shell"><table class="turn-table"><thead><tr>';
 		h += '<th style="width:22px"></th>';
 		h += '<th>#</th>';
 		h += '<th>Model</th>';
+		if (chatCount > 1) h += '<th>Chat</th>';
 		h += '<th>Processed input</th>';
 		h += '<th>Cache reuse</th>';
 		if (hasPrefix) h += '<th>Status</th>';
-		h += '<th>TTFT</th>';
-		h += '<th>Speed</th>';
+		h += '<th>At</th>';
 		h += '<th>Tools</th>';
 		h += '<th>Context</th>';
 		h += '<th>Compact</th>';
 		h += '<th style="width:52px">Data</th>';
 		h += '</tr></thead><tbody>';
 
-		for (let i = 0; i < d.records.length; i++) {
-			const r = d.records[i];
+		const displayOffset = allRecords.length - displayRecords.length;
+		for (let i = 0; i < displayRecords.length; i++) {
+			const r = displayRecords[i];
+			// data-index must address DATA.records (full history), not the
+			// truncated display list, so Alt+Copy keeps working.
+			const dataIndex = displayOffset + i;
 			const hit = EFFECTIVE_HIT(r);
 			const detailId = "detail-" + i;
 			const cacheIssue = typeof hit === "number" && hit < 90;
@@ -550,14 +697,14 @@ function render() {
 			);
 			const reasonIssue = Boolean(r.cacheMissReason && r.cacheMissReason !== "healthy" && r.cacheMissReason !== "cold_start");
 			const issue = critical || cacheIssue || reasonIssue;
-			const searchable = [r.modelId, r.cacheMissReason, r.requestId].filter(Boolean).join(" ").toLowerCase();
+			const searchable = [r.modelId, r.cacheMissReason, r.requestId, r.conversationKey].filter(Boolean).join(" ").toLowerCase();
 
-			h += '<tr class="turn-row ' + (critical ? 'critical' : issue ? 'issue' : '') + '" tabindex="0" role="button" aria-expanded="false" data-detail="' + detailId + '" data-issue="' + (issue ? '1' : '0') + '" data-model="' + escAttr(String(r.modelId || '')) + '" data-search="' + escAttr(searchable) + '">';
+			h += '<tr class="turn-row ' + (critical ? 'critical' : issue ? 'issue' : '') + '" tabindex="0" role="button" aria-expanded="false" data-detail="' + detailId + '" data-issue="' + (issue ? '1' : '0') + '" data-model="' + escAttr(String(r.modelId || '')) + '" data-chat="' + escAttr(String(r.conversationKey || '')) + '" data-search="' + escAttr(searchable) + '">';
 			h += '<td><span class="expand-icon">▶</span></td>';
 			h += '<td class="compact-number">' + r.index + (r.isSubagent ? '<span class="subagent-tag">sub</span>' : '') + '</td>';
 			h += '<td class="model-cell" title="' + escAttr(String(r.modelId || '')) + '">' + esc(MODEL_LABEL(r.modelId)) + '</td>';
-			h += '<td class="compact-number" title="' + FMT(r.promptTokens) + ' tokens processed across ' + FMT(r.modelTurns ?? 1) + ' model segment(s)">' + FMT_SHORT(r.promptTokens) + '</td>';
-			// Cache cell with mini bar
+			if (chatCount > 1) h += '<td class="compact-number" title="Chat ' + escAttr(String(r.conversationKey || 'unknown')) + '">' + (r.conversationKey ? esc(r.conversationKey.slice(0, 8)) : '—') + '</td>';
+			h += '<td class="compact-number" title="' + FMT(r.promptTokens) + ' tokens processed across ' + FMT(r.modelTurns ?? 1) + ' model segment(s)">' + FMT_SHORT(r.promptTokens) + '</td>';			// Cache cell with mini bar
 			h += '<td class="cache-cell">';
 			const cacheInput = IS_CODEX(r) && typeof r.finalSegmentInputTokens === "number" ? r.finalSegmentInputTokens : r.promptTokens;
 			const cacheTokens = IS_CODEX(r) && typeof r.finalSegmentCachedInputTokens === "number" ? r.finalSegmentCachedInputTokens : r.cachedPromptTokens;
@@ -582,19 +729,18 @@ function render() {
 				const reason = r.cacheMissReason;
 				h += '<td><span class="' + REASON_CLASS(reason || (typeof hit === 'number' && hit >= 90 ? 'healthy' : 'unknown')) + '">' + REASON_LABEL(reason || (typeof hit === 'number' && hit >= 90 ? 'healthy' : 'unknown')) + '</span></td>';
 			}
-			h += '<td class="compact-number">' + DURATION(r.firstTokenLatencyMs) + '</td>';
-			h += '<td class="compact-number">' + (r.tokensPerSecond !== undefined ? FMT1(r.tokensPerSecond) + ' t/s' : "n/a") + '</td>';
+			h += '<td class="compact-number" title="' + (r.startedAtMs !== undefined ? new Date(r.startedAtMs).toLocaleString() : '') + '">' + CLOCK(r.startedAtMs) + '</td>';
 			h += '<td>' + (r.toolCalls ?? 0) + (r.repairedToolCalls ? " (" + r.repairedToolCalls + "r)" : "") + (r.rejectedToolCalls ? " (" + r.rejectedToolCalls + "x)" : "") + '</td>';
 			h += '<td>' + (r.context?.estimatedUsagePercent !== undefined ? FMT1(r.context.estimatedUsagePercent) + "%" : "n/a") + '</td>';
 			h += '<td>' + (r.context?.hardCompacted ? "hard" : r.context?.autoCompacted ? "auto" : "—") + '</td>';
 			// Default clipboard payload is compact. Full diagnostics remain available
 			// from DATA by record index without duplicating the large JSON in the DOM.
 			const turnJson = safeStringify(compactTurnRecord(r));
-			h += '<td><span class="copy-btn" role="button" tabindex="0" data-index="' + i + '" data-json="' + turnJson + '" title="Click: compact JSON · Shift+click: formatted text · Alt+click: full JSON">Copy</span></td>';
+			h += '<td><span class="copy-btn" role="button" tabindex="0" data-index="' + dataIndex + '" data-json="' + turnJson + '" title="Click: compact JSON · Shift+click: formatted text · Alt+click: full JSON">Copy</span></td>';
 			h += '</tr>';
 
-			// Detail row ...
-			const detailColspan = hasPrefix ? 12 : 11;
+			// Detail row — expandable cache/context/tool/backend diagnostics.
+			const detailColspan = (hasPrefix ? 11 : 10) + (chatCount > 1 ? 1 : 0);
 			h += '<tr class="detail-row" id="' + detailId + '"><td colspan="' + detailColspan + '">';
 			h += '<div class="detail-grid">';
 
@@ -644,25 +790,93 @@ function render() {
 			// cache reads from cache creation, and stateless HTTP uses the prompt.
 			const detailInputTokens = IS_CODEX(r) && typeof r.finalSegmentInputTokens === "number" ? r.finalSegmentInputTokens : r.promptTokens;
 			const detailCachedTokens = IS_CODEX(r) && typeof r.finalSegmentCachedInputTokens === "number" ? r.finalSegmentCachedInputTokens : r.cachedPromptTokens;
+			const structMode = !IS_CODEX(r) && !IS_CLAUDE(r);
 			if (typeof detailInputTokens === "number" && detailInputTokens > 0 && typeof detailCachedTokens === "number") {
 				const cached = detailCachedTokens;
 				const uncached = Math.max(0, detailInputTokens - cached);
 				const hitPct = (cached / detailInputTokens) * 100;
-				const cacheWrite = IS_CLAUDE(r) ? Math.min(uncached, r.cacheWriteInputTokens ?? 0) : 0;
-				const fresh = Math.max(0, uncached - cacheWrite);
-				const writePct = (cacheWrite / detailInputTokens) * 100;
-				const missPct = (fresh / detailInputTokens) * 100;
-				h += '<div style="margin-top:4px">';
-				h += '<div class="bar-wrap" style="width:100%">';
-				if (hitPct > 0) h += '<div class="bar bar-cached" style="width:' + hitPct.toFixed(1) + '%" title="Cached: ' + FMT(cached) + ' tokens"></div>';
-				if (writePct > 0) h += '<div class="bar bar-cache-write" style="width:' + writePct.toFixed(1) + '%" title="Cache creation: ' + FMT(cacheWrite) + ' tokens"></div>';
-				if (missPct > 0) h += '<div class="bar bar-uncached" style="width:' + missPct.toFixed(1) + '%" title="Fresh: ' + FMT(fresh) + ' tokens"></div>';
-				h += '</div>';
-				h += '<div style="font-size:10px;color:var(--dim);margin-top:1px">';
-				h += '<span style="color:var(--good)">cached ' + FMT(cached) + ' (' + hitPct.toFixed(1) + '%)</span>';
-				if (IS_CLAUDE(r)) h += ' &middot; <span style="color:var(--warn)">cache write ' + FMT(cacheWrite) + ' (' + writePct.toFixed(1) + '%)</span>';
-				h += ' &middot; <span style="color:var(--bad)">' + (IS_CLAUDE(r) ? 'fresh ' + FMT(fresh) : 'uncached ' + FMT(uncached)) + ' (' + missPct.toFixed(1) + '%)</span>';
-				h += '</div>';
+				// Stateless HTTP (llama/deepseek) shows the input structure bar
+				// instead of the generic cached/miss split — the structure bar
+				// already paints each block's cache coverage.
+				if (!structMode) {
+					const cacheWrite = IS_CLAUDE(r) ? Math.min(uncached, r.cacheWriteInputTokens ?? 0) : 0;
+					const fresh = Math.max(0, uncached - cacheWrite);
+					const writePct = (cacheWrite / detailInputTokens) * 100;
+					const missPct = (fresh / detailInputTokens) * 100;
+					h += '<div style="margin-top:4px">';
+					h += '<div class="bar-wrap" style="width:100%">';
+					if (hitPct > 0) h += '<div class="bar bar-cached" style="width:' + hitPct.toFixed(1) + '%" title="Cached: ' + FMT(cached) + ' tokens"></div>';
+					if (writePct > 0) h += '<div class="bar bar-cache-write" style="width:' + writePct.toFixed(1) + '%" title="Cache creation: ' + FMT(cacheWrite) + ' tokens"></div>';
+					if (missPct > 0) h += '<div class="bar bar-uncached" style="width:' + missPct.toFixed(1) + '%" title="Fresh: ' + FMT(fresh) + ' tokens"></div>';
+					h += '</div>';
+					h += '<div style="font-size:10px;color:var(--dim);margin-top:1px">';
+					h += '<span style="color:var(--good)">cached ' + FMT(cached) + ' (' + hitPct.toFixed(1) + '%)</span>';
+					if (IS_CLAUDE(r)) h += ' &middot; <span style="color:var(--warn)">cache write ' + FMT(cacheWrite) + ' (' + writePct.toFixed(1) + '%)</span>';
+					h += ' &middot; <span style="color:var(--bad)">' + (IS_CLAUDE(r) ? 'fresh ' + FMT(fresh) : 'uncached ' + FMT(uncached)) + ' (' + missPct.toFixed(1) + '%)</span>';
+					h += '</div>';
+				}
+
+				// Input structure: show WHERE the cache break lands. The prompt is
+				// system → tools → messages and the Anthropic/OpenAI prompt cache
+				// only covers a byte-identical prefix, so a changed tools block
+				// invalidates every message after it. Segment the bar by block and
+				// paint the cached portion of each block green.
+				if (structMode && r.context) {
+					const structSystem = typeof r.context.systemTokens === "number" ? r.context.systemTokens : 0;
+					const structTools = typeof r.context.toolTokens === "number" ? r.context.toolTokens : 0;
+					const structMessages = typeof r.context.messageTokensAfterCompact === "number"
+						? r.context.messageTokensAfterCompact
+						: 0;
+					const structOther = typeof r.context.otherTokens === "number" ? r.context.otherTokens : 0;
+					const structTotal = structSystem + structTools + structMessages + structOther;
+					if (structTotal > 0 && typeof detailInputTokens === "number" && detailInputTokens > 0) {
+						// Scale the heuristic blocks to the server-reported input.
+						const scale = detailInputTokens / structTotal;
+						const blocks = [
+							{ label: "System", tokens: structSystem * scale, css: "struct-system" },
+							{ label: "Tools", tokens: structTools * scale, css: "struct-tools" },
+							{ label: "Other", tokens: structOther * scale, css: "struct-other" },
+							{ label: "Messages", tokens: structMessages * scale, css: "struct-msg" },
+						].filter(b => b.tokens > 0);
+						let consumed = 0;
+						const segments = [];
+						for (const block of blocks) {
+							const blockCached = Math.max(0, Math.min(block.tokens, cached - consumed));
+							const blockMiss = Math.max(0, block.tokens - blockCached);
+							const blockHit = block.tokens > 0 ? Math.round((blockCached / block.tokens) * 100) : 0;
+							if (blockCached > 0) {
+								segments.push({
+									css: "bar bar-cached " + block.css,
+									width: blockCached,
+									title: block.label + ": " + blockHit + "% cached (" + FMT(Math.round(blockCached)) + " of " + FMT(Math.round(block.tokens)) + " tokens)",
+								});
+							}
+							if (blockMiss > 0) {
+								segments.push({
+									css: "bar bar-uncached " + block.css,
+									width: blockMiss,
+									title: block.label + ": " + blockHit + "% cached — " + FMT(Math.round(blockMiss)) + " tokens not cached",
+								});
+							}
+							consumed += block.tokens;
+						}
+						h += '<div class="struct-bar" style="margin-top:6px">';
+						for (const segment of segments) {
+							h += '<div class="' + segment.css + '" style="width:' + ((segment.width / detailInputTokens) * 100).toFixed(2) + '%" title="' + escAttr(segment.title) + '"></div>';
+						}
+						h += '</div>';
+						h += '<div class="struct-legend" style="font-size:10px;color:var(--dim);margin-top:3px">';
+						let legendConsumed = 0;
+						for (const block of blocks) {
+							const blockCached = Math.max(0, Math.min(block.tokens, cached - legendConsumed));
+							const blockHit = block.tokens > 0 ? Math.round((blockCached / block.tokens) * 100) : 0;
+							const stateColor = blockHit >= 99 ? 'var(--good)' : blockHit >= 50 ? 'var(--warn)' : 'var(--bad)';
+							h += '<span class="struct-block" style="margin-right:10px"><span class="struct-dot" style="background:' + stateColor + '"></span><strong>' + esc(block.label) + '</strong> ' + FMT_SHORT(Math.round(block.tokens)) + ' · ' + blockHit + '%</span>';
+							legendConsumed += block.tokens;
+						}
+						h += '</div>';
+					}
+				}
 
 				// Composition: explain WHERE the uncached tokens came from.
 				const prevMsgCount = r.prefixPreviousMessageCount;
@@ -748,6 +962,8 @@ function render() {
 			// Performance
 			h += '<section class="detail-card"><h3>Performance</h3>';
 			if (r.lifecyclePhase) h += '<div class="kv"><span class="k">Lifecycle</span><span class="v ' + LIFECYCLE_TONE(r.lifecyclePhase) + '">' + esc(r.lifecyclePhase) + '</span></div>';
+			if (r.startedAtMs !== undefined) h += '<div class="kv"><span class="k">Started</span><span class="v">' + new Date(r.startedAtMs).toLocaleString() + '</span></div>';
+			if (r.gapSinceLastResponseMs !== undefined) h += '<div class="kv"><span class="k">Gap since prev turn</span><span class="v ' + (r.gapSinceLastResponseMs > 30000 ? 'tone-warn' : '') + '">' + DURATION(r.gapSinceLastResponseMs) + '</span></div>';
 			h += '<div class="kv"><span class="k">Duration</span><span class="v">' + (r.durationMs ?? 0) + ' ms' + '</span></div>';
 			h += '<div class="kv"><span class="k">Queue wait</span><span class="v">' + (r.queueWaitMs ?? 0) + ' ms' + '</span></div>';
 			if ((r.modelTurns ?? 1) > 1) h += '<div class="kv"><span class="k">Model turns</span><span class="v">' + r.modelTurns + ' (multi-step)</span></div>';
@@ -814,13 +1030,227 @@ function render() {
 	} else {
 		h += '<div class="empty">No turns recorded yet. Start a model turn to see live metrics here.</div>';
 	}
+	h += '</div>'; // tab-cache
+
+	h += '<div id="tab-perf" class="tab-panel" data-panel="perf" hidden>';
+	h += renderPerfTab(d);
+	h += '</div>';
+
+	h += '<div id="tab-errors" class="tab-panel" data-panel="errors" hidden>';
+	h += renderErrorsTab(d);
+	h += '</div>';
 
 	h += '</main>';
 	document.getElementById("app").innerHTML = h;
+	restoreTabState();
+}
+
+const ERROR_KIND_LABEL = {
+	turn_failed: "Turn failed",
+	turn_timed_out: "Turn timed out",
+	tool_rejected: "Tool rejected",
+	tool_repair_retry: "Tool repair retry",
+	tool_loop: "Tool loop",
+	api_overflow_retry: "API overflow retry",
+	resume_failed: "Session resume failed",
+	safety_stop: "Safety stop",
+};
+
+function renderErrorsTab(d) {
+	const errors = Array.isArray(d.errors) ? d.errors : [];
+	if (!errors.length) {
+		return '<div class="empty">No errors recorded. Failed turns, rejected tool calls and API problems will appear here.</div>';
+	}
+	let h = "";
+	const byKind = {};
+	for (const e of errors) byKind[e.kind] = (byKind[e.kind] || 0) + 1;
+	const chats = [...new Set(errors.map(e => e.conversationKey).filter(Boolean))];
+
+	h += '<section class="metric-grid" aria-label="Errors summary">';
+	h += '<article class="metric-card tone-bad"><div class="metric-label">Errors</div><div class="metric-value">' + FMT(errors.length) + '</div><div class="metric-caption">across ' + FMT(chats.length) + ' chat' + (chats.length === 1 ? '' : 's') + '</div></article>';
+	for (const [kind, count] of Object.entries(byKind).sort((a, b) => b[1] - a[1]).slice(0, 5)) {
+		h += '<article class="metric-card tone-warn"><div class="metric-label">' + esc(ERROR_KIND_LABEL[kind] || kind) + '</div><div class="metric-value">' + FMT(count) + '</div><div class="metric-caption">of ' + FMT(errors.length) + ' total</div></article>';
+	}
+	h += '</section>';
+
+	h += '<section class="section"><div class="section-heading"><h2>Error log</h2><span class="section-note">Turn number, chat and what happened — newest first</span></div>';
+	h += '<div class="turn-toolbar"><div class="turn-filters">';
+	if (chats.length > 1) {
+		h += '<select id="error-chat-filter" class="select" aria-label="Filter errors by chat"><option value="">All chats</option>';
+		for (const chat of chats) h += '<option value="' + escAttr(chat) + '">' + esc(chat.slice(0, 8)) + '</option>';
+		h += '</select>';
+	}
+	h += '</div></div>';
+	h += '<div class="table-shell"><table class="turn-table"><thead><tr>';
+	h += '<th>#</th><th>At</th><th>Chat</th><th>Model</th><th>Type</th><th>Details</th>';
+	h += '</tr></thead><tbody>';
+	const rows = [...errors].reverse();
+	for (const e of rows) {
+		h += '<tr class="error-row" data-error-chat="' + escAttr(String(e.conversationKey || '')) + '">';
+		h += '<td class="compact-number">#' + e.index + '</td>';
+		h += '<td class="compact-number" title="' + (e.startedAtMs !== undefined ? new Date(e.startedAtMs).toLocaleString() : '') + '">' + CLOCK(e.startedAtMs) + '</td>';
+		h += '<td class="compact-number" title="' + escAttr(String(e.conversationKey || 'unknown')) + '">' + (e.conversationKey ? esc(e.conversationKey.slice(0, 8)) : '—') + '</td>';
+		h += '<td class="model-cell" title="' + escAttr(String(e.modelId || '')) + '">' + esc(MODEL_LABEL(e.modelId)) + '</td>';
+		h += '<td><span class="reason-badge reason-' + escAttr(e.kind) + '">' + esc(ERROR_KIND_LABEL[e.kind] || e.kind) + (e.count > 1 ? ' ×' + e.count : '') + '</span></td>';
+		h += '<td class="error-detail" title="' + escAttr(e.detail) + '">' + esc(e.detail) + '</td>';
+		h += '</tr>';
+	}
+	h += '</tbody></table></div></section>';
+	return h;
+}
+
+function applyErrorFilters() {
+	const chat = document.getElementById("error-chat-filter")?.value || "";
+	document.querySelectorAll(".error-row").forEach(function(row) {
+		const matches = !chat || row.getAttribute("data-error-chat") === chat;
+		row.classList.toggle("hidden-row", !matches);
+	});
+}
+
+function renderPerfTab(d) {
+	const records = Array.isArray(d.records) ? d.records : [];
+	if (!records.length) {
+		return '<div class="empty">No turns recorded yet. Performance data appears as turns complete.</div>';
+	}
+	let h = "";
+	const median = (values) => {
+		if (!values.length) return undefined;
+		const s = [...values].sort((a, b) => a - b);
+		return s[Math.floor(s.length / 2)];
+	};
+	const pct = (values, p) => {
+		if (!values.length) return undefined;
+		const s = [...values].sort((a, b) => a - b);
+		return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
+	};
+	// Gaps that led into a tool-continuation round measure the renderer+plumbing
+	// pause inside one agent turn. Gaps that led into a fresh user turn include
+	// how long the user took to type — those are excluded from statistics.
+	const gapRecords = records.filter(r =>
+		typeof r.gapSinceLastResponseMs === "number" && r.gapKind !== "user"
+	);
+	const gaps = gapRecords.map(r => r.gapSinceLastResponseMs).filter(v => typeof v === "number");
+	const durs = records.map(r => r.durationMs).filter(v => typeof v === "number");
+	const ttfts = records.map(r => r.firstTokenLatencyMs).filter(v => typeof v === "number");
+	const ctks = records.map(r => r.hostTokenCountCalls).filter(v => typeof v === "number");
+	const chats = [...new Set(records.map(r => r.conversationKey).filter(Boolean))];
+
+	const perfMetric = (label, value, caption, tone) =>
+		'<article class="metric-card ' + (tone || 'tone-info') + '"><div class="metric-label">' + label + '</div><div class="metric-value">' + value + '</div><div class="metric-caption">' + caption + '</div></article>';
+
+	h += '<section class="metric-grid" aria-label="Performance summary">';
+	h += perfMetric("Gap med / p95", DURATION(median(gaps)) + ' / ' + DURATION(pct(gaps, 95)), 'Tool-round pauses only — user typing time excluded', gaps.length && median(gaps) > 60000 ? 'tone-warn' : 'tone-info');
+	h += perfMetric("Gap max", DURATION(gaps.length ? Math.max(...gaps) : undefined), 'Worst tool-round pause', gaps.length && Math.max(...gaps) > 120000 ? 'tone-bad' : 'tone-info');
+	h += perfMetric("Turn med / p95", DURATION(median(durs)) + ' / ' + DURATION(pct(durs, 95)), 'Provider duration — the model call itself', 'tone-purple');
+	h += perfMetric("TTFT med", DURATION(median(ttfts)), 'Time to first token inside the provider call', ttfts.length && median(ttfts) > 10000 ? 'tone-warn' : 'tone-info');
+	h += perfMetric("Host tokenizer", ctks.length ? median(ctks).toFixed(0) + ' calls' : 'n/a', 'Memoised countTokens RPCs per turn', ctks.length && median(ctks) > 10 ? 'tone-warn' : 'tone-good');
+	h += perfMetric("Turns tracked", FMT(records.length), 'From ' + FMT(records.length) + ' records · gap−turn ≈ Copilot-side time', 'tone-good');
+	h += '</section>';
+
+	// Gap histogram (tool gaps only)
+	if (gaps.length) {
+		const buckets = [
+			{ label: '<5s', max: 5000 }, { label: '5-15s', max: 15000 }, { label: '15-30s', max: 30000 },
+			{ label: '30-60s', max: 60000 }, { label: '60-120s', max: 120000 }, { label: '>120s', max: Infinity },
+		];
+		const counts = buckets.map(b => gaps.filter(g => g < b.max).length);
+		buckets.forEach((b, i) => { counts[i] = gaps.filter(g => g >= (i === 0 ? 0 : buckets[i - 1].max) && g < b.max).length; });
+		const maxCount = Math.max(1, ...counts);
+		h += '<section class="section"><div class="section-heading"><h2>Gap distribution</h2><span class="section-note">' + gaps.length + ' tool-round pauses (user gaps excluded)</span></div><div class="gap-hist">';
+		buckets.forEach((b, i) => {
+			h += '<div class="gap-hist-col" title="' + b.label + ': ' + counts[i] + ' turns">';
+			h += '<div class="gap-hist-bar" style="height:' + Math.max(4, (counts[i] / maxCount) * 60).toFixed(0) + 'px"></div>';
+			h += '<div class="gap-hist-count">' + counts[i] + '</div><div class="gap-hist-label">' + b.label + '</div>';
+			h += '</div>';
+		});
+		h += '</div></section>';
+	}
+
+	// Sparkline of recent tool gaps
+	if (gaps.length > 1) {
+		const recent = gaps.slice(-30);
+		const maxGap = Math.max(...recent, 1);
+		h += '<section class="section"><div class="section-heading"><h2>Recent gaps</h2><span class="section-note">last ' + recent.length + ' tool-round pauses — each bar is one pause</span></div><div class="spark">';
+		for (const g of recent) {
+			const tone = g > 120000 ? 'spark-bad' : g > 60000 ? 'spark-warn' : 'spark-good';
+			h += '<div class="spark-bar ' + tone + '" style="height:' + Math.max(3, (g / maxGap) * 48).toFixed(0) + 'px" title="' + DURATION(g) + '"></div>';
+		}
+		h += '</div></section>';
+	}
+
+	// Perf turn table with chat filter
+	h += '<section class="section turns-section"><div class="section-heading"><h2>Turn timeline</h2><span class="section-note">Gap &gt; 60s is highlighted; user gaps shown grey and excluded from stats</span></div>';
+	h += '<div class="turn-toolbar"><div class="turn-filters">';
+	if (chats.length > 1) {
+		h += '<select id="perf-chat-filter" class="select" aria-label="Filter performance by chat"><option value="">All chats</option>';
+		for (const chat of chats) h += '<option value="' + escAttr(chat) + '">' + esc(chat.slice(0, 8)) + '</option>';
+		h += '</select>';
+	}
+	h += '</div><span class="section-note">Chat filter isolates one conversation</span></div>';
+	h += '<div class="table-shell"><table class="turn-table"><thead><tr>';
+	h += '<th>At</th><th>Msgs</th><th>Gap</th><th>Turn</th><th>TTFT</th><th>Cache</th><th>Tokens</th><th>ctk</th>';
+	if (chats.length > 1) h += '<th>Chat</th>';
+	h += '<th>Model</th></tr></thead><tbody>';
+	const rows = [...records].sort((a, b) => (a.startedAtMs || 0) - (b.startedAtMs || 0));
+	for (const r of rows) {
+		const isUserGap = r.gapKind === "user" && typeof r.gapSinceLastResponseMs === "number";
+		const slow = !isUserGap && typeof r.gapSinceLastResponseMs === "number" && r.gapSinceLastResponseMs > 60000;
+		const bad = !isUserGap && typeof r.gapSinceLastResponseMs === "number" && r.gapSinceLastResponseMs > 120000;
+		h += '<tr class="perf-row' + (bad ? ' perf-bad' : slow ? ' perf-slow' : '') + '" data-perf-chat="' + escAttr(String(r.conversationKey || '')) + '">';
+		h += '<td class="compact-number" title="' + (r.startedAtMs !== undefined ? new Date(r.startedAtMs).toLocaleString() : '') + '">' + CLOCK(r.startedAtMs) + '</td>';
+		h += '<td class="compact-number">' + (r.messageCount !== undefined ? FMT(r.messageCount) : '—') + '</td>';
+		h += '<td class="compact-number ' + (isUserGap ? 'gap-user' : slow ? 'tone-warn' : '') + '" title="' + (isUserGap ? 'User gap — waiting for your next message, excluded from stats' : 'Pause before this tool round') + '">' + DURATION(r.gapSinceLastResponseMs) + (isUserGap ? ' u' : '') + '</td>';
+		h += '<td class="compact-number">' + DURATION(r.durationMs) + '</td>';
+		h += '<td class="compact-number">' + DURATION(r.firstTokenLatencyMs) + '</td>';
+		h += '<td class="' + HIT_COLOR(EFFECTIVE_HIT(r)) + '">' + PCT(EFFECTIVE_HIT(r)) + '</td>';
+		h += '<td class="compact-number" title="' + FMT(r.promptTokens) + ' processed tokens">' + FMT_SHORT(r.promptTokens) + '</td>';
+		h += '<td class="compact-number">' + (typeof r.hostTokenCountCalls === "number" ? r.hostTokenCountCalls : 'n/a') + '</td>';
+		if (chats.length > 1) h += '<td class="compact-number" title="' + escAttr(String(r.conversationKey || 'unknown')) + '">' + (r.conversationKey ? esc(r.conversationKey.slice(0, 8)) : '—') + '</td>';
+		h += '<td class="model-cell" title="' + escAttr(String(r.modelId || '')) + '">' + esc(MODEL_LABEL(r.modelId)) + '</td>';
+		h += '</tr>';
+	}
+	h += '</tbody></table></div></section>';
+	return h;
+}
+
+// Perf tab chat filter
+function applyPerfFilters() {
+	const chat = document.getElementById("perf-chat-filter")?.value || "";
+	document.querySelectorAll(".perf-row").forEach(function(row) {
+		const matches = !chat || row.getAttribute("data-perf-chat") === chat;
+		row.classList.toggle("hidden-row", !matches);
+	});
+}
+
+function switchTab(name) {
+	document.querySelectorAll(".tab-btn").forEach(b => {
+		const active = b.getAttribute("data-tab") === name;
+		b.classList.toggle("active", active);
+		b.setAttribute("aria-selected", String(active));
+	});
+	document.querySelectorAll(".tab-panel").forEach(p => {
+		p.hidden = p.getAttribute("data-panel") !== name;
+	});
+	if (name === "perf") applyPerfFilters();
+	if (name === "errors") applyErrorFilters();
+}
+
+function restoreTabState(state) {
+	const name = (state && state.tab) || "cache";
+	switchTab(name);
+	const perfChat = document.getElementById("perf-chat-filter");
+	if (perfChat && state && state.perfChat) perfChat.value = state.perfChat;
+	applyPerfFilters();
 }
 
 // Delegated click handler — avoids onclick attributes (stripped by VS Code Webview).
 document.addEventListener("click", function(e) {
+	const tabBtn = e.target.closest(".tab-btn");
+	if (tabBtn) {
+		switchTab(tabBtn.getAttribute("data-tab"));
+		return;
+	}
+
 	const issuesButton = e.target.closest("#issues-filter");
 	if (issuesButton) {
 		const active = !issuesButton.classList.contains("active");
@@ -886,7 +1316,9 @@ document.addEventListener("input", function(e) {
 	if (e.target.id === "turn-search") applyTurnFilters();
 });
 document.addEventListener("change", function(e) {
-	if (e.target.id === "model-filter") applyTurnFilters();
+	if (e.target.id === "model-filter" || e.target.id === "chat-filter") applyTurnFilters();
+	if (e.target.id === "perf-chat-filter") applyPerfFilters();
+	if (e.target.id === "error-chat-filter") applyErrorFilters();
 });
 
 function setRowOpen(row, open) {
@@ -903,12 +1335,14 @@ function setRowOpen(row, open) {
 function applyTurnFilters() {
 	const query = (document.getElementById("turn-search")?.value || "").trim().toLowerCase();
 	const model = document.getElementById("model-filter")?.value || "";
+	const chat = document.getElementById("chat-filter")?.value || "";
 	const issuesOnly = document.getElementById("issues-filter")?.classList.contains("active") || false;
 	document.querySelectorAll(".turn-row").forEach(function(row) {
 		const matchesQuery = !query || (row.getAttribute("data-search") || "").includes(query);
 		const matchesModel = !model || row.getAttribute("data-model") === model;
+		const matchesChat = !chat || row.getAttribute("data-chat") === chat;
 		const matchesIssue = !issuesOnly || row.getAttribute("data-issue") === "1";
-		const visible = matchesQuery && matchesModel && matchesIssue;
+		const visible = matchesQuery && matchesModel && matchesChat && matchesIssue;
 		row.classList.toggle("hidden-row", !visible);
 		const detail = document.getElementById(row.getAttribute("data-detail"));
 		if (detail) detail.classList.toggle("hidden-row", !visible);
@@ -938,6 +1372,9 @@ function captureViewState() {
 		openRows: saveOpenRows(),
 		query: document.getElementById("turn-search")?.value || "",
 		model: document.getElementById("model-filter")?.value || "",
+		chat: document.getElementById("chat-filter")?.value || "",
+		perfChat: document.getElementById("perf-chat-filter")?.value || "",
+		tab: document.querySelector(".tab-btn.active")?.getAttribute("data-tab") || "cache",
 		issuesOnly: document.getElementById("issues-filter")?.classList.contains("active") || false,
 	};
 }
@@ -945,15 +1382,18 @@ function captureViewState() {
 function restoreViewState(state) {
 	const search = document.getElementById("turn-search");
 	const model = document.getElementById("model-filter");
+	const chat = document.getElementById("chat-filter");
 	const issues = document.getElementById("issues-filter");
 	if (search) search.value = state.query;
 	if (model) model.value = state.model;
+	if (chat && state.chat) chat.value = state.chat;
 	if (issues) {
 		issues.classList.toggle("active", state.issuesOnly);
 		issues.setAttribute("aria-pressed", String(state.issuesOnly));
 	}
 	applyTurnFilters();
 	restoreOpenRows(state.openRows);
+	restoreTabState(state);
 }
 
 function esc(s) {
@@ -976,7 +1416,6 @@ function formatTurnText(r) {
 	lines.push("Duration: " + fmt(r.durationMs) + " ms");
 	lines.push((IS_STATEFUL(r) ? "First model event: " : "TTFT: ") + (r.firstTokenLatencyMs !== undefined ? r.firstTokenLatencyMs + " ms" : "n/a"));
 	lines.push("First visible text: " + (r.firstVisibleLatencyMs !== undefined ? r.firstVisibleLatencyMs + " ms" : "n/a"));
-	lines.push("Speed: " + (r.tokensPerSecond !== undefined ? r.tokensPerSecond.toFixed(1) + " tok/s" : "n/a"));
 	lines.push("Queue wait: " + fmt(r.queueWaitMs) + " ms");
 	lines.push("Model turns: " + fmt(r.modelTurns));
 

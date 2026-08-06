@@ -303,6 +303,8 @@ interface ConvertMessagesOptions {
 	toolResultMode?: ToolResultMode;
 	/** When false, image DataParts are converted to text placeholders instead of image_url blocks. */
 	supportsImageInput?: boolean;
+	/** Strip tool_calls from every assistant message (user tool-result mode: the server sees no tool-role responses at all). */
+	stripAllToolCalls?: boolean;
 }
 
 interface ConvertToolsOptions {
@@ -626,28 +628,39 @@ export function convertMessages(
 
 		merged.push(msg);
 	}
-	return sanitizeOrphanToolCalls(merged);
+	// In user mode results are plain user messages, so the server sees
+	// assistant tool_calls with no tool-role responses at all and rejects
+	// the sequence (DeepSeek 400). Strip all assistant tool_calls; the
+	// results remain in the transcript as user text.
+	return sanitizeOrphanToolCalls(
+		merged,
+		options?.stripAllToolCalls === true || toolResultMode !== "tool"
+	);
 }
 
 /**
- * Removes tool_calls from assistant messages that are not followed by
- * enough tool-result messages. OpenAI-compatible servers reject such
- * sequences with 400 "insufficient tool messages following tool_calls
+ * Removes tool_calls from assistant messages that are not immediately
+ * followed by enough tool-result messages. OpenAI-compatible servers reject
+ * such sequences with 400 "insufficient tool messages following tool_calls
  * message". Orphans appear when a turn was interrupted/steered while a
  * native tool card was still pending, or when a subagent context drops
  * tool results while keeping the assistant tool_calls message.
+ *
+ * In user tool-result mode the results are plain user messages, so the
+ * server sees assistant tool_calls with no tool-role responses at all —
+ * DeepSeek rejects those unconditionally. In that mode all assistant
+ * tool_calls are stripped (the results remain in the transcript as user
+ * text, so no information is lost).
  */
-function sanitizeOrphanToolCalls(messages: OpenAIChatMessage[]): OpenAIChatMessage[] {
+function sanitizeOrphanToolCalls(
+	messages: OpenAIChatMessage[],
+	stripAllToolCalls: boolean
+): OpenAIChatMessage[] {
 	const isToolResultLike = (message: OpenAIChatMessage): boolean =>
 		message.role === "tool"
 		|| (message.role === "user" && typeof message.content === "string"
 			&& (message.content.includes("[tool_result") || message.content.includes("call_id=")));
 	let stripped = 0;
-	// Suffix counts avoid O(n²) slice+filter scans on large chats.
-	const suffixResultCounts = new Array<number>(messages.length + 1).fill(0);
-	for (let i = messages.length - 1; i >= 0; i--) {
-		suffixResultCounts[i] = suffixResultCounts[i + 1] + (isToolResultLike(messages[i]) ? 1 : 0);
-	}
 	const sanitized = messages.map((message, index) => {
 		if (
 			message.role !== "assistant"
@@ -656,7 +669,14 @@ function sanitizeOrphanToolCalls(messages: OpenAIChatMessage[]): OpenAIChatMessa
 		) {
 			return message;
 		}
-		if (suffixResultCounts[index + 1] < message.tool_calls.length) {
+		// Count only the tool results IMMEDIATELY following this assistant
+		// message — a user text message in between breaks the required
+		// assistant(tool_calls) → tool(...) sequence for the server.
+		let followingResults = 0;
+		for (let j = index + 1; j < messages.length && isToolResultLike(messages[j]); j++) {
+			followingResults += 1;
+		}
+		if (stripAllToolCalls || followingResults < message.tool_calls.length) {
 			stripped += 1;
 			const rest: OpenAIChatMessage = { role: message.role, content: message.content };
 			if (message.reasoning_content !== undefined) {
@@ -737,22 +757,31 @@ export function convertTools(
 	}
 
 	const getToolPriority = (name: string): number => {
-		const directPriority: Record<string, number> = {
-			run_in_terminal: 200,
-			run_task: 198,
-			read_file: 195,
-			grep_search: 190,
-			file_search: 185,
-			list_dir: 180,
-			get_errors: 176,
-			llamacpp_search_memory: 175,
-			llamacpp_store_memory: 174,
-			semantic_search: 172,
-			vscode_listCodeUsages: 168,
-			replace_string_in_file: 164,
-			get_changed_files: 160,
-			create_file: 156,
-			create_and_run_task: 152,
+			// Editing tools must never fall out of the apiDirect catalog when it
+			// is capped at 70 tools: a missing multi_replace_string_in_file made
+			// the model call it → "unknown tool" → repair retry → visible
+			// duplicate edit attempts while nothing actually executed.
+			const directPriority: Record<string, number> = {
+				run_in_terminal: 200,
+				run_task: 198,
+				read_file: 195,
+				grep_search: 190,
+				file_search: 185,
+				list_dir: 180,
+				get_errors: 176,
+				llamacpp_search_memory: 175,
+				llamacpp_store_memory: 174,
+				semantic_search: 172,
+				vscode_listCodeUsages: 168,
+				multi_replace_string_in_file: 167,
+				edit_file: 166,
+				text_document_edit: 166,
+				apply_edit: 166,
+				replace_string_in_file: 164,
+				get_changed_files: 160,
+				create_file: 156,
+				delete_file: 154,
+				move_file: 153,
 			get_task_output: 150,
 			get_terminal_output: 148,
 			send_to_terminal: 144,
@@ -840,7 +869,7 @@ export function convertTools(
 
 		const countLimit = apiDirectIncludeAllTools
 			? apiDirectMaxTools
-			: Math.min(apiDirectMaxTools, 70);
+			: Math.min(apiDirectMaxTools, 100);
 		return stableTools.slice(0, countLimit);
 	})();
 

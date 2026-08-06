@@ -168,7 +168,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 
                 const deepSeekInfo = infos.find(info => info.id === "deepseek::deepseek-v4-pro");
                 assert.ok(deepSeekInfo);
-                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 65536);
+                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 131072);
             } finally {
                 providerAny.getModelSources = originalGetModelSources;
                 providerAny.getRuntimeContextLengthWithCache = originalGetRuntimeContextLengthWithCache;
@@ -1962,7 +1962,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                     name: undefined,
                 },
             ];
-            const out = convertMessages(messages);
+            const out = convertMessages(messages, { toolResultMode: "tool" });
             assert.strictEqual(out.length, 2);
             assert.strictEqual(out[0].role, "assistant");
             assert.strictEqual(out[0].content, "thinking...");
@@ -2098,6 +2098,63 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.strictEqual(out[1].role, "tool");
         });
 
+        test("strips tool_calls when a user message breaks the assistant→tool sequence", () => {
+            const callId = "call_broken_1";
+            const messages: vscode.LanguageModelChatMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.Assistant,
+                    content: [new vscode.LanguageModelToolCallPart(callId, "my_tool", { q: 1 })],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [new vscode.LanguageModelTextPart("steering text in between")],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.Assistant,
+                    content: [new vscode.LanguageModelToolCallPart("call_kept_2", "other_tool", {})],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [new vscode.LanguageModelToolResultPart("call_kept_2", [new vscode.LanguageModelTextPart("ok")])],
+                    name: undefined,
+                },
+            ];
+
+            const out = convertMessages(messages, { toolResultMode: "tool" });
+            // First assistant's call is orphaned (user text follows it); second is intact.
+            assert.strictEqual(out[0].role, "assistant");
+            assert.strictEqual(out[0].tool_calls, undefined, "broken assistant→tool sequence must strip tool_calls");
+            assert.strictEqual(out[1].role, "user");
+            assert.strictEqual(out[2].role, "assistant");
+            assert.ok(out[2].tool_calls && out[2].tool_calls.length === 1, "later complete round must keep tool_calls");
+        });
+
+        test("strips all assistant tool_calls in user tool-result mode", () => {
+            const callId = "call_user_mode_1";
+            const messages: vscode.LanguageModelChatMessage[] = [
+                {
+                    role: vscode.LanguageModelChatMessageRole.Assistant,
+                    content: [new vscode.LanguageModelToolCallPart(callId, "my_tool", { q: 1 })],
+                    name: undefined,
+                },
+                {
+                    role: vscode.LanguageModelChatMessageRole.User,
+                    content: [new vscode.LanguageModelToolResultPart(callId, [new vscode.LanguageModelTextPart("ok")])],
+                    name: undefined,
+                },
+            ];
+
+            const out = convertMessages(messages, { toolResultMode: "user" });
+            assert.strictEqual(out.length, 2);
+            assert.strictEqual(out[0].role, "assistant");
+            assert.strictEqual(out[0].tool_calls, undefined, "user mode must strip tool_calls (server sees no tool role)");
+            assert.strictEqual(out[1].role, "user");
+            assert.ok(String(out[1].content).includes("call_id="));
+        });
+
         test("preserves tool-result images for vision models", () => {
             const callId = "call_image_1";
             const imagePart = vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png");
@@ -2226,7 +2283,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 				role: vscode.LanguageModelChatMessageRole.User,
 				content: [new vscode.LanguageModelToolResultPart("", [new vscode.LanguageModelTextPart("ok")])],
 				name: undefined,
-			}]);
+			}], { toolResultMode: "tool" });
 			const second = convertMessages([{
 				role: vscode.LanguageModelChatMessageRole.Assistant,
 				content: [new vscode.LanguageModelToolCallPart("", "stable_tool", secondInput)],
@@ -2235,7 +2292,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 				role: vscode.LanguageModelChatMessageRole.User,
 				content: [new vscode.LanguageModelToolResultPart("", [new vscode.LanguageModelTextPart("ok")])],
 				name: undefined,
-			}]);
+			}], { toolResultMode: "tool" });
 
 			assert.strictEqual(first[0].tool_calls?.[0].id, second[0].tool_calls?.[0].id);
 			assert.strictEqual(

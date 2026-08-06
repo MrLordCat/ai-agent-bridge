@@ -8,6 +8,7 @@ import {
     CancellationToken,
     LanguageModelChatInformation,
     LanguageModelChatMessage,
+    LanguageModelChatRequestMessage,
     ProvideLanguageModelChatResponseOptions,
     LanguageModelResponsePart,
     Progress,
@@ -145,7 +146,17 @@ export interface LlamaChatTurnMetrics {
     threadReuseMissReason?: string;
     conversationKey?: string;
     durationMs: number;
+    /** Epoch ms when Copilot handed this turn to the provider. */
+    startedAtMs?: number;
+    /** Wall-clock pause between this conversation's previous completed turn and this request, measured by the provider. */
+    gapSinceLastResponseMs?: number;
+    /** Whether the gap led into a tool-continuation round ("tool") or a fresh user turn ("user"). */
+    gapKind?: "tool" | "user";
     queueWaitMs: number;
+    /** How many host-side token-count RPC calls this request caused (memoised to ~0). */
+    hostTokenCountCalls?: number;
+    /** Number of messages Copilot passed to the provider for this turn. */
+    messageCount?: number;
     firstTokenLatencyMs?: number;
     /** Time until the first user-visible assistant text, when distinct from first model activity. */
     firstVisibleLatencyMs?: number;
@@ -247,6 +258,8 @@ export interface LlamaChatContextUsageMetrics {
     messageCountBeforeCompact: number;
     messageCountAfterCompact: number;
     toolTokens: number;
+    /** Estimated tokens of system-role messages that lead the request. */
+    systemTokens?: number;
     /** Context tokens not attributed to compacted messages or tool schemas. */
     otherTokens?: number;
     replyReserveTokens: number;
@@ -279,6 +292,8 @@ interface CachePrefixSnapshot {
     staticFieldsHash: string;
     toolsHash: string;
     toolsCount: number;
+    /** Advertised tool names (sorted) — for a readable diff when toolsMatch fails. */
+    toolNames?: string[];
     systemHash?: string;
     messageParts: string[];
     messageChars: number;
@@ -289,6 +304,10 @@ interface StableToolCatalogSnapshot {
     toolChoice: ReturnType<typeof convertTools>["tool_choice"];
     fingerprint: string;
     updatedAt: number;
+    /** apiDirectMaxTools in effect when the snapshot was taken — a user change
+     *  to this setting invalidates the retained catalog so the new tool set
+     *  actually takes effect (at the cost of one cold prefix). */
+    maxToolsAtSnapshot?: number;
 }
 
 interface ConversationMessageSnapshot {
@@ -440,6 +459,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly lastCompactionSentAtByScope = new Map<string, number>();
     private readonly lastTurnCompactedByScope = new Map<string, boolean>();
     private readonly lastResponseEndedAtByScope = new Map<string, number>();
+    /**
+     * VS Code counts tokens one message at a time over the whole conversation
+     * before every agent round. Each call is a separate RPC, so the aggregate is
+     * reported with the next request to show how much of the inter-turn gap the
+     * host spends here.
+     */
+    private tokenCountCalls = 0;
+    private tokenCountChars = 0;
+    private tokenCountMs = 0;
     private deepSeekBalance: { summary: string; fetchedAt: number } | undefined;
     private deepSeekBalanceInflight: Promise<string | undefined> | undefined;
 
@@ -455,7 +483,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         private readonly userAgent: string,
         private readonly logger?: LlamaLogSink,
         private readonly sharedMemory?: SharedMemoryContextProvider,
-        private readonly globalState?: vscode.Memento
+        private readonly globalState?: vscode.Memento,
+        private readonly storagePath?: string
     ) {
         super(secrets);
         this.chatRequestQueue = new SerialRequestQueue(event => {
@@ -774,6 +803,64 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return createHash("sha256").update(value).digest("hex").slice(0, 16);
     }
 
+    private describeMessageShape(
+        messages: readonly vscode.LanguageModelChatRequestMessage[]
+    ): {
+        messageCount: number;
+        byRole: Record<string, number>;
+        totalChars: number;
+        toolCalls: number;
+        toolResults: number;
+        headRoles: string[];
+        tailRoles: string[];
+        largestChars: number;
+    } {
+        const byRole: Record<string, number> = {};
+        let totalChars = 0;
+        let toolCalls = 0;
+        let toolResults = 0;
+        let largestChars = 0;
+        for (const message of messages) {
+            const role = message.role === vscode.LanguageModelChatMessageRole.User
+                ? "user"
+                : message.role === vscode.LanguageModelChatMessageRole.Assistant
+                    ? "assistant"
+                    : "system";
+            byRole[role] = (byRole[role] ?? 0) + 1;
+            let chars = 0;
+            for (const part of message.content) {
+                if (part instanceof vscode.LanguageModelTextPart) {
+                    chars += part.value.length;
+                } else if (part instanceof vscode.LanguageModelToolCallPart) {
+                    toolCalls += 1;
+                    const rawInput = (part as unknown as { input?: unknown }).input;
+                    chars += (part.name ?? "").length + (typeof rawInput === "string" ? rawInput.length : 0);
+                } else if (part instanceof vscode.LanguageModelToolResultPart) {
+                    toolResults += 1;
+                }
+            }
+            totalChars += chars;
+            largestChars = Math.max(largestChars, chars);
+        }
+        const roles = messages.map(message =>
+            message.role === vscode.LanguageModelChatMessageRole.User
+                ? "u"
+                : message.role === vscode.LanguageModelChatMessageRole.Assistant
+                    ? "a"
+                    : "s"
+        );
+        return {
+            messageCount: messages.length,
+            byRole,
+            totalChars,
+            toolCalls,
+            toolResults,
+            headRoles: roles.slice(0, 8),
+            tailRoles: roles.slice(-8),
+            largestChars,
+        };
+    }
+
     private cachePrefixScope(
         modelId: string,
         options: ProvideLanguageModelChatResponseOptions
@@ -813,7 +900,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             return config;
         }
 
-        const availableNames = new Set((options.tools ?? []).map(tool => tool.name));
         // Sort tools by name for stable fingerprinting — VS Code can change
         // enumeration order between restarts.
         const sortedTools = Array.isArray(config.tools)
@@ -829,11 +915,38 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             message.role === "assistant"
             && message.tool_calls?.some(call => call.function.name.startsWith("activate_"))
         );
-        const previousStillAvailable = previous?.tools.every(tool =>
-            availableNames.has(tool.function.name)
-        ) === true;
+        // A user-visible config change (tool count cap) means the retained
+        // catalog is intentionally stale — apply the new set once instead of
+        // pinning the old one forever. Patch upgrades are deliberately NOT a
+        // reason: they happen often and each one would throw away a perfectly
+        // warm catalog (and the upstream prompt cache) for no user-visible gain.
+        const configMaxTools = vscode.workspace.getConfiguration("llamacpp")
+            .get<number>("apiDirectMaxTools", 100);
+        const configChanged = previous
+            && typeof previous.maxToolsAtSnapshot === "number"
+            && previous.maxToolsAtSnapshot !== configMaxTools;
+        if (configChanged) {
+            this.log("chat.tools.catalog_config_changed", {
+                requestId,
+                modelId,
+                previousToolCount: previous?.tools.length ?? 0,
+                currentToolCount: sortedTools.length,
+                previousMaxTools: previous?.maxToolsAtSnapshot,
+                currentMaxTools: configMaxTools,
+            });
+        }
 
-        if (previous && previousStillAvailable && !recentActivation) {
+        // Keep the previous catalog verbatim when the tool count is unchanged:
+        // MCP servers (chrome-devtools) register a different tool *set* between
+        // restarts while keeping the same count, and any catalog rewrite burns
+        // the whole upstream prefix. As long as the count matches, reuse the
+        // exact previous list so the prompt stays byte-identical. When the
+        // count differs, rebuild.
+        const countUnchanged = previous
+            && Array.isArray(config.tools)
+            && previous.tools.length === config.tools.length;
+
+        if (countUnchanged && !recentActivation && !configChanged) {
             this.stableToolCatalogs.delete(scope);
             this.stableToolCatalogs.set(scope, previous);
             if (previous.fingerprint !== currentFingerprint) {
@@ -844,6 +957,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     currentToolCount: config.tools.length,
                     retainedFingerprint: previous.fingerprint,
                     currentFingerprint,
+                    reason: "count-match",
                 });
             }
             return {
@@ -858,6 +972,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             toolChoice: config.tool_choice,
             fingerprint: currentFingerprint,
             updatedAt: Date.now(),
+            maxToolsAtSnapshot: configMaxTools,
         };
         this.stableToolCatalogs.set(scope, next);
         if (previous) {
@@ -916,6 +1031,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         staticFieldsHash: string,
         toolsHash: string,
         toolsCount: number,
+        toolNames: string[],
     ): { messages: OpenAIChatMessage[]; stabilized: boolean; prefix: Record<string, unknown> } {
         if (!scope) {
             return { messages, stabilized: false, prefix: { scope: "unavailable" } };
@@ -931,6 +1047,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             staticFieldsHash,
             toolsHash,
             toolsCount,
+            toolNames,
             systemHash,
             messageParts,
             messageChars,
@@ -965,6 +1082,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
         const staticFieldsMatch = previous?.staticFieldsHash === staticFieldsHash;
         const toolsMatch = previous?.toolsHash === toolsHash;
+        const previousToolNames = previous?.toolNames;
+        const removedTools = toolsMatch || !Array.isArray(previousToolNames)
+            ? []
+            : previousToolNames.filter(name => !toolNames.includes(name)).sort();
+        const addedTools = toolsMatch || !Array.isArray(previousToolNames)
+            ? []
+            : toolNames.filter(name => !previousToolNames.includes(name)).sort();
         const reusableMessagePercent = previous && staticFieldsMatch && toolsMatch && previous.messageChars > 0
             ? Number(((sharedMessagePrefixChars / previous.messageChars) * 100).toFixed(1))
             : previous ? 0 : undefined;
@@ -974,6 +1098,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             toolsHash,
             toolsCount,
             previousToolsCount: previous?.toolsCount,
+            removedTools,
+            addedTools,
             systemHash: messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined,
             systemChanged: previous !== undefined
                 && (previous.systemHash ?? undefined) !== systemHash,
@@ -1317,10 +1443,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             // model picker so Copilot Chat sees a 12.5% output reservation
             // while the full hard cap still applies to actual API requests.
             const advertisedCap = this.clampInt(
-                this.getConfig().get("deepSeekDefaultMaxOutputTokens", 65536),
+                this.getConfig().get("deepSeekDefaultMaxOutputTokens", 131072),
                 1024,
                 393216,
-                65536
+                131072
             );
             return Math.min(advertisedCap, configuredOutputCap, contextBound);
         }
@@ -1708,43 +1834,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private loadPersistedPrefixSnapshots(): void {
-        if (!this.globalState) {
+        const stored = this.readPersistedSessionState();
+        if (!stored) {
             return;
         }
         try {
-            // Clear stale snapshots saved by an older extension version whose
-            // tool ordering or hash computation may have differed.
-            // Only clear on MAJOR or MINOR version bumps — patch upgrades
-            // (1.8.27 → 1.8.28) keep the snapshots intact.
-            const savedVersion = this.globalState.get<string>(
-                LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY
-            );
-            const extVersion = vscode.extensions.getExtension("mrlordcat.llama-vscode-chat")
-                ?.packageJSON?.version;
-            const savedMinor = savedVersion?.split(".").slice(0, 2).join(".") ?? "";
-            const extMinor = extVersion?.split(".").slice(0, 2).join(".") ?? "";
-            if (savedMinor !== extMinor) {
-                const reason = !savedVersion ? "first_install" : "minor_version_changed";
-                this.log("chat.cache.prefix_snapshots_version_changed", {
-                    reason,
-                    savedVersion: savedVersion ?? "none",
-                    currentVersion: extVersion ?? "unknown",
-                });
-                void this.globalState.update(LlamaCppChatModelProvider.PREFIX_STATE_KEY, undefined);
-                void this.globalState.update(
-                    LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY,
-                    extVersion
-                );
-                return;
-            }
-            const stored = this.globalState.get<Record<string, CachePrefixSnapshot>>(
-                LlamaCppChatModelProvider.PREFIX_STATE_KEY
-            );
-            if (!stored || typeof stored !== "object") {
-                return;
-            }
             let loaded = 0;
-            for (const [scope, snapshot] of Object.entries(stored)) {
+            for (const [scope, snapshot] of Object.entries(stored.prefixSnapshots ?? {})) {
                 if (snapshot && typeof snapshot.staticFieldsHash === "string") {
                     this.cachePrefixSnapshots.set(scope, snapshot);
                     loaded += 1;
@@ -1758,19 +1854,137 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
     }
 
-    private async persistPrefixSnapshots(): Promise<void> {
+    /**
+     * Session state (prefix snapshots + continuation snapshots) lives in a file
+     * under globalStorageUri, not in globalState/state.vscdb: individual prefix
+     * snapshots of large chats reach multiple megabytes, and VS Code warns above
+     * ~10 MB of extension state (and serializes the whole blob on every turn).
+     * Kept out of vscdb entirely, so nothing is dropped for size anymore.
+     */
+    private sessionStateFilePath(): string | undefined {
+        if (!this.storagePath) {
+            return undefined;
+        }
+        try {
+            return path.join(this.storagePath, "session-state.json");
+        } catch {
+            return undefined;
+        }
+    }
+
+    private readPersistedSessionState(): {
+        prefixSnapshots?: Record<string, CachePrefixSnapshot>;
+        conversations?: Record<string, ConversationMessageSnapshot>;
+        toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
+    } | undefined {
+        if (!this.globalState) {
+            return undefined;
+        }
+        try {
+            const extVersion = vscode.extensions.getExtension("mrlordcat.llama-vscode-chat")
+                ?.packageJSON?.version;
+            const savedVersion = this.globalState.get<string>(
+                LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY
+            );
+            const savedMinor = savedVersion?.split(".").slice(0, 2).join(".") ?? "";
+            const extMinor = extVersion?.split(".").slice(0, 2).join(".") ?? "";
+            if (savedMinor !== extMinor) {
+                const reason = !savedVersion ? "first_install" : "minor_version_changed";
+                this.log("chat.cache.prefix_snapshots_version_changed", {
+                    reason,
+                    savedVersion: savedVersion ?? "none",
+                    currentVersion: extVersion ?? "unknown",
+                });
+                if (extVersion) {
+                    void this.globalState.update(
+                        LlamaCppChatModelProvider.PREFIX_STATE_VERSION_KEY,
+                        extVersion
+                    );
+                }
+                return undefined;
+            }
+
+            const filePath = this.sessionStateFilePath();
+            let fileState: {
+                prefixSnapshots?: Record<string, CachePrefixSnapshot>;
+                conversations?: Record<string, ConversationMessageSnapshot>;
+                toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
+            } | undefined;
+            if (filePath) {
+                try {
+                    const raw = fs.readFileSync(filePath, "utf8");
+                    if (raw) {
+                        fileState = JSON.parse(raw) as typeof fileState;
+                    }
+                } catch (error) {
+                    this.logError("chat.cache.session_state_file_read_failed", error);
+                }
+            }
+
+            if (fileState && (
+                Object.keys(fileState.prefixSnapshots ?? {}).length > 0
+                || Object.keys(fileState.conversations ?? {}).length > 0
+            )) {
+                return fileState;
+            }
+
+            // Migration from the old globalState-backed store: read it once and
+            // clear the large keys so state.vscdb shrinks back.
+            const legacyPrefix = this.globalState.get<Record<string, CachePrefixSnapshot>>(
+                LlamaCppChatModelProvider.PREFIX_STATE_KEY
+            );
+            const legacyContinuation = this.globalState.get<{
+                conversations?: Record<string, ConversationMessageSnapshot>;
+                toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
+            }>(LlamaCppChatModelProvider.CONTINUATION_STATE_KEY);
+            if (legacyPrefix || legacyContinuation) {
+                void this.globalState.update(LlamaCppChatModelProvider.PREFIX_STATE_KEY, undefined);
+                void this.globalState.update(LlamaCppChatModelProvider.CONTINUATION_STATE_KEY, undefined);
+                this.log("chat.cache.session_state_migrated_from_vscdb", {
+                    prefixEntries: Object.keys(legacyPrefix ?? {}).length,
+                    continuationEntries: Object.keys(legacyContinuation ?? {}).length,
+                });
+                return {
+                    prefixSnapshots: legacyPrefix ?? {},
+                    conversations: legacyContinuation?.conversations ?? {},
+                    toolCatalogs: legacyContinuation?.toolCatalogs ?? {},
+                };
+            }
+            return undefined;
+        } catch (error) {
+            this.logError("chat.cache.prefix_snapshots_load_failed", error);
+            return undefined;
+        }
+    }
+
+    private async persistSessionState(): Promise<void> {
         if (!this.globalState) {
             return;
         }
         try {
-            const serializable: Record<string, CachePrefixSnapshot> = {};
-            for (const [scope, snapshot] of this.cachePrefixSnapshots) {
-                serializable[scope] = snapshot;
+            const filePath = this.sessionStateFilePath();
+            if (!filePath) {
+                return;
             }
-            await this.globalState.update(
-                LlamaCppChatModelProvider.PREFIX_STATE_KEY,
-                serializable
-            );
+            const prefixSnapshots: Record<string, CachePrefixSnapshot> = {};
+            for (const [scope, snapshot] of this.cachePrefixSnapshots) {
+                prefixSnapshots[scope] = snapshot;
+            }
+            const conversations: Record<string, ConversationMessageSnapshot> = {};
+            for (const [scope, snapshot] of this.conversationMessageSnapshots) {
+                conversations[scope] = snapshot;
+            }
+            const toolCatalogs: Record<string, StableToolCatalogSnapshot> = {};
+            for (const [scope, snapshot] of this.stableToolCatalogs) {
+                toolCatalogs[scope] = snapshot;
+            }
+            const payload = JSON.stringify({ prefixSnapshots, conversations, toolCatalogs });
+            const tmpPath = filePath + ".tmp";
+            fs.mkdirSync(path.dirname(filePath), { recursive: true });
+            fs.writeFileSync(tmpPath, payload, "utf8");
+            fs.renameSync(tmpPath, filePath);
+            // The version marker stays small in globalState; large payloads no
+            // longer live there.
             const extVersion = vscode.extensions.getExtension("mrlordcat.llama-vscode-chat")
                 ?.packageJSON?.version;
             if (extVersion) {
@@ -1780,8 +1994,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 );
             }
         } catch (error) {
-            this.logError("chat.cache.prefix_snapshots_persist_failed", error);
+            this.logError("chat.cache.session_state_persist_failed", error);
         }
+    }
+
+    private async persistPrefixSnapshots(): Promise<void> {
+        await this.persistSessionState();
     }
 
     private isOpenAIChatMessage(value: unknown): value is OpenAIChatMessage {
@@ -1826,17 +2044,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private loadPersistedContinuationState(): void {
-        if (!this.globalState) {
+        const stored = this.readPersistedSessionState();
+        if (!stored) {
             return;
         }
         try {
-            const stored = this.globalState.get<{
-                conversations?: Record<string, ConversationMessageSnapshot>;
-                toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
-            }>(LlamaCppChatModelProvider.CONTINUATION_STATE_KEY);
             let loadedConversations = 0;
             let loadedToolCatalogs = 0;
-            for (const [scope, snapshot] of Object.entries(stored?.conversations ?? {})) {
+            for (const [scope, snapshot] of Object.entries(stored.conversations ?? {})) {
                 if (
                     scope
                     && snapshot
@@ -1852,7 +2067,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     loadedConversations += 1;
                 }
             }
-            for (const [scope, snapshot] of Object.entries(stored?.toolCatalogs ?? {})) {
+            for (const [scope, snapshot] of Object.entries(stored.toolCatalogs ?? {})) {
                 if (
                     scope
                     && snapshot
@@ -1905,25 +2120,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private async persistContinuationState(): Promise<void> {
-        if (!this.globalState) {
-            return;
-        }
-        try {
-            const conversations: Record<string, ConversationMessageSnapshot> = {};
-            const toolCatalogs: Record<string, StableToolCatalogSnapshot> = {};
-            for (const [scope, snapshot] of this.conversationMessageSnapshots) {
-                conversations[scope] = snapshot;
-            }
-            for (const [scope, snapshot] of this.stableToolCatalogs) {
-                toolCatalogs[scope] = snapshot;
-            }
-            await this.globalState.update(
-                LlamaCppChatModelProvider.CONTINUATION_STATE_KEY,
-                { conversations, toolCatalogs }
-            );
-        } catch (error) {
-            this.logError("chat.continuation.state_persist_failed", error);
-        }
+        await this.persistSessionState();
     }
 
     protected async processStreamingResponse(
@@ -2598,6 +2795,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return sortedEntries;
     }
 
+    override async provideTokenCount(
+        model: LanguageModelChatInformation,
+        text: string | LanguageModelChatRequestMessage,
+        token: CancellationToken
+    ): Promise<number> {
+        const startedAt = Date.now();
+        try {
+            return await super.provideTokenCount(model, text, token);
+        } finally {
+            this.tokenCountCalls += 1;
+            this.tokenCountMs += Date.now() - startedAt;
+            this.tokenCountChars += typeof text === "string" ? text.length : 0;
+        }
+    }
+
     /**
      * Provides a chat response from the Llama.cpp model.
      * Sends a chat completion request to the server and processes the streaming response.
@@ -2635,17 +2847,36 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const lastResponseEndedAt = conversationScope
             ? this.lastResponseEndedAtByScope.get(conversationScope)
             : undefined;
+        let gapSinceLastResponseMs: number | undefined;
+        const isToolRound = messages.length > 0
+            && messages[messages.length - 1].content.some(
+                part => part instanceof vscode.LanguageModelToolResultPart
+            );
         if (lastResponseEndedAt !== undefined) {
+            gapSinceLastResponseMs = Date.now() - lastResponseEndedAt;
             this.log("chat.request.arrived", {
                 requestId,
                 messageCount: messages.length,
-                gapSinceLastResponseMs: Date.now() - lastResponseEndedAt,
-                toolResultRound: messages.length > 0
-                    && messages[messages.length - 1].content.some(
-                        part => part instanceof vscode.LanguageModelToolResultPart
-                    ),
+                gapSinceLastResponseMs,
+                gapKind: isToolRound ? "tool" : "user",
+                toolResultRound: isToolRound,
+                hostTokenCounting: {
+                    calls: this.tokenCountCalls,
+                    busyMs: this.tokenCountMs,
+                    chars: this.tokenCountChars,
+                },
             });
         }
+        const hostTokenCountCalls = this.tokenCountCalls;
+        this.tokenCountCalls = 0;
+        this.tokenCountMs = 0;
+        this.tokenCountChars = 0;
+        // Shape of the incoming conversation — which roles, how much text and how
+        // many tool calls. A "history" cap can silently stop working when Copilot
+        // starts feeding the prompt from a different source, and this log makes
+        // that visible without a profiler.
+        const shape = this.describeMessageShape(messages);
+        this.log("chat.request.shape", { requestId, ...shape });
         const imageInputSupported = model.capabilities?.imageInput === true;
         const processedMessages = imageInputSupported
             ? messages
@@ -2740,7 +2971,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             && cfg.get<boolean>("preserveThinking", true) !== false;
         const toolResultModeConfig = this.normalizeToolResultMode(cfg.get("toolResultMode", "auto"));
         const toolCallingModeConfig = this.normalizeToolCallingMode(cfg.get("toolCallingMode", "apiDirect"));
-        const apiDirectMaxTools = this.clampInt(cfg.get("apiDirectMaxTools", 70), 1, 128, 70);
+        const apiDirectMaxTools = this.clampInt(cfg.get("apiDirectMaxTools", 100), 1, 128, 100);
         const apiDirectIncludeAllTools = cfg.get<boolean>("apiDirectIncludeAllTools", false) === true;
         const apiDirectToolTokenBudget = this.clampInt(cfg.get("apiDirectToolTokenBudget", 12000), 256, 65536, 12000);
         const knowledgeMode = normalizeKnowledgeMode(cfg.get("knowledgeMode", "adaptive"));
@@ -2761,6 +2992,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             source: source.key,
             serverUrl,
             messageCount: messages.length,
+            // How many tools VS Code actually advertised vs how many survived
+            // our catalog build — answers "I see 109 tools, why only 79?".
+            advertisedToolCount: Array.isArray(options.tools) ? options.tools.length : 0,
             requestedModelOptions: this.cloneForLog(options.modelOptions),
             settings: {
                 contextLength,
@@ -2817,6 +3051,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             apiDirectIncludeAllTools,
             apiDirectToolTokenBudget,
         });
+        if (Array.isArray(convertedToolConfig.tools)) {
+            this.log("chat.tools.catalog_converted", {
+                requestId,
+                modelId: requestModelId,
+                advertised: Array.isArray(options.tools) ? options.tools.length : 0,
+                converted: convertedToolConfig.tools.length,
+                tokenEstimate: this.estimateToolTokens(convertedToolConfig.tools),
+            });
+        }
         const toolConfig = this.stabilizeToolCatalog(
             requestModelId,
             options,
@@ -2859,6 +3102,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const converted = convertMessages(processedMessages, {
                 toolResultMode: mode,
                 supportsImageInput: imageInputSupported,
+                // In user mode results are plain user messages, so the server
+                // sees assistant tool_calls with no tool-role responses at all
+                // and rejects them (DeepSeek 400). Strip them; the results stay
+                // in the transcript as user text.
+                stripAllToolCalls: mode === "user",
             });
             const withReasoning = this.injectStoredReasoningContent(converted);
             const withKnowledge = injectKnowledgeSystemPrompt(withReasoning, knowledgeSystemPrompt);
@@ -2906,7 +3154,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             modelMaxOutputTokens: model.maxOutputTokens,
             hardCap: maxOutputCap,
             localDefault: this.clampInt(cfg.get("localDefaultMaxOutputTokens", 32768), 1024, 131072, 32768),
-            deepSeekDefault: this.clampInt(cfg.get("deepSeekDefaultMaxOutputTokens", 65536), 1024, 393216, 65536),
+            deepSeekDefault: this.clampInt(cfg.get("deepSeekDefaultMaxOutputTokens", 131072), 1024, 393216, 131072),
             deepSeekMaximum: DEEPSEEK_MAX_OUTPUT_TOKENS,
         });
         const { defaultMaxTokens: defaultMaxOutputTokens, requestedMaxTokens } = outputBudget;
@@ -3263,7 +3511,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const toolsHash = this.shortHash(stableJsonStringify(toolsForHash));
             const stabilized = this.stabilizeMessagePrefix(
                 requestId, requestModelId, conversationScope, prepared.messages, staticFieldsHash, toolsHash,
-                Array.isArray(cappedToolConfig.tools) ? cappedToolConfig.tools.length : 0
+                Array.isArray(cappedToolConfig.tools) ? cappedToolConfig.tools.length : 0,
+                Array.isArray(cappedToolConfig.tools)
+                    ? (cappedToolConfig.tools as Array<{ function?: { name?: string } }>)
+                        .map(tool => tool.function?.name ?? "")
+                        .filter(Boolean)
+                    : []
             );
             requestBody.messages = stabilized.messages;
             this.setConversationMessageSnapshot(
@@ -3285,6 +3538,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 replyReserve
             );
 
+            // System-role messages (knowledge prompt, custom prompt) lead the
+            // request. Split them out so the live report can show the input
+            // structure (system → tools → messages) and where the cache break
+            // actually lands.
+            let systemTokensEstimate = 0;
+            for (const budgetMessage of prepared.messages) {
+                if (budgetMessage.role === "system" && typeof budgetMessage.content === "string") {
+                    systemTokensEstimate += Math.ceil(budgetMessage.content.length / 4);
+                }
+            }
             latestContextUsage = {
                 requestId,
                 modelId: model.id,
@@ -3298,6 +3561,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 messageCountBeforeCompact: prepared.initialMessageCount,
                 messageCountAfterCompact: prepared.finalMessageCount,
                 toolTokens: toolTokenCount,
+                systemTokens: systemTokensEstimate || undefined,
                 replyReserveTokens: replyReserve,
                 cappedTools,
                 autoCompacted: prepared.autoCompacted,
@@ -3663,6 +3927,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 });
                 let roundServerUsage: ChatTokenUsage | undefined;
                 try {
+                    // Tell the base stream handler which setting actually lifts
+                    // max_tokens so its stop hint does not mislead the user.
+                    this.outputLimitHintSetting = resolvedFamily === "deepseek"
+                        ? "llamacpp.deepSeekDefaultMaxOutputTokens"
+                        : "llamacpp.maxOutputTokensCap";
                     roundServerUsage = await this.processStreamingResponse(responseBody, measuredProgress, token);
                     await streamLogTask;
                     mergeReliabilityMetrics(this.consumeToolCallReliabilityMetrics());
@@ -3887,7 +4156,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     ? this.shortHash(options.modelOptions._copilotConversationId)
                     : undefined,
                 durationMs: finishedAt - turnStartedAt,
+                startedAtMs: turnStartedAt,
+                gapSinceLastResponseMs,
+                hostTokenCountCalls,
+                messageCount: messages.length,
                 queueWaitMs,
+                gapKind: gapSinceLastResponseMs !== undefined
+                    ? (isToolRound ? "tool" : "user")
+                    : undefined,
                 firstTokenLatencyMs,
                 emittedParts,
                 outputChars,
@@ -3948,6 +4224,41 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             } else {
                 this.logError("chat.turn.failed", err, { requestId });
                 console.error("[Llama.cpp Provider] Chat request failed", err);
+                // Surface the failure to the session report / live panel: failed
+                // turns were previously invisible there, so tool/API problems
+                // "quietly passed" without a trace in the dashboard.
+                const failedMetrics: LlamaChatTurnMetrics = {
+                    requestId,
+                    modelId: model.id,
+                    providerKind: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                    lifecyclePhase: "failed",
+                    terminalDetail: err instanceof Error ? err.message : String(err),
+                    conversationKey: typeof options.modelOptions?._copilotConversationId === "string"
+                        ? this.shortHash(options.modelOptions._copilotConversationId)
+                        : undefined,
+                    durationMs: Date.now() - turnStartedAt,
+                    startedAtMs: turnStartedAt,
+                    queueWaitMs: chatSlot?.waitMs ?? 0,
+                    emittedParts: 0,
+                    outputChars: 0,
+                    thinkingChars: 0,
+                    estimatedOutputTokens: 0,
+                    outputTokens: 0,
+                    promptTokens: 0,
+                    cachedPromptTokens: 0,
+                    repairedToolCalls: 0,
+                    rejectedToolCalls: 0,
+                    schemaRejectedToolCalls: 0,
+                    toolCallRepairRetries: 0,
+                    toolLoopDetected: false,
+                    toolCalls: 0,
+                    delegatedToolCalls: 0,
+                    catalogToolCalls: 0,
+                    usageEstimated: true,
+                    retriedAfterOverflow: false,
+                    modelTurns: 1,
+                };
+                this._onDidCompleteChatTurn.fire(failedMetrics);
             }
             throw err;
         } finally {

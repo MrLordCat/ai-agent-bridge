@@ -53,6 +53,9 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     /** Track whether we already emitted a max-length hint in the current response stream. */
     private _emittedLengthFinishHint = false;
 
+    /** Which setting actually raises the sent max_tokens; DeepSeek differs from the local default. */
+    protected outputLimitHintSetting = "llamacpp.maxOutputTokensCap";
+
     // Lightweight tokenizer state for tool calls embedded in text
     private _textToolParserBuffer = "";
     private _textToolActive:
@@ -667,7 +670,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             if (!this._emittedLengthFinishHint) {
                 progress.report(
                     new vscode.LanguageModelTextPart(
-                        "\n\n[output stopped: reached max output tokens; increase llamacpp.maxOutputTokensCap if needed]"
+                        `\n\n[output stopped: reached max output tokens; increase ${this.outputLimitHintSetting} if needed]`
                     )
                 );
                 this._emittedLengthFinishHint = true;

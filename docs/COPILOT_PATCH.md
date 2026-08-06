@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. `scripts/patch-copilot-chat.mjs` is a thin development
 CLI over that same implementation, so runtime and repository commands cannot
-drift apart. Patch v16 makes the following changes:
+drift apart. Patch v19 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -88,6 +88,21 @@ drift apart. Patch v16 makes the following changes:
   serializes them into persisted chat history;
 - binary and other non-text tool payloads are replaced by a compact history
   placeholder. The live tool card is unaffected.
+- the tokenizer for extension-contributed models memoises token counts by
+  content. Copilot otherwise calls `LanguageModelChat.countTokens` once per
+  message, text part and tool-schema key on every agent round — measured at
+  14 637 sequential round trips and ~155s of wall clock per round on a
+  1 500-message conversation, while the provider itself spent 11ms on them.
+  Built-in models already use a cached local tokenizer.
+- the rendered agent history is capped for llama.cpp models
+  (`llamacpp.agentHistoryRounds`, default 400 tool-call rounds, 0 disables the
+  cap). Copilot's prompt-tsx builds a node tree from every tool-call round and
+  walks it repeatedly for token accounting and node coalescing, so a
+  1 500-message conversation costs minutes of host CPU per step even after the
+  token-count RPCs are memoised. The oldest 20% of rounds are kept as a stable
+  prefix for the upstream prompt cache plus the newest rounds; the cap only
+  trims what is rendered into the prompt — the persisted chat session is never
+  modified.
 
 The extension maps native values to its request modes:
 

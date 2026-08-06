@@ -4,12 +4,17 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v17";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v21";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
-export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v1";
+export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v2";
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
+export const VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER = "/* llama-vscode-chat:vscode-chat-history-bounds:v1 */";
 
 const LEGACY_PATCH_MARKERS = [
+	"/* llama-vscode-chat:copilot-native-model-controls:v20 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v19 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v18 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v17 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v16 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v15 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v14 */",
@@ -215,9 +220,26 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 		return source;
 	}
 
+	// Upgrade path: v1 already replaced the serializer call sites, so only the
+	// helper itself needs the CPR sanitizer. Reuse the v1 call sites as-is.
+	if (source.includes(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER)) {
+		const upgraded = replaceOnce(
+			source,
+			"function __llamaBoundToolText(e){if(typeof e!=\"string\"||e.length<=12000)return e;",
+			`${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){` +
+				'if(typeof e!="string")return e;' +
+				'e=e.replace(/\\x1b\\[[\\d;]*R/g,"");' +
+				'if(e.length<=12000)return e;',
+			"terminal tool output CPR sanitizer upgrade"
+		);
+		return upgraded.replace(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER, "");
+	}
+
 	const helper =
 		`${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){` +
-		'if(typeof e!="string"||e.length<=12000)return e;' +
+		'if(typeof e!="string")return e;' +
+		'e=e.replace(/\\x1b\\[[\\d;]*R/g,"");' +
+		'if(e.length<=12000)return e;' +
 		'let t="\\n...["+(e.length-12000)+" stored tool-output characters omitted]...\\n",' +
 		'o=Math.max(0,12000-t.length),n=Math.floor(o*.35);' +
 		'return e.slice(0,n)+t+e.slice(-(o-n))}' +
@@ -382,6 +404,81 @@ export function patchCopilotBundle(source: string): string {
 		'$1.tools=$2.tools?.slice().sort((a,b)=>{let x=a.name,y=b.name;return x<y?-1:x>y?1:0}).map($3=>({type:"function",function:{name:$3.name,description:$3.description,parameters:$3.inputSchema&&Object.keys($3.inputSchema).length?$3.inputSchema:void 0}}))',
 		"deterministic tool ordering"
 	);
+	// Copilot's prompt renderer (prompt-tsx) walks and rebalances the whole element
+	// tree on every step, so a 1500-message conversation costs minutes of host CPU
+	// per agent round even when token counts are cached. Cap the rendered history
+	// for llama.cpp: keep the oldest 20% of tool-call rounds (stable prefix for the
+	// upstream prompt cache) plus the newest rounds. llamacpp.agentHistoryRounds=0
+	// disables the cap.
+	patched = replacePatternOnce(
+		patched,
+		/_=o\.userQueryTagName,w=o\.ReminderInstructionsClass,E=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
+		'_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;' +
+			'let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;' +
+			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+			'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
+			'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
+			'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
+			'let __llamaHead=Math.floor(__llamaCap*.2);' +
+			'__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}' +
+			'if(Array.isArray(__llamaResults)&&__llamaResults.length>__llamaCap)' +
+			'__llamaResults=__llamaResults.slice(__llamaResults.length-__llamaCap)}' +
+			'return this.props.enableSummarization?',
+		"extension model agent history cap"
+	);
+	patched = replaceOnce(
+		patched,
+		'toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1',
+		'toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:v,enableCacheBreakpoints:!1',
+		"extension model agent history cap wiring"
+	);
+	// The history element (dl) is shared by every agent prompt — the main Agent
+	// prompt plus the specialised editing/exploring agents. Cap the rounds there
+	// too so chats that render through another agent class get the same bound.
+	// toolCallResults is left untouched: it is a lookup map, never rendered, and
+	// the round renderer needs it to resolve results for the retained head.
+	patched = replaceOnce(
+		patched,
+		'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;',
+		'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
+			'let __llamaRounds=this.props.toolCallRounds;' +
+			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+			'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
+			'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
+			'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
+			'let __llamaHead=Math.floor(__llamaCap*.2);' +
+			'__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}}',
+		"agent history element cap"
+	);
+	patched = replaceOnce(
+		patched,
+		'l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));',
+		'l=__llamaRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,__llamaRounds.length,s,c,a));',
+		"agent history element cap wiring"
+	);
+	// Rounds only bound the current request. Everything before it arrives as prior
+	// conversation turns, and a CPU profile of a 1573-message chat put 35% of the
+	// host time in prompt-tsx token accounting and 29% in its node-removal walk,
+	// both proportional to the materialised tree. Bound the turns handed to the
+	// prompt at their single construction site. The retained head plus a stepped
+	// drop keep the rendered prefix byte-stable between step boundaries, so the
+	// upstream prompt cache survives.
+	patched = replacePatternOnce(
+		patched,
+		/let ([A-Za-z_$][\w$]*)=this\.options\.conversation\.turns\.slice\(0,-1\)\.filter\(([A-Za-z_$][\w$]*)=>\2\.responseStatus!=="prompt-filtered"\);return\{requestId:this\.turn\.id,query:([A-Za-z_$][\w$]*),history:\1,/,
+		'let $1=this.options.conversation.turns.slice(0,-1).filter($2=>$2.responseStatus!=="prompt-filtered");' +
+			'if(this.options.request?.model?.vendor==="llamacpp"){' +
+			"let __llamaTurnCap=globalThis.__llamaAgentHistoryTurns;" +
+			"if(!Number.isFinite(__llamaTurnCap)||__llamaTurnCap<1)__llamaTurnCap=80;" +
+			"else __llamaTurnCap=Math.min(Math.floor(__llamaTurnCap),2000);" +
+			"if($1.length>__llamaTurnCap){" +
+			"let __llamaHead=Math.floor(__llamaTurnCap*.2)," +
+			"__llamaStep=Math.max(1,Math.floor(__llamaTurnCap*.1))," +
+			"__llamaDrop=Math.floor(($1.length-__llamaTurnCap)/__llamaStep)*__llamaStep;" +
+			"if(__llamaDrop>0)$1=$1.slice(0,__llamaHead).concat($1.slice(__llamaHead+__llamaDrop))}}" +
+			"return{requestId:this.turn.id,query:$3,history:$1,",
+		"extension model agent history turn cap"
+	);
 	// Prevent auto-compaction after reload — Copilot restores full history and compacts it
 	// when message tokens exceed softInputTarget, invalidating both Copilot and upstream caches.
 	// For llama.cpp, set the render budget to unlimited so the trimming loop never executes.
@@ -436,7 +533,60 @@ export function patchCopilotBundle(source: string): string {
 		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==this._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
 		"tool catalog stabilisation after reload"
 	);
+	patched = patchExtensionTokenizerCache(patched);
 	return patched;
+}
+
+/**
+ * Copilot counts tokens for extension-contributed models by calling
+ * `LanguageModelChat.countTokens` once per message, per text part and per tool
+ * schema key, sequentially, with no cache — measured at ~14.6k round trips and
+ * ~155s of wall clock per agent round on a large conversation. Built-in models
+ * use a local tokenizer with an LRU. Content-keyed memoisation removes the
+ * repeats; token counts for identical content never change.
+ */
+export function patchExtensionTokenizerCache(source: string): string {
+	// Copilot builds a fresh tokenizer for every acquireTokenizer() call, so the cache
+	// lives on the class object, which is module-scoped and outlives the instances.
+	const lazyState =
+		"let __llamaT=this.constructor," +
+		"__llamaC=__llamaT.__llamaTokenCache||(__llamaT.__llamaTokenCache=new Map())," +
+		"__llamaH=__llamaT.__llamaTokenHash||(__llamaT.__llamaTokenHash=s=>{let a=2166136261;" +
+		"for(let i=0;i<s.length;i++){a^=s.charCodeAt(i);a=Math.imul(a,16777619)}" +
+		'return(a>>>0).toString(36)}),' +
+		'__llamaM=(this.languageModel.id||this.languageModel.family||"")+"|";';
+	return replacePatternOnceWith(
+		source,
+		/async _textTokenLength\(([A-Za-z_$][\w$]*)\)\{return \1\?this\.languageModel\.countTokens\(\1\):0\}async countMessageTokens\(([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\[\2\],\{emitCacheBreakpoints:([A-Za-z_$][\w$]*)\(this\.languageModel\.vendor\)\}\);if\(\3\.length===0\)return 0;let ([A-Za-z_$][\w$]*)=await this\.languageModel\.countTokens\(\3\[0\]\);return ([A-Za-z_$][\w$]*)\+\6\}/,
+		match => {
+			const [, text, message, raw, toRaw, breakpoints, count, base] = match;
+			return (
+				`async _textTokenLength(${text}){` +
+				`if(!${text})return 0;` +
+				`if(this.languageModel.vendor!=="llamacpp")return this.languageModel.countTokens(${text});` +
+				lazyState +
+				`let __llamaK=__llamaM+"s"+${text}.length+":"+(${text}.length>200?__llamaH(${text}):${text}),` +
+				"__llamaV=__llamaC.get(__llamaK);" +
+				"if(__llamaV!==void 0)return __llamaV;" +
+				`__llamaV=await this.languageModel.countTokens(${text});` +
+				"if(__llamaC.size>3e4)__llamaC.clear();" +
+				"__llamaC.set(__llamaK,__llamaV);" +
+				"return __llamaV}" +
+				`async countMessageTokens(${message}){` +
+				`let ${raw}=${toRaw}([${message}],{emitCacheBreakpoints:${breakpoints}(this.languageModel.vendor)});` +
+				`if(${raw}.length===0)return 0;` +
+				lazyState +
+				"let __llamaK;" +
+				'if(this.languageModel.vendor==="llamacpp"){' +
+				`try{let __llamaS=JSON.stringify(${raw}[0]);__llamaK=__llamaM+"m"+__llamaS.length+":"+__llamaH(__llamaS)}catch{__llamaK=void 0}` +
+				"if(__llamaK!==void 0){let __llamaV=__llamaC.get(__llamaK);if(__llamaV!==void 0)return __llamaV}}" +
+				`let ${count}=${base}+await this.languageModel.countTokens(${raw}[0]);` +
+				`if(__llamaK!==void 0){if(__llamaC.size>3e4)__llamaC.clear();__llamaC.set(__llamaK,${count})}` +
+				`return ${count}}`
+			);
+		},
+		"extension model tokenizer memoisation"
+	);
 }
 
 export function getCopilotPatchStatus(target: CopilotPatchTarget): CopilotPatchStatus {
@@ -499,15 +649,18 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	if (initialStatus.workbenchApplied && !initialStatus.workbenchBackupExists) {
 		throw new Error("Cannot manage the VS Code chat history patch because its original workbench backup is missing.");
 	}
-	if (initialStatus.workbenchBackupExists && !force && !initialStatus.workbenchApplied) {
+	// An installed v1 workbench patch (legacy marker) upgrades in place: the
+	// helper is replaced by the v2 definition, so the existing backup stays valid.
+	const installedWorkbenchBefore = fs.readFileSync(target.workbenchPath, "utf8");
+	const workbenchLegacyUpgrade = installedWorkbenchBefore.includes(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER);
+	if (initialStatus.workbenchBackupExists && !force && !initialStatus.workbenchApplied && !workbenchLegacyUpgrade) {
 		throw new Error(
 			`Backup already exists: ${initialStatus.workbenchBackupPath}. Restore it first or explicitly force the patch after inspection.`
 		);
 	}
 
 	const patched = patchCopilotBundle(original);
-	const installedWorkbench = fs.readFileSync(target.workbenchPath, "utf8");
-	const patchedWorkbench = patchVsCodeWorkbenchBundle(installedWorkbench);
+	const patchedWorkbench = patchVsCodeWorkbenchBundle(installedWorkbenchBefore);
 	const validationPath = target.bundlePath + ".llama-vscode-chat.tmp.js";
 	const workbenchValidationPath = target.workbenchPath + ".llama-vscode-chat.tmp.mjs";
 	fs.writeFileSync(validationPath, patched);

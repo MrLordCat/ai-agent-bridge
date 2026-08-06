@@ -336,6 +336,19 @@ function updateClaudeSessionQuality(
 	const lifecyclePhase: LlamaChatTurnMetrics["lifecyclePhase"] = update.phase === "cancelled"
 		? "interrupted"
 		: update.phase;
+	// Claude segments report cache read/write from the Anthropic API, but never
+	// explain WHY a cold segment happened. Derive the reason from the session
+	// lifecycle: a fresh SDK session (or a restored one) is the only way to
+	// cold-start 200-500K tokens between turns.
+	const claudeSessionReason = update.context.sessionMissReason;
+	const claudeColdReason = cacheMissReason
+		?? ((cacheHitPercent ?? 100) < 90
+			? update.context.sessionMode === "warm" || update.context.sessionMode === "rollover"
+				? "claude_cold_segment"
+				: update.context.sessionMode === "restored"
+					? "claude_resume_rebuild"
+					: "claude_new_session"
+			: undefined);
 	const turn: LlamaChatTurnMetrics = {
 		requestId: update.requestId,
 		modelId: update.modelId,
@@ -362,8 +375,10 @@ function updateClaudeSessionQuality(
 		continuationCacheHitPercent: segments.length > 1 ? segments.at(-1)?.cacheHitPercent : undefined,
 		finalSegmentInputTokens: segments.at(-1)?.inputTokens,
 		finalSegmentCachedInputTokens: segments.at(-1)?.cacheReadInputTokens,
-		cacheMissReason,
-		cacheMissDetail,
+		cacheMissReason: claudeColdReason,
+		cacheMissDetail: claudeSessionReason
+			? `Session cause: ${claudeSessionReason}${update.context.runtimeChanged ? " · runtime changed" : ""}`
+			: cacheMissDetail,
 		resumeFailureReason: update.context.resumeFailureReason,
 		resumeFailureStage: update.context.resumeFailureStage,
 		resumeFailureDetail: update.context.resumeFailureDetail,
@@ -517,8 +532,35 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	registerMemoryTools(context, memoryService);
 	registerCopilotPatchIntegration(context);
 
+	// Expose agent history caps to the prompt-tsx patch via globalThis.
+	// The prompt-tsx configurationService does not expose getValue(), so the
+	// injected code reads these globals instead of calling configurationService.
+	const updateAgentHistoryCaps = () => {
+		const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
+		(globalThis as Record<string, unknown>).__llamaAgentHistoryRounds = cfg.get<number>("agentHistoryRounds", 400);
+		(globalThis as Record<string, unknown>).__llamaAgentHistoryTurns = cfg.get<number>("agentHistoryTurns", 80);
+	};
+	updateAgentHistoryCaps();
+	context.subscriptions.push(
+		vscode.workspace.onDidChangeConfiguration(e => {
+			if (
+				e.affectsConfiguration(`${CONFIG_SECTION}.agentHistoryRounds`)
+				|| e.affectsConfiguration(`${CONFIG_SECTION}.agentHistoryTurns`)
+			) {
+				updateAgentHistoryCaps();
+			}
+		})
+	);
+
 	// Llama.cpp Provider
-	const llamaProvider = new LlamaCppChatModelProvider(context.secrets, ua, logService, memoryService, context.globalState);
+	const llamaProvider = new LlamaCppChatModelProvider(
+		context.secrets,
+		ua,
+		logService,
+		memoryService,
+		context.globalState,
+		context.globalStorageUri.fsPath
+	);
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
 	context.subscriptions.push(codexProvider);

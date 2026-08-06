@@ -39,7 +39,15 @@ const CLAUDE_DURABLE_SESSION_STATE_KEY = "llamacpp.claudeDurableSessions.v1";
 const CLAUDE_PENDING_ROLLOVER_STATE_KEY = "llamacpp.claudePendingRollover.v1";
 const MAX_CLAUDE_SESSIONS = 8;
 const MAX_CLAUDE_DURABLE_SESSIONS = 24;
-const CLAUDE_USAGE_REFRESH_TTL_MS = 60_000;
+/**
+ * How fresh the subscription-usage snapshot must be before the probe is
+ * skipped. Each probe spawns a full Claude Code CLI agent (potentially a
+ * 1M-context model), and logs showed 680+ spawns/day with a 60s TTL — one
+ * every ~70 seconds while Claude was in use. Usage limits don't move that
+ * fast; 5 minutes keeps the snapshot fresh enough for keep-alive decisions
+ * while cutting the spawn rate ~5x.
+ */
+const CLAUDE_USAGE_REFRESH_TTL_MS = 5 * 60_000;
 const CLAUDE_USAGE_REFRESH_TIMEOUT_MS = 20_000;
 /**
  * The usage probe spawns a full Claude Code CLI agent (potentially a 1M-context
@@ -1357,6 +1365,28 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				: reused
 					? "warm"
 					: "new";
+		// Diagnose why a fresh SDK session was needed: a live session existed for
+		// this conversation but could not be reused. This is the usual cause of
+		// a cold 200-500K-token first segment, and until now the live report had
+		// no way to tell "model switch" apart from "resume rebuild" or an
+		// unhealthy session.
+		let sessionMissReason: string | undefined;
+		if (!reused && !restored && !rolledOver) {
+			const liveCandidates = [...this.sessions.values()].filter(candidate =>
+				candidate.modelId === modelId && candidate.conversationId === conversationId
+			);
+			if (liveCandidates.length === 0) {
+				sessionMissReason = "no_live_session_for_conversation";
+			} else if (!liveCandidates.some(candidate => candidate.runtimeKey === runtimeKey)) {
+				sessionMissReason = "model_switch";
+			} else if (!liveCandidates.some(candidate =>
+				candidate.client.isStreamHealthy && candidate.client.pendingCallIds.size === 0
+			)) {
+				sessionMissReason = "session_unhealthy";
+			} else {
+				sessionMissReason = "conversation_not_matched";
+			}
+		}
 		const turnContext: ClaudeAgentTurnContext = {
 			sessionMode,
 			inputMode: reused ? "user-turn" : "full",
@@ -1365,6 +1395,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			toolCount: nativeTools.length,
 			toolSchemaTokens: Math.ceil(toolSchemaChars / 4),
 			runtimeChanged,
+			sessionMissReason,
 			turnMaxModelSegments: safety.maxAgentTurns,
 			turnMaxCumulativeInputTokens: safety.maxCumulativeInputTokens,
 		};

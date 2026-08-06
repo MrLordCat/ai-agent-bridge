@@ -262,6 +262,16 @@ suite("session quality panel", () => {
 		assert.match(html, /aria-expanded="false"/);
 		assert.ok(!html.includes("</script><script>bad()"));
 
+		// Performance tab
+		assert.match(html, /class="tabs"/);
+		assert.match(html, /data-tab="cache"/);
+		assert.match(html, /data-tab="perf"/);
+		assert.match(html, /id="tab-perf"/);
+		assert.match(html, /Gap med \/ p95/);
+		assert.match(html, /Gap distribution/);
+		assert.match(html, /spark-bar/);
+		assert.match(html, /perf-chat-filter/);
+
 		const scriptMatch = html.match(/<script>([\s\S]*)<\/script>/);
 		assert.ok(scriptMatch, "expected an embedded dashboard script");
 		assert.doesNotThrow(() => new Script(scriptMatch[1]));

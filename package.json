@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
 	},
-	"version": "1.10.1",
+	"version": "1.10.30",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -440,6 +440,20 @@
 					"maximum": 32,
 					"description": "Number of recent non-system messages to keep during hard compaction retry."
 				},
+				"llamacpp.agentHistoryRounds": {
+					"type": "number",
+					"default": 400,
+					"minimum": 0,
+					"maximum": 2000,
+					"description": "Cap for agent tool-call rounds rendered into the prompt for llama.cpp models. The oldest 20% plus the newest rounds are kept; 0 disables the cap. Large conversations make Copilot's prompt renderer spend minutes per step even when tokens are cached."
+				},
+				"llamacpp.agentHistoryTurns": {
+					"type": "number",
+					"default": 80,
+					"minimum": 0,
+					"maximum": 2000,
+					"description": "Cap for previous conversation turns rendered into the prompt for llama.cpp models. The oldest 20% plus the newest turns are kept, and the drop point moves in steps so the upstream prompt cache stays valid. 0 restores the default."
+				},
 				"llamacpp.maxOutputTokensCap": {
 					"type": "number",
 					"default": 131072,
@@ -456,10 +470,10 @@
 				},
 				"llamacpp.deepSeekDefaultMaxOutputTokens": {
 					"type": "number",
-					"default": 65536,
+					"default": 131072,
 					"minimum": 1024,
 					"maximum": 393216,
-					"description": "Default max_tokens requested from DeepSeek when the chat session does not provide an explicit limit. Keeps normal turns below the 393216-token emergency ceiling."
+					"description": "Default max_tokens requested from DeepSeek when the chat session does not provide an explicit limit. Keep it equal to maxOutputTokensCap (131072) so long answers are not cut at 64K; raise it only if the emergency ceiling is really needed."
 				},
 				"llamacpp.minReplyReserveTokens": {
 					"type": "number",
@@ -550,7 +564,7 @@
 				},
 				"llamacpp.apiDirectMaxTools": {
 					"type": "number",
-					"default": 70,
+					"default": 100,
 					"minimum": 1,
 					"maximum": 128,
 					"description": "Maximum number of prioritized tools included when toolCallingMode=apiDirect."

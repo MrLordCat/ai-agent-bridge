@@ -130,10 +130,11 @@ suite("message compaction", () => {
 
 	test("deduplicates old compaction summaries on repeated compaction", () => {
 		// Simulate the result of a first compaction pass: system prompt,
-		// a summary, and a few recent turns.
+		// a summary (user role since summaries moved out of the system block),
+		// and a few recent turns.
 		const afterFirstCompact: OpenAIChatMessage[] = [
 			{ role: "system", content: "Stable system prompt" },
-			{ role: "system", content: "Conversation summary (auto-compact):\nBuilt fix in src/foo.ts" },
+			{ role: "user", content: "Conversation summary (auto-compact):\nBuilt fix in src/foo.ts" },
 			{ role: "user", content: "latest question" },
 			{ role: "assistant", content: "latest answer" },
 		];
@@ -158,9 +159,9 @@ suite("message compaction", () => {
 			estimateTokens: items => items.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : 0), 0),
 		});
 
-		// Count how many system messages are compaction summaries.
+		// Count how many messages are compaction summaries (any role).
 		const summaryMessages = compacted.filter(
-			m => m.role === "system"
+			m => (m.role === "system" || m.role === "user")
 				&& typeof m.content === "string"
 				&& m.content.startsWith("Conversation summary"),
 		);
@@ -170,30 +171,36 @@ suite("message compaction", () => {
 			`expected exactly one summary message but got ${summaryMessages.length}: ${summaryMessages.map(m => (m.content as string).slice(0, 60)).join(" | ")}`,
 		);
 
-		// The first system message should be the original prompt.
+		// The first system message should be the original prompt, and the
+		// summary must NOT be a system message (it would break the upstream
+		// prompt cache for tools + messages when it changes).
 		assert.strictEqual(compacted[0].role, "system");
 		assert.strictEqual(compacted[0].content, "Stable system prompt");
-	});
+                const summaryMessage = compacted.find(
+                        m => typeof m.content === "string" && m.content.startsWith("Conversation summary"),
+                );
+                assert.strictEqual(summaryMessage?.role, "user", "summary must use the user role so system+tools stay cached");
+        });
 
-	test("fills a large target with recent history instead of only the minimum tail", () => {
-		const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
-		for (let index = 0; index < 120; index += 1) {
-			messages.push(
-				{ role: "user", content: `request-${index}: ${"u".repeat(100)}` },
-				{ role: "assistant", content: `answer-${index}: ${"a".repeat(100)}` },
-			);
-		}
-		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
-			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
-			0
-		);
-		const tokenBudget = 14_000;
-		const compacted = compactMessages(messages, {
-			tokenBudget,
-			keepLastCount: 12,
-			label: "Conversation summary (auto-compact)",
-			estimateTokens,
-		});
+        test("fills a large target with recent history instead of only the minimum tail", () => {
+                const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
+                for (let index = 0; index < 120; index += 1) {
+                        messages.push(
+                                { role: "user", content: `request-${index}: ${"u".repeat(100)}` },
+                                { role: "assistant", content: `answer-${index}: ${"a".repeat(100)}` },
+                        );
+                }
+                const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+                        (sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+                        0
+                );
+                const tokenBudget = 14_000;
+                const compacted = compactMessages(messages, {
+                        tokenBudget,
+                        keepLastCount: 12,
+                        label: "Conversation summary (auto-compact)",
+                        estimateTokens,
+                });
 
 		const used = estimateTokens(compacted);
 		assert.ok(used <= tokenBudget, `expected ${used} to fit within ${tokenBudget}`);
