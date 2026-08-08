@@ -533,6 +533,18 @@ export function patchCopilotBundle(source: string): string {
 		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==this._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
 		"tool catalog stabilisation after reload"
 	);
+	// Subagent tool parity: VS Code narrows a subagent request to a single
+	// tool (session_store_sql), so external-provider subagents see no file
+	// tools. Cache the full advertised set from ordinary turns and restore it
+	// for subagent turns — the subagent gets the same tools as the calling
+	// agent. The cache lives on the request handler instance (per conversation
+	// session), matching the tool signature cache above.
+	patched = replaceOnce(
+		patched,
+		'}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		'}this._llamaToolsSignature=__llamaToolCurrent}if(!this.options.request.subAgentInvocationId&&o.length>0)this._llamaFullTools=o;else if(this.options.request.subAgentInvocationId&&Array.isArray(this._llamaFullTools)&&this._llamaFullTools.length>o.length)o=this._llamaFullTools;if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		"subagent tool parity with the calling agent"
+	);
 	patched = patchExtensionTokenizerCache(patched);
 	return patched;
 }

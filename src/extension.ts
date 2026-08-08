@@ -19,7 +19,6 @@ import {
 	PROVIDER_VENDOR,
 } from "./constants";
 import { LlamaLogService } from "./logger";
-import { renderProviderHealthMarkdown } from "./diagnostics/provider-health";
 import { SessionQualityTracker } from "./diagnostics/session-report";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
@@ -27,6 +26,7 @@ import { registerContextControlCommand } from "./ui/context-control";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
 import { SessionQualityPanel } from "./ui/session-quality-panel";
+import { MemoryManagerPanel, estimateMemoryTokens } from "./ui/memory-manager";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
@@ -572,6 +572,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	let lastPromptCache: string | undefined;
 	let lastContextUsage: ContextUsageDisplay | undefined;
 	let lastHealthStatus: string | undefined;
+	let lastHealthEnriched: unknown | undefined;
 	const runtimeMetrics = new Map<RuntimeSource, ProviderRuntimeMetrics>();
 	const quickActionsProvider = new LlamaQuickActionsProvider(
 		() => lastThroughput,
@@ -579,7 +580,6 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => memoryService.count,
 		() => lastPromptCache,
 		() => sessionQuality.count === 0 ? "No turns" : `${sessionQuality.count} turns / cache ${sessionQuality.summary.cacheHitPercent ?? "n/a"}%`,
-		() => lastHealthStatus,
 		() => memoryService.expiredCount,
 		() => codexProvider.accountSummary,
 		() => claudeProvider.accountSummary,
@@ -598,10 +598,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => codexProvider.codexUsageLimitPercent,
 		() => codexProvider.codexUsageLimitResetLabel,
 		() => claudeProvider.claudeUsageLimitPercent,
-		() => claudeProvider.claudeUsageLimitResetLabel
+		() => claudeProvider.claudeUsageLimitResetLabel,
+		() => estimateMemoryTokens(memoryService.list())
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(usageExperiments.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(codexProvider.onDidChangeStatus(() => quickActionsProvider.refresh()));
@@ -782,18 +784,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		return markdownPath;
 	};
 
-	// Live-updating session quality report — single file, no timestamp spam.
-	const liveReportPath = path.join(reportDirectory, "session-quality-live.md");
+	// Live-updating session quality JSON — single file, no timestamp spam.
+	// The markdown file was removed: the Live Report webview superseded it.
 	const liveReportJsonPath = path.join(reportDirectory, "session-quality-live.json");
 
 	const writeLiveSessionReport = async (): Promise<void> => {
 		await fs.mkdir(reportDirectory, { recursive: true });
-		const markdown = sessionQuality.renderMarkdown(extVersion, vscodeVersion);
 		const json = sessionQuality.toJSON();
-		await Promise.all([
-			fs.writeFile(liveReportPath, markdown, "utf8"),
-			fs.writeFile(liveReportJsonPath, `${JSON.stringify(json, null, 2)}\n`, "utf8"),
-		]);
+		await fs.writeFile(liveReportJsonPath, `${JSON.stringify(json, null, 2)}\n`, "utf8");
 	};
 
 	// Auto-refresh the live report and webview panel after every completed turn
@@ -858,9 +856,57 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					},
 					() => llamaProvider.runHealthCheck(extVersion, cancellation.token)
 				);
+				// Enrich the provider snapshot with session metrics and the
+				// subscription providers so the health panel is a full picture.
+				const summary = sessionQuality.summary;
+				const records = sessionQuality.records;
+				const errorCount = records.reduce((total, record) => {
+					const turn = record.turn;
+					if (turn.lifecyclePhase === "failed" || turn.lifecyclePhase === "timed_out") {
+						total += 1;
+					}
+					if (turn.rejectedToolCalls) {total += turn.rejectedToolCalls;}
+					if (turn.toolLoopDetected) {total += 1;}
+					return total;
+				}, 0);
+				const enriched = {
+					...report,
+					sessionSummary: {
+						turns: summary.turns,
+						totalModelTurns: summary.totalModelTurns,
+						cacheHitPercent: summary.cacheHitPercent,
+						promptTokens: summary.promptTokens,
+						cachedPromptTokens: summary.cachedPromptTokens,
+						rejectedToolCalls: summary.rejectedToolCalls,
+						repairedToolCalls: summary.repairedToolCalls,
+						toolLoopsDetected: summary.toolLoopsDetected,
+						errorCount,
+					},
+					claude: {
+						status: claudeProvider.statusSummary.startsWith("Connected") ? "connected" : claudeProvider.statusSummary.startsWith("Paused") ? "paused_usage_limit" : "warning",
+						summary: claudeProvider.statusSummary,
+						usagePercent: claudeProvider.claudeUsageLimitPercent,
+						resetLabel: claudeProvider.claudeUsageLimitResetLabel,
+						keepAlive: claudeProvider.cacheKeepAliveStatus,
+					},
+					codex: {
+						status: codexProvider.accountSummary === "Connected" ? "connected" : "warning",
+						summary: codexProvider.accountSummary,
+					},
+				};
 				lastHealthStatus = report.overallStatus.toUpperCase();
-				await writeReport("provider-health", renderProviderHealthMarkdown(report), report);
+				lastHealthEnriched = enriched;
 				quickActionsProvider.refresh();
+				// The health report now lives in the Live Report webview (Health
+				// tab) — no standalone panel and no markdown file anymore.
+				SessionQualityPanel.createOrShow(
+					context.extensionUri,
+					sessionQuality,
+					extVersion,
+					vscodeVersion,
+					() => claudeProvider.cacheKeepAliveStatus,
+					() => lastHealthEnriched
+				);
 				vscode.window.showInformationMessage(`Local LLM health check: ${lastHealthStatus}`);
 			} finally {
 				cancellation.dispose();
@@ -873,7 +919,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 					sessionQuality,
 					extVersion,
 					vscodeVersion,
-					() => claudeProvider.cacheKeepAliveStatus
+					() => claudeProvider.cacheKeepAliveStatus,
+					() => lastHealthEnriched
 				);
 			} catch (err: unknown) {
 				void vscode.window.showErrorMessage(
@@ -1279,9 +1326,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			await config.update("apiDirectMaxTools", 70, vscode.ConfigurationTarget.Global);
 			await config.update("apiDirectIncludeAllTools", false, vscode.ConfigurationTarget.Global);
 			await config.update("apiDirectToolTokenBudget", 12000, vscode.ConfigurationTarget.Global);
-			await config.update("deepSeekDefaultMaxOutputTokens", 65536, vscode.ConfigurationTarget.Global);
+			await config.update("deepSeekDefaultMaxOutputTokens", 131072, vscode.ConfigurationTarget.Global);
 			await config.update("toolResultMode", "auto", vscode.ConfigurationTarget.Global);
-			await config.update("autoCompact", true, vscode.ConfigurationTarget.Global);
+			await config.update("autoCompact", false, vscode.ConfigurationTarget.Global);
 			await config.update("retryOnContextOverflow", true, vscode.ConfigurationTarget.Global);
 			await config.update("modelDiscoveryTimeoutMs", DEEPSEEK_DISCOVERY_TIMEOUT_MS, vscode.ConfigurationTarget.Global);
 			await config.update("requestTimeoutMs", 1200000, vscode.ConfigurationTarget.Global);
@@ -1336,9 +1383,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 
 	context.subscriptions.push(
-		vscode.commands.registerCommand("llamacpp.openMemory", async () => {
-			const document = await vscode.workspace.openTextDocument(vscode.Uri.file(memoryService.filePath));
-			await vscode.window.showTextDocument(document, { preview: false });
+		vscode.commands.registerCommand("llamacpp.openMemory", () => {
+			MemoryManagerPanel.createOrShow(context.extensionUri, memoryService);
 		})
 	);
 

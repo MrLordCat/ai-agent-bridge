@@ -33,6 +33,15 @@ export function buildKnowledgeSystemPrompt(options: KnowledgeSystemPromptOptions
 			"Complete requested implementation and verification when tools permit. For audits, cite local file paths and line numbers, record commands or tests used as evidence, and keep unresolved claims explicit.",
 		].join("\n"));
 
+		sections.push([
+			"File editing discipline:",
+			"- Before replacing text, use the latest file content — read the relevant section again if the file may have changed since your last read.",
+			"- Keep oldString short and unique to the target location (a few unchanged lines around the change, not a giant block).",
+			"- If a replacement fails with \"Could not find matching text\", do NOT retry the same pair — first read the file section to see its current exact content, then retry with a corrected oldString.",
+			"- When applying several edits to one file, treat each edit as changing the file: the next oldString must match the file AFTER the previous edit, not the original version.",
+			"- Prefer one well-placed edit over many overlapping ones.",
+		].join("\n"));
+
 		if (options.mode === "strict") {
 			sections.push([
 				"Knowledge verification mode: strict.",

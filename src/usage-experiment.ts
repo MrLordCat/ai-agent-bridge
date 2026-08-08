@@ -6,10 +6,11 @@ import type {
 	TokenUsageProvider,
 } from "./token-usage-history";
 import {
-	emptyTokenUsageAggregate,
-	mergeTokenUsageAggregates,
 	tokenUsageCacheHitPercent,
+	mergeTokenUsageAggregates,
+	emptyTokenUsageAggregate,
 } from "./token-usage-history";
+import { nonNegativeInteger } from "./utils";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -80,12 +81,6 @@ const UNKNOWN_MODEL = "unknown";
 // ---------------------------------------------------------------------------
 // Normalization helpers (safe from malformed persisted data)
 // ---------------------------------------------------------------------------
-
-function nonNegativeInteger(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value)
-		? Math.max(0, Math.floor(value))
-		: 0;
-}
 
 function normalizeAggregate(value: unknown): TokenUsageAggregate {
 	const record = value && typeof value === "object" ? (value as Record<string, unknown>) : {};

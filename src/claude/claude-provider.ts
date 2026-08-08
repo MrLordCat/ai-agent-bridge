@@ -7,7 +7,7 @@ import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_ACTIVE_SESSION_IDLE_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
 import { setSubagentModelProfiles } from "../subagent-guidance";
-import { formatShortResetTime, isCacheControlPart, stableJsonStringify } from "../utils";
+import { clampInteger, formatShortResetTime, formatTokenCount, isCacheControlPart, normalizeCopilotTurnIndex, stableJsonStringify } from "../utils";
 import {
 	buildClaudeModelAvailability,
 	type ClaudeModelAvailability,
@@ -387,25 +387,25 @@ export function resolveClaudeSafetySettings(value: {
 		? value.resumeFallbackPolicy
 		: "safe";
 	return {
-		maxAgentTurns: clampInteger(value.maxAgentTurns, 0, 0, 1_000),
+		maxAgentTurns: clampInteger(value.maxAgentTurns, 0, 1_000, 0),
 		maxCumulativeInputTokens: clampInteger(
 			value.maxCumulativeInputTokens,
-			DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS,
 			100_000,
-			50_000_000
+			50_000_000,
+			DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS
 		),
 		resumeFallbackPolicy: policy,
 		resumeFallbackMaxInputTokens: clampInteger(
 			value.resumeFallbackMaxInputTokens,
-			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS,
 			0,
-			1_000_000
+			1_000_000,
+			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS
 		),
 		resumeFallbackMaxUsagePercent: clampInteger(
 			value.resumeFallbackMaxUsagePercent,
-			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT,
 			0,
-			100
+			100,
+			DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT
 		),
 	};
 }
@@ -454,11 +454,6 @@ export function resolveClaudeResumeFallbackDecision(value: {
 	return { allowed: true, reason: "safe_limits", detail: "Replay is within configured token and usage limits." };
 }
 
-function clampInteger(value: unknown, fallback: number, minimum: number, maximum: number): number {
-	const numeric = Number(value);
-	return Math.max(minimum, Math.min(maximum, Number.isFinite(numeric) ? Math.floor(numeric) : fallback));
-}
-
 export function findPersistedClaudeConversation(
 	entries: readonly PersistedClaudeConversationSession[],
 	value: {
@@ -497,16 +492,6 @@ export function findLatestPersistedClaudeConversation(
 interface ClaudeToolContinuation {
 	session: ClaudeConversationSession;
 	results: vscode.LanguageModelToolResultPart[];
-}
-
-function formatTokenCount(count: number): string {
-	if (count >= 1_000_000) {
-		return `${(count / 1_000_000).toFixed(1)}M`;
-	}
-	if (count >= 1_000) {
-		return `${(count / 1_000).toFixed(1)}K`;
-	}
-	return String(count);
 }
 
 export interface ClaudeUsageLimit {
@@ -2125,11 +2110,6 @@ function normalizeConversationId(value: unknown): string | undefined {
 	return normalized.length > 0 && normalized.length <= 256 ? normalized : undefined;
 }
 
-function normalizeCopilotTurnIndex(value: unknown): number | undefined {
-	const numeric = typeof value === "number" ? value : Number.NaN;
-	return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
-}
-
 function resolveEffort(value: unknown): "low" | "medium" | "high" | "xhigh" | "max" | undefined {
 	return value === "low"
 		|| value === "medium"
@@ -2302,9 +2282,6 @@ function createSdkUserMessage(content: Record<string, unknown>[]): SDKUserMessag
 		},
 	} as unknown as SDKUserMessage;
 }
-
-/** Default interval between keep-alive turns (inside the 1h Anthropic cache TTL). */
-export const DEFAULT_CLAUDE_KEEPALIVE_MS = 45 * 60_000;
 
 /** Sessions with a smaller prefix are cheaper to rewrite than to keep warm. */
 export const MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS = 100_000;

@@ -86,8 +86,11 @@ suite("message compaction", () => {
 
 		assert.deepStrictEqual(
 			compacted.filter(message => message.role !== "system").map(message => message.role),
-			["user", "assistant"]
+			["user", "user", "assistant"]
 		);
+		assert.ok(compacted.some(message =>
+			typeof message.content === "string" && message.content.includes("Summary")
+		));
 		assert.ok(!compacted.some(message => message.role === "tool"));
 	});
 
@@ -210,4 +213,66 @@ suite("message compaction", () => {
 			"expected substantially more than the fixed 12-message minimum"
 		);
 	});
+
+	test("keeps many turns when early tool results are huge (skewed token distribution)", () => {
+		// Real chats are skewed: a few early turns carry huge tool outputs.
+		// Without per-message truncation the binary search cannot buy whole
+		// heavy turns and collapses to the minimum tail (187 -> 15 messages)
+		// while the budget is 60% of the current size.
+		const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
+		for (let index = 0; index < 100; index += 1) {
+			const heavy = index < 60;
+			messages.push(
+				{ role: "user", content: "request-" + index },
+				{ role: "assistant", content: "answer-" + index },
+				{
+					role: "tool",
+					name: "run_in_terminal",
+					tool_call_id: "call-" + index,
+					content: heavy ? "x".repeat(20_000) : "ok",
+				},
+			);
+		}
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+			0
+		);
+		// Without truncation: budget = 60% of ~700k chars ≈ 420k; the 60 heavy
+		// results alone are 1.2M chars, so only the last ~40 light turns fit
+		// and the heavy early turns are dropped wholesale.
+		const tokenBudget = Math.floor(estimateTokens(messages) * 0.6);
+		const compacted = compactMessages(messages, {
+			tokenBudget,
+			keepLastCount: 12,
+			label: "Conversation summary (auto-compact)",
+			estimateTokens,
+			maxToolResultChars: 2000,
+		});
+
+		const used = estimateTokens(compacted);
+		assert.ok(used <= tokenBudget, "expected " + used + " to fit within " + tokenBudget);
+		// With truncation, most turns (including the heavy early ones) survive.
+		const nonSystem = compacted.filter(message => message.role !== "system");
+		assert.ok(
+			nonSystem.length > 150,
+			"expected truncation to keep most turns, got " + nonSystem.length + " messages"
+		);
+		const heavySurvivors = nonSystem.filter(
+			message => message.role === "tool" && typeof message.content === "string" && message.content.length > 500
+		).length;
+		assert.ok(
+			heavySurvivors >= 30,
+			"expected many truncated heavy tool results to survive, got " + heavySurvivors
+		);
+		assert.ok(
+			compacted.every(message =>
+				typeof message.content !== "string"
+				|| message.content.length <= 2100
+				|| message.role === "user"
+				|| message.role === "assistant"
+			),
+			"expected retained tool results to be truncated to maxToolResultChars"
+		);
+	});
+
 });

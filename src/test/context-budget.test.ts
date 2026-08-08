@@ -3,6 +3,7 @@ import {
 	calculateContextBudget,
 	estimateContextUsage,
 	selectContextCompaction,
+	updateHeuristicCalibration,
 } from "../context/context-budget";
 
 suite("context budget", () => {
@@ -71,48 +72,70 @@ suite("context budget", () => {
 		});
 	});
 
-	test("does not apply hard compaction after normal soft compaction", () => {
+	test("calibration converges to the actual raw-to-server token multiplier", () => {
+		const actualMultiplier = 1.68;
+		let factor = 1;
+		for (let turn = 0; turn < 20; turn += 1) {
+			const residualRatio = actualMultiplier / factor;
+			factor = updateHeuristicCalibration(factor, residualRatio);
+		}
+
+		assert.ok(
+			Math.abs(factor - actualMultiplier) < 0.02,
+			`expected calibration near ${actualMultiplier}, got ${factor}`
+		);
+		const calibratedMessageTokens = Math.round(150_000 * factor);
+		assert.strictEqual(
+			selectContextCompaction({
+				messageTokens: calibratedMessageTokens,
+				autoCompact: true,
+				softInputTarget: 218_739,
+				overflowRetry: false,
+			}).kind,
+			"auto",
+			"the calibrated estimate must trigger compaction before the real prompt overflows"
+		);
+	});
+
+	test("applies a single soft compaction scheme", () => {
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 110000,
 			autoCompact: true,
 			softInputTarget: 101171,
-			hardInputTarget: 84131,
 			overflowRetry: false,
-		}), { kind: "auto", target: 75878 });
+		}), { kind: "auto", target: 82500 });
 
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 101000,
 			autoCompact: true,
 			softInputTarget: 101171,
-			hardInputTarget: 84131,
 			overflowRetry: false,
 		}), { kind: "none" });
 	});
 
 	test("auto-compaction lands below the trigger to avoid micro-compactions", () => {
-		// Compacting exactly to the soft target re-triggers on the next turn.
-		// The 0.75 ratio leaves headroom so a single compaction lasts for many turns.
+		// Compacting to exactly the soft target re-triggers on the next turn.
+		// The 0.75 ratio keeps 75% of the current size (~25% reduction), which
+		// leaves headroom so a single compaction lasts for many turns.
 		const decision = selectContextCompaction({
 			messageTokens: 450000,
 			autoCompact: true,
 			softInputTarget: 402100,
-			hardInputTarget: 333943,
 			overflowRetry: false,
 		});
 		assert.strictEqual(decision.kind, "auto");
 		if (decision.kind === "auto") {
-			assert.strictEqual(decision.target, 301575);
-			assert.ok(decision.target < 402100 * 0.8);
+			assert.strictEqual(decision.target, 337500);
+			assert.ok(decision.target < 402100, "target must stay below the trigger");
 		}
 	});
 
-	test("reserves the hard target for a confirmed overflow retry", () => {
+	test("applies the same soft compaction on a confirmed overflow retry", () => {
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 101000,
 			autoCompact: true,
 			softInputTarget: 101171,
-			hardInputTarget: 84131,
 			overflowRetry: true,
-		}), { kind: "hard", target: 84131 });
+		}), { kind: "auto", target: 75750 });
 	});
 });

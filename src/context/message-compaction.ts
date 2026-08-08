@@ -1,4 +1,5 @@
 import type { OpenAIChatMessage } from "../types";
+import { contentToText } from "../utils";
 import { summarizeToolCallArguments, summarizeToolResultContent } from "./tool-result-summary";
 
 const MAX_SUMMARY_MESSAGES = 32;
@@ -14,6 +15,16 @@ interface CompactMessagesOptions {
 	keepLastCount: number;
 	label: string;
 	estimateTokens(messages: OpenAIChatMessage[]): number;
+	/**
+	 * Long tool-result messages in the retained tail are truncated to this
+	 * many characters. Token volume in real chats is skewed: a few early
+	 * turns carry huge tool outputs, so without truncation a binary search
+	 * over whole turns cannot fill the token budget and drops almost the
+	 * entire history (e.g. 187 -> 15 messages while the budget is 60% of
+	 * the current size). Truncating long results lets many more recent
+	 * turns survive inside the same budget.
+	 */
+	maxToolResultChars?: number;
 }
 
 const SUMMARY_LABEL_PATTERN = /^Conversation summary \((?:auto-compact|hard compact(?:, keep \d+)?|overflow retry)\):/;
@@ -33,18 +44,6 @@ interface SummaryCandidate {
 	priority: number;
 	role: OpenAIChatMessage["role"];
 	line: string;
-}
-
-function contentToText(content: OpenAIChatMessage["content"]): string {
-	if (typeof content === "string") {
-		return content;
-	}
-	if (Array.isArray(content)) {
-		return content
-			.map(part => part.type === "text" && typeof part.text === "string" ? part.text : "")
-			.join("\n");
-	}
-	return "";
 }
 
 function clip(value: string, maxChars: number): string {
@@ -258,7 +257,24 @@ export function compactMessages(
 		summaryCount: number;
 	} => {
 		const head = turns.slice(0, keepTurnIndex).flat();
-		const tailTurns = turns.slice(keepTurnIndex).map(turn => turn.map(cloneMessage));
+		const truncateToolResult = (message: OpenAIChatMessage): OpenAIChatMessage => {
+			if (!options.maxToolResultChars || options.maxToolResultChars <= 0) {
+				return message;
+			}
+			if (typeof message.content !== "string") {
+				return message;
+			}
+			const isToolResult = message.role === "tool"
+				|| (message.role === "user" && message.content.includes("[tool_result"));
+			if (!isToolResult || message.content.length <= options.maxToolResultChars) {
+				return message;
+			}
+			return {
+				...message,
+				content: `${message.content.slice(0, Math.max(1, options.maxToolResultChars - 64))}\n...[tool result truncated during compaction to keep more recent context]...`,
+			};
+		};
+		const tailTurns = turns.slice(keepTurnIndex).map(turn => turn.map(message => truncateToolResult(cloneMessage(message))));
 		const summaryLines = selectSummaryLines(head);
 		// The summary intentionally uses the user role (not system):
 		// OpenAI-style prompts keep system messages and the tools block

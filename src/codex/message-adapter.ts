@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import * as vscode from "vscode";
 
-import { isCacheControlPart } from "../utils";
+import { bytesToBase64, isCacheControlPart } from "../utils";
 import { compactMessages } from "../context/message-compaction";
 import type { OpenAIChatMessage } from "../types";
 import type { CodexDynamicToolCallResponse } from "./dynamic-tools";
@@ -68,10 +68,6 @@ const MAX_MAX_TOOL_RESULT_CHARS = 100_000;
 const MAX_PRESERVED_FIRST_MESSAGE_CHARS = 32_000;
 const CODEX_ANCHOR_USER_MESSAGES = 8;
 const COMPACTION_MARKER = "[Earlier VS Code conversation messages were omitted by the provider to fit the Codex input budget.]";
-
-function bytesToBase64(bytes: Uint8Array): string {
-	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
-}
 
 function collectUnknownText(value: unknown): string {
 	if (!value || typeof value !== "object") {

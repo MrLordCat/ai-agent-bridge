@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { nonNegativeInteger } from "./utils";
 
 export type TokenUsageProvider = "local" | "deepseek" | "codex" | "claude";
 
@@ -84,12 +85,6 @@ export function emptyTokenUsageHistorySummary(): TokenUsageHistorySummary {
 		today: emptyTokenUsagePeriodSummary(),
 		week: emptyTokenUsagePeriodSummary(),
 	};
-}
-
-function nonNegativeInteger(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value)
-		? Math.max(0, Math.floor(value))
-		: 0;
 }
 
 function normalizeAggregate(value: unknown): TokenUsageAggregate {

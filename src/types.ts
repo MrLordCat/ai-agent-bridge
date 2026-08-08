@@ -78,6 +78,20 @@ export interface OpenAIChatMessage {
 	 * ID of the tool call this message is responding to, if applicable.
 	 */
 	tool_call_id?: string;
+	/**
+	 * Provider-injected message that is not part of the host conversation
+	 * history (loop guards, nudges, repair prompts). Excluded from prefix and
+	 * budget snapshots so a later turn's host history still aligns with them.
+	 */
+	ephemeral?: boolean;
+	/**
+	 * Provider-owned message retained in the sent-message snapshot even though
+	 * VS Code never places it in host history. Alignment skips overlays as host
+	 * pivots but preserves their original prompt position.
+	 */
+	providerOverlay?: "shared-memory";
+	/** Stable entry revisions carried by an append-only shared-memory overlay. */
+	sharedMemoryRevisions?: Array<{ id: string; revision: string }>;
 }
 
 /**

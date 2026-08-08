@@ -1,6 +1,10 @@
 import * as assert from "assert";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import * as vscode from "vscode";
 import { LlamaCppChatModelProvider, stripCacheControlArtifacts } from "../llama-provider";
+import { injectSharedMemoryContext } from "../memory/prompt";
 import { ToolCallValidationError, type ToolCallReliabilityMetrics } from "../tools/tool-call-reliability";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
 import { convertMessages, convertTools, validateRequest } from "../utils";
@@ -168,7 +172,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 
                 const deepSeekInfo = infos.find(info => info.id === "deepseek::deepseek-v4-pro");
                 assert.ok(deepSeekInfo);
-                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 131072);
+                assert.strictEqual(deepSeekInfo!.maxOutputTokens, 70000);
             } finally {
                 providerAny.getModelSources = originalGetModelSources;
                 providerAny.getRuntimeContextLengthWithCache = originalGetRuntimeContextLengthWithCache;
@@ -474,7 +478,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 "Conversation summary (auto-compact)"
             );
 
-            const summary = compacted.find(msg => msg.role === "system" && typeof msg.content === "string" && msg.content.includes("Conversation summary"));
+            const summary = compacted.find(msg => msg.role === "user" && typeof msg.content === "string" && msg.content.includes("Conversation summary"));
             assert.ok(summary && typeof summary.content === "string");
             assert.ok(summary!.content!.includes("[tool_result read_file]"));
             assert.ok(summary!.content!.includes("[tool_calls] read_file"));
@@ -502,10 +506,158 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.ok(truncated[0].content!.includes("tool result summarized"));
         });
 
-        test("strips every cache_control marker shape so tool text stays stable", () => {
-            const legacy = 'result {"$mid":17,"mimeType":"cache_control","data":"QUJD"} tail';
-            assert.strictEqual(stripCacheControlArtifacts(legacy), "result  tail");
+        test("never summarizes a large system prompt as a tool result", () => {
+            const providerAny = provider as unknown as {
+                truncateToolResultMessages: (
+                    messages: Array<{ role: "system" | "user" | "assistant" | "tool"; content?: string }>,
+                    maxChars: number,
+                    requestId: string
+                ) => Array<{ role: string; content?: string }>;
+            };
 
+            const longSystemPrompt = "You are a careful coding agent. ".repeat(200).trimEnd();
+            const result = providerAny.truncateToolResultMessages(
+                [
+                    { role: "system", content: longSystemPrompt },
+                    { role: "assistant", content: "x".repeat(500) },
+                ],
+                120,
+                "test-request"
+            );
+
+            assert.strictEqual(result[0].content, longSystemPrompt);
+            assert.strictEqual(result[1].content, "x".repeat(500));
+        });
+
+	test("counts tool execution errors only after the turn's query", () => {
+		const providerAny = provider as unknown as {
+			truncateToolResultMessages: (
+				messages: Array<{ role: string; content?: string; tool_call_id?: string }>,
+				maxChars: number,
+				requestId: string
+			) => Array<{ role: string; content?: string }>;
+			lastToolExecutionErrorCount: number;
+			lastToolExecutionErrorDetails: Array<{ name?: string; command?: string; head?: string }>;
+		};
+
+		const failing = { role: "tool", tool_call_id: "call_new_1", content: "Traceback (most recent call last): boom" };
+		const ok = { role: "tool", tool_call_id: "call_new_2", content: "successfully edited: x" };
+		const oldFailing = { role: "tool", tool_call_id: "call_old_1", content: "Traceback (most recent call last): boom" };
+		const oldOk = { role: "tool", tool_call_id: "call_old_2", content: "file contents" };
+		const query = { role: "user", content: "check the logs" };
+
+		// History before the query is never re-counted; only this turn's
+		// results (after the query) are.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[oldFailing, oldOk, query, failing, ok],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 1);
+		assert.strictEqual(providerAny.lastToolExecutionErrorDetails[0]?.head, "Traceback (most recent call last): boom");
+
+		// A compaction summary is a user message but must not split the turn:
+		// it sits before the query and both are "before fresh".
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[
+				{ role: "user", content: "Conversation summary (auto-compact): prior" },
+				query,
+				failing,
+			],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 1);
+
+		// No plain user query in the batch (image-only or system-only) →
+		// nothing is classified as fresh, so history can never inflate.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[oldFailing, failing],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 0);
+	});
+
+	test("ignores grep-style exit code 1 but keeps real failures", () => {
+		const providerAny = provider as unknown as {
+			truncateToolResultMessages: (
+				messages: Array<{
+					role: string;
+					content?: string;
+					tool_call_id?: string;
+					tool_calls?: Array<{ id: string; type: string; function: { name: string; arguments: string } }>;
+				}>,
+				maxChars: number,
+				requestId: string
+			) => Array<{ role: string; content?: string }>;
+			lastToolExecutionErrorCount: number;
+			lastToolExecutionErrorDetails: Array<{ name?: string; command?: string; head?: string }>;
+		};
+		const query = { role: "user", content: "audit" };
+
+		// grep found nothing: short output + exit 1 → not an error.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[query, { role: "tool", content: "log: test.jsonl\n0\n\nCommand exited with code 1" }],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 0);
+
+		// grep-style exit 1 with a camelCase identifier in the output (e.g.
+		// `lastToolExecutionErrorCount` printed by a diagnostics loop) must not
+		// match the failure signal — "error" inside a word is not an error.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[query, { role: "tool", content: "=== src/llama-provider.ts ===\nlastToolExecutionErrorCount: 4\n\nCommand exited with code 1" }],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 0);
+
+		// Real compiler failure: exit 1 + "error TS" in the output → counted.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[query, { role: "tool", content: "> tsc -p ./\nsrc/a.ts(1,1): error TS2322: Type mismatch\n\nCommand exited with code 1" }],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 1);
+
+		// Exit codes 2+ always count.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[query, { role: "tool", content: "boom\nCommand exited with code 2" }],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 1);
+
+		// The failing command itself is recorded for the report.
+		providerAny.lastToolExecutionErrorCount = 0;
+		providerAny.truncateToolResultMessages(
+			[
+				query,
+				{
+					role: "assistant",
+					content: "",
+					tool_calls: [{ id: "call_x1", type: "function", function: { name: "run_in_terminal", arguments: '{"command":"npm run compile"}' } }],
+				},
+				{ role: "tool", tool_call_id: "call_x1", content: "error TS2322\n\nCommand exited with code 1" },
+			],
+			100_000,
+			"test-request"
+		);
+		assert.strictEqual(providerAny.lastToolExecutionErrorCount, 1);
+		assert.strictEqual(providerAny.lastToolExecutionErrorDetails[0]?.name, "run_in_terminal");
+		assert.strictEqual(providerAny.lastToolExecutionErrorDetails[0]?.command, "npm run compile");
+	});
+
+        test("strips every cache_control marker shape so tool text stays stable", () => {
             // Shape VS Code emits today; the previous regex did not match it and the
             // leftover marker moved between turns, breaking the cached prefix.
             const modern = 'result {"type":"data","mimeType":"cache_control","bytes":9} tail';
@@ -640,6 +792,131 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 "the earlier message must keep the reasoning it was already sent with"
             );
             assert.strictEqual(secondPass[3].reasoning_content, "turn-2-reasoning");
+        });
+
+        test("strips reasoning the host already serialized into assistant content", () => {
+            const memento = new MockMemento();
+            const target = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const api = target as unknown as {
+                stripReasoningDuplicatesFromContent: (messages: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+
+            const reasoning = "I need to inspect the file first. Let me read it and check its contents before answering.";
+            const answer = "The file contains the expected value.";
+            const messages: OpenAIChatMessage[] = [
+                {
+                    role: "assistant",
+                    content: `${reasoning}${answer}`,
+                    reasoning_content: reasoning,
+                    tool_calls: [{ id: "call-1", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+                // Content that only shares a short coincidental prefix stays untouched.
+                {
+                    role: "assistant",
+                    content: `${reasoning.slice(0, 40)} but then something different`,
+                    reasoning_content: reasoning,
+                },
+                // Non-assistant messages and messages without reasoning are untouched.
+                { role: "user", content: "hi" },
+            ];
+
+            const stripped = api.stripReasoningDuplicatesFromContent(messages);
+            assert.strictEqual(stripped[0].content, answer, "the duplicated reasoning prefix must be removed");
+            assert.strictEqual(stripped[0].reasoning_content, reasoning, "reasoning_content must be preserved");
+            assert.strictEqual(
+                stripped[1].content,
+                `${reasoning.slice(0, 40)} but then something different`,
+                "short coincidental prefixes must not be stripped"
+            );
+            assert.strictEqual(stripped[2].content, "hi");
+        });
+
+        test("restores reasoning from the snapshot when the host rewrote the history", () => {
+            const memento = new MockMemento();
+            const target = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const api = target as unknown as {
+                restoreReasoningFromSnapshot: (messages: OpenAIChatMessage[], snapshot: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+
+            const snapshot: OpenAIChatMessage[] = [
+                { role: "user", content: "go" },
+                {
+                    role: "assistant",
+                    content: "answer",
+                    reasoning_content: "old-thoughts",
+                    tool_calls: [{ id: "call-1", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+            ];
+            // The host rewrote the assistant message (new content, reasoning
+            // dropped) but kept the same call id.
+            const rewritten: OpenAIChatMessage[] = [
+                { role: "user", content: "go" },
+                {
+                    role: "assistant",
+                    content: "rewritten",
+                    tool_calls: [{ id: "call-1", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: "result" },
+            ];
+
+            const restored = api.restoreReasoningFromSnapshot(rewritten, snapshot);
+            assert.strictEqual(restored[1].reasoning_content, "old-thoughts", "reasoning must be carried over by call id");
+
+            // Unknown call ids never receive foreign reasoning.
+            const foreign: OpenAIChatMessage[] = [
+                {
+                    role: "assistant",
+                    content: "x",
+                    tool_calls: [{ id: "call-9", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+            ];
+            const untouched = api.restoreReasoningFromSnapshot(foreign, snapshot);
+            assert.strictEqual(untouched[0].reasoning_content, undefined);
+        });
+
+        test("keeps the tail stable when the host truncates messages it already sent", () => {
+            const memento = new MockMemento();
+            const target = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent", undefined, undefined, memento);
+            const api = target as unknown as {
+                stabilizeTailFromSnapshot: (tail: OpenAIChatMessage[], snapshotPrefix: OpenAIChatMessage[]) => OpenAIChatMessage[];
+            };
+
+            const fullToolResult = "FULL TOOL RESULT ".repeat(50);
+            const snapshotPrefix: OpenAIChatMessage[] = [
+                { role: "user", content: "go" },
+                {
+                    role: "assistant",
+                    content: "answer",
+                    reasoning_content: "thoughts",
+                    tool_calls: [{ id: "call-1", type: "function" as const, function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: fullToolResult },
+            ];
+            // The host rewrote the tail: the tool result it already sent is now
+            // truncated, and one genuinely new user message was added. The
+            // rewritten tail must be replaced by the snapshot version (the
+            // prompt weight must stay monotonic, the cache prefix stable),
+            // while genuinely new messages stay as the host provided them.
+            const hostTail: OpenAIChatMessage[] = [
+                { role: "tool", tool_call_id: "call-1", content: "TRUNCATED" },
+                { role: "user", content: "new question" },
+            ];
+
+            const stabilized = api.stabilizeTailFromSnapshot(hostTail, snapshotPrefix);
+            assert.strictEqual(
+                stabilized[0].content,
+                fullToolResult,
+                "a rewritten tool result with a known call id must keep the snapshot version"
+            );
+            assert.strictEqual(stabilized[1].content, "new question", "genuinely new messages must stay from the host");
+            assert.strictEqual(stabilized[0].tool_call_id, "call-1");
+
+            // Unknown call ids are never replaced.
+            const foreignTail: OpenAIChatMessage[] = [
+                { role: "tool", tool_call_id: "call-99", content: "fresh" },
+            ];
+            const untouched = api.stabilizeTailFromSnapshot(foreignTail, snapshotPrefix);
+            assert.strictEqual(untouched[0].content, "fresh");
         });
 
         test("serializes local chat request slots", async () => {
@@ -1218,14 +1495,580 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.deepStrictEqual(second.tools, first.tools);
         });
 
+        test("restores host-rewritten history without dropping the new turn", () => {
+            const providerAny = provider as unknown as {
+                stabilizeMessagePrefix: (
+                    requestId: string,
+                    modelId: string,
+                    scope: string | undefined,
+                    messages: OpenAIChatMessage[],
+                    staticFieldsHash: string,
+                    toolsHash: string,
+                    toolsCount: number,
+                    toolNames: string[]
+                ) => { messages: OpenAIChatMessage[]; stabilized: boolean };
+            };
+            const history = (tree: string, answer: string): OpenAIChatMessage[] => [
+                { role: "system", content: "You are a careful coding agent." },
+                { role: "user", content: `Fix it\n<workspace_info>\n${tree}\n</workspace_info>` },
+                {
+                    role: "assistant",
+                    content: "checking",
+                    tool_calls: [{ id: "call-1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: answer },
+            ];
+            const stabilize = (messages: OpenAIChatMessage[], requestId: string) => providerAny.stabilizeMessagePrefix(
+                requestId,
+                "deepseek-v4-pro",
+                "conversation-prefix-1",
+                messages,
+                "static-hash",
+                "tools-hash",
+                1,
+                ["read_file"]
+            );
+
+            stabilize(history("src/a.ts", "full result"), "request-1");
+            // The host re-renders the workspace tree and re-summarizes the tool
+            // result, then appends this turn's new user message.
+            const rewritten = [
+                ...history("src/a.ts\nsnapshot.html", "result [summarized]"),
+                { role: "user", content: "and now this" } as OpenAIChatMessage,
+            ];
+            const result = stabilize(rewritten, "request-2");
+
+            assert.strictEqual(result.stabilized, true);
+            assert.deepStrictEqual(result.messages.slice(0, 4), history("src/a.ts", "full result"));
+            assert.deepStrictEqual(result.messages[4], { role: "user", content: "and now this" });
+        });
+
+        test("persists the stabilized prefix that was actually sent", () => {
+            const providerAny = provider as unknown as {
+                stabilizeMessagePrefix: (
+                    requestId: string,
+                    modelId: string,
+                    scope: string | undefined,
+                    messages: OpenAIChatMessage[],
+                    staticFieldsHash: string,
+                    toolsHash: string,
+                    toolsCount: number,
+                    toolNames: string[]
+                ) => { messages: OpenAIChatMessage[]; stabilized: boolean };
+            };
+            const history = (reasoning: string | undefined, tail: string): OpenAIChatMessage[] => [
+                { role: "system", content: "system" },
+                { role: "user", content: "inspect" },
+                {
+                    role: "assistant",
+                    content: "checking",
+                    reasoning_content: reasoning,
+                    tool_calls: [{ id: "call-reasoning", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-reasoning", content: "result" },
+                { role: "user", content: tail },
+            ];
+            const stabilize = (messages: OpenAIChatMessage[], requestId: string) => providerAny.stabilizeMessagePrefix(
+                requestId,
+                "deepseek-v4-flash",
+                "conversation-prefix-reasoning",
+                messages,
+                "static-hash",
+                "tools-hash",
+                1,
+                ["read_file"]
+            );
+
+            stabilize(history("stable reasoning", "turn one"), "request-reasoning-1");
+            const second = stabilize(
+                [...history(undefined, "turn one"), { role: "user", content: "turn two" }],
+                "request-reasoning-2"
+            );
+            const third = stabilize(
+                [...history(undefined, "turn one"), { role: "user", content: "turn two" }, { role: "user", content: "turn three" }],
+                "request-reasoning-3"
+            );
+
+            assert.strictEqual(second.messages[2].reasoning_content, "stable reasoning");
+            assert.strictEqual(
+                third.messages[2].reasoning_content,
+                "stable reasoning",
+                "the next prefix must reuse the stabilized version sent on the previous request"
+            );
+        });
+
+        test("keeps live shared memory while restoring a durable snapshot prefix", () => {
+            const providerAny = provider as unknown as {
+                stabilizeMessagePrefix: (
+                    requestId: string,
+                    modelId: string,
+                    scope: string | undefined,
+                    messages: OpenAIChatMessage[],
+                    staticFieldsHash: string,
+                    toolsHash: string,
+                    toolsCount: number,
+                    toolNames: string[]
+                ) => { messages: OpenAIChatMessage[]; stabilized: boolean; prefix: Record<string, unknown> };
+            };
+            const durable = (workspace: string, result: string): OpenAIChatMessage[] => [
+                { role: "system", content: "system" },
+                { role: "user", content: `inspect\n<workspace_info>\n${workspace}\n</workspace_info>` },
+                {
+                    role: "assistant",
+                    content: "reading",
+                    tool_calls: [{ id: "call-memory", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-memory", content: result },
+            ];
+            const stabilize = (messages: OpenAIChatMessage[], requestId: string) => providerAny.stabilizeMessagePrefix(
+                requestId,
+                "deepseek-v4-pro",
+                "conversation-prefix-memory",
+                messages,
+                "static-hash",
+                "tools-hash",
+                1,
+                ["read_file"]
+            );
+
+            const first = injectSharedMemoryContext(durable("src/a.ts", "full result"), "memory turn one");
+            const firstResult = stabilize(first, "request-memory-1");
+            assert.strictEqual(firstResult.prefix.messageCount, 4, "memory must stay outside the durable snapshot");
+            assert.strictEqual(typeof firstResult.prefix.ephemeralHash, "string");
+            assert.ok(Number(firstResult.prefix.ephemeralChars) > 0);
+
+            const secondDurable: OpenAIChatMessage[] = [
+                ...durable("src/a.ts\nsrc/b.ts", "result [summarized]"),
+                {
+                    role: "assistant",
+                    content: "checking",
+                    tool_calls: [{ id: "call-next", type: "function", function: { name: "grep_search", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-next", content: "fresh result" },
+            ];
+            const second = injectSharedMemoryContext(secondDurable, "memory turn two");
+            const result = stabilize(second, "request-memory-2");
+            const memoryMessages = result.messages.filter(message => message.ephemeral);
+
+            assert.strictEqual(result.stabilized, true);
+            assert.strictEqual(result.prefix.ephemeralChanged, true, "changed memory must be visible to cache diagnostics");
+            assert.strictEqual(result.prefix.previousEphemeralHash, firstResult.prefix.ephemeralHash);
+            assert.strictEqual(memoryMessages.length, 1, "current shared memory must reach every request");
+            assert.match(String(memoryMessages[0].content), /memory turn two/);
+            assert.strictEqual(
+                result.messages.filter(message => message.tool_call_id === "call-memory").length,
+                1,
+                "restoring the durable prefix must not duplicate the adjacent tool result"
+            );
+            assert.strictEqual(result.messages.at(-1)?.content, "fresh result");
+        });
+
+        test("freezes shared memory across tool rounds and refreshes it on the next user turn", async () => {
+            let memoryBuildCalls = 0;
+            const memoryTexts = ["memory selected for turn one", "memory selected for turn two", "unexpected tool-round refresh"];
+            const memoryProvider = {
+                buildPromptContext: async () => {
+                    const text = memoryTexts[Math.min(memoryBuildCalls, memoryTexts.length - 1)];
+                    memoryBuildCalls += 1;
+                    return {
+                        text,
+                        entryCount: 1,
+                        entryIds: [`memory-${memoryBuildCalls}`],
+                        estimatedTokens: Math.ceil(text.length / 4),
+                        expiredEntryCount: 0,
+                    };
+                },
+            };
+            const isolatedProvider = new LlamaCppChatModelProvider(
+                new MockSecretStorage(),
+                "test-user-agent",
+                undefined,
+                memoryProvider
+            );
+            const providerAny = isolatedProvider as unknown as {
+                getModelSources: () => Promise<Array<{
+                    key: string;
+                    label: string;
+                    serverUrl: string;
+                    familyOverride?: string;
+                    contextLengthFallback?: number;
+                }>>;
+                getRuntimeContextLengthWithCache: () => Promise<number | undefined>;
+                acquireChatRequestSlot: (
+                    requestId: string,
+                    queueTimeoutMs: number,
+                    token: vscode.CancellationToken
+                ) => Promise<{ release: () => void; waitMs: number }>;
+                sendChatCompletion: (
+                    serverUrl: string,
+                    headers: Record<string, string>,
+                    requestBody: Record<string, unknown>,
+                    timeoutMs: number,
+                    token: vscode.CancellationToken
+                ) => Promise<Response>;
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken
+                ) => Promise<void>;
+            };
+            const sent: Array<Record<string, unknown>> = [];
+            providerAny.getModelSources = async () => [{
+                key: "local",
+                label: "Local",
+                serverUrl: "http://localhost:8000",
+                familyOverride: "qwen",
+                contextLengthFallback: 65536,
+            }];
+            providerAny.getRuntimeContextLengthWithCache = async () => 65536;
+            providerAny.acquireChatRequestSlot = async () => ({ release: () => undefined, waitMs: 0 });
+            providerAny.sendChatCompletion = async (_serverUrl, _headers, requestBody) => {
+                sent.push(JSON.parse(JSON.stringify(requestBody)) as Record<string, unknown>);
+                return new Response(new ReadableStream<Uint8Array>({
+                    start(controller) { controller.close(); },
+                }), { status: 200 });
+            };
+            providerAny.processStreamingResponse = async (_responseBody, progress) => {
+                progress.report(new vscode.LanguageModelTextPart("done"));
+            };
+
+            const model = {
+                id: "local::qwen3-local",
+                name: "qwen3-local (Local)",
+                family: "qwen",
+                version: "1",
+                maxInputTokens: 60000,
+                maxOutputTokens: 4096,
+                capabilities: {},
+            } as unknown as vscode.LanguageModelChatInformation;
+            const options = {
+                modelOptions: { _copilotConversationId: "memory-freeze-conversation" },
+                tools: [{
+                    name: "read_file",
+                    description: "Read a file",
+                    inputSchema: { type: "object", properties: {} },
+                }],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } satisfies vscode.ProvideLanguageModelChatResponseOptions;
+            const call = new vscode.LanguageModelToolCallPart("call-memory-freeze", "read_file", {});
+            const result = new vscode.LanguageModelToolResultPart(
+                "call-memory-freeze",
+                [new vscode.LanguageModelTextPart("file contents")]
+            );
+            const firstTurn = [vscode.LanguageModelChatMessage.User("inspect the file")];
+            const toolRound: vscode.LanguageModelChatMessage[] = [
+                ...firstTurn,
+                { role: vscode.LanguageModelChatMessageRole.Assistant, content: [call], name: undefined },
+                { role: vscode.LanguageModelChatMessageRole.User, content: [result], name: undefined },
+            ];
+            const secondTurn: vscode.LanguageModelChatMessage[] = [
+                ...toolRound,
+                vscode.LanguageModelChatMessage.Assistant("finished the first task"),
+                vscode.LanguageModelChatMessage.User("start the next task"),
+            ];
+            const progress = { report: () => undefined };
+            const cancellation = new vscode.CancellationTokenSource().token;
+
+            await isolatedProvider.provideLanguageModelChatResponse(model, firstTurn, options, progress, cancellation);
+            await isolatedProvider.provideLanguageModelChatResponse(model, toolRound, options, progress, cancellation);
+            await isolatedProvider.provideLanguageModelChatResponse(model, secondTurn, options, progress, cancellation);
+
+            const memoryMessagesFrom = (body: Record<string, unknown>): string[] => {
+                const messages = body.messages as Array<{ content?: unknown }>;
+                return messages
+                    .filter(message =>
+                        typeof message.content === "string"
+                        && message.content.includes("Shared durable memory")
+                    )
+                    .map(message => String(message.content));
+            };
+            assert.strictEqual(sent.length, 3);
+            assert.strictEqual(memoryMessagesFrom(sent[0]).length, 1);
+            assert.match(memoryMessagesFrom(sent[0])[0], /memory selected for turn one/);
+            assert.strictEqual(
+                memoryMessagesFrom(sent[1])[0],
+                memoryMessagesFrom(sent[0])[0],
+                "tool-result rounds must reuse the byte-identical memory block from the active user turn"
+            );
+            assert.strictEqual(
+                memoryMessagesFrom(sent[2])[0],
+                memoryMessagesFrom(sent[0])[0],
+                "a new user turn must retain the old memory checkpoint at its original prefix position"
+            );
+            assert.strictEqual(
+                memoryMessagesFrom(sent[2]).length,
+                2,
+                "newly selected memory must append a delta instead of replacing the old checkpoint"
+            );
+            assert.match(memoryMessagesFrom(sent[2])[1], /memory selected for turn two/);
+            assert.strictEqual(memoryBuildCalls, 2, "memory retrieval must run once per genuine user turn");
+            for (const body of sent) {
+                const wireMessages = body.messages as Array<Record<string, unknown>>;
+                assert.ok(
+                    wireMessages.every(message =>
+                        message.providerOverlay === undefined
+                        && message.sharedMemoryRevisions === undefined
+                        && message.ephemeral === undefined
+                    ),
+                    "provider-only alignment metadata must never be sent to the API"
+                );
+            }
+        });
+
+        test("builds an exclusive ordered prompt breakdown with memory and message subsections", () => {
+            const providerAny = provider as unknown as {
+                buildPromptSegments: (
+                    messages: OpenAIChatMessage[],
+                    toolTokens: number,
+                    messageTokens: number
+                ) => Array<{ kind: string; label: string; tokens: number }>;
+            };
+            const segments = providerAny.buildPromptSegments([
+                { role: "system", content: "system prompt" },
+                {
+                    role: "user",
+                    content: "shared memory",
+                    providerOverlay: "shared-memory",
+                    sharedMemoryRevisions: [{ id: "memory-1", revision: "abc" }],
+                },
+                { role: "user", content: "request\n<workspace_info>tree</workspace_info>" },
+                {
+                    role: "assistant",
+                    content: "reading",
+                    reasoning_content: "need to inspect",
+                    tool_calls: [{
+                        id: "call-1",
+                        type: "function",
+                        function: { name: "read_file", arguments: "{}" },
+                    }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: "file contents" },
+                { role: "user", content: "guard", ephemeral: true },
+            ], 600, 4_400);
+
+            assert.deepStrictEqual(
+                segments.map(segment => segment.kind),
+                ["system", "tools", "shared_memory", "user_context", "assistant", "reasoning", "tool_calls", "tool_results", "guard"]
+            );
+            assert.strictEqual(
+                segments.reduce((sum, segment) => sum + segment.tokens, 0),
+                5_000,
+                "exclusive message segments plus tools must equal the local prompt estimate"
+            );
+        });
+
+        test("keeps the snapshot aligned when an ephemeral nudge disappears", () => {
+            const providerAny = provider as unknown as {
+                stabilizeMessagePrefix: (
+                    requestId: string,
+                    modelId: string,
+                    scope: string | undefined,
+                    messages: OpenAIChatMessage[],
+                    staticFieldsHash: string,
+                    toolsHash: string,
+                    toolsCount: number,
+                    toolNames: string[]
+                ) => { messages: OpenAIChatMessage[]; stabilized: boolean; prefix: Record<string, unknown> };
+            };
+            const turn = (answer: string, toolCallId: string): OpenAIChatMessage[] => [
+                { role: "system", content: "You are a careful coding agent." },
+                { role: "user", content: "keep going" },
+                {
+                    role: "assistant",
+                    content: "reading",
+                    tool_calls: [{ id: toolCallId, type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: toolCallId, content: answer },
+            ];
+            const stabilize = (messages: OpenAIChatMessage[], requestId: string) => providerAny.stabilizeMessagePrefix(
+                requestId,
+                "deepseek-v4-pro",
+                "conversation-prefix-2",
+                messages,
+                "static-hash",
+                "tools-hash",
+                1,
+                ["read_file"]
+            );
+
+            // Turn 1 ends with a cross-turn nudge the provider injected itself.
+            const withNudge: OpenAIChatMessage[] = [
+                ...turn("result-1", "call-1"),
+                { role: "user", content: "Pause and summarize.", ephemeral: true },
+            ];
+            const first = stabilize(withNudge, "request-1");
+            // The nudge still reaches the server...
+            assert.strictEqual(first.messages.at(-1)?.content, "Pause and summarize.");
+            // ...but it is excluded from the recorded prefix.
+            assert.strictEqual(first.prefix.messageCount, 4);
+
+            // Turn 2: the host sends the real history (no nudge) plus a new question.
+            const next = stabilize(
+                [...turn("result-1", "call-1"), { role: "user", content: "new question" } as OpenAIChatMessage],
+                "request-2"
+            );
+
+            // Byte-identical prefix: no rewrite needed, but the prefix aligns.
+            assert.strictEqual(next.prefix.identicalMessagePrefix, 4);
+            assert.strictEqual(next.prefix.ephemeralChanged, true, "a disappearing provider nudge changes the real prompt");
+            assert.deepStrictEqual(next.messages.slice(0, 4), turn("result-1", "call-1"));
+            assert.deepStrictEqual(next.messages[4], { role: "user", content: "new question" });
+
+            // Turn 3: the host re-summarizes the tool result of the same call —
+            // the call id anchors it, so the sent version is restored from the
+            // snapshot instead of rewriting the cached prefix.
+            const rewritten = stabilize(
+                [...turn("result-1 [summarized]", "call-1"), { role: "user", content: "and now" } as OpenAIChatMessage],
+                "request-3"
+            );
+            assert.strictEqual(rewritten.stabilized, true);
+            assert.deepStrictEqual(rewritten.messages.slice(0, 4), turn("result-1", "call-1"));
+            assert.deepStrictEqual(rewritten.messages[4], { role: "user", content: "and now" });
+        });
+
+        test("keeps the compacted snapshot usable after the host re-renders its tail", () => {
+            const providerAny = provider as unknown as {
+                findSnapshotAlignment: (
+                    source: OpenAIChatMessage[],
+                    snapshot: OpenAIChatMessage[]
+                ) => { snapshotPrefix: number; newMessages: OpenAIChatMessage[] } | undefined;
+            };
+            const snapshot: OpenAIChatMessage[] = [
+                { role: "system", content: "summary of earlier work" },
+                { role: "user", content: "keep going\n<workspace_info>\nsrc/a.ts\n</workspace_info>" },
+                {
+                    role: "assistant",
+                    content: "reading",
+                    tool_calls: [{ id: "call-9", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-9", content: "full file body" },
+            ];
+            // After a restart the host re-renders the workspace tree and
+            // re-summarizes the tool result of the very same turns.
+            const source: OpenAIChatMessage[] = [
+                { role: "system", content: "summary of earlier work" },
+                { role: "user", content: "keep going\n<workspace_info>\nsrc/a.ts\nout/b.js\n</workspace_info>" },
+                {
+                    role: "assistant",
+                    content: "reading",
+                    tool_calls: [{ id: "call-9", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-9", content: "[tool result summarized]" },
+                { role: "user", content: "next question" },
+            ];
+
+            const alignment = providerAny.findSnapshotAlignment(source, snapshot);
+
+            assert.strictEqual(alignment?.snapshotPrefix, 4);
+            assert.deepStrictEqual(alignment?.newMessages, [{ role: "user", content: "next question" }]);
+        });
+
+        test("rewinds the pivot when the host drops the snapshot tail", () => {
+            const providerAny = provider as unknown as {
+                findSnapshotAlignment: (
+                    source: OpenAIChatMessage[],
+                    snapshot: OpenAIChatMessage[]
+                ) => { snapshotPrefix: number; newMessages: OpenAIChatMessage[] } | undefined;
+            };
+            const shared: OpenAIChatMessage[] = [
+                { role: "system", content: "system" },
+                { role: "user", content: "start" },
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call-1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: "a" },
+            ];
+            // The snapshot still holds an answer the host discarded when the
+            // user sent a new message.
+            const snapshot: OpenAIChatMessage[] = [...shared, { role: "assistant", content: "interrupted answer" }];
+            const source: OpenAIChatMessage[] = [...shared, { role: "user", content: "new question" }];
+
+            const alignment = providerAny.findSnapshotAlignment(source, snapshot);
+
+            assert.strictEqual(alignment?.snapshotPrefix, 4);
+            assert.deepStrictEqual(alignment?.newMessages, [{ role: "user", content: "new question" }]);
+        });
+
+        test("keeps the snapshot when the host trims its own history window", () => {
+            const providerAny = provider as unknown as {
+                tailRepeatsSnapshotCalls: (
+                    snapshot: readonly OpenAIChatMessage[],
+                    tail: readonly OpenAIChatMessage[]
+                ) => boolean;
+            };
+            const snapshot: OpenAIChatMessage[] = [
+                { role: "system", content: "system" },
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call-1", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-1", content: "body" },
+            ];
+            const freshTail: OpenAIChatMessage[] = [
+                {
+                    role: "assistant",
+                    content: "",
+                    tool_calls: [{ id: "call-2", type: "function", function: { name: "read_file", arguments: "{}" } }],
+                },
+                { role: "tool", tool_call_id: "call-2", content: "body" },
+            ];
+            const repeatedTail: OpenAIChatMessage[] = [
+                { role: "tool", tool_call_id: "call-1", content: "body rewritten" },
+            ];
+
+            assert.strictEqual(providerAny.tailRepeatsSnapshotCalls(snapshot, freshTail), false);
+            assert.strictEqual(providerAny.tailRepeatsSnapshotCalls(snapshot, repeatedTail), true);
+        });
+
+        test("keeps a fresh turn when the host replaces the last message", () => {
+            const providerAny = provider as unknown as {
+                stabilizeMessagePrefix: (
+                    requestId: string,
+                    modelId: string,
+                    scope: string | undefined,
+                    messages: OpenAIChatMessage[],
+                    staticFieldsHash: string,
+                    toolsHash: string,
+                    toolsCount: number,
+                    toolNames: string[]
+                ) => { messages: OpenAIChatMessage[]; stabilized: boolean };
+            };
+            const stabilize = (messages: OpenAIChatMessage[], requestId: string) => providerAny.stabilizeMessagePrefix(
+                requestId,
+                "deepseek-v4-pro",
+                "conversation-prefix-2",
+                messages,
+                "static-hash",
+                "tools-hash",
+                0,
+                []
+            );
+
+            stabilize([
+                { role: "system", content: "system" },
+                { role: "user", content: "first question" },
+            ], "request-1");
+            const result = stabilize([
+                { role: "system", content: "system" },
+                { role: "user", content: "second question" },
+            ], "request-2");
+
+            assert.strictEqual(result.messages[1].content, "second question");
+        });
+
         test("restores the sent-message snapshot and tool catalog after provider restart", async () => {
             const memento = new MockMemento();
+            const storageDir = fs.mkdtempSync(path.join(os.tmpdir(), "llamacpp-test-"));
             const firstProvider = new LlamaCppChatModelProvider(
                 new MockSecretStorage(),
                 "test-user-agent",
                 undefined,
                 undefined,
-                memento
+                memento,
+                storageDir
             );
             const firstProviderAny = firstProvider as unknown as {
                 setConversationMessageSnapshot: (
@@ -1245,6 +2088,12 @@ suite("Llama.cpp Chat Provider Extension", () => {
             const scope = "deepseek-v4-pro\0conversation-restart-1";
             const sentMessages: OpenAIChatMessage[] = [
                 { role: "system", content: "stable instructions" },
+                {
+                    role: "user",
+                    content: "persisted shared memory",
+                    providerOverlay: "shared-memory",
+                    sharedMemoryRevisions: [{ id: "entry-1", revision: "revision-1" }],
+                },
                 { role: "user", content: "continue this long conversation" },
                 { role: "assistant", content: "continuation point" },
             ];
@@ -1274,7 +2123,8 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 "test-user-agent",
                 undefined,
                 undefined,
-                memento
+                memento,
+                storageDir
             );
             const restartedProviderAny = restartedProvider as unknown as {
                 getConversationMessageSnapshot: (scope: string) => {
@@ -1798,7 +2648,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.strictEqual(textParts[0].value, "Recovered response");
         });
 
-        test("retries a rejected tool call with a bounded correction prompt", async () => {
+        test("retries a rejected tool call after partial text with a bounded correction prompt", async () => {
             const providerAny = provider as unknown as {
                 getServerUrl: () => Promise<string>;
                 getApiKey: () => Promise<string | undefined>;
@@ -1850,6 +2700,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 providerAny.processStreamingResponse = async (_body, progress) => {
                     streamInvocation += 1;
                     if (streamInvocation === 1) {
+                        progress.report(new vscode.LanguageModelTextPart("Inspecting the file first."));
                         throw new ToolCallValidationError("$.path is required", "read_file", "schema");
                     }
                     progress.report(new vscode.LanguageModelTextPart("Recovered after correction"));
@@ -2054,28 +2905,24 @@ suite("Llama.cpp Chat Provider Extension", () => {
           assert.ok((out[1].content as string).includes("ok"));
           });
 
-        test("strips orphan tool_calls when the tool result is missing (interrupted turn)", () => {
-            const callId = "call_orphan_1";
-            const messages: vscode.LanguageModelChatMessage[] = [
-                {
-                    role: vscode.LanguageModelChatMessageRole.Assistant,
-                    content: [new vscode.LanguageModelTextPart("checking..."), new vscode.LanguageModelToolCallPart(callId, "my_tool", { q: 1 })],
-                    name: undefined,
-                },
-                {
-                    role: vscode.LanguageModelChatMessageRole.User,
-                    content: [new vscode.LanguageModelTextPart("steering message — the tool never completed")],
-                    name: undefined,
-                },
-            ];
+		test("keeps serialized text parts (constructor lost over IPC)", () => {
+			// Parts crossing the extension-host boundary arrive as plain
+			// objects with a `value` string and no class identity. Without
+			// shape matching their text silently vanishes from the prompt.
+			const messages = [
+				{
+					role: vscode.LanguageModelChatMessageRole.User,
+					content: [
+						{ value: "user text that must survive" },
+					],
+					name: undefined,
+				},
+			] as unknown as vscode.LanguageModelChatMessage[];
 
-            const out = convertMessages(messages, { toolResultMode: "tool" });
-            assert.strictEqual(out.length, 2);
-            assert.strictEqual(out[0].role, "assistant");
-            assert.strictEqual(out[0].tool_calls, undefined, "orphan tool_calls must be stripped");
-            assert.ok(String(out[0].content).includes("checking..."));
-            assert.strictEqual(out[1].role, "user");
-        });
+			const out = convertMessages(messages);
+			assert.strictEqual(out.length, 1);
+			assert.ok(String(out[0].content).includes("user text that must survive"));
+		});
 
         test("keeps tool_calls when every call has a matching tool result", () => {
             const callId = "call_kept_1";
@@ -2406,7 +3253,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.deepEqual(names, ["run_in_terminal", "read_file"]);
         });
 
-        test("convertTools apiDirect keeps runSubagent in the default 70-tool subset", () => {
+        test("convertTools apiDirect keeps runSubagent in a 70-tool subset", () => {
             const fillerTools = Array.from({ length: 79 }, (_, index) => ({
                 name: `random_tool_${index}`,
                 description: `Random tool ${index}`,
@@ -2423,7 +3270,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                         { name: "grep_search", description: "Search", inputSchema: { type: "object", properties: {} } },
                     ],
                 } satisfies vscode.ProvideLanguageModelChatResponseOptions,
-                { mode: "apiDirect", apiDirectToolTokenBudget: 65536 }
+                { mode: "apiDirect", apiDirectMaxTools: 70, apiDirectToolTokenBudget: 65536 }
             );
 
             const names = (out.tools ?? []).map(t => t.function.name);
@@ -2621,7 +3468,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 				{ mode: "apiDirect", apiDirectIncludeAllTools: false, apiDirectMaxTools: 128 }
 			);
 
-            assert.equal((out.tools ?? []).length, 70);
+            assert.equal((out.tools ?? []).length, 83);
 		});
 
 		test("convertTools apiDirect respects the approximate schema token budget", () => {

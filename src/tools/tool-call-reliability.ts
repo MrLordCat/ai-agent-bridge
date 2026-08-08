@@ -346,6 +346,24 @@ function repairTerminalTimeout(
 }
 
 /**
+ * DeepSeek-family models frequently omit the required `mode` field when
+ * calling run_in_terminal, which would otherwise trigger an expensive
+ * reject + retry round trip. Sync is the safe default (the tool result
+ * carries the command output); auto-fill it instead of rejecting.
+ */
+function repairMissingTerminalMode(
+	name: string,
+	argumentsValue: Record<string, unknown>,
+	repairEnabled: boolean
+): boolean {
+	if (!repairEnabled || name !== "run_in_terminal" || typeof argumentsValue.mode === "string") {
+		return false;
+	}
+	argumentsValue.mode = "sync";
+	return true;
+}
+
+/**
  * Auto-fills empty string defaults for the `description` field when it is required but missing.
  * VS Code Copilot tools (e.g. subagent dispatch) often require `description` in their input
  * schema, but local models may omit it. An empty description is safe as a fallback.
@@ -434,6 +452,9 @@ export class ToolCallReliabilityGuard {
 			}
 		}
 		if (repairTerminalTimeout(name, parsed.value, this.options.repairEnabled)) {
+			repaired = true;
+		}
+		if (repairMissingTerminalMode(name, parsed.value, this.options.repairEnabled)) {
 			repaired = true;
 		}
 
@@ -536,11 +557,59 @@ export function injectToolLoopGuard(
 		...next,
 		{
 			role: "user",
+			ephemeral: true,
 			content: [
 				"Tool reliability guard:",
 				`The identical ${detection.toolName} call has already been attempted ${detection.repetitions} consecutive times.`,
 				"Do not repeat it with the same arguments. Use the existing result, inspect the error, change the approach, or explain what blocks progress.",
 			].join("\n"),
+		},
+	];
+}
+
+export type RecentTurnShape = "toolOnly" | "text";
+
+export const RECENT_TURN_WINDOW = 8;
+
+export function recordRecentTurnShape(
+	queue: readonly RecentTurnShape[],
+	shape: RecentTurnShape,
+	window = RECENT_TURN_WINDOW
+): RecentTurnShape[] {
+	const next = [...queue, shape];
+	return next.length > window ? next.slice(next.length - window) : next;
+}
+
+export function toolCallOnlyDensity(queue: readonly RecentTurnShape[]): number {
+	return queue.reduce((count, shape) => (shape === "toolOnly" ? count + 1 : count), 0);
+}
+
+/**
+ * Cross-turn tool-call pacing guard: nudge only when tool-call-only turns
+ * clearly dominate a full recent window (e.g. 5 of the last 8 turns), so
+ * normal agentic work with occasional tool calls is never disturbed.
+ */
+export function shouldInjectToolCallOnlyNudge(
+	queue: readonly RecentTurnShape[],
+	threshold: number
+): boolean {
+	return queue.length >= RECENT_TURN_WINDOW && toolCallOnlyDensity(queue) >= threshold;
+}
+
+export function injectToolCallOnlyNudge(
+	messages: readonly OpenAIChatMessage[],
+	message: string | undefined
+): OpenAIChatMessage[] {
+	const next = messages.map(entry => ({ ...entry }));
+	if (!message) {
+		return next;
+	}
+	return [
+		...next,
+		{
+			role: "user",
+			ephemeral: true,
+			content: message,
 		},
 	];
 }

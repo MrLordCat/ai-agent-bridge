@@ -2,7 +2,11 @@ import * as assert from "node:assert";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { buildMemoryQuery, injectSharedMemoryContext } from "../memory/prompt";
+import {
+	buildMemoryQuery,
+	injectAppendOnlySharedMemoryContext,
+	injectSharedMemoryContext,
+} from "../memory/prompt";
 import { SharedMemoryService } from "../memory/shared-memory-service";
 import type { OpenAIChatMessage } from "../types";
 
@@ -101,6 +105,7 @@ suite("Shared memory", () => {
 		assert.ok(context?.text.includes("Qwen model rule"));
 		assert.ok(!context?.text.includes("Qwen stale external fact"));
 		assert.strictEqual(context?.expiredEntryCount, 1);
+		assert.deepStrictEqual(context?.scopeCounts, { global: 1, workspace: 1, model: 1 });
 
 		const modelOnly = memory.search("qwen", 1, {
 			workspaceId: "file:///a",
@@ -109,6 +114,54 @@ suite("Shared memory", () => {
 		});
 		assert.strictEqual(modelOnly.length, 1);
 		assert.strictEqual(modelOnly[0].scope, "model");
+	});
+
+	test("does not delete memory outside the explicitly selected scope", async () => {
+		const global = await memory.upsert({ title: "Global", content: "Shared everywhere", scope: "global" });
+		const workspace = await memory.upsert({
+			title: "Workspace A",
+			content: "Only project A",
+			scope: "workspace",
+			scopeId: "file:///a",
+		});
+
+		assert.strictEqual(await memory.remove(workspace.id, {
+			scope: "workspace",
+			workspaceId: "file:///b",
+		}), false, "another workspace must not be able to delete the entry by id");
+		assert.strictEqual(await memory.remove(global.id, {
+			scope: "workspace",
+			workspaceId: "file:///a",
+		}), false, "the requested scope must match the stored scope");
+		assert.strictEqual(await memory.remove(workspace.id, {
+			scope: "workspace",
+			workspaceId: "file:///a",
+		}), true);
+		assert.strictEqual(await memory.remove(global.id, { scope: "global" }), true);
+	});
+
+	test("publishes only explicit global and current-project tool scopes", async () => {
+		const packageJsonPath = path.resolve(__dirname, "../../package.json");
+		const packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf8")) as {
+			contributes?: { languageModelTools?: Array<Record<string, unknown>> };
+		};
+		const tools = packageJson.contributes?.languageModelTools ?? [];
+		const tool = (name: string): Record<string, unknown> => {
+			const found = tools.find(candidate => candidate.name === name);
+			assert.ok(found, `missing ${name}`);
+			return found;
+		};
+		const schema = (name: string) => tool(name).inputSchema as {
+			properties: Record<string, { enum?: string[] }>;
+			required?: string[];
+		};
+
+		for (const name of ["llamacpp_store_memory", "llamacpp_search_memory", "llamacpp_delete_memory"]) {
+			assert.deepStrictEqual(schema(name).properties.scope.enum, ["global", "workspace"]);
+		}
+		assert.ok(schema("llamacpp_store_memory").required?.includes("scope"));
+		assert.ok(schema("llamacpp_delete_memory").required?.includes("scope"));
+		assert.ok(!("scopeId" in schema("llamacpp_store_memory").properties));
 	});
 
 	test("uses fuzzy retrieval without letting pinned unrelated entries leak in", async () => {
@@ -147,6 +200,10 @@ suite("Shared memory", () => {
 		assert.ok(context);
 		assert.ok(context!.estimatedTokens <= 128);
 		assert.ok(context!.text.length <= 512);
+		assert.ok(
+			(context!.entries ?? []).reduce((sum, entry) => sum + entry.text.length, 0) <= 512,
+			"per-entry delta payload must honor the same prompt budget"
+		);
 	});
 
 	test("injects shared memory near the latest user turn to preserve the cached prefix", () => {
@@ -162,8 +219,46 @@ suite("Shared memory", () => {
 		assert.deepStrictEqual(injected.slice(0, 3), messages.slice(0, 3));
 		assert.strictEqual(injected[3].role, "user");
 		assert.match(String(injected[3].content), /Preferred model: Qwen/);
+		assert.strictEqual(injected[3].ephemeral, true);
 		assert.strictEqual(injected[4].content, "Work on the local provider");
 		assert.strictEqual(messages[0].content, "Base instructions");
+	});
+
+	test("keeps identical memory checkpoints in place and appends only updated revisions", () => {
+		const firstContext = {
+			text: "current memory\n\n- [entry-1] Build command\nnpm test",
+			entryCount: 1,
+			entryIds: ["entry-1"],
+			entries: [{ id: "entry-1", text: "- [entry-1] Build command\nnpm test" }],
+			estimatedTokens: 10,
+			expiredEntryCount: 0,
+		};
+		const first = injectAppendOnlySharedMemoryContext([
+			{ role: "system", content: "system" },
+			{ role: "user", content: "first task" },
+		], firstContext);
+		const second = injectAppendOnlySharedMemoryContext([
+			...first,
+			{ role: "assistant", content: "first answer" },
+			{ role: "user", content: "second task" },
+		], firstContext);
+		const overlaysAfterSameMemory = second.filter(message => message.providerOverlay === "shared-memory");
+
+		assert.strictEqual(overlaysAfterSameMemory.length, 1);
+		assert.strictEqual(second.indexOf(overlaysAfterSameMemory[0]), first.indexOf(
+			first.find(message => message.providerOverlay === "shared-memory")!
+		));
+
+		const updated = injectAppendOnlySharedMemoryContext(second, {
+			...firstContext,
+			text: "updated memory\n\n- [entry-1] Build command\nnpm test -- --grep memory",
+			entries: [{ id: "entry-1", text: "- [entry-1] Build command\nnpm test -- --grep memory" }],
+		});
+		const overlaysAfterUpdate = updated.filter(message => message.providerOverlay === "shared-memory");
+		assert.strictEqual(overlaysAfterUpdate.length, 2);
+		assert.strictEqual(overlaysAfterUpdate[0].content, overlaysAfterSameMemory[0].content);
+		assert.match(String(overlaysAfterUpdate[1].content), /Append-only shared memory update/);
+		assert.match(String(overlaysAfterUpdate[1].content), /npm test -- --grep memory/);
 	});
 
 	test("builds retrieval query from recent user messages only", () => {

@@ -1,7 +1,9 @@
 import * as vscode from "vscode";
-import { getCurrentWorkspaceScopeId } from "./scope";
+import { getCurrentWorkspaceScopeId, getCurrentWorkspaceScopeLabel } from "./scope";
 import type { SharedMemoryService } from "./shared-memory-service";
-import type { SharedMemoryKind, SharedMemoryScope } from "./types";
+import type { SharedMemoryKind } from "./types";
+
+type AgentMemoryScope = "global" | "workspace";
 
 interface StoreMemoryInput {
 	id?: string;
@@ -9,8 +11,7 @@ interface StoreMemoryInput {
 	content: string;
 	tags?: string[];
 	pinned?: boolean;
-	scope?: SharedMemoryScope;
-	scopeId?: string;
+	scope: AgentMemoryScope;
 	kind?: SharedMemoryKind;
 	sourceUrl?: string;
 	verifiedAt?: string;
@@ -20,36 +21,65 @@ interface StoreMemoryInput {
 interface SearchMemoryInput {
 	query?: string;
 	limit?: number;
-	modelId?: string;
 	includeExpired?: boolean;
-	scope?: SharedMemoryScope;
+	scope?: AgentMemoryScope;
 }
 
 interface DeleteMemoryInput {
 	id: string;
+	scope: AgentMemoryScope;
+}
+
+function scopeDescription(scope: AgentMemoryScope): string {
+	return scope === "global"
+		? "global memory (available to agents in every project)"
+		: `project memory (only ${getCurrentWorkspaceScopeLabel()})`;
+}
+
+function resolveScope(scope: AgentMemoryScope): { scope: AgentMemoryScope; scopeId?: string } {
+	if (scope === "global") {
+		return { scope };
+	}
+	if (scope !== "workspace") {
+		throw new Error('Memory scope must be either "global" or "workspace".');
+	}
+	const scopeId = getCurrentWorkspaceScopeId();
+	if (!scopeId) {
+		throw new Error("Project memory requires an open VS Code workspace.");
+	}
+	return { scope, scopeId };
 }
 
 class StoreMemoryTool implements vscode.LanguageModelTool<StoreMemoryInput> {
 	constructor(private readonly memory: SharedMemoryService) {}
 
 	prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<StoreMemoryInput>): vscode.PreparedToolInvocation {
+		const destination = scopeDescription(options.input.scope);
 		return {
-			invocationMessage: `Saving shared memory: ${options.input.title}`,
+			invocationMessage: `Saving ${destination}: ${options.input.title}`,
 			confirmationMessages: {
-				title: "Save shared memory",
-				message: `Store "${options.input.title}" for use across chats, projects, and models?`,
+				title: options.input.scope === "global" ? "Save global memory" : "Save project memory",
+				message: `Store "${options.input.title}" in ${destination}?`,
 			},
 		};
 	}
 
 	async invoke(options: vscode.LanguageModelToolInvocationOptions<StoreMemoryInput>): Promise<vscode.LanguageModelToolResult> {
-		const input = { ...options.input };
-		if (input.scope === "workspace" && !input.scopeId) {
-			input.scopeId = getCurrentWorkspaceScopeId();
+		const destination = resolveScope(options.input.scope);
+		const existing = options.input.id ? this.memory.get(options.input.id) : undefined;
+		if (
+			existing?.scope === "workspace"
+			&& existing.scopeId !== getCurrentWorkspaceScopeId()
+		) {
+			throw new Error("Cannot update memory owned by another project.");
 		}
-		const entry = await this.memory.upsert(input);
+		if (existing?.scope === "model") {
+			throw new Error("Legacy model-scoped memory cannot be changed through the two-scope memory tool.");
+		}
+		const entry = await this.memory.upsert({ ...options.input, ...destination });
+		const label = entry.scope === "global" ? "global" : "project";
 		return new vscode.LanguageModelToolResult([
-			new vscode.LanguageModelTextPart(`Saved ${entry.scope}/${entry.kind} memory ${entry.id}: ${entry.title}`),
+			new vscode.LanguageModelTextPart(`Saved ${label}/${entry.kind} memory ${entry.id}: ${entry.title}`),
 		]);
 	}
 }
@@ -62,14 +92,14 @@ class SearchMemoryTool implements vscode.LanguageModelTool<SearchMemoryInput> {
 	}
 
 	invoke(options: vscode.LanguageModelToolInvocationOptions<SearchMemoryInput>): vscode.LanguageModelToolResult {
+		const selectedScope = options.input.scope ? resolveScope(options.input.scope) : undefined;
 		const entries = this.memory.search(
 			options.input.query ?? "",
 			options.input.limit ?? 12,
 			{
-				workspaceId: getCurrentWorkspaceScopeId(),
-				modelId: options.input.modelId,
+				workspaceId: selectedScope?.scopeId ?? getCurrentWorkspaceScopeId(),
 				includeExpired: options.input.includeExpired === true,
-				scope: options.input.scope,
+				scope: selectedScope?.scope,
 			}
 		);
 		const result = entries.length === 0
@@ -91,19 +121,27 @@ class DeleteMemoryTool implements vscode.LanguageModelTool<DeleteMemoryInput> {
 	constructor(private readonly memory: SharedMemoryService) {}
 
 	prepareInvocation(options: vscode.LanguageModelToolInvocationPrepareOptions<DeleteMemoryInput>): vscode.PreparedToolInvocation {
+		const destination = scopeDescription(options.input.scope);
 		return {
-			invocationMessage: `Deleting shared memory ${options.input.id}`,
+			invocationMessage: `Deleting ${destination} ${options.input.id}`,
 			confirmationMessages: {
-				title: "Delete shared memory",
-				message: `Permanently delete shared memory entry "${options.input.id}"?`,
+				title: options.input.scope === "global" ? "Delete global memory" : "Delete project memory",
+				message: `Permanently delete entry "${options.input.id}" from ${destination}?`,
 			},
 		};
 	}
 
 	async invoke(options: vscode.LanguageModelToolInvocationOptions<DeleteMemoryInput>): Promise<vscode.LanguageModelToolResult> {
-		const removed = await this.memory.remove(options.input.id);
+		const selected = resolveScope(options.input.scope);
+		const removed = await this.memory.remove(options.input.id, {
+			scope: selected.scope,
+			...(selected.scopeId ? { workspaceId: selected.scopeId } : {}),
+		});
+		const label = selected.scope === "global" ? "global" : "project";
 		return new vscode.LanguageModelToolResult([
-			new vscode.LanguageModelTextPart(removed ? `Deleted shared memory ${options.input.id}.` : `Shared memory ${options.input.id} was not found.`),
+			new vscode.LanguageModelTextPart(removed
+				? `Deleted ${label} memory ${options.input.id}.`
+				: `No ${label} memory ${options.input.id} is visible in the selected scope.`),
 		]);
 	}
 }

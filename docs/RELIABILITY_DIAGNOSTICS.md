@@ -63,9 +63,14 @@ configuration is active, and `INFO` records expected provider-specific behavior.
 Run `Local LLM: Open Session Quality Report` to open the live webview for
 metrics accumulated since extension activation or the last reset. It updates
 without replacing the webview document, preserving expanded rows and active
-model/search/issues-only filters.
+model/search/issues-only filters. Turn details use stable request ids, so a new
+live turn cannot redirect an already open card; its viewport position is also
+preserved across updates.
 
 - prompt and cached prompt tokens with weighted cache-hit percentage;
+- ordered prompt/cache blocks with an optional exploded view: every block gets
+  its own full-width cached/uncached meter and exact total/read/miss/hit values,
+  including blocks too small to inspect in the proportional overview;
 - per-model cache health, miss classification, and best/worst turn visibility;
 - first-model-event, first-visible-text, and generation throughput metrics;
 - tool calls, native tool duration/breakdown, deterministic repairs,

@@ -1,5 +1,168 @@
 # Changelog
 
+## 1.11.0 (stable) - 2026-08-08
+
+Stability release: stable context and 98%+ cache hit rate, memory management through a UI, and a full code audit. 97 dev patches (1.10.1–1.10.97) after stable 1.10.0.
+
+### Key improvements
+
+- **Stable context and cache (98%+ hit rate)**: snapshot-stabilized tail (the tail comes from the snapshot, new messages from the source), fixed history duplication when VS Code rewrites the transcript (`rewritten_history` detector), and reasoning-block deduplication by common prefix. Turn N+1 prompt = turn N prompt + only the new messages.
+- **Unified compaction scheme**: a single soft scheme (target 0.75 × current size), truncation of heavy tool results in the tail (`compactMaxToolResultChars`), and protection against compaction between restarts.
+- **Loop protection**: a working repeated-tool-call detector, cross-turn "pause and summarize" nudge, and a hard `maxModelTurnsPerRequest` limit.
+- **Reasoning no longer leaks into visible text**: multi-marker thinking parser, fallback hidden when there is no ThinkingPart.
+- **Shared Memory UI**: a webview memory manager instead of raw JSON — create/edit/delete entries, project filters (All/Global/This project/Other projects), per-entry context estimation, and correct workspace binding.
+- **DeepSeek sliders**: Max Output and Maximum Context in quick access via the Provider Context panel.
+- **Live Report**: expandable exploded view of the prompt/cache structure with stable requestId-based identity.
+- **Code audit**: 8 utilities deduplicated (asRecord, clampInteger, truncate, bytesToBase64, normalizeCopilotTurnIndex, contentToText, nonNegativeInteger, formatTokenCount), dead code removed.
+- **Subagent tool parity (Copilot patch)**: VS Code narrowed subagent requests to a single tool (`session_store_sql`); the Copilot bundle patch now caches the full advertised tool set from ordinary turns and restores it for subagent turns — subagents get the same tools as the calling agent (1 → 64 tools).
+- **Tests**: 346 passing, pinned to VS Code 1.131 (copilot-patch patterns are incompatible with 1.132+).
+
+---
+
+## 1.10.1 - 1.10.97 (dev patches) - 2026-08-07
+
+Dev fixes after stable 1.10.0 (patch-only increments).
+
+### 1.10.97
+- Shared Memory UI improved for comfortable editing of entries from different windows: cards show the human-readable project (workspace:d:/GitHub/llama.cpp-with-GUI) and an `other project` label for entries of foreign workspaces; filter chips All / Global / This project / Other projects added; editing a foreign entry shows a warning and keeps its original scopeId (the project is not rebind to the current window) — rebinding only happens on an explicit Scope change.
+- Memory data: an entry with a broken scopeId `file:///d:/...` (without percent-encoding) was normalized to `file:///d%3A/...` — it is now visible in its own window.
+- Removed the dead file `src/ui/health-check-panel.ts` (was not used anywhere).
+- Tests: 3 new (project labels, other-project badge and filter chips, form warning). Full suite — 346 passing.
+
+### 1.10.96
+- Full code audit: deduplication and dead code. `src/utils.ts` now holds single implementations: `asRecord`, `clampInteger` (canonical argument order value/min/max/fallback), `truncate`, `bytesToBase64` (Buffer), `normalizeCopilotTurnIndex`, `contentToText`, `nonNegativeInteger`, `formatTokenCount`. Local copies removed from 12 files: app-server-client, codex-provider (truncate calls with explicit limit), rollout-metrics, turn-bridge (truncate(item.command, 240)), message-adapter, message-compaction, memory/prompt, output-budget, token-usage-history, usage-experiment, claude-provider (4 clampInteger calls rewritten — the old (value, fallback, min, max) order was a mine), ui/context-control (unified K/M token format).
+- Dead code removed: the ternary with identical branches `/user/balance` in llama-provider; the unused constant `DEFAULT_CLAUDE_KEEPALIVE_MS`; the unused asRecord import in claude-provider; the duplicate btoa-based bytesToBase64 in utils; `llamacpp.autoCompact` default synchronized `true → false` (matches the code fallback and the "Disabled by default" description).
+- Regression: 343 passing, eslint clean across the whole src.
+
+### 1.10.95
+- Shared Memory got a UI manager instead of raw JSON: `Local LLM: Open Shared Memory` (and the quick access item) opens a webview panel listing entries — title, kind/scope/pinned/expired badges, tags, content, token estimate and dates. Entries can be created, edited (title, content, tags, kind, scope, pinned, expiresAt) and deleted right in the panel; the `Open JSON file` button keeps access to the source file. Live refresh on memory change; delete uses the correct scope + workspace id; creating a workspace entry without an open project is blocked with an error.
+- The quick access Memory section shows the estimated context footprint: `N entries / M expired · ~X tokens context` (new `getMemoryContextTokens` callback at the end of the provider constructor — positionally safe; estimate ~4 chars/token, expired excluded).
+- Regression: 4 memory-manager tests (token estimate, list rendering, edit/new form, XSS escaping) + updated quick-access test. Full suite — 343 passing.
+
+### 1.10.94
+- DeepSeek got sliders in quick access: `DeepSeek → Max Output` and `DeepSeek → Maximum Context` open the Provider Context panel (`llamacpp.openContextControl`) with two new range sliders. Max output changes `deepSeekDefaultMaxOutputTokens` (1024–393216, default 70000), context — `deepSeekContextLength` (32K–1M, default 258.4K). Apply saves both values to Global; live values update while dragging.
+- The `Maximum Context` quick access item now leads to the sliders instead of QuickPick presets; a `Max Output` item with the current value (`70.0K` by default) was added. `ContextControlState` extended with DeepSeek fields (target/min/max for context and max output); clamp bounds match package.json and the provider clamp.
+- Regression tests: quick access expects `openContextControl` for both DeepSeek items and the `70.0K` format; `caps context control values` checks the clamp `2M → 1 048 576` and `500K → 393 216`. Full suite — 339 passing.
+
+### 1.10.93
+- Live Report got an expandable exploded view for the ordered prompt/cache structure. The `Expand block details` button shows each source segment as its own full-width row regardless of its share of the total prompt: ordinal number, category, message count, exact total/cached/miss tokens, hit%, plus its own cached/uncached scale with minimally visible narrow parts. Small Memory delta, Guard, Tool call and other blocks no longer disappear visually inside the combined bar.
+- Fixed detail toggling switching to a new turn during live update. The detail row used to be named by its current newest-first position (`detail-0`, `detail-1`); after a new turn was inserted on top, the same ID belonged to a different record and restoreOpenRows expanded it. Identity is now built from the stable `requestId` (with a safe fallback), the exploded state is stored separately, and the viewport anchor compensates the inserted top row, keeping the selected turn at its previous screen position.
+- UI regression verifies request-based detail identity, absence of the old positional ID, expanded segment controls/exact stats, expanded-state retention and the viewport anchor. Embedded JavaScript passes syntax validation; full suite — 339 passing.
+
+### 1.10.92
+- The public Shared Memory contract is split into two explicit scopes: `global` for durable preferences and workflows useful to all agents across projects, and `workspace` for paths, commands, architecture and decisions of the current project only. `scope` is now required on save and delete; the ambiguous default-global is gone. The agent tool no longer accepts an arbitrary `scopeId`: the current multi-root workspace id is computed by the extension, so an agent cannot write memory into a foreign project.
+- Deletion is protected at the `SharedMemoryService.remove(id, context)` level: a known id alone is not enough — the stored scope and workspace must match the explicitly chosen ones. Updating a workspace entry of another project and changing legacy model-scoped entries through the public two-scope tool are also rejected. Searching without scope sees global + the current project; an explicit workspace search requires an open project.
+- Legacy `model` entries remain readable for format compatibility, but new ones cannot be created through agent tools. The confirmation UI and tool results explicitly say "global" or "project". `chat.memory.context` gained `scopeCounts` so the JSONL shows the actual global/workspace entry counts in the prompt and cross-project leakage can be verified.
+- Regression tests first reproduced the missing scoped-delete on 1.10.91 (TypeScript: `Expected 1 arguments, but got 2`), then verified the delete denial for another workspace, the required scope, the absent public scopeId and exactly two scopes across all three tools.
+
+### 1.10.91
+- Shared memory moved from a relocatable ephemeral block to an append-only ledger. 1.10.90 stabilized memory inside the tool loop, but on the next real user turn the same block was removed from its old position and inserted before the new user message, rewriting the whole cached assistant/tool tail even when the text was byte-identical. Now the first selection creates a provider overlay checkpoint persisted in the conversation snapshot at its original position; identical entry revisions add nothing, new and updated entries are added as a separate Memory delta before the new uncached user tail. Old checkpoints are never rewritten.
+- SharedMemoryPromptContext passes individually rendered entries; the SHA-256 revision is compared by the stable entry id. An update with the same id appends a new revision explicitly superseding the old one. Overlay metadata is not sent to the API but is kept in session-state.json; snapshot alignment matches only the host projection and returns the full prefix together with the overlay. The first tool turn after a reload uses persisted-overlay-tool-turn without a new retrieval. On compaction the current checkpoint is restored inside the already intentionally rewritten region. Per-entry delta respects sharedMemoryMaxTokens.
+- Live Report now has ordered promptSegments instead of the opaque Messages: System, Tool catalog, Shared memory/Memory delta, User + host context, User, Assistant, Reasoning, Tool calls, Tool results, Compaction summary, Guards/nudges and Unmeasured. Segments are mutually exclusive and sum to the local prompt estimate; server cached_tokens are projected onto them left to right. The legend aggregates categories and marks the split as estimated. The previous double-counting of System inside messageTokensAfterCompact is fixed; the turn JSON now also contains promptSegments.
+- After moving memory from ephemeral to the durable overlay, the ephemeral_context_changed class no longer blames a trailing guard/nudge for losing the old prefix: guards are appended to the tail only and cannot causally explain the disappearance of previously cached tokens, so such an anomaly stays upstream_cache_partial with an explicit note.
+- The user → tool → new user regression was red on 1.10.90: the third request replaced memory turn one with memory turn two. After the fix the first checkpoint stays, a new entry creates the second delta; separate tests cover unchanged/updated revisions, persistence across restart, a clean wire payload, the exclusive prompt-segment sum and Live Report. Total 337 passing.
+
+### 1.10.90
+- Fixed a locally caused DeepSeek cache miss on tool turns from changing shared memory. On live turn 34 (b81cc3ff, conversation b32eed1e) the durable history matched, but the retriever re-picked memory: 3 entries/1028 tokens became 2 entries/829 tokens and the ephemeral context changed 4368 → 3812 chars. Because the memory message sits before the last real user message, changing a few hundred characters rewrote the entire following assistant/tool tail: 16331 previously sent tokens stopped being read from cache.
+- The shared-memory prompt is now selected once per real user turn and stored per conversation scope. All subsequent tool-result rounds reuse the same object and byte-identical text; the next real user turn refreshes the selection. A separate null-sentinel records the correct "memory not selected" result so a tool round does not re-run retrieval. After a reload the first encountered turn initializes the value once. The chat.memory.context event reports source=retrieved-user-turn or source=frozen-tool-turn.
+- The integration regression runs three full provider requests user → tool result → new user. Before the fix the test failed with actual=memory selected for turn two instead of expected=memory selected for turn one; after the fix the tool round keeps the first block, the new user turn gets the second one, and retrieval is called exactly twice. Full suite: 335 passing.
+
+### 1.10.89
+- DeepSeek cache classification fully reworked after an audit of the original 30 and the accumulated 50 live turns of `b32eed1e`. `upstream_expired` is no longer used as an unproven catch-all for the direct DeepSeek/local API, and a CloudFront `Via`/`Cf-Pop` change is no longer claimed as the root cause: the statistics showed the same number of hit<95% with both changed and unchanged visible routes. The new neutral class `upstream_cache_partial` states only a proven fact: with a byte-stable durable prefix, a material part of the already-sent prompt stopped being read from cache. Metric: `lostPriorPrefix=max(0, previousPromptTokens-currentCachedTokens)`; material threshold — at least 2048 tokens and 4% of the previous prompt. A route change remains in the detail as a correlation, not proof of an origin/cache-shard switch.
+- Separate explicit causes added: `history_rebuilt_after_restart` for the first request after the extension host starts and VS Code rebuilt the history differently from the persisted snapshot; `ephemeral_context_changed` when the durable history matched but the actually sent provider-only memory/guard messages changed; `upstream_cache_pending` for a materially unwarmed prefix right after compaction. `stabilizeMessagePrefix` now stores/compares `ephemeralHash` and `ephemeralChars` without adding ephemeral messages to the durable snapshot.
+- An offline replay of the new classifier over 50 actual cache reports gave: 30 `healthy`, 12 `upstream_cache_partial`, 4 `history_summarized`, 3 `upstream_cache_pending`, 1 `history_rebuilt_after_restart`. Edge cases fixed: a normal 2–3% cache gap stays healthy; a large new tail with a small loss of the old prefix stays healthy; a 4.98% post-compaction gap no longer falls on the boundary. Six new regressions were red before the implementation; provider wiring for ephemeral telemetry is also covered. Total 334 passing.
+
+### 1.10.88
+- Fixed the classification of partial DeepSeek cache misses after an upstream route change. Turns 54 and 57 of chat `b32eed1e` were wrongly marked `healthy`: the sent prefix matched 100%, there was no compaction, yet after a CloudFront `Via`/`Cf-Pop` change 18.6K/25.9K cached tokens suddenly disappeared. The provider now stores the previous route and server `prompt_tokens` per conversation scope; the classifier separates the expected new tail from an unexplained uncached remainder and emits `upstream_route_changed` only when a route change is simultaneously proven. A POP change itself is not a problem: turn 56 with a route change and 489 uncached tokens stays `healthy`; an anomalous miss without a route change is `upstream_expired`; after compaction — `upstream_cache_pending`. Backend telemetry added to `chat.cache.report`, a badge in Live Report and three regression tests on the real numbers of turns 54/56/57; total 328 passing.
+
+### 1.10.87
+- Fixed the self-calibration of the heuristic token counter for DeepSeek that started auto-compaction too late. The formula smoothed the residual ratio `server/calibratedEstimate` as if it were the full multiplier and converged to the square root of the correct coefficient: in live turns the factor stuck at `1.295` with residual also `1.294`, while the actual raw→server multiplier was about `1.676`. The EMA now smooths `previousFactor × residualRatio`; a new `observedFactorTarget` field added to `chat.heuristic.calibrate`. The regression test converges to `1.68` and confirms the `auto` decision when crossing the soft target.
+- Fixed the prefix flip-flop that caused `history_rewritten` and partial cache misses on turns 18–19 of chat `b32eed1e`. The old assistant message #255 was alternately sent with/without `reasoning_content`, because the cache-prefix snapshot stored the input host version before stabilization instead of what was actually sent. `stabilizedDurable` is now persisted in memory, on disk and in cache telemetry; `firstDivergence`, identical/shared prefix and reusable percent are also computed from the sent prompt. The regression test checks three consecutive turns without losing reasoning. Total 325 passing.
+
+### 1.10.86
+- Fixed a whole-turn crash with `ToolCallValidationError: arguments are not a valid JSON object` caught by the error tracker (`d697b601`, conversation `b32eed1e`). The turn had `toolCallRepairEnabled=true` and one repair attempt, but the model had already emitted 49 characters of text: the `roundOutputChars === 0` condition forbade the retry, so `flushToolCallBuffers` ended the turn with an error immediately. Partial text no longer blocks the bounded correction retry; the `roundToolCallParts === 0` guard is kept so an already-sent valid tool call is not executed twice.
+- The correction prompt warns not to repeat the already shown text and asks to return only the fixed tool call. `chat.tools.validation_retry` events now include `roundOutputChars`/`roundToolCallParts`; cases that cannot be safely retried emit `chat.tools.validation_unrecoverable` with the reason and retry state. Regression test `retries a rejected tool call after partial text with a bounded correction prompt`: red before the fix, green after; total 323 passing.
+
+### 1.10.85
+- Fixed shared memory loss on consecutive tool turns. Memory used to be added before `findSnapshotAlignment`; since the block is inserted before the last regular user message, on a tool turn it could land before the pivot and miss `newMessages`. So `chat.memory.context` reported the same 13 entries (~3690 tokens), but the server prompt shrank `192253 → 188315`. Shared memory is now injected after building the durable context from source + conversation snapshot and is guaranteed present in every request.
+- `stabilizeMessagePrefix` now aligns only durable messages and then restores the current ephemeral injections at their positions. Previously the filtered-snapshot indices were applied to the unfiltered array, so memory/guards could disappear or shift a neighboring message. `chat.messages.initial` gained `ephemeralMsgCount`, `ephemeralChars`, `sharedMemoryExpected`. Regression test `keeps live shared memory while restoring a durable snapshot prefix`; total 323 passing.
+
+### 1.10.84
+- Tail stabilization from snapshot versions (`stabilizeTailFromSnapshot`): when the host rewrites history between turns (truncates tool results, regenerates messages), the pivot rewinds and the tail used to come from the source in the REWRITTEN form — already-sent content changed, so server prompt tokens and uncached amounts "jumped" by several thousand between turns (diagnosed from logs: turn 4→5 the host deleted 4 messages user 122→118/toolResults 106→102; turn 6→7 chars −8787). Now messages recognized by call id as already sent (tool results and assistant with tool_calls) come back in their snapshot version; truly new ones (unknown call ids) stay as the host gave them. Turn N+1 content = turn N content + only new messages: the context weight is monotonic and the cache prefix does not jump. Regression test "keeps the tail stable when the host truncates messages it already sent" (322 passing).
+
+### 1.10.83
+- Reasoning weight stabilization between turns: the new `restoreReasoningFromSnapshot` (in `prepareMessagesForBudget`, before dedup) restores `reasoning_content` on assistant messages with tool calls that the host rewrote (transfer by call id from the conversation snapshot — it stores the version the message was already sent with). Previously, if the host changed the history and a call id "fell out" of the reasoning map, the thought was not restored and the context "floated" ±2–4K tokens between turns (sawtooth on long runs). Test "restores reasoning from the snapshot when the host rewrote the history" (321 passing).
+
+### 1.10.82
+- Reasoning-weight diagnostics: `chat.messages.initial` now contains `reasoningMsgCount` and `reasoningChars` (sum of `reasoning_content` chars in the sent messages). `reasoning_content` is restored by tool-call id and can "float" ±2–4K tokens between turns when the host rewrites history (call id changes/message comes from the source without thoughts) — now visible on every request. `chat.messages.snapshot_rewound` extended with `pivotIndex` and `rewoundCount` (how many messages were rewound) — you can see where the host trimmed its own tail.
+
+### 1.10.81
+- Reasoning dedup (1.10.80) moved into `prepareMessagesForBudget`: the cleanup now applies to ALL request messages, including those reused from the conversation snapshot. In 1.10.80 the strip only ran in `convertForMode` (fresh messages from VS Code), while old messages with duplicated thoughts (content=thoughts+answer) that survived a restart entered the request through `reusedSnapshot` bypassing the cleanup and were preserved in the snapshot forever (after restart: 49/53 reasoning messages still duplicated, ~130K chars ≈ 32K tokens out of 179K).
+
+### 1.10.80
+- Agent reasoning no longer duplicated in context: VS Code serializes a ThinkingPart into history as plain text (indistinguishable from a normal text part), so convertMessages put thoughts into `content` and `injectStoredReasoningContent` added the same thoughts to `reasoning_content` (a hard DeepSeek requirement on tool-call follow-ups, otherwise 400) — every turn carried reasoning twice, in long sessions up to ~38K extra tokens per request. The new `stripReasoningDuplicatesFromContent` (llama-provider.ts) cuts the prefix of `content` that matches `reasoning_content` (threshold: ≥100 chars or a full match for short ones), applied before budget counting and snapshotting. Test "strips reasoning the host already serialized into assistant content" (320 passing).
+
+### 1.10.79
+- Shared memory injection (`injectSharedMemoryContext`) is marked `ephemeral`: the memory block is live content (entries change between turns), it stays in every request but no longer enters the prefix/budget snapshots and cannot desync the cache prefix (previously, adding memory entries made the block position/text "float", causing misses).
+
+### 1.10.78
+- Force-text against host-driven loops: the VS Code host loop makes one request per tool call, so per-request limits (`maxModelTurnsPerRequest`) do not see it. The new setting `llamacpp.toolLoopForceTextThreshold` (default 12, 6-40): after N consecutive tool-call-only turns (no visible text) the next request is sent WITHOUT tools plus a stop message — the model is forced to answer with text and the loop is broken. The counter resets on a text turn. Log `chat.response.tool_force_text`. This is an escalation on top of the soft cross-turn nudge (4/8 turns).
+
+### 1.10.77
+- Window race over `session-state.json` fixed: persist now MERGES changes with the current file and writes only the scopes changed in this extension host (dirty tracking for prefix/conversation/toolCatalog snapshots). Previously any window overwrote the whole file with its own (possibly stale) copies of foreign scopes — a chat snapshot could "freeze" at an old turn, and after a reload the first turn aligned to the stale snapshot (turn 17a1cc78: snapshot 362 instead of 411 → +51 messages from source, ~46K uncached). Snapshot deletions also reach the file.
+
+### 1.10.76
+- `prefix.firstDivergence` diagnostics extended: on a prefix divergence the `chat.cache.report` log shows role, tool_call_id, callIds, reasoning presence and content length for both message versions (previous + currentMessage) — you immediately see how the host rewrote the message (text, call id or structure).
+
+### 1.10.75
+- Ephemeral injections (cross-turn nudge, loop guard, repair/continuation retry messages) no longer enter prefix and budget snapshots (`ephemeral` flag on `OpenAIChatMessage`): they exist in the sent request but are absent from host history, which used to make the snapshot tail unfindable in the source on the next turn → full cache miss (turn 50: 431K→483K, hit 2%). Snapshots filter ephemeral messages; the `snapshot_rebuilt` log now contains `reason` (alignment-not-found / rewritten-history-would-duplicate / migrated-from-prefix) and snapshot/source sizes.
+
+### 1.10.74
+- Snapshot pivot rewind (SNAPSHOT_PIVOT_MAX_REWIND=24): when the host drops its own tail (interrupted reply) on a new user message, the snapshot is no longer discarded entirely — a deeper common join point is found and the cache prefix survives. `findSnapshotAlignment` returns `{snapshotPrefix, newMessages}`; search uses precomputed `conversationMessageKey` keys with a position index (no O(n·m) normalizations). The `chat.messages.snapshot_rewound` log shows when it fired. Diagnostics: `prefix.firstDivergence {messageIndex, index, previous, current}` — the first diverging message (not only system).
+
+### 1.10.73
+- The system prompt is no longer truncated as a tool result: `truncateToolResultMessages` applies summarization only to real tool results (`role==="tool"` or user messages with the `[tool_result` marker). Previously the ~38K-char system prompt (instructions + skills + agents) collapsed into `[tool result summarized: original=38534 chars...]` → `system_prompt_changed` and a full miss on the first turn after restart.
+
+### 1.10.72
+- The false "duplicate detector" no longer discards a valid snapshot: duplication is determined by repeated `tool_call_id`s in the tail (`tailRepeatsSnapshotCalls`) instead of the length ratio. The host trims its own history window, so a snapshot longer than the source is normal, not a duplicate (previously: 405→404 messages, 0-3% hit on turns 10/11/13).
+
+### 1.10.71
+- First turn after restart: finding the snapshot/source join point now uses the common predicate `isSameConversationMessage` (tool_call_id / ids of all tool_calls / text with volatile blocks masked: `environment_info`, `workspace_info`, `context`, `attachments`, `reminderInstructions`). Previously the pivot gram required byte equality — after a restart the host re-rendered the history, the snapshot was discarded and the full history went out (387 msg instead of 316) → 1% miss.
+
+### 1.10.70
+- Prefix stabilization rewritten to positional alignment: a message is replaced by the previously sent version when bytes match OR tool_call_id / ids of all tool_calls match OR the text is equal after masking the host's volatile blocks. Previously the "bytes" strategy reused only N byte-matching messages (3 of 875 → 1.8% hit) and the "aggressive" branch could lose a fresh user turn. The last message is never replaced. New field `restoredCount` in `chat.cache.prefix_stabilized`.
+
+### 1.10.69
+- Fix for the "first turn after restart": history used to inflate (324 → 778 messages) with a cache miss from losing the pivot when VS Code rebuilt the history. Pivot search now uses a K-gram (3 consecutive snapshot tail messages, SNAPSHOT_PIVOT_GRAM=3) — resilient to 1-2 changed tail messages.
+- DeepSeek max output: `deepSeekDefaultMaxOutputTokens` 131072 → 70000 (reasoning counts into output tokens; caps "endless thoughts" in one turn, lowers loop risk and cost).
+
+### 1.10.68
+- Fix for the Live Report context "chaos" (jumps 122K→178K→167K→141K→174K with autoCompacted:false): when VS Code rewrites already-sent messages (history_rewritten), the snapshot logic no longer duplicates the history tail — if snapshot+newMessages is longer than the full source, the snapshot is declared stale (reason=rewritten_history_would_duplicate) and the full source is sent. The cache prefix is stable: 4.5% miss → ~95%.
+
+### 1.10.67
+- Gentler compaction: `COMPACTION_TARGET_RATIO` 0.6 → 0.75 (~75% of current context is kept instead of ~60%; ~25% loss instead of ~40%). Reason: compaction snapshots showed that at 0.6 agent chats lost too much working context (201K→113K, 218K→129K). context-budget tests updated.
+
+### 1.10.66
+- Compaction diagnostics: every compaction (auto-compact and overflow retry) is auto-saved as a JSON snapshot in `<globalStorage>/compactions/` (rotation of 20 files, best-effort). Contains before/after (messages, tokens, chars), targetTokens, a summary sample (400 chars), the last 2 tail messages and the number of truncated tool results — so compression quality can be reviewed manually.
+
+### 1.10.65
+- Fix for "thoughts as the answer": reasoning in `delta.content` is folded by three markers (`<think>`, `|thinking|>`, `thinking>`); the fallback without `LanguageModelThinkingPart` no longer prints thoughts as visible text (hides them, symmetric to `emitThinkingText`).
+
+### 1.10.64
+- Fix for hard compaction: new setting `llamacpp.compactMaxToolResultChars` (default 8000, 1000-24000) — long tool results in the kept tail are truncated, so significantly more turns fit into the budget (was: 187 → 15 messages at a 60% budget because of uneven token distribution).
+- DeepSeek setup wizard: `deepSeekDefaultMaxOutputTokens` 65536 → 131072; the wizard no longer re-enables `autoCompact`.
+
+### 1.10.63
+- DeepSeek loop fixes: the repeated-tool-call detector is fixed (separate `loopInspectionMessages` conversion in tool mode — previously the detector never fired); cross-turn nudge over an 8-turn window at tool-only density; hard `maxModelTurnsPerRequest` limit (default 6, clamp 2-20) with the "[agent loop guard]" text.
+
+### 1.10.60
+- Unified soft compaction scheme: target = current size × 0.6 (`COMPACTION_TARGET_RATIO`), the same for proactive compaction and overflow retry; the hard scheme and the `hardCompactKeepLastTurns` setting were removed (hardInputTarget stays as a diagnostic metric).
+- `llamacpp.autoCompact` back to default true; `contextUtilization` 0.94 (~40K headroom to the trigger in a 258K window).
+- Compaction protection between restarts: on the first request of a scope after extension startup without a snapshot, proactive compaction is skipped (`scopesSeenSinceStartup`).
+
+### 1.10.58
+- `autoCompact` default false — compaction used to fire between restarts (later reverted in 1.10.60 in favor of the `scopesSeenSinceStartup` protection).
+
 ## 1.10.0 - 2026-08-04
 
 Stable release after the 1.9.x dev-patch series. Highlights:

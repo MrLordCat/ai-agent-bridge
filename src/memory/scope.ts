@@ -10,3 +10,14 @@ export function getCurrentWorkspaceScopeId(): string | undefined {
 		.sort((a, b) => a.localeCompare(b))
 		.join("|");
 }
+
+export function getCurrentWorkspaceScopeLabel(): string {
+	const folders = vscode.workspace.workspaceFolders;
+	if (!folders || folders.length === 0) {
+		return "current project";
+	}
+	return folders
+		.map(folder => folder.name)
+		.sort((a, b) => a.localeCompare(b))
+		.join(", ");
+}

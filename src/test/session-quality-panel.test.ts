@@ -112,6 +112,13 @@ suite("session quality panel", () => {
 					estimatedUsagePercent: 84.8,
 					autoCompacted: true,
 					hardCompacted: false,
+					promptSegments: [
+						{ kind: "system", label: "System", tokens: 1200 },
+						{ kind: "tools", label: "Tool catalog", tokens: 7064 },
+						{ kind: "shared_memory", label: "Shared memory", tokens: 829 },
+						{ kind: "reasoning", label: "Reasoning", tokens: 4043 },
+						{ kind: "tool_results", label: "Tool results", tokens: 2500 },
+					],
 				},
 			}, {
 				index: 2,
@@ -237,6 +244,21 @@ suite("session quality panel", () => {
 		assert.match(html, /Model usage segments/);
 		assert.match(html, /Codex session &amp; cache/);
 		assert.match(html, /Processed blend/);
+		assert.match(html, /Shared memory/);
+		assert.match(html, /Reasoning/);
+		assert.match(html, /Tool results/);
+		assert.match(html, /estimated block split/);
+		assert.match(html, /const detailKey = String\(r\.requestId/);
+		assert.match(html, /const detailId = "detail-" \+ detailKey/);
+		assert.match(html, /"struct-details-" \+ detailKey/);
+		assert.match(html, /data-target=/);
+		assert.match(html, /Expand block details/);
+		assert.match(html, /class="struct-detail-list"/);
+		assert.match(html, /block\.tokens\)\) \+ ' total/);
+		assert.match(html, /saveOpenStructureDetails/);
+		assert.match(html, /captureOpenTurnAnchor/);
+		assert.match(html, /restoreOpenTurnAnchor\(state\.turnAnchor\)/);
+		assert.ok(!html.includes('const detailId = "detail-" + i;'));
 		assert.match(html, /Final \/ continuation segment/);
 		assert.match(html, /Delegated VS Code tools/);
 		assert.match(html, /cold Codex startup/);

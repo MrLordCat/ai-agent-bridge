@@ -53,7 +53,6 @@ suite("quick access", () => {
 			() => 0,
 			() => "75.0% (75/100)",
 			() => "4 turns / cache 75%",
-			() => "PASS"
 		);
 		const diagnostics = (await getItems(provider)).find(item => labelOf(item) === "Diagnostics");
 		assert.ok(diagnostics);
@@ -62,15 +61,15 @@ suite("quick access", () => {
 		assert.ok(children.some(item => labelOf(item) === "Throughput"));
 		assert.ok(children.some(item => labelOf(item) === "Context Usage"));
 		assert.ok(!children.some(item => labelOf(item) === "Prompt Cache"));
-		assert.strictEqual(children.find(item => labelOf(item) === "Provider Health Check")?.description, "PASS");
 		const usage = (await getItems(provider)).find(item => labelOf(item) === "Token Usage");
 		assert.ok(String(usage?.tooltip).includes("Last local cache snapshot: 75.0% (75/100)"));
-		assert.strictEqual(children.find(item => labelOf(item) === "Session Quality Report")?.description, "4 turns / cache 75%");
+		assert.strictEqual(children.find(item => labelOf(item) === "Live Report")?.description, "4 turns / cache 75%");
 		assert.strictEqual(
-			children.find(item => labelOf(item) === "Provider Health Check")?.command?.command,
-			"llamacpp.runHealthCheck"
+			children.find(item => labelOf(item) === "Live Report")?.command?.command,
+			"llamacpp.openSessionReport"
 		);
 		assert.ok(!children.some(item => labelOf(item) === "Context Breakdown"));
+		assert.ok(!children.some(item => labelOf(item) === "Run Health Check"));
 		assert.strictEqual(
 			children.find(item => labelOf(item) === "Context Usage")?.tooltip,
 			"msg 20K + tools 2K + reserved 8K"
@@ -88,18 +87,36 @@ suite("quick access", () => {
 		assert.strictEqual(knowledge.command?.command, "llamacpp.setKnowledgeMode");
 	});
 
-	test("shows expired memory separately", async () => {
+	test("shows expired memory separately with estimated context tokens", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined,
 			() => undefined,
 			() => 5,
 			() => undefined,
 			() => undefined,
+			() => 2,
 			() => undefined,
-			() => 2
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => emptyTokenUsageHistorySummary(),
+			() => emptyUsageExperimentSummary(),
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => 5000
 		);
 		const memory = (await getItems(provider)).find(item => labelOf(item) === "Memory");
-		assert.strictEqual(memory?.description, "5 entries / 2 expired");
+		assert.strictEqual(memory?.description, "5 entries / 2 expired · ~5.0K tokens context");
 	});
 
 	test("shows separate Claude subscription limit windows", async () => {
@@ -107,7 +124,6 @@ suite("quick access", () => {
 			() => undefined,
 			() => undefined,
 			() => 0,
-			() => undefined,
 			() => undefined,
 			() => undefined,
 			() => 0,
@@ -144,9 +160,12 @@ suite("quick access", () => {
 		assert.ok(deepSeek && claude && codex && local);
 
 		const deepSeekLimit = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Maximum Context");
+		const deepSeekOutput = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Max Output");
 		const claudeLimit = (await getItems(provider, claude)).find(item => labelOf(item) === "Maximum Context");
 		assert.strictEqual(deepSeekLimit?.description, "258.4K");
-		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.setDeepSeekContextLength");
+		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.openContextControl");
+		assert.strictEqual(deepSeekOutput?.description, "70.0K");
+		assert.strictEqual(deepSeekOutput?.command?.command, "llamacpp.openContextControl");
 		assert.strictEqual(claudeLimit?.description, "258.4K target / 1M max");
 		assert.strictEqual(claudeLimit?.command?.command, "llamacpp.openContextControl");
 		const codexTarget = (await getItems(provider, codex)).find(item => labelOf(item) === "Working Context");
@@ -158,7 +177,7 @@ suite("quick access", () => {
 	test("shows live usage limits and DeepSeek balance near the providers", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => "Connected (Max)", () => "Connected (Pro)",
 			() => undefined, () => undefined, () => [],
 			() => undefined, () => undefined, () => undefined, () => undefined,
@@ -206,6 +225,8 @@ suite("quick access", () => {
 			["claudeContextLength", 1_048_576],
 			["codexWorkingContextTarget", 500_000],
 			["codexContextLength", 400_000],
+			["deepSeekContextLength", 2_000_000],
+			["deepSeekDefaultMaxOutputTokens", 500_000],
 		]);
 		const state = resolveContextControlState({
 			get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback,
@@ -218,6 +239,8 @@ suite("quick access", () => {
 		assert.strictEqual(state.codexTarget, 258_400);
 		assert.strictEqual(state.codexMaximum, 258_400);
 		assert.strictEqual(state.codexMaximumObserved, true);
+		assert.strictEqual(state.deepSeekContextTarget, 1_048_576);
+		assert.strictEqual(state.deepSeekMaxOutputTarget, 393_216);
 	});
 
 	test("moves the same last-request metrics into Token Usage for every provider", async () => {
@@ -231,7 +254,7 @@ suite("quick access", () => {
 		};
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => "Connected", () => "Connected", () => undefined, () => undefined, () => [],
 			() => metrics, () => metrics, () => metrics, () => metrics
 		);
@@ -268,7 +291,7 @@ suite("quick access", () => {
 		};
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => "Connected", () => "Connected", () => undefined, () => undefined, () => [],
 			() => undefined, () => undefined, () => metrics, () => undefined
 		);
@@ -305,7 +328,7 @@ suite("quick access", () => {
 		});
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => "Connected", () => "Connected", () => undefined, () => undefined, () => [],
 			() => undefined, () => undefined, () => undefined, () => undefined, () => undefined,
 			() => [], () => history
@@ -368,7 +391,7 @@ suite("quick access", () => {
 		};
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => undefined, () => undefined, () => undefined, () => undefined, () => [],
 			() => undefined, () => undefined, () => undefined, () => undefined, () => undefined,
 			() => [], () => emptyTokenUsageHistorySummary(), () => ({
@@ -403,7 +426,7 @@ suite("quick access", () => {
 	test("groups advertised subagent models by provider", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined, () => undefined, () => 0,
-			() => undefined, () => undefined, () => undefined, () => 0,
+			() => undefined, () => undefined, () => 0,
 			() => undefined, () => undefined, () => undefined, () => undefined, () => [],
 			() => undefined, () => undefined, () => undefined, () => undefined, () => undefined,
 			() => [{

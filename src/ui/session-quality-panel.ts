@@ -68,6 +68,18 @@ function collectTurnErrors(records: readonly SessionTurnRecord[] | undefined): A
 		if (turn.toolLoopDetected) {
 			push(turnIndex, turn, "tool_loop", "tool call loop detected — repeated identical calls were stopped");
 		}
+		if (typeof turn.toolExecutionErrors === "number" && turn.toolExecutionErrors > 0) {
+			const callLines = Array.isArray(turn.toolExecutionErrorDetails) && turn.toolExecutionErrorDetails.length > 0
+				? turn.toolExecutionErrorDetails.map(d => {
+					const label = d.command || d.name || "tool call";
+					const head = d.head ? ` — ${d.head.replace(/\n/g, " ").slice(0, 90)}` : "";
+					return `"${label}"${head}`;
+				}).join("; ")
+				: undefined;
+			push(turnIndex, turn, "tool_execution_error",
+				`${turn.toolExecutionErrors} tool result(s) contained execution failures (tracebacks, "Command exited with code 1", edit mismatch)${callLines ? ` — ${callLines}` : ""} — check the turn's tool output`,
+				turn.toolExecutionErrors);
+		}
 		if (turn.retriedAfterOverflow) {
 			push(turnIndex, turn, "api_overflow_retry", "the API rejected the prompt as too long; the turn was retried with a hard-compacted context");
 		}
@@ -92,6 +104,7 @@ export class SessionQualityPanel {
 	private readonly _extensionVersion: string;
 	private readonly _vscodeVersion: string;
 	private readonly _getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus;
+	private readonly _getHealthData: () => unknown;
 
 	private constructor(
 		panel: vscode.WebviewPanel,
@@ -99,20 +112,23 @@ export class SessionQualityPanel {
 		extensionVersion: string,
 		vscodeVersion: string,
 		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
+		getHealthData: () => unknown,
 	) {
 		this._panel = panel;
 		this._tracker = tracker;
 		this._extensionVersion = extensionVersion;
 		this._vscodeVersion = vscodeVersion;
 		this._getClaudeCacheKeepAliveStatus = getClaudeCacheKeepAliveStatus;
+		this._getHealthData = getHealthData;
 
 		this._panel.onDidDispose(() => {
 			SessionQualityPanel.current = undefined;
 		});
 
 		this._panel.webview.onDidReceiveMessage(message => {
-			// Future: handle row-expand requests in a more granular way.
-			void message;
+			if (message?.type === "runHealthCheck") {
+				void vscode.commands.executeCommand("llamacpp.runHealthCheck");
+			}
 		});
 
 		this.refresh();
@@ -124,6 +140,7 @@ export class SessionQualityPanel {
 		extensionVersion: string,
 		vscodeVersion: string,
 		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
+		getHealthData: () => unknown,
 	): void {
 		if (SessionQualityPanel.current) {
 			SessionQualityPanel.current._panel.reveal(vscode.ViewColumn.Beside);
@@ -133,7 +150,7 @@ export class SessionQualityPanel {
 
 		const panel = vscode.window.createWebviewPanel(
 			SessionQualityPanel.viewType,
-			"Session Quality",
+			"Live Report",
 			vscode.ViewColumn.Beside,
 			{
 				enableScripts: true,
@@ -149,6 +166,7 @@ export class SessionQualityPanel {
 				extensionVersion,
 				vscodeVersion,
 				getClaudeCacheKeepAliveStatus,
+				getHealthData,
 			);
 		} catch (err: unknown) {
 			panel.dispose();
@@ -185,6 +203,7 @@ export class SessionQualityPanel {
 			providerHealth: {
 				claudeCacheKeepAlive: this._getClaudeCacheKeepAliveStatus(),
 			},
+			health: this._getHealthData() ?? null,
 			summary: {
 				turns: summary.turns,
 					totalModelTurns: summary.totalModelTurns,
@@ -263,7 +282,6 @@ h1 { margin: 0; font-size: 22px; line-height: 1.25; letter-spacing: -.2px; }
 .btn:hover { background: var(--row-hover); }
 .btn.active { border-color: var(--accent); color: var(--accent); background: rgba(55,148,255,.08); }
 .section { margin-top: 20px; }
-.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
 h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
 .section-note { color: var(--dim); font-size: 11px; }
 .metric-grid { display: grid; grid-template-columns: repeat(6, minmax(145px, 1fr)); gap: 10px; }
@@ -300,6 +318,12 @@ h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
 .model-card { padding: 12px 13px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 .model-head, .model-stats { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .model-name { min-width: 0; font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.model-card-head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.model-card-head .model-name { flex: 1; }
+.model-dim { color: var(--dim); font-size: 11px; overflow-wrap: anywhere; margin: 2px 0; }
+.reason-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.reason-label { font-weight: 600; }
+.reason-detail { color: var(--dim); font-size: 11px; margin-top: 2px; overflow-wrap: anywhere; }
 .model-hit { font-size: 18px; font-weight: 720; }
 .model-stats { margin-top: 8px; color: var(--dim); font-size: 10px; }
 .model-stats strong { color: var(--fg); font-weight: 600; }
@@ -312,7 +336,6 @@ h2 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .01em; }
 .select { padding: 4px 26px 4px 8px; }
 .table-shell { width: 100%; overflow: auto; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); }
 table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12px; }
-.turn-table { min-width: 920px; }
 th, td { padding: 8px 9px; text-align: left; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { position: sticky; top: 0; z-index: 2; background: var(--surface-2); color: var(--dim); font-size: 10px; font-weight: 700; letter-spacing: .045em; text-transform: uppercase; }
 tbody tr:last-child td { border-bottom: 0; }
@@ -322,13 +345,21 @@ tr.turn-row.issue { box-shadow: inset 3px 0 0 var(--warn); }
 tr.turn-row.critical { box-shadow: inset 3px 0 0 var(--bad); }
 tr.detail-row { display: none; }
 tr.detail-row.open { display: table-row; }
-tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,127,127,.035); }
-.detail-grid { display: grid; grid-template-columns: repeat(4, minmax(220px, 1fr)); gap: 9px; }
-.detail-card { min-width: 0; padding: 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); }
-.detail-card.wide { grid-column: span 2; }
-.detail-card h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .045em; text-transform: uppercase; color: var(--dim); }
-.detail-card .kv { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; }
-.detail-card .kv .k { color: var(--dim); }
+tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,127,127,.05); border-top: 1px solid rgba(127,127,127,.18); border-bottom: 1px solid rgba(127,127,127,.18); }
+tr.turn-row { border-bottom: 1px solid rgba(127,127,127,.1); }
+tr.turn-row.open { border-bottom-color: transparent; }
+.detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; }
+@media (max-width: 640px) {
+	.detail-grid { grid-template-columns: 1fr; }
+}
+.detail-card { min-width: 0; padding: 11px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); transition: border-color .12s, box-shadow .12s; }
+.detail-card:hover { border-color: rgba(127,127,127,.4); }
+.detail-card.wide { grid-column: 1 / -1; }
+.detail-card h3 { margin: 0 0 8px; font-size: 11px; letter-spacing: .045em; text-transform: uppercase; color: var(--dim); padding-bottom: 6px; border-bottom: 1px solid rgba(127,127,127,.14); display: flex; align-items: center; gap: 6px; }
+.detail-card h3::before { content: ""; width: 3px; height: 12px; border-radius: 2px; background: var(--accent); opacity: .8; flex: none; }
+.detail-card .kv { display: flex; justify-content: space-between; gap: 12px; padding: 4px 0; border-bottom: 1px dashed rgba(127,127,127,.1); }
+.detail-card .kv:last-child { border-bottom: none; }
+.detail-card .kv .k { color: var(--dim); flex: none; }
 .detail-card .kv .v { min-width: 0; text-align: right; color: var(--fg); font-weight: 580; overflow-wrap: anywhere; }
 .expand-icon { display: inline-grid; width: 18px; height: 18px; place-items: center; color: var(--dim); transition: transform .15s; }
 .expand-icon.open { transform: rotate(90deg); color: var(--accent); }
@@ -345,8 +376,11 @@ tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,12
 .reason-cold_start { background: rgba(148,163,184,.16); color: #cbd5e1; }
 .reason-upstream_expired { background: rgba(245,158,11,.16); color: #f6c45f; }
 .reason-upstream_cache_pending { background: rgba(245,158,11,.16); color: #f6c45f; }
+.reason-upstream_route_changed { background: rgba(245,158,11,.16); color: #f6c45f; }
+.reason-upstream_cache_partial { background: rgba(245,158,11,.16); color: #f6c45f; }
+.reason-ephemeral_context_changed { background: rgba(229,173,66,.16); color: #f2c66d; }
 .reason-healthy { background: rgba(70,201,111,.14); color: var(--good); }
-.reason-history_rewritten, .reason-history_truncated, .reason-history_summarized { background: rgba(181,138,240,.15); color: #c9a7f6; }
+.reason-history_rebuilt_after_restart, .reason-history_rewritten, .reason-history_truncated, .reason-history_summarized { background: rgba(181,138,240,.15); color: #c9a7f6; }
 .reason-session_not_reused { background: rgba(239,98,98,.15); color: #ff8d8d; }
 .reason-request_params_changed, .reason-tool_catalog_changed, .reason-system_prompt_changed { background: rgba(229,173,66,.16); color: #f2c66d; }
 .reason-unknown { background: var(--track); color: var(--dim); }
@@ -383,35 +417,72 @@ tr.detail-row > td { padding: 12px; white-space: normal; background: rgba(127,12
 .spark-bad { background: var(--bad); }
 .perf-row.perf-slow td { box-shadow: inset 3px 0 0 var(--warn); }
 .perf-row.perf-bad td { box-shadow: inset 3px 0 0 var(--bad); }
+.perf-row td, .error-row td { padding: 8px 9px; }
+tr.perf-row:hover td, tr.error-row:hover td { background: rgba(127,127,127,.06); }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 4px 0 10px; }
+.section-heading h2 { margin: 0; font-size: 13px; font-weight: 700; letter-spacing: .02em; display: flex; align-items: center; gap: 7px; }
+.section-heading h2::before { content: ""; width: 3px; height: 13px; border-radius: 2px; background: var(--accent); opacity: .85; }
+.section { margin: 18px 0 6px; }
+.reason-item, .model-card { border-bottom: 1px solid rgba(127,127,127,.1); }
 .gap-user { color: var(--dim); font-style: italic; }
-/* Input structure bar (system → tools → messages cache coverage) */
+/* Ordered input structure and estimated prefix-cache coverage. */
 .struct-bar { display: flex; width: 100%; height: 14px; border-radius: 3px; overflow: hidden; border: 1px solid var(--border); background: rgba(255,255,255,.05); }
 .struct-bar .bar { height: 100%; border-radius: 0; }
-.struct-system, .struct-tools, .struct-msg, .struct-other { box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); }
+.struct-detail-actions { display: flex; justify-content: flex-end; margin-top: 7px; }
+.struct-detail-toggle { font-size: 10px; padding: 3px 7px; }
+.struct-detail-list { display: none; margin-top: 7px; border: 1px solid var(--border); border-radius: 5px; overflow: hidden; max-height: 360px; overflow-y: auto; }
+.struct-detail-list.open { display: block; }
+.struct-detail-row { display: grid; grid-template-columns: minmax(125px, 1fr) minmax(130px, 2fr) minmax(215px, auto); align-items: center; gap: 9px; padding: 6px 7px; border-bottom: 1px solid rgba(127,127,127,.12); }
+.struct-detail-row:last-child { border-bottom: 0; }
+.struct-detail-label { min-width: 0; overflow-wrap: anywhere; }
+.struct-detail-order { color: var(--dim); display: inline-block; min-width: 22px; font-variant-numeric: tabular-nums; }
+.struct-detail-meter { display: flex; width: 100%; height: 9px; overflow: hidden; border-radius: 3px; background: var(--track); }
+.struct-detail-meter .bar { height: 100%; min-width: 3px; border-radius: 0; }
+.struct-detail-stats { color: var(--dim); font-size: 10px; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.struct-system, .struct-tools, .struct-memory, .struct-guard, .struct-user, .struct-assistant, .struct-reasoning, .struct-tool-io, .struct-summary, .struct-other { box-shadow: inset 0 0 0 1px rgba(255,255,255,.25); }
 .struct-block { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .struct-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .struct-bar .bar-cached.struct-system { background: #2f8f4e; }
 .struct-bar .bar-cached.struct-tools { background: #2e7d32; }
 .struct-bar .bar-cached.struct-other { background: #3a8f6e; }
-.struct-bar .bar-cached.struct-msg { background: #46c96f; }
+.struct-bar .bar-cached.struct-memory { background: #238b78; }
+.struct-bar .bar-cached.struct-guard { background: #678a3e; }
+.struct-bar .bar-cached.struct-user { background: #46a96f; }
+.struct-bar .bar-cached.struct-assistant { background: #46c96f; }
+.struct-bar .bar-cached.struct-reasoning { background: #369c64; }
+.struct-bar .bar-cached.struct-tool-io { background: #2f966f; }
+.struct-bar .bar-cached.struct-summary { background: #5a9c54; }
 .struct-bar .bar-uncached.struct-system { background: #7a2e2e; }
 .struct-bar .bar-uncached.struct-tools { background: #a33b3b; }
 .struct-bar .bar-uncached.struct-other { background: #a3663b; }
-.struct-bar .bar-uncached.struct-msg { background: #ef6262; }
+.struct-bar .bar-uncached.struct-memory { background: #d15d76; }
+.struct-bar .bar-uncached.struct-guard { background: #b47745; }
+.struct-bar .bar-uncached.struct-user { background: #df654f; }
+.struct-bar .bar-uncached.struct-assistant { background: #ef6262; }
+.struct-bar .bar-uncached.struct-reasoning { background: #d94d63; }
+.struct-bar .bar-uncached.struct-tool-io { background: #d95b47; }
+.struct-bar .bar-uncached.struct-summary { background: #c46a43; }
 .struct-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
 .gap-user { color: var(--dim); opacity: .75; font-style: italic; }
 @media (max-width: 1180px) {
 	.metric-grid { grid-template-columns: repeat(3, minmax(150px, 1fr)); }
-	.detail-grid { grid-template-columns: repeat(2, minmax(220px, 1fr)); }
 }
 @media (max-width: 720px) {
 	.page { padding: 16px 12px 30px; }
 	.topbar, .turn-toolbar { align-items: stretch; flex-direction: column; }
 	.header-actions { justify-content: flex-start; }
 	.metric-grid { grid-template-columns: repeat(2, minmax(130px, 1fr)); }
-	.detail-grid { grid-template-columns: 1fr; }
-	.detail-card.wide { grid-column: auto; }
 	.search { width: 100%; }
+	.struct-detail-row { grid-template-columns: 1fr; gap: 4px; }
+	.struct-detail-stats { text-align: left; white-space: normal; }
+}
+@media (max-width: 480px) {
+	.turn-table { font-size: 12px; }
+}
+@media (max-width: 960px) {
+	/* Let the turn table (and the detail grid inside it) shrink to the
+	   panel width instead of forcing a 920px minimum + horizontal scroll. */
+	.turn-table th, .turn-table td { white-space: normal; }
 }
 </style>
 </head>
@@ -425,6 +496,14 @@ const FMT_SHORT = (v) => typeof v === "number" ? new Intl.NumberFormat("en-US", 
 const PCT = (v) => typeof v === "number" ? v.toFixed(1) + "%" : "n/a";
 const DURATION = (v) => typeof v !== "number" ? "n/a" : v >= 1000 ? (v / 1000).toFixed(v >= 10000 ? 1 : 2) + " s" : Math.round(v) + " ms";
 const CLOCK = (v) => typeof v === "number" ? new Date(v).toLocaleTimeString() : "never";
+const metric = (label, value, caption, tone, meter) => {
+	let card = '<article class="metric-card ' + tone + '">';
+	card += '<div class="metric-label">' + label + '</div>';
+	card += '<div class="metric-value">' + value + '</div>';
+	card += '<div class="metric-caption" title="' + escAttr(String(caption)) + '">' + caption + '</div>';
+	if (typeof meter === "number") card += '<div class="meter"><span class="meter-fill" style="width:' + Math.max(0, Math.min(100, meter)).toFixed(1) + '%"></span></div>';
+	return card + '</article>';
+};
 const YESNO = (v) => v === true ? "✅" : v === false ? "❌" : "—";
 const HIT_COLOR = (v) => v >= 90 ? "hit-good" : v >= 50 ? "hit-warn" : "hit-bad";
 const HIT_TONE = (v) => v >= 90 ? "tone-good" : v >= 50 ? "tone-warn" : "tone-bad";
@@ -506,6 +585,10 @@ var compactTurnRecord = function(r) {
 			usedTokens: r.context.estimatedUsedTokens,
 			freeTokens: r.context.estimatedFreeTokens,
 			usagePercent: r.context.estimatedUsagePercent,
+			messageTokens: r.context.messageTokensAfterCompact,
+			toolSchemaTokens: r.context.toolTokens,
+			systemTokens: r.context.systemTokens,
+			promptSegments: r.context.promptSegments,
 			advertisedTools: r.context.cappedTools,
 			autoCompacted: r.context.autoCompacted,
 			hardCompacted: r.context.hardCompacted,
@@ -517,6 +600,16 @@ var compactTurnRecord = function(r) {
 const DISPLAY_SERIES = (items) => !Array.isArray(items) || items.length <= 12
 	? items || []
 	: [...items.slice(0, 3), ...items.slice(-5)];
+// Newest-first variant for detail step tables: the newest step sits at the top.
+const DISPLAY_SERIES_NEWEST = (items) => {
+	if (!Array.isArray(items) || !items.length) {
+		return items || [];
+	}
+	const selected = items.length <= 12
+		? items.slice()
+		: [...items.slice(0, 3), ...items.slice(-5)];
+	return selected.reverse();
+};
 
 function render() {
 	const d = DATA;
@@ -525,25 +618,19 @@ function render() {
 	const missTurns = Math.max(0, s.turnsWithCacheReport - s.cacheHealthyTurns);
 	const startupMissTurns = s.cacheStartupMissTurns ?? 0;
 	const seriousIssues = s.rejectedToolCalls + s.toolLoopsDetected + s.overflowRetries;
-	const metric = (label, value, caption, tone, meter) => {
-		let card = '<article class="metric-card ' + tone + '">';
-		card += '<div class="metric-label">' + label + '</div>';
-		card += '<div class="metric-value">' + value + '</div>';
-		card += '<div class="metric-caption" title="' + escAttr(String(caption)) + '">' + caption + '</div>';
-		if (typeof meter === "number") card += '<div class="meter"><span class="meter-fill" style="width:' + Math.max(0, Math.min(100, meter)).toFixed(1) + '%"></span></div>';
-		return card + '</article>';
-	};
 
 	// Header
 	h += '<main class="page">';
 	h += '<header class="topbar"><div>';
-	h += '<div class="title-row"><h1>Session Quality</h1><span class="live-pill">Live</span></div>';
+	h += '<div class="title-row"><h1>Live Report</h1><span class="live-pill">Live</span></div>';
 	h += '<div class="sub">Updated ' + new Date(d.generatedAt).toLocaleTimeString() + ' &middot; Extension ' + d.extensionVersion + ' &middot; VS Code ' + d.vscodeVersion + '</div>';
 	h += '</div><div class="header-actions"><span class="section-note">' + s.turns + ' logical turn' + (s.turns === 1 ? '' : 's') + ' · ' + FMT(s.totalModelTurns ?? s.turns) + ' model segment' + ((s.totalModelTurns ?? s.turns) === 1 ? '' : 's') + '</span></div></header>';
 	h += '<nav class="tabs" role="tablist" aria-label="Dashboard sections">';
 	h += '<button id="tab-btn-cache" class="tab-btn active" role="tab" aria-selected="true" data-tab="cache">Cache &amp; models</button>';
 	h += '<button id="tab-btn-perf" class="tab-btn" role="tab" aria-selected="false" data-tab="perf">Performance</button>';
 	h += '<button id="tab-btn-errors" class="tab-btn' + (d.errors && d.errors.length ? ' tab-has-issues' : '') + '" role="tab" aria-selected="false" data-tab="errors">Errors' + (d.errors && d.errors.length ? ' (' + d.errors.length + ')' : '') + '</button>';
+	h += '<button id="tab-btn-health" class="tab-btn" role="tab" aria-selected="false" data-tab="health">Health</button>';
+
 	h += '</nav>';
 	h += '<div id="tab-cache" class="tab-panel" data-panel="cache">';
 
@@ -627,7 +714,7 @@ function render() {
 			h += '<article class="model-card ' + HIT_TONE(m.hitPercent) + '">';
 			h += '<div class="model-head"><div class="model-name" title="' + escAttr(String(m.modelLabel)) + '">' + esc(m.modelLabel) + '</div><div class="model-hit ' + HIT_COLOR(m.hitPercent) + '">' + PCT(m.hitPercent) + '</div></div>';
 			h += '<div class="meter"><span class="meter-fill" style="width:' + Math.max(0, Math.min(100, m.hitPercent)).toFixed(1) + '%"></span></div>';
-			h += '<div class="model-stats"><span><strong>' + m.turns + '</strong> turns</span><span><strong>' + FMT(m.modelSegments ?? m.turns) + '</strong> segments</span><span><strong>' + FMT_SHORT(m.promptTokens) + '</strong> prompt</span><span><strong>' + FMT_SHORT(m.cachedTokens) + '</strong> cached</span><span><strong>' + m.missTurns + '</strong> misses</span>' + (m.subagentTurns > 0 ? '<span><strong>' + m.subagentTurns + '</strong> subagent</span>' : '') + '</div>';
+			h += '<div class="model-stats"><span><strong>' + m.turns + '</strong> turns</span><span><strong>' + FMT(m.modelSegments ?? m.turns) + '</strong> segments</span><span><strong>' + FMT_SHORT(m.promptTokens) + '</strong> prompt</span><span><strong>' + FMT_SHORT(m.cachedTokens) + '</strong> cached</span><span><strong>' + m.missTurns + '</strong> misses</span>' + (m.subagentTurns > 0 ? '<span><strong>' + m.subagentTurns + '</strong> subagent</span>' : '') + (m.chats && m.chats.length ? '<span class="model-chats" title="' + escAttr(m.chats.join(', ')) + '"><strong>' + m.chats.length + '</strong> chat' + (m.chats.length === 1 ? '' : 's') + ': ' + esc(m.chats.map(c => c.slice(0, 8)).join(', ')) + '</span>' : '') + '</div>';
 			h += '</article>';
 		}
 		h += '</div></section>';
@@ -684,13 +771,17 @@ function render() {
 		h += '</tr></thead><tbody>';
 
 		const displayOffset = allRecords.length - displayRecords.length;
-		for (let i = 0; i < displayRecords.length; i++) {
-			const r = displayRecords[i];
+		// Newest first: the latest turn sits at the top of the table.
+		const displayRows = [...displayRecords].reverse();
+		for (let i = 0; i < displayRows.length; i++) {
+			const r = displayRows[i];
 			// data-index must address DATA.records (full history), not the
 			// truncated display list, so Alt+Copy keeps working.
-			const dataIndex = displayOffset + i;
+			const dataIndex = displayOffset + (displayRecords.length - 1 - i);
 			const hit = EFFECTIVE_HIT(r);
-			const detailId = "detail-" + i;
+			const detailKey = String(r.requestId || ("turn-" + String(r.index ?? dataIndex) + "-" + String(r.conversationKey || "")))
+				.replace(/[^a-zA-Z0-9_-]/g, "-");
+			const detailId = "detail-" + detailKey;
 			const cacheIssue = typeof hit === "number" && hit < 90;
 			const critical = Boolean(
 				r.rejectedToolCalls || r.toolLoopDetected || r.retriedAfterOverflow || r.safetyStopReason
@@ -748,7 +839,7 @@ function render() {
 			// app-server thread, so generic byte-prefix fields are not meaningful.
 			const isColdStart = r.prefixPreviousMessageCount === undefined;
 			if (IS_CODEX(r)) {
-				h += '<section class="detail-card wide"><h3>Codex session &amp; cache</h3>';
+				h += '<section class="detail-card"><h3>Codex session &amp; cache</h3>';
 				h += '<div class="kv"><span class="k">Lifecycle</span><span class="v ' + LIFECYCLE_TONE(r.lifecyclePhase) + '">' + esc(r.lifecyclePhase || 'unknown') + '</span></div>';
 				h += '<div class="kv"><span class="k">Thread mode</span><span class="v">' + esc(r.threadMode || 'unknown') + '</span></div>';
 				h += '<div class="kv"><span class="k">Reuse miss</span><span class="v">' + esc(r.threadReuseMissReason || '—') + '</span></div>';
@@ -759,7 +850,7 @@ function render() {
 				h += '<div class="kv"><span class="k">Detail</span><span class="v">' + esc(r.cacheMissDetail || "—") + '</span></div>';
 				if (r.terminalDetail) h += '<div class="kv"><span class="k">Terminal detail</span><span class="v">' + esc(r.terminalDetail) + '</span></div>';
 			} else if (IS_CLAUDE(r)) {
-				h += '<section class="detail-card wide"><h3>Claude session &amp; cache</h3>';
+				h += '<section class="detail-card"><h3>Claude session &amp; cache</h3>';
 				h += '<div class="kv"><span class="k">Lifecycle</span><span class="v ' + LIFECYCLE_TONE(r.lifecyclePhase) + '">' + esc(r.lifecyclePhase || 'unknown') + '</span></div>';
 				h += '<div class="kv"><span class="k">Session mode</span><span class="v">' + esc(r.sessionMode || 'unknown') + '</span></div>';
 				if (r.resumeFailureReason) h += '<div class="kv"><span class="k">Resume failure</span><span class="v bad">' + esc(r.resumeFailureReason) + '</span></div>';
@@ -777,7 +868,7 @@ function render() {
 				h += '<div class="kv"><span class="k">Detail</span><span class="v">' + esc(r.cacheMissDetail || "—") + '</span></div>';
 				if (r.terminalDetail) h += '<div class="kv"><span class="k">Terminal detail</span><span class="v">' + esc(r.terminalDetail) + '</span></div>';
 			} else {
-				h += '<section class="detail-card wide"><h3>Prefix &amp; cache</h3>';
+				h += '<section class="detail-card"><h3>Prefix &amp; cache</h3>';
 				h += '<div class="kv"><span class="k">Identical msgs</span><span class="v">' + (isColdStart ? 'cold start' : r.prefixIdenticalMessageCount !== undefined ? r.prefixIdenticalMessageCount + " of " + FMT(r.prefixPreviousMessageCount) : "n/a") + '</span></div>';
 				h += '<div class="kv"><span class="k">Reusable %</span><span class="v">' + (isColdStart ? '—' : r.prefixReusableMessagePercent !== undefined ? PCT(r.prefixReusableMessagePercent) : "n/a") + '</span></div>';
 				h += '<div class="kv"><span class="k">Static fields</span><span class="v">' + (isColdStart ? '—' : YESNO(r.prefixStaticFieldsMatch)) + '</span></div>';
@@ -821,25 +912,69 @@ function render() {
 				// only covers a byte-identical prefix, so a changed tools block
 				// invalidates every message after it. Segment the bar by block and
 				// paint the cached portion of each block green.
+				//
+				// The heuristic block sizes are NOT scaled up to the
+				// server-reported input total: scaling distorted the cache split
+				// (cached is a real server number, so scaled blocks made
+				// system+tools appear larger than the cache could cover and
+				// painted a false miss inside the tools block).
 				if (structMode && r.context) {
 					const structSystem = typeof r.context.systemTokens === "number" ? r.context.systemTokens : 0;
 					const structTools = typeof r.context.toolTokens === "number" ? r.context.toolTokens : 0;
-					const structMessages = typeof r.context.messageTokensAfterCompact === "number"
+					const structMessageTotal = typeof r.context.messageTokensAfterCompact === "number"
 						? r.context.messageTokensAfterCompact
 						: 0;
+					// messageTokens includes system-role messages; subtract them in
+					// the legacy fallback so System is never counted twice.
+					const structMessages = Math.max(0, structMessageTotal - structSystem);
 					const structOther = typeof r.context.otherTokens === "number" ? r.context.otherTokens : 0;
-					const structTotal = structSystem + structTools + structMessages + structOther;
+					const segmentCss = {
+						system: "struct-system",
+						tools: "struct-tools",
+						shared_memory: "struct-memory",
+						guard: "struct-guard",
+						user: "struct-user",
+						user_context: "struct-user",
+						assistant: "struct-assistant",
+						reasoning: "struct-reasoning",
+						tool_calls: "struct-tool-io",
+						tool_results: "struct-tool-io",
+						summary: "struct-summary",
+						other: "struct-other",
+					};
+					const orderedSegments = Array.isArray(r.context.promptSegments)
+						? r.context.promptSegments.filter(segment => Number(segment.tokens) > 0)
+						: [];
+					const blocks = orderedSegments.length > 0
+						? orderedSegments.map(segment => ({
+							label: String(segment.label || segment.kind || "Other"),
+							tokens: Number(segment.tokens) || 0,
+							css: segmentCss[segment.kind] || "struct-other",
+							messageCount: Number(segment.messageCount) || undefined,
+						}))
+						: [
+							{ label: "System", tokens: structSystem, css: "struct-system" },
+							{ label: "Tool catalog", tokens: structTools, css: "struct-tools" },
+							{ label: "Other", tokens: structOther, css: "struct-other" },
+							{ label: "Messages", tokens: structMessages, css: "struct-assistant" },
+						].filter(block => block.tokens > 0);
+					const structTotal = blocks.reduce((sum, block) => sum + block.tokens, 0);
 					if (structTotal > 0 && typeof detailInputTokens === "number" && detailInputTokens > 0) {
-						// Scale the heuristic blocks to the server-reported input.
-						const scale = detailInputTokens / structTotal;
-						const blocks = [
-							{ label: "System", tokens: structSystem * scale, css: "struct-system" },
-							{ label: "Tools", tokens: structTools * scale, css: "struct-tools" },
-							{ label: "Other", tokens: structOther * scale, css: "struct-other" },
-							{ label: "Messages", tokens: structMessages * scale, css: "struct-msg" },
-						].filter(b => b.tokens > 0);
+						// The heuristic block sizes usually under-count the real
+						// server-side input (tokenizer details, tool schemas, extra
+						// system text). Without the missing tail, cached tokens could
+						// cover every block (all 100%) while the server still reports
+						// a lower blended hit — paint the unmeasured tail so the bar
+						// stays consistent with the overall cache hit.
+						const unmeasuredTail = Math.max(0, detailInputTokens - structTotal);
+						if (unmeasuredTail > 0) {
+							blocks.push({ label: "Unmeasured", tokens: unmeasuredTail, css: "struct-other" });
+						}
+						const structTotalWithTail = structTotal + unmeasuredTail;
 						let consumed = 0;
 						const segments = [];
+						const detailBlocks = [];
+						const legend = new Map();
 						for (const block of blocks) {
 							const blockCached = Math.max(0, Math.min(block.tokens, cached - consumed));
 							const blockMiss = Math.max(0, block.tokens - blockCached);
@@ -858,22 +993,49 @@ function render() {
 									title: block.label + ": " + blockHit + "% cached — " + FMT(Math.round(blockMiss)) + " tokens not cached",
 								});
 							}
+							const aggregate = legend.get(block.label) || { label: block.label, tokens: 0, cached: 0 };
+							aggregate.tokens += block.tokens;
+							aggregate.cached += blockCached;
+							legend.set(block.label, aggregate);
+							detailBlocks.push({
+								label: block.label,
+								tokens: block.tokens,
+								cached: blockCached,
+								miss: blockMiss,
+								hit: blockHit,
+								css: block.css,
+								messageCount: block.messageCount,
+							});
 							consumed += block.tokens;
 						}
 						h += '<div class="struct-bar" style="margin-top:6px">';
 						for (const segment of segments) {
-							h += '<div class="' + segment.css + '" style="width:' + ((segment.width / detailInputTokens) * 100).toFixed(2) + '%" title="' + escAttr(segment.title) + '"></div>';
+							h += '<div class="' + segment.css + '" style="width:' + ((segment.width / structTotalWithTail) * 100).toFixed(2) + '%" title="' + escAttr(segment.title) + '"></div>';
 						}
 						h += '</div>';
 						h += '<div class="struct-legend" style="font-size:10px;color:var(--dim);margin-top:3px">';
-						let legendConsumed = 0;
-						for (const block of blocks) {
-							const blockCached = Math.max(0, Math.min(block.tokens, cached - legendConsumed));
-							const blockHit = block.tokens > 0 ? Math.round((blockCached / block.tokens) * 100) : 0;
+						for (const block of legend.values()) {
+							const blockHit = block.tokens > 0 ? Math.round((block.cached / block.tokens) * 100) : 0;
 							const stateColor = blockHit >= 99 ? 'var(--good)' : blockHit >= 50 ? 'var(--warn)' : 'var(--bad)';
 							h += '<span class="struct-block" style="margin-right:10px"><span class="struct-dot" style="background:' + stateColor + '"></span><strong>' + esc(block.label) + '</strong> ' + FMT_SHORT(Math.round(block.tokens)) + ' · ' + blockHit + '%</span>';
-							legendConsumed += block.tokens;
 						}
+						h += '<span style="opacity:.7">estimated block split; cached cutoff is server-reported</span>';
+						h += '</div>';
+						const structureDetailId = "struct-details-" + detailKey;
+						h += '<div class="struct-detail-actions"><button class="btn struct-detail-toggle" type="button" aria-expanded="false" aria-controls="' + structureDetailId + '" data-target="' + structureDetailId + '">Expand block details</button></div>';
+						h += '<div class="struct-detail-list" id="' + structureDetailId + '">';
+						detailBlocks.forEach(function(block, blockIndex) {
+							const cachedPct = block.tokens > 0 ? (block.cached / block.tokens) * 100 : 0;
+							const missPct = Math.max(0, 100 - cachedPct);
+							h += '<div class="struct-detail-row">';
+							h += '<div class="struct-detail-label"><span class="struct-detail-order">#' + (blockIndex + 1) + '</span><strong>' + esc(block.label) + '</strong>' + (block.messageCount ? ' <span class="section-note">· ' + FMT(block.messageCount) + ' msg</span>' : '') + '</div>';
+							h += '<div class="struct-detail-meter" title="' + escAttr(block.label + ": " + block.hit + "% cached") + '">';
+							if (block.cached > 0) h += '<div class="bar bar-cached ' + block.css + '" style="width:' + cachedPct.toFixed(2) + '%"></div>';
+							if (block.miss > 0) h += '<div class="bar bar-uncached ' + block.css + '" style="width:' + missPct.toFixed(2) + '%"></div>';
+							h += '</div>';
+							h += '<div class="struct-detail-stats">' + FMT(Math.round(block.tokens)) + ' total · ' + FMT(Math.round(block.cached)) + ' cached · ' + FMT(Math.round(block.miss)) + ' miss · <strong>' + block.hit + '%</strong></div>';
+							h += '</div>';
+						});
 						h += '</div>';
 					}
 				}
@@ -896,14 +1058,13 @@ function render() {
 						h += '<div style="font-size:10px;color:var(--dim);margin-top:1px">~' + avgNewMsgTokens + ' tok per new message (estimated)</div>';
 					}
 				}
-				h += '</div>';
 			}
 			h += '</section>';
 
 			// Context section
 			if (r.context) {
 				const c = r.context;
-				h += '<section class="detail-card wide"><h3>' + (IS_CODEX(r) ? 'Final context snapshot' : IS_CLAUDE(r) ? 'Claude SDK context snapshot' : 'Context budget') + '</h3>';
+				h += '<section class="detail-card"><h3>' + (IS_CODEX(r) ? 'Final context snapshot' : IS_CLAUDE(r) ? 'Claude SDK context snapshot' : 'Context budget') + '</h3>';
 				h += '<div class="kv"><span class="k">Budget</span><span class="v">' + FMT(c.contextLength) + ' total / ' + FMT(c.inputBudget) + ' usable</span></div>';
 				if (IS_STATEFUL(r)) h += '<div class="kv"><span class="k">Processed across segments</span><span class="v">' + FMT(r.promptTokens) + ' input · ' + FMT(r.outputTokens) + ' output</span></div>';
 				if (IS_CLAUDE(r) && c.rawMaxTokens !== undefined) h += '<div class="kv"><span class="k">Provider raw / SDK usable</span><span class="v">' + FMT(c.rawMaxTokens) + ' / ' + FMT(c.usableMaxTokens) + '</span></div>';
@@ -987,7 +1148,7 @@ function render() {
 			if (Array.isArray(r.steps) && r.steps.length) {
 				h += '<section class="detail-card wide"><h3>' + (IS_CLAUDE(r) ? 'Claude' : IS_CODEX(r) ? 'Codex' : 'Provider') + ' live steps (' + FMT(r.steps.length) + ')</h3>';
 				h += '<div class="table-shell" style="max-height:340px"><table><thead><tr><th>#</th><th>Kind</th><th>Step</th><th>Status</th><th>At</th><th>Duration</th><th>Input</th><th>Cache read</th><th>Cache write</th><th>Output</th></tr></thead><tbody>';
-				for (const step of DISPLAY_SERIES(r.steps)) {
+				for (const step of DISPLAY_SERIES_NEWEST(r.steps)) {
 					const statusClass = step.status === 'failed' || step.status === 'timed_out' ? 'bad' : step.status === 'running' || step.status === 'cancelled' ? 'warn' : 'good';
 					const kindLabel = step.kind === 'tool' && step.toolCategory ? 'tool · ' + step.toolCategory : step.kind;
 					h += '<tr><td>' + FMT(step.index) + '</td><td>' + esc(kindLabel) + '</td><td>' + esc(step.label) + '</td><td class="' + statusClass + '">' + esc(step.status) + '</td><td>' + esc(step.startedAt ? new Date(step.startedAt).toLocaleTimeString() : 'n/a') + '</td><td>' + DURATION(step.durationMs) + '</td><td>' + FMT(step.inputTokens) + '</td><td class="' + HIT_COLOR(step.cacheHitPercent) + '">' + FMT(step.cachedInputTokens) + ' · ' + PCT(step.cacheHitPercent) + '</td><td>' + FMT(step.cacheCreationInputTokens) + '</td><td>' + FMT(step.outputTokens) + '</td></tr>';
@@ -1000,7 +1161,7 @@ function render() {
 			if (Array.isArray(r.usageSegments) && r.usageSegments.length) {
 				h += '<section class="detail-card wide"><h3>Model usage segments (' + FMT(r.modelTurns ?? r.usageSegments.length) + ')</h3>';
 				h += '<div class="table-shell" style="max-height:300px"><table><thead><tr><th>#</th><th>At</th>' + (IS_CLAUDE(r) ? '<th>Fresh</th>' : '') + '<th>Input</th><th>Cache read</th>' + (IS_CLAUDE(r) ? '<th>Cache write</th>' : '') + '<th>Hit</th><th>Output</th><th>Reasoning</th><th>Total</th></tr></thead><tbody>';
-				for (const segment of DISPLAY_SERIES(r.usageSegments)) {
+				for (const segment of DISPLAY_SERIES_NEWEST(r.usageSegments)) {
 					h += '<tr><td>' + FMT(segment.index) + '</td><td>' + esc(segment.recordedAt ? new Date(segment.recordedAt).toLocaleTimeString() : 'n/a') + '</td>' + (IS_CLAUDE(r) ? '<td>' + FMT(segment.freshInputTokens) + '</td>' : '') + '<td>' + FMT(segment.inputTokens) + '</td><td>' + FMT(segment.cachedInputTokens) + '</td>' + (IS_CLAUDE(r) ? '<td>' + FMT(segment.cacheCreationInputTokens) + '</td>' : '') + '<td class="' + HIT_COLOR(segment.cacheHitPercent) + '">' + PCT(segment.cacheHitPercent) + '</td><td>' + FMT(segment.outputTokens) + '</td><td>' + FMT(segment.reasoningOutputTokens) + '</td><td>' + FMT(segment.totalTokens) + '</td></tr>';
 				}
 				h += '</tbody></table></div>';
@@ -1011,7 +1172,7 @@ function render() {
 
 			// Request and backend diagnostics
 			const hasBackend = r.backendVia || r.backendCfPop || r.backendTraceId;
-			h += '<section class="detail-card wide"><h3>Request &amp; backend</h3>';
+			h += '<section class="detail-card"><h3>Request &amp; backend</h3>';
 			h += '<div class="kv"><span class="k">Request ID</span><span class="v backend-info">' + esc(r.requestId || 'n/a') + '</span></div>';
 			if (r.conversationKey) h += '<div class="kv"><span class="k">Conversation key</span><span class="v backend-info">' + esc(r.conversationKey) + '</span></div>';
 			if (r.parentRequestId) h += '<div class="kv"><span class="k">Parent request</span><span class="v backend-info">' + esc(r.parentRequestId) + '</span></div>';
@@ -1040,9 +1201,14 @@ function render() {
 	h += renderErrorsTab(d);
 	h += '</div>';
 
+	h += '<div id="tab-health" class="tab-panel" data-panel="health" hidden>';
+	h += renderHealthTab(d);
+	h += '</div>';
+
 	h += '</main>';
 	document.getElementById("app").innerHTML = h;
 	restoreTabState();
+	bindHealthActions();
 }
 
 const ERROR_KIND_LABEL = {
@@ -1051,10 +1217,26 @@ const ERROR_KIND_LABEL = {
 	tool_rejected: "Tool rejected",
 	tool_repair_retry: "Tool repair retry",
 	tool_loop: "Tool loop",
+	tool_execution_error: "Tool execution error",
 	api_overflow_retry: "API overflow retry",
 	resume_failed: "Session resume failed",
 	safety_stop: "Safety stop",
 };
+
+// Kinds that signal real API-level failures or silent crashes. Everything else
+// (rejected tool calls, repair retries, execution errors like "path not found")
+// is usually non-fatal — the model recovers and the turn completes.
+const ERROR_CRITICAL_KINDS = new Set([
+	"turn_failed",
+	"turn_timed_out",
+	"api_overflow_retry",
+	"resume_failed",
+	"safety_stop",
+	"tool_loop",
+]);
+function isCriticalErrorKind(kind) {
+	return ERROR_CRITICAL_KINDS.has(kind);
+}
 
 function renderErrorsTab(d) {
 	const errors = Array.isArray(d.errors) ? d.errors : [];
@@ -1080,13 +1262,22 @@ function renderErrorsTab(d) {
 		for (const chat of chats) h += '<option value="' + escAttr(chat) + '">' + esc(chat.slice(0, 8)) + '</option>';
 		h += '</select>';
 	}
+	h += '<select id="error-kind-filter" class="select" aria-label="Filter errors by kind"><option value="">All kinds</option>';
+	const kinds = Object.keys(byKind).sort((a, b) => {
+		const la = ERROR_KIND_LABEL[a] || a;
+		const lb = ERROR_KIND_LABEL[b] || b;
+		return la.localeCompare(lb);
+	});
+	for (const kind of kinds) h += '<option value="' + escAttr(kind) + '">' + esc(ERROR_KIND_LABEL[kind] || kind) + '</option>';
+	h += '</select>';
+	h += '<button id="error-critical-filter" class="btn active" type="button" aria-pressed="true" title="Show only API errors and silent failures (turn failures, timeouts, overflow retries, resume/safety stops, tool loops). Tool rejections and execution errors like &quot;path not found&quot; are hidden by default.">API &amp; failures only</button>';
 	h += '</div></div>';
 	h += '<div class="table-shell"><table class="turn-table"><thead><tr>';
 	h += '<th>#</th><th>At</th><th>Chat</th><th>Model</th><th>Type</th><th>Details</th>';
 	h += '</tr></thead><tbody>';
 	const rows = [...errors].reverse();
 	for (const e of rows) {
-		h += '<tr class="error-row" data-error-chat="' + escAttr(String(e.conversationKey || '')) + '">';
+		h += '<tr class="error-row" data-error-chat="' + escAttr(String(e.conversationKey || '')) + '" data-error-kind="' + escAttr(e.kind) + '" data-error-critical="' + (isCriticalErrorKind(e.kind) ? '1' : '0') + '">';
 		h += '<td class="compact-number">#' + e.index + '</td>';
 		h += '<td class="compact-number" title="' + (e.startedAtMs !== undefined ? new Date(e.startedAtMs).toLocaleString() : '') + '">' + CLOCK(e.startedAtMs) + '</td>';
 		h += '<td class="compact-number" title="' + escAttr(String(e.conversationKey || 'unknown')) + '">' + (e.conversationKey ? esc(e.conversationKey.slice(0, 8)) : '—') + '</td>';
@@ -1101,10 +1292,92 @@ function renderErrorsTab(d) {
 
 function applyErrorFilters() {
 	const chat = document.getElementById("error-chat-filter")?.value || "";
+	const kind = document.getElementById("error-kind-filter")?.value || "";
+	const criticalOnly = document.getElementById("error-critical-filter")?.classList.contains("active") || false;
 	document.querySelectorAll(".error-row").forEach(function(row) {
-		const matches = !chat || row.getAttribute("data-error-chat") === chat;
-		row.classList.toggle("hidden-row", !matches);
+		const matchesChat = !chat || row.getAttribute("data-error-chat") === chat;
+		const matchesKind = !kind || row.getAttribute("data-error-kind") === kind;
+		const matchesCritical = !criticalOnly || row.getAttribute("data-error-critical") === "1";
+		row.classList.toggle("hidden-row", !(matchesChat && matchesKind && matchesCritical));
 	});
+}
+
+const HEALTH_STATUS_LABEL = { pass: "Pass", warn: "Warning", fail: "Failed", unknown: "Unknown" };
+const HEALTH_TONE = { pass: "tone-good", warn: "tone-warn", fail: "tone-bad", unknown: "tone-info" };
+
+function renderHealthTab(d) {
+	const hd = d.health;
+	if (!hd) {
+		return '<div class="empty">No provider health check has been run yet.<br><button id="health-run" class="btn" type="button">Run health check</button></div>';
+	}
+	const overall = hd.overallStatus || "unknown";
+	let h = "";
+
+	h += '<section class="metric-grid" aria-label="Health summary">';
+	h += '<article class="metric-card ' + (HEALTH_TONE[overall] || "tone-info") + '"><div class="metric-label">Overall</div><div class="metric-value">' + esc((HEALTH_STATUS_LABEL[overall] || overall).toUpperCase()) + '</div><div class="metric-caption">checked ' + (hd.generatedAt ? new Date(hd.generatedAt).toLocaleTimeString() : "—") + '</div></article>';
+	const ss = hd.sessionSummary;
+	if (ss) {
+		h += metric("Session turns", FMT(ss.turns), FMT(ss.totalModelTurns ?? ss.turns) + " model segments", "tone-info");
+		h += metric("Cache hit", PCT(ss.cacheHitPercent), "across " + FMT_SHORT(ss.promptTokens ?? 0) + " input tokens", HIT_TONE(ss.cacheHitPercent ?? 0));
+		h += metric("Errors", FMT(ss.errorCount ?? 0), ss.rejectedToolCalls + " rejected · " + ss.repairedToolCalls + " repaired · " + (ss.toolLoopsDetected || 0) + " loops", (ss.errorCount || 0) > 0 ? "tone-warn" : "tone-good");
+	}
+	h += '<button id="health-run" class="btn" type="button">Run health check</button>';
+	h += '</section>';
+
+	if (Array.isArray(hd.configurationChecks) && hd.configurationChecks.length) {
+		h += '<section class="section"><div class="section-heading"><h2>Configuration</h2><span class="section-note">Extension settings</span></div><div class="reason-list">';
+		for (const check of hd.configurationChecks) {
+			const tone = HEALTH_TONE[check.status] || "tone-info";
+			h += '<div class="reason-item"><div class="reason-main"><span class="reason-badge reason-' + escAttr(check.status) + '">' + esc(check.status) + '</span><span class="reason-label">' + esc(check.label) + '</span></div><div class="reason-detail ' + tone + '">' + esc(check.detail || "") + '</div></div>';
+		}
+		h += '</div></section>';
+	}
+
+	if (Array.isArray(hd.sources) && hd.sources.length) {
+		h += '<section class="section"><div class="section-heading"><h2>Endpoints</h2><span class="section-note">Direct LLM servers</span></div>';
+		for (const source of hd.sources) {
+			h += '<div class="model-card"><div class="model-card-head"><span class="reason-badge reason-' + escAttr(source.status || "unknown") + '">' + esc(source.status || "unknown") + '</span><span class="model-name">' + esc(source.label || source.key) + '</span><span class="model-dim">' + esc(source.serverUrl || "") + '</span></div>';
+			if (Array.isArray(source.modelIds) && source.modelIds.length) {
+				h += '<div class="model-dim">Models: ' + esc(source.modelIds.join(", ")) + '</div>';
+			}
+			if (Array.isArray(source.checks) && source.checks.length) {
+				for (const check of source.checks) {
+					h += '<div class="reason-item"><div class="reason-main"><span class="reason-badge reason-' + escAttr(check.status) + '">' + esc(check.status) + '</span><span class="reason-label">' + esc(check.label) + '</span></div><div class="reason-detail">' + esc(check.detail || "") + '</div></div>';
+				}
+			}
+			h += '</div>';
+		}
+		h += '</section>';
+	}
+
+	if (hd.claude || hd.codex) {
+		h += '<section class="section"><div class="section-heading"><h2>Subscription providers</h2><span class="section-note">Claude and Codex</span></div><div class="model-grid">';
+		if (hd.claude) {
+			h += '<div class="model-card"><div class="model-card-head"><span class="reason-badge reason-' + escAttr(hd.claude.status) + '">' + esc(hd.claude.status) + '</span><span class="model-name">Claude</span></div><div class="reason-detail">' + esc(hd.claude.summary || "") + (hd.claude.usagePercent !== undefined ? " · usage " + FMT1(hd.claude.usagePercent) + "%" : "") + (hd.claude.resetLabel ? " · resets " + esc(hd.claude.resetLabel) : "") + '</div>';
+			if (hd.claude.keepAlive) {
+				h += '<div class="model-dim">Keep-alive: ' + esc(hd.claude.keepAlive.state) + (hd.claude.keepAlive.reason ? " (" + esc(hd.claude.keepAlive.reason) + ")" : "") + (hd.claude.keepAlive.enabled ? " · every " + FMT(Math.round((hd.claude.keepAlive.intervalMs || 0) / 60000)) + " min" : " · disabled") + '</div>';
+			}
+			h += '</div>';
+		}
+		if (hd.codex) {
+			h += '<div class="model-card"><div class="model-card-head"><span class="reason-badge reason-' + escAttr(hd.codex.status) + '">' + esc(hd.codex.status) + '</span><span class="model-name">Codex</span></div><div class="reason-detail">' + esc(hd.codex.summary || "") + '</div></div>';
+		}
+		h += '</div></section>';
+	}
+
+	h += '<div class="section-note" style="margin-top:10px">Generated ' + (hd.generatedAt ? new Date(hd.generatedAt).toLocaleString() : "—") + ' · Extension ' + esc(hd.extensionVersion || "") + ' · VS Code ' + esc(hd.vscodeVersion || "") + '</div>';
+	return h;
+}
+
+function bindHealthActions() {
+	const runBtn = document.getElementById("health-run");
+	if (runBtn && !runBtn.dataset.bound) {
+		runBtn.dataset.bound = "1";
+		runBtn.addEventListener("click", function() {
+			// eslint-disable-next-line no-undef
+			acquireVsCodeApi().postMessage({ type: "runHealthCheck" });
+		});
+	}
 }
 
 function renderPerfTab(d) {
@@ -1168,7 +1441,7 @@ function renderPerfTab(d) {
 
 	// Sparkline of recent tool gaps
 	if (gaps.length > 1) {
-		const recent = gaps.slice(-30);
+		const recent = gaps.slice(-40);
 		const maxGap = Math.max(...recent, 1);
 		h += '<section class="section"><div class="section-heading"><h2>Recent gaps</h2><span class="section-note">last ' + recent.length + ' tool-round pauses — each bar is one pause</span></div><div class="spark">';
 		for (const g of recent) {
@@ -1189,9 +1462,9 @@ function renderPerfTab(d) {
 	h += '</div><span class="section-note">Chat filter isolates one conversation</span></div>';
 	h += '<div class="table-shell"><table class="turn-table"><thead><tr>';
 	h += '<th>At</th><th>Msgs</th><th>Gap</th><th>Turn</th><th>TTFT</th><th>Cache</th><th>Tokens</th><th>ctk</th>';
-	if (chats.length > 1) h += '<th>Chat</th>';
+	h += '<th>Chat</th>';
 	h += '<th>Model</th></tr></thead><tbody>';
-	const rows = [...records].sort((a, b) => (a.startedAtMs || 0) - (b.startedAtMs || 0));
+	const rows = [...records].sort((a, b) => (a.startedAtMs || 0) - (b.startedAtMs || 0)).slice(-40).reverse();
 	for (const r of rows) {
 		const isUserGap = r.gapKind === "user" && typeof r.gapSinceLastResponseMs === "number";
 		const slow = !isUserGap && typeof r.gapSinceLastResponseMs === "number" && r.gapSinceLastResponseMs > 60000;
@@ -1205,7 +1478,7 @@ function renderPerfTab(d) {
 		h += '<td class="' + HIT_COLOR(EFFECTIVE_HIT(r)) + '">' + PCT(EFFECTIVE_HIT(r)) + '</td>';
 		h += '<td class="compact-number" title="' + FMT(r.promptTokens) + ' processed tokens">' + FMT_SHORT(r.promptTokens) + '</td>';
 		h += '<td class="compact-number">' + (typeof r.hostTokenCountCalls === "number" ? r.hostTokenCountCalls : 'n/a') + '</td>';
-		if (chats.length > 1) h += '<td class="compact-number" title="' + escAttr(String(r.conversationKey || 'unknown')) + '">' + (r.conversationKey ? esc(r.conversationKey.slice(0, 8)) : '—') + '</td>';
+		h += '<td class="compact-number" title="' + escAttr(String(r.conversationKey || 'unknown')) + '">' + (r.conversationKey ? esc(r.conversationKey.slice(0, 8)) : '—') + '</td>';
 		h += '<td class="model-cell" title="' + escAttr(String(r.modelId || '')) + '">' + esc(MODEL_LABEL(r.modelId)) + '</td>';
 		h += '</tr>';
 	}
@@ -1233,6 +1506,7 @@ function switchTab(name) {
 	});
 	if (name === "perf") applyPerfFilters();
 	if (name === "errors") applyErrorFilters();
+	if (name === "health") bindHealthActions();
 }
 
 function restoreTabState(state) {
@@ -1260,12 +1534,33 @@ document.addEventListener("click", function(e) {
 		return;
 	}
 
+	const errorCriticalButton = e.target.closest("#error-critical-filter");
+	if (errorCriticalButton) {
+		const active = !errorCriticalButton.classList.contains("active");
+		errorCriticalButton.classList.toggle("active", active);
+		errorCriticalButton.setAttribute("aria-pressed", String(active));
+		applyErrorFilters();
+		return;
+	}
+
 	const expandButton = e.target.closest("#expand-all");
 	if (expandButton) {
 		const visibleRows = [...document.querySelectorAll(".turn-row:not(.hidden-row)")];
 		const shouldOpen = visibleRows.some(row => row.getAttribute("aria-expanded") !== "true");
 		visibleRows.forEach(row => setRowOpen(row, shouldOpen));
 		expandButton.textContent = shouldOpen ? "Collapse all" : "Expand all";
+		return;
+	}
+
+	const structureButton = e.target.closest(".struct-detail-toggle");
+	if (structureButton) {
+		const targetId = structureButton.getAttribute("data-target");
+		const target = targetId ? document.getElementById(targetId) : null;
+		if (!target) return;
+		const open = !target.classList.contains("open");
+		target.classList.toggle("open", open);
+		structureButton.setAttribute("aria-expanded", String(open));
+		structureButton.textContent = open ? "Collapse block details" : "Expand block details";
 		return;
 	}
 
@@ -1318,7 +1613,7 @@ document.addEventListener("input", function(e) {
 document.addEventListener("change", function(e) {
 	if (e.target.id === "model-filter" || e.target.id === "chat-filter") applyTurnFilters();
 	if (e.target.id === "perf-chat-filter") applyPerfFilters();
-	if (e.target.id === "error-chat-filter") applyErrorFilters();
+	if (e.target.id === "error-chat-filter" || e.target.id === "error-kind-filter") applyErrorFilters();
 });
 
 function setRowOpen(row, open) {
@@ -1367,13 +1662,64 @@ function restoreOpenRows(open) {
 	});
 }
 
+function saveOpenStructureDetails() {
+	const open = new Set();
+	document.querySelectorAll(".struct-detail-list.open").forEach(function(el) {
+		open.add(el.id);
+	});
+	return open;
+}
+
+function restoreOpenStructureDetails(open) {
+	open.forEach(function(id) {
+		const detail = document.getElementById(id);
+		if (!detail) return;
+		detail.classList.add("open");
+		const button = [...document.querySelectorAll(".struct-detail-toggle")]
+			.find(candidate => candidate.getAttribute("data-target") === id);
+		if (button) {
+			button.setAttribute("aria-expanded", "true");
+			button.textContent = "Collapse block details";
+		}
+	});
+}
+
+function captureOpenTurnAnchor() {
+	const rows = [...document.querySelectorAll(".turn-row.open:not(.hidden-row)")];
+	if (!rows.length) return undefined;
+	const visible = rows.find(function(row) {
+		const rect = row.getBoundingClientRect();
+		return rect.bottom > 0 && rect.top < window.innerHeight;
+	});
+	const row = visible || rows[0];
+	return {
+		detailId: row.getAttribute("data-detail"),
+		top: row.getBoundingClientRect().top,
+	};
+}
+
+function restoreOpenTurnAnchor(anchor) {
+	if (!anchor || !anchor.detailId || typeof anchor.top !== "number") return;
+	const row = document.querySelector('.turn-row[data-detail="' + anchor.detailId + '"]');
+	if (!row) return;
+	const delta = row.getBoundingClientRect().top - anchor.top;
+	if (Math.abs(delta) > 0.5) {
+		window.scrollBy(0, delta);
+	}
+}
+
 function captureViewState() {
 	return {
 		openRows: saveOpenRows(),
+		openStructureDetails: saveOpenStructureDetails(),
+		turnAnchor: captureOpenTurnAnchor(),
 		query: document.getElementById("turn-search")?.value || "",
 		model: document.getElementById("model-filter")?.value || "",
 		chat: document.getElementById("chat-filter")?.value || "",
 		perfChat: document.getElementById("perf-chat-filter")?.value || "",
+		errorChat: document.getElementById("error-chat-filter")?.value || "",
+		errorKind: document.getElementById("error-kind-filter")?.value || "",
+		errorCritical: document.getElementById("error-critical-filter")?.classList.contains("active") || false,
 		tab: document.querySelector(".tab-btn.active")?.getAttribute("data-tab") || "cache",
 		issuesOnly: document.getElementById("issues-filter")?.classList.contains("active") || false,
 	};
@@ -1391,9 +1737,21 @@ function restoreViewState(state) {
 		issues.classList.toggle("active", state.issuesOnly);
 		issues.setAttribute("aria-pressed", String(state.issuesOnly));
 	}
+	const errorChat = document.getElementById("error-chat-filter");
+	const errorKind = document.getElementById("error-kind-filter");
+	const errorCritical = document.getElementById("error-critical-filter");
+	if (errorChat && state.errorChat) errorChat.value = state.errorChat;
+	if (errorKind && state.errorKind) errorKind.value = state.errorKind;
+	if (errorCritical) {
+		errorCritical.classList.toggle("active", Boolean(state.errorCritical));
+		errorCritical.setAttribute("aria-pressed", String(Boolean(state.errorCritical)));
+	}
 	applyTurnFilters();
+	applyErrorFilters();
 	restoreOpenRows(state.openRows);
+	restoreOpenStructureDetails(state.openStructureDetails || new Set());
 	restoreTabState(state);
+	restoreOpenTurnAnchor(state.turnAnchor);
 }
 
 function esc(s) {

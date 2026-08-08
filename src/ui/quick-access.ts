@@ -321,7 +321,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getMemoryCount: () => number,
 		private readonly getLastPromptCache: () => string | undefined = () => undefined,
 		private readonly getSessionSummary: () => string | undefined = () => undefined,
-		private readonly getHealthStatus: () => string | undefined = () => undefined,
+
 		private readonly getExpiredMemoryCount: () => number = () => 0,
 		private readonly getCodexStatus: () => string | undefined = () => undefined,
 		private readonly getClaudeStatus: () => string | undefined = () => undefined,
@@ -340,7 +340,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getCodexUsageLimitPercent: () => number | undefined = () => undefined,
 		private readonly getCodexUsageLimitReset: () => string | undefined = () => undefined,
 		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
-		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined
+		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
+		private readonly getMemoryContextTokens: () => number = () => 0
 	) {}
 
 	refresh(): void {
@@ -365,6 +366,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const localServerEnabled = config.get<boolean>("enableLocalServer", true) !== false;
 		const deepSeekEnabled = config.get<boolean>("enableDeepSeek", true) !== false;
 		const deepSeekContextLength = Number(config.get("deepSeekContextLength", 258_400)) || 258_400;
+		const deepSeekMaxOutputTokens = Number(config.get("deepSeekDefaultMaxOutputTokens", 70_000)) || 70_000;
 		const codexEnabled = config.get<boolean>("enableCodexSubscription", true) !== false;
 		const codexDeferredToolsEnabled = config.get<boolean>("codexDeferNonCoreTools", true) !== false;
 		const codexCacheKeepAliveEnabled = config.get<boolean>("codexCacheKeepAliveEnabled", false) === true;
@@ -391,14 +393,14 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const memoryEnabled = config.get<boolean>("memoryEnabled", true) !== false;
 		const memoryCount = this.getMemoryCount();
 		const expiredMemoryCount = this.getExpiredMemoryCount();
+		const memoryContextTokens = this.getMemoryContextTokens();
 		const memoryDescription = memoryEnabled
-			? `${memoryCount} entries${expiredMemoryCount > 0 ? ` / ${expiredMemoryCount} expired` : ""}`
+			? `${memoryCount} entries${expiredMemoryCount > 0 ? ` / ${expiredMemoryCount} expired` : ""} · ~${formatCompactTokenCount(memoryContextTokens)} tokens context`
 			: "Off";
 		const lastThroughput = this.getLastThroughput();
 		const lastContextUsage = this.getLastContextUsage();
 		const lastPromptCache = this.getLastPromptCache();
 		const sessionSummary = this.getSessionSummary();
-		const healthStatus = this.getHealthStatus();
 		const codexStatus = this.getCodexStatus();
 		const claudeStatus = this.getClaudeStatus();
 		const codexUsageLimitPercent = this.getCodexUsageLimitPercent();
@@ -465,9 +467,15 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				}),
 				new QuickAccessItem("deepseek.contextLimit", "Maximum Context", {
 					description: formatCompactTokenCount(deepSeekContextLength),
-					tooltip: "Upper context limit advertised to VS Code for DeepSeek. Applies to new requests; local Qwen remains server-controlled.",
+					tooltip: "Open the DeepSeek sliders to set the context window advertised to VS Code for DeepSeek requests.",
 					icon: new vscode.ThemeIcon("symbol-numeric"),
-					command: command("llamacpp.setDeepSeekContextLength", "Set DeepSeek Maximum Context"),
+					command: command("llamacpp.openContextControl", "Open DeepSeek Context Slider"),
+				}),
+				new QuickAccessItem("deepseek.maxOutput", "Max Output", {
+					description: formatCompactTokenCount(deepSeekMaxOutputTokens),
+					tooltip: "Open the DeepSeek sliders to set max output tokens per request. Reasoning counts toward the budget.",
+					icon: new vscode.ThemeIcon("output"),
+					command: command("llamacpp.openContextControl", "Open DeepSeek Max Output Slider"),
 				}),
 				new QuickAccessItem("deepseek.settings", "Connection", {
 					description: formatEndpointLabel(serverUrl),
@@ -834,17 +842,11 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			description: `${lastThroughput ?? "n/a"} · ctx ${lastContextUsage?.summary ?? "n/a"}`,
 			icon: new vscode.ThemeIcon("pulse"),
 			children: [
-				new QuickAccessItem("diagnostics.health", "Provider Health Check", {
-					description: healthStatus ?? "Not run",
-					tooltip: "Run read-only endpoint, runtime context, tokenizer, cache, and reliability checks.",
-					icon: new vscode.ThemeIcon("heart"),
-					command: command("llamacpp.runHealthCheck", "Run Provider Health Check"),
-				}),
-				new QuickAccessItem("diagnostics.session", "Session Quality Report", {
+				new QuickAccessItem("diagnostics.session", "Live Report", {
 					description: sessionSummary ?? "No turns",
-					tooltip: "Export aggregate cache, latency, context, compaction, and tool-call reliability metrics.",
+					tooltip: "Cache, performance, errors and provider health in one live webview.",
 					icon: new vscode.ThemeIcon("graph"),
-					command: command("llamacpp.openSessionReport", "Open Session Quality Report"),
+					command: command("llamacpp.openSessionReport", "Open Live Report"),
 				}),
 				new QuickAccessItem("diagnostics.resetSession", "Reset Session Metrics", {
 					icon: new vscode.ThemeIcon("clear-all"),

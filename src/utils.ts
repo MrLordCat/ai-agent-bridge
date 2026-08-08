@@ -319,17 +319,6 @@ interface LanguageModelDataPartLike {
 	data: Uint8Array;
 }
 
-/**
- * Convert a Uint8Array to a base64 string without relying on Buffer (browser-safe).
- */
-function bytesToBase64(bytes: Uint8Array): string {
-	let binary = "";
-	for (let i = 0; i < bytes.byteLength; i++) {
-		binary += String.fromCharCode(bytes[i]);
-	}
-	return btoa(binary);
-}
-
 function asLanguageModelDataPart(value: unknown): LanguageModelDataPartLike | undefined {
 	if (!value || typeof value !== "object") {
 		return undefined;
@@ -398,10 +387,27 @@ function collectThinkingPartText(part: unknown): string {
 }
 
 /**
- * Convert VS Code chat request messages into OpenAI-compatible message objects.
- * @param messages The VS Code chat messages to convert.
- * @returns OpenAI-compatible messages array.
+ * True for text parts that lost their class when crossing the extension-host
+ * boundary (plain objects with a string `value` and no tool/result/mime
+ * markers). Without this check `instanceof LanguageModelTextPart` misses them
+ * and the user's message text silently vanishes from the prompt.
  */
+function isSerializedTextPart(part: unknown): boolean {
+	if (!part || typeof part !== "object") {
+		return false;
+	}
+	const obj = part as Record<string, unknown>;
+	return (
+		typeof obj.value === "string" &&
+		obj.mimeType === undefined &&
+		!("callId" in obj) &&
+		!("tool_call_id" in obj) &&
+		!("name" in obj) &&
+		!("input" in obj) &&
+		!(Array.isArray(obj.content))
+	);
+}
+
 /**
  * Converts VS Code language model chat messages to OpenAI-compatible format.
  * Transforms message roles and content to match OpenAI's chat completion API.
@@ -427,6 +433,13 @@ export function convertMessages(
 		for (const [partIndex, part] of (m.content ?? []).entries()) {
 			if (part instanceof vscode.LanguageModelTextPart) {
 				textParts.push(part.value);
+			} else if (isSerializedTextPart(part)) {
+				// Parts can cross the extension-host boundary as plain objects
+				// (constructor name lost), so `instanceof` silently misses them
+				// and the user's text would vanish from the prompt. Match by
+				// shape instead: a `value` string with no tool/result/mime
+				// markers is a text part.
+				textParts.push((part as { value: string }).value);
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
 				let args = "{}";
 				try {
@@ -1059,3 +1072,74 @@ function collectToolResultContent(pr: { content?: ReadonlyArray<unknown> }): {
 	return { content: text, dataParts };
 }
 
+// --- Shared helpers (single implementations for previously duplicated code) ---
+
+/**
+ * Casts an unknown value to a plain record, or returns an empty record for
+ * non-objects and arrays. Strict version — arrays are never treated as records.
+ */
+export function asRecord(value: unknown): Record<string, unknown> {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? value as Record<string, unknown>
+		: {};
+}
+
+/**
+ * Parses an unknown value as an integer clamped to [minimum, maximum], using
+ * `fallback` for non-finite input. Canonical argument order: value, min, max,
+ * fallback (previously duplicated with conflicting orders across modules).
+ */
+export function clampInteger(value: unknown, minimum: number, maximum: number, fallback: number): number {
+	const parsed = Number(value);
+	if (!Number.isFinite(parsed)) {
+		return fallback;
+	}
+	return Math.max(minimum, Math.min(maximum, Math.floor(parsed)));
+}
+
+/** Truncates a string with an ellipsis when it exceeds maxChars. */
+export function truncate(value: string, maxChars: number): string {
+	return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+/** Node-compatible binary-to-base64 (Buffer path; faster than btoa loops). */
+export function bytesToBase64(bytes: Uint8Array): string {
+	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");
+}
+
+/** Normalizes a Copilot turn index to a safe integer (or undefined). */
+export function normalizeCopilotTurnIndex(value: unknown): number | undefined {
+	const numeric = typeof value === "number" ? value : Number.NaN;
+	return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
+}
+
+/** Extracts plain text from a chat message content (string or parts). */
+export function contentToText(content: OpenAIChatMessage["content"]): string {
+	if (typeof content === "string") {
+		return content;
+	}
+	if (Array.isArray(content)) {
+		return content
+			.map(part => part.type === "text" && typeof part.text === "string" ? part.text : "")
+			.join("\n");
+	}
+	return "";
+}
+
+/** Parses an unknown value as a non-negative integer (0 for invalid input). */
+export function nonNegativeInteger(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value)
+		? Math.max(0, Math.floor(value))
+		: 0;
+}
+
+/** Formats a token count as 1.2K / 3.4M / plain number. */
+export function formatTokenCount(value: number): string {
+	if (value >= 1_000_000) {
+		return `${(value / 1_000_000).toFixed(1)}M`;
+	}
+	if (value >= 1_000) {
+		return `${(value / 1_000).toFixed(1)}K`;
+	}
+	return String(value);
+}

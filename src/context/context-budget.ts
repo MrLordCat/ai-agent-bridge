@@ -25,47 +25,56 @@ interface ContextUsageEstimate {
 
 export type ContextCompactionDecision =
 	| { kind: "none" }
-	| { kind: "auto" | "hard"; target: number };
+	| { kind: "auto"; target: number };
 
 interface ContextCompactionDecisionInput {
 	messageTokens: number;
 	autoCompact: boolean;
 	softInputTarget: number;
-	hardInputTarget: number;
 	overflowRetry: boolean;
 }
 
 /**
- * How far below the soft trigger an auto-compaction should land. Compacting to
- * exactly the trigger threshold would re-trigger on the very next turn (a
- * micro-compaction), and every real compaction rewrites the prefix and loses
- * the upstream prompt cache. Landing at 75% of the soft target leaves real
- * headroom: one compaction buys ~30% context reduction and dozens of turns
- * before the next one.
- */
-export const COMPACTION_TARGET_RATIO = 0.75;
-
-/**
- * Chooses one compaction tier for a request.
- *
- * Normal requests may compact to 75% of the soft target (COMPACTION_TARGET_RATIO).
- * The lower hard target is deliberately reserved for a retry after the backend
- * confirms an overflow; applying both tiers to one normal request needlessly
- * rewrites the prompt and destroys an otherwise reusable DeepSeek cache prefix.
+ * Chooses whether to compact for a request. A single soft scheme is used in
+ * every case: proactively when the context passes the soft target, and
+ * unconditionally on a confirmed overflow retry. Both compact to 75% of the
+ * current size (COMPACTION_TARGET_RATIO), so the logic stays simple and the
+ * prompt cache is only rewritten when a rewrite is actually needed.
  */
 export function selectContextCompaction(
 	input: ContextCompactionDecisionInput
 ): ContextCompactionDecision {
-	if (input.overflowRetry) {
-		return { kind: "hard", target: Math.max(1, Math.floor(input.hardInputTarget)) };
-	}
-	if (input.autoCompact && input.messageTokens > input.softInputTarget) {
+	if (input.overflowRetry || (input.autoCompact && input.messageTokens > input.softInputTarget)) {
 		return {
 			kind: "auto",
-			target: Math.max(1, Math.floor(input.softInputTarget * COMPACTION_TARGET_RATIO)),
+			target: Math.max(1, Math.floor(input.messageTokens * COMPACTION_TARGET_RATIO)),
 		};
 	}
 	return { kind: "none" };
+}
+
+/**
+ * How much of the current context a compaction should retain. A single soft
+ * scheme is used for both proactive compaction and overflow retries: it keeps
+ * ~75% of the current message tokens (a ~25% reduction). Compacting to exactly
+ * the trigger threshold would re-trigger on the very next turn (a
+ * micro-compaction), so the 25% reduction doubles as the headroom that makes
+ * one compaction last for many turns. Raised from 0.6 (2026-08-07): a 40%
+ * reduction was eating too much working context for agent chats.
+ */
+export const COMPACTION_TARGET_RATIO = 0.75;
+
+/** Updates the heuristic token multiplier from the latest server observation. */
+export function updateHeuristicCalibration(
+	previousFactor: number,
+	residualRatio: number,
+	alpha = 0.3
+): number {
+	const normalizedPrevious = Math.max(0.2, Math.min(3.0, previousFactor));
+	const clampedRatio = Math.max(0.2, Math.min(3.0, residualRatio));
+	const observedTarget = Math.max(0.2, Math.min(3.0, normalizedPrevious * clampedRatio));
+	const normalizedAlpha = Math.max(0, Math.min(1, alpha));
+	return normalizedPrevious * (1 - normalizedAlpha) + observedTarget * normalizedAlpha;
 }
 
 export function calculateContextBudget(input: ContextBudgetInput): ContextBudget {

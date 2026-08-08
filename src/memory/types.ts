@@ -42,6 +42,9 @@ export interface SharedMemoryPromptContext {
 	text: string;
 	entryCount: number;
 	entryIds: string[];
+	scopeCounts?: Partial<Record<SharedMemoryScope, number>>;
+	/** Individually rendered entries used to build append-only prompt deltas. */
+	entries?: Array<{ id: string; text: string }>;
 	estimatedTokens: number;
 	expiredEntryCount: number;
 }

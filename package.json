@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
 	},
-	"version": "1.10.30",
+	"version": "1.11.0",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -334,8 +334,8 @@
 				},
 				"llamacpp.autoCompact": {
 					"type": "boolean",
-					"default": true,
-					"description": "Automatically compact old chat history before sending requests when close to context limit."
+					"default": false,
+					"description": "Compact chat history proactively before reaching the context limit. Disabled by default: history is sent as-is and compaction only happens when the server confirms a context overflow (see retryOnContextOverflow), avoiding cache-prefix rewrites from double compaction."
 				},
 				"llamacpp.accurateTokenCounting": {
 					"type": "boolean",
@@ -366,17 +366,31 @@
 					"maximum": 3,
 					"description": "Maximum automatic continuation retries for empty model responses per turn."
 				},
+				"llamacpp.compactMaxToolResultChars": {
+					"type": "number",
+					"default": 8000,
+					"minimum": 1000,
+					"maximum": 24000,
+					"description": "Maximum characters kept for each tool result when compaction retains history. Long tool outputs are truncated to this size so more recent turns fit inside the compaction budget instead of being dropped entirely."
+				},
 				"llamacpp.toolCallOnlyAutoretry": {
 					"type": "boolean",
 					"default": true,
-					"description": "Automatically inject a task-summary nudge when the model makes tool calls without any text for several consecutive turns."
+					"description": "Automatically inject a task-summary nudge when the model makes tool calls without text: several consecutive rounds within one request, or tool-call-only turns dominating the recent 8-turn window across requests."
 				},
 				"llamacpp.toolCallOnlyAutoretryThreshold": {
 					"type": "number",
 					"default": 3,
 					"minimum": 2,
 					"maximum": 10,
-					"description": "Number of consecutive tool-call-only turns before triggering an automatic task-summary nudge."
+					"description": "Number of tool-call-only turns that triggers the task-summary nudge: consecutive within one request, or within the recent 8-turn window across requests (effective floor of 4)."
+				},
+				"llamacpp.toolLoopForceTextThreshold": {
+					"type": "number",
+					"default": 12,
+					"minimum": 6,
+					"maximum": 40,
+					"description": "After this many consecutive tool-call-only turns across requests (host-driven agent loop), the next request is sent WITHOUT tools so the model is forced to answer in text, breaking the loop. Set to a high value to effectively disable."
 				},
 				"llamacpp.toolCallRepairEnabled": {
 					"type": "boolean",
@@ -407,6 +421,13 @@
 					"maximum": 10,
 					"description": "Number of consecutive identical tool calls that activates loop protection."
 				},
+				"llamacpp.maxModelTurnsPerRequest": {
+					"type": "number",
+					"default": 6,
+					"minimum": 2,
+					"maximum": 20,
+					"description": "Hard cap on model rounds per single chat request. Stops requests that keep retrying (empty responses, tool-call-only nudges, tool-call repairs) without producing a final answer."
+				},
 				"llamacpp.emptyResponseContinuationPrompt": {
 					"type": "string",
 					"default": "Continue from your previous response and complete the answer. Do not repeat already completed parts.",
@@ -414,7 +435,7 @@
 				},
 				"llamacpp.contextUtilization": {
 					"type": "number",
-					"default": 0.85,
+					"default": 0.94,
 					"minimum": 0.5,
 					"maximum": 0.95,
 					"description": "Soft context budget ratio used before compaction."
@@ -424,21 +445,14 @@
 					"default": 0.72,
 					"minimum": 0.4,
 					"maximum": 0.9,
-					"description": "Hard context budget ratio used for overflow retry compaction."
+					"description": "Diagnostic only: lower reference point for the hard input target shown in logs and the dashboard. Compaction itself uses a single soft scheme (see autoCompact)."
 				},
 				"llamacpp.compactKeepLastTurns": {
 					"type": "number",
 					"default": 12,
 					"minimum": 2,
 					"maximum": 64,
-					"description": "Number of most recent non-system messages to keep during normal compaction."
-				},
-				"llamacpp.hardCompactKeepLastTurns": {
-					"type": "number",
-					"default": 6,
-					"minimum": 1,
-					"maximum": 32,
-					"description": "Number of recent non-system messages to keep during hard compaction retry."
+					"description": "Number of most recent non-system messages to keep during compaction."
 				},
 				"llamacpp.agentHistoryRounds": {
 					"type": "number",
@@ -470,10 +484,10 @@
 				},
 				"llamacpp.deepSeekDefaultMaxOutputTokens": {
 					"type": "number",
-					"default": 131072,
+					"default": 70000,
 					"minimum": 1024,
 					"maximum": 393216,
-					"description": "Default max_tokens requested from DeepSeek when the chat session does not provide an explicit limit. Keep it equal to maxOutputTokensCap (131072) so long answers are not cut at 64K; raise it only if the emergency ceiling is really needed."
+					"description": "Default max_tokens requested from DeepSeek when the chat session does not provide an explicit limit. 70000 balances long autonomous work against cost and loop risk (reasoning tokens count toward the output budget); raise only if long answers get cut."
 				},
 				"llamacpp.minReplyReserveTokens": {
 					"type": "number",
@@ -693,8 +707,8 @@
 				"name": "llamacpp_store_memory",
 				"displayName": "Store Shared Memory",
 				"toolReferenceName": "storeSharedMemory",
-				"modelDescription": "Create or update a durable user-approved memory entry shared across VS Code chats, workspaces, local models, and DeepSeek. Use it for stable preferences, project decisions, environment facts, and reusable workflow knowledge. Do not store secrets, transient chat details, or guesses.",
-				"userDescription": "Save durable context for future chats and models.",
+				"modelDescription": "Create or update a durable user-approved memory entry. You MUST choose scope explicitly: global only for information useful to agents in every project, or workspace for information useful only in the current project. Prefer workspace for repository paths, commands, architecture, decisions, and project-specific environment facts. Use global for stable cross-project user preferences and reusable workflows. Do not store secrets, transient chat details, or guesses.",
+				"userDescription": "Save durable context globally or only for the current project.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(database)",
 				"tags": [
@@ -731,14 +745,9 @@
 							"type": "string",
 							"enum": [
 								"global",
-								"workspace",
-								"model"
+								"workspace"
 							],
-							"description": "Where this memory applies. Workspace scopeId is filled automatically when omitted."
-						},
-						"scopeId": {
-							"type": "string",
-							"description": "Workspace URI or model id for non-global memory. Required for model scope."
+							"description": "Required destination. Use global only when useful in every project; use workspace for the current project. The workspace identity is filled securely by the extension."
 						},
 						"kind": {
 							"type": "string",
@@ -767,7 +776,8 @@
 					},
 					"required": [
 						"title",
-						"content"
+						"content",
+						"scope"
 					],
 					"additionalProperties": false
 				}
@@ -776,7 +786,7 @@
 				"name": "llamacpp_search_memory",
 				"displayName": "Search Shared Memory",
 				"toolReferenceName": "searchSharedMemory",
-				"modelDescription": "Search durable shared memory when exact prior preferences, project decisions, environment facts, or reusable workflow knowledge are needed. An empty query lists recent and pinned entries.",
+				"modelDescription": "Search durable memory visible to the current project. Without scope, results include global memory plus memory belonging to the current project. Set global or workspace to restrict the search. An empty query lists recent and pinned entries.",
 				"userDescription": "Find durable context saved by this extension.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(search)",
@@ -797,10 +807,6 @@
 							"maximum": 50,
 							"description": "Maximum number of entries to return."
 						},
-						"modelId": {
-							"type": "string",
-							"description": "Optional model id used to include matching model-scoped entries."
-						},
 						"includeExpired": {
 							"type": "boolean",
 							"description": "Include expired entries for maintenance and review."
@@ -809,10 +815,9 @@
 							"type": "string",
 							"enum": [
 								"global",
-								"workspace",
-								"model"
+								"workspace"
 							],
-							"description": "Optionally restrict results to one memory scope."
+							"description": "Optionally restrict results to global memory or memory owned by the current project."
 						}
 					},
 					"additionalProperties": false
@@ -822,7 +827,7 @@
 				"name": "llamacpp_delete_memory",
 				"displayName": "Delete Shared Memory",
 				"toolReferenceName": "deleteSharedMemory",
-				"modelDescription": "Delete one durable shared memory entry by exact id when it is obsolete or incorrect. Never use this tool speculatively.",
+				"modelDescription": "Delete one durable memory entry by exact id and explicit scope when it is obsolete or incorrect. Choose global only for a global entry, or workspace for an entry belonging to the current project. Never use this tool speculatively.",
 				"userDescription": "Remove an obsolete durable memory entry.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(trash)",
@@ -836,10 +841,19 @@
 						"id": {
 							"type": "string",
 							"description": "Exact id of the memory entry to delete."
+						},
+						"scope": {
+							"type": "string",
+							"enum": [
+								"global",
+								"workspace"
+							],
+							"description": "Required scope of the entry. Workspace deletion is restricted to the current project."
 						}
 					},
 					"required": [
-						"id"
+						"id",
+						"scope"
 					],
 					"additionalProperties": false
 				}

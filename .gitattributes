@@ -1,0 +1,6 @@
+# Normalize text in Git while allowing each OS to use its native working-copy
+# line endings (core.autocrlf=true gives Windows CRLF and keeps Git blobs LF).
+* text=auto
+
+# Bash scripts must remain LF so their shebangs work in Git Bash and Linux.
+*.sh text eol=lf

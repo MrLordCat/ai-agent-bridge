@@ -53,7 +53,7 @@ suite("Claude subscription provider", () => {
 		const common = { enabled: true, now, intervalMs: 45 * 60_000, sessions: [] };
 		assert.strictEqual(resolveClaudeCacheKeepAliveDecision(common).state, "paused_usage_unknown");
 		assert.strictEqual(resolveClaudeCacheKeepAliveDecision({
-			...common, usagePercent: 20, usageSnapshotAgeMs: 121_000,
+			...common, usagePercent: 20, usageSnapshotAgeMs: 700_000,
 		}).state, "paused_usage_stale");
 		assert.strictEqual(resolveClaudeCacheKeepAliveDecision({
 			...common, usagePercent: 90, usageSnapshotAgeMs: 1_000,
@@ -136,7 +136,7 @@ suite("Claude subscription provider", () => {
 		}).reason, "usage_unknown");
 		assert.strictEqual(resolveClaudeResumeFallbackDecision({
 			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,
-			usagePercent: 20, usageSnapshotAgeMs: 121_000, maxUsagePercent: 80,
+			usagePercent: 20, usageSnapshotAgeMs: 700_000, maxUsagePercent: 80,
 		}).reason, "usage_stale");
 		assert.strictEqual(resolveClaudeResumeFallbackDecision({
 			policy: "safe", estimatedInputTokens: 32_000, maxInputTokens: 64_000,

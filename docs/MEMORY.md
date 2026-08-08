@@ -1,8 +1,8 @@
 # Shared Memory
 
 Shared memory is durable reference context owned by the extension. It is
-available to local models and DeepSeek across chats, while each entry controls
-whether it applies globally, to one workspace, or to one model.
+available to local models and DeepSeek across chats. Agents explicitly choose
+whether each new entry applies globally or only to the current project.
 
 ## Storage And Migration
 
@@ -46,9 +46,17 @@ manual edits are rejected on reload without replacing active in-memory data.
 
 Scopes:
 
-- `global`: eligible in every workspace and for every model.
+- `global`: eligible for every agent and project. Use it only for durable
+  cross-project preferences and reusable workflows.
 - `workspace`: eligible only when `scopeId` equals the current workspace id.
-- `model`: eligible only when `scopeId` equals the selected model id.
+  Use it for repository paths, commands, architecture, decisions, and
+  project-specific environment facts.
+
+The public agent tools expose exactly these two scopes and require an explicit
+choice when saving or deleting. The extension derives `scopeId` itself; an
+agent cannot write into or delete from another project by supplying a path.
+Legacy `model` entries remain readable for format compatibility but new ones
+cannot be created through the agent tools.
 
 Kinds:
 
@@ -67,7 +75,7 @@ excluded from normal search and automatic prompt injection.
 ## Retrieval
 
 For every request, the extension builds a query from the four most recent user
-messages. It first filters entries by active workspace/model scope and expiry,
+messages. It first filters entries by active project scope and expiry,
 then ranks them with:
 
 - weighted exact title, tag, and content terms;
@@ -79,17 +87,21 @@ then ranks them with:
 Pinned entries are not injected merely because they are pinned. They must still
 match a non-empty query. An empty manual search lists pinned and recent entries.
 
-Selected entries are inserted immediately before the latest user request. This
-keeps the older system and conversation prefix stable for prompt-cache reuse.
+The first selected set is inserted immediately before the current user request.
+Later changes are appended as memory-delta checkpoints while earlier checkpoints
+stay byte-stable for prompt-cache reuse. Tool rounds freeze the selected set; a
+new user turn may append newly relevant or updated entries. Compaction restores
+a consolidated current checkpoint if older deltas are summarized.
 `llamacpp.memoryMaxTokens` caps automatic memory context; the default is 4096.
 
 ## Agent Tools
 
-- `llamacpp_store_memory`: create an entry or update one by id. Workspace scope
-  automatically uses the current workspace id when `scopeId` is omitted.
-- `llamacpp_search_memory`: hybrid search with optional model, scope, and
-  expired-entry filters.
-- `llamacpp_delete_memory`: delete one entry by exact id.
+- `llamacpp_store_memory`: create or update an entry with mandatory `global`
+  or `workspace` scope. Workspace identity is always filled by the extension.
+- `llamacpp_search_memory`: hybrid search over global plus current-project
+  entries, optionally restricted to one of those scopes.
+- `llamacpp_delete_memory`: delete one entry by exact id and mandatory scope.
+  Workspace deletion is rejected if the entry belongs to another project.
 
 VS Code asks for confirmation before extension tools execute. Users can inspect
 or edit the file with `Local LLM: Open Shared Memory` and remove all entries

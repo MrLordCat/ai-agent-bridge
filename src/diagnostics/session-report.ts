@@ -24,6 +24,8 @@ export interface PerModelCacheStats {
 	healthyTurns: number;
 	missTurns: number;
 	subagentTurns: number;
+	/** Distinct conversation keys that produced these turns. */
+	chats: string[];
 }
 
 export interface SessionQualitySummary {
@@ -57,10 +59,6 @@ export interface SessionQualitySummary {
 	toolLoopsDetected: number;
 	compactedTurns: number;
 	overflowRetries: number;
-}
-
-function formatPercent(value: number): string {
-	return value.toFixed(1);
 }
 
 function extractModelLabel(modelId: string): string {
@@ -240,18 +238,22 @@ export class SessionQualityTracker {
 			healthyTurns: number;
 			missTurns: number;
 			subagentTurns: number;
+			chats: Set<string>;
 		}>();
 		for (const record of this.records) {
 			const label = extractModelLabel(record.turn.modelId);
 			let bucket = modelBuckets.get(label);
 			if (!bucket) {
-				bucket = { label, turns: 0, modelSegments: 0, reportedTurns: 0, promptTokens: 0, cachedTokens: 0, healthyTurns: 0, missTurns: 0, subagentTurns: 0 };
+				bucket = { label, turns: 0, modelSegments: 0, reportedTurns: 0, promptTokens: 0, cachedTokens: 0, healthyTurns: 0, missTurns: 0, subagentTurns: 0, chats: new Set() };
 				modelBuckets.set(label, bucket);
 			}
 			bucket.turns += 1;
 			bucket.modelSegments += Math.max(1, record.turn.modelTurns);
 			bucket.promptTokens += record.turn.promptTokens;
 			bucket.cachedTokens += record.turn.cachedPromptTokens ?? 0;
+			if (record.turn.conversationKey) {
+				bucket.chats.add(record.turn.conversationKey);
+			}
 			if (record.turn.isSubagent) {
 				bucket.subagentTurns += 1;
 			}
@@ -276,6 +278,7 @@ export class SessionQualityTracker {
 				healthyTurns: b.healthyTurns,
 				missTurns: b.missTurns,
 				subagentTurns: b.subagentTurns,
+				chats: [...b.chats],
 			}))
 			.sort((a, b) => b.turns - a.turns);
 
@@ -328,153 +331,4 @@ export class SessionQualityTracker {
 		};
 	}
 
-	renderMarkdown(extensionVersion: string, vscodeVersion: string): string {
-		const summary = this.summary;
-		const lines = [
-			"# Local LLM Session Quality Report",
-			"",
-			`Generated: ${new Date().toISOString()}`,
-			`Extension: ${extensionVersion}`,
-			`VS Code: ${vscodeVersion}`,
-			"",
-			"## Summary",
-			"",
-			`- Turns: ${summary.turns}`,
-			`- Model segments: ${summary.totalModelTurns}`,
-			`- Prompt tokens: ${summary.promptTokens}`,
-			`- Cached prompt tokens: ${summary.cachedPromptTokens} (${summary.cacheHitPercent ?? "n/a"}%)`,
-			summary.cacheAverageHitPercent !== undefined
-				? `- Average per-turn cache hit: ${formatPercent(summary.cacheAverageHitPercent)}%`
-				: `- Average per-turn cache hit: n/a`,
-			summary.cacheWorstHitPercent !== undefined
-				? `- Worst per-turn cache hit: ${formatPercent(summary.cacheWorstHitPercent)}%`
-				: `- Worst per-turn cache hit: n/a`,
-			`- Average first-token latency: ${summary.averageFirstTokenLatencyMs ?? "n/a"} ms`,
-			`- Average generation speed: ${summary.averageTokensPerSecond ?? "n/a"} tok/s`,
-			`- Tool calls: ${summary.totalToolCalls}`,
-			`- Tool calls repaired/rejected: ${summary.repairedToolCalls}/${summary.rejectedToolCalls}`,
-			`- Tool-call correction retries: ${summary.toolCallRepairRetries}`,
-			`- Tool loops detected: ${summary.toolLoopsDetected}`,
-			`- Compacted turns: ${summary.compactedTurns}`,
-			`- Context-overflow retries: ${summary.overflowRetries}`,
-			"",
-		];
-
-		// --- Per-model cache breakdown ---
-		if (summary.cacheByModel.length > 0) {
-			lines.push(
-				"## Cache by Model",
-				"",
-				"| Model | Turns | Segments | Prompt | Cached | Hit% | Healthy | Miss | Subagent |",
-				"| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
-			);
-			for (const m of summary.cacheByModel) {
-				const sub = m.subagentTurns > 0 ? `${m.subagentTurns}` : "—";
-				lines.push(
-					`| ${m.modelLabel} | ${m.turns} | ${m.modelSegments} | ${m.promptTokens} | ${m.cachedTokens} | ${m.hitPercent !== undefined ? formatPercent(m.hitPercent) + "%" : "n/a"} | ${m.healthyTurns} | ${m.missTurns} | ${sub} |`
-				);
-			}
-			lines.push("");
-		}
-
-		// --- Cache Analysis section ---
-		if (summary.turnsWithCacheReport > 0) {
-			const missCount = summary.turnsWithCacheReport - summary.cacheHealthyTurns;
-			lines.push(
-				"## Cache Miss Reasons",
-				"",
-				`- Server-reported turns: ${summary.turnsWithCacheReport} of ${summary.turns} total`,
-				`- Healthy cache turns (≥90% hit): ${summary.cacheHealthyTurns}`,
-				`- Cache miss turns: ${missCount}`,
-				`- Cold Codex startup segments recovered separately: ${summary.cacheStartupMissTurns}`,
-				`- Unique miss reasons: ${summary.cacheMissReasonCount}`,
-				"",
-			);
-
-			if (summary.cacheMissBreakdown.length > 0) {
-				lines.push(
-					"| Reason | Count | % of misses |",
-					"| --- | ---: | ---: |",
-				);
-				for (const entry of summary.cacheMissBreakdown) {
-					lines.push(`| \`${entry.reason}\` | ${entry.count} | ${formatPercent(entry.percent)}% |`);
-				}
-				lines.push("");
-			}
-		}
-
-		// --- Turns table (enhanced with cache diagnostic columns) ---
-		const hasAnyPrefixData = this._records.some(
-			record => record.turn.cacheMissReason !== undefined || record.turn.prefixIdenticalMessageCount !== undefined
-		);
-
-		lines.push(
-			"## Turns",
-			"",
-		);
-
-		if (hasAnyPrefixData) {
-			lines.push(
-				"| # | Model | Prompt | Cache | Hit% | Reason | Match Msg | Detail | TTFT ms | tok/s | Context | Compact |",
-				"| ---: | --- | ---: | ---: | ---: | --- | ---: | --- | ---: | ---: | ---: | --- |",
-			);
-			for (const [index, record] of this._records.entries()) {
-				const turn = record.turn;
-				const context = record.context;
-				const hitPercent = turn.promptCacheHitPercent !== undefined
-					? formatPercent(turn.promptCacheHitPercent)
-					: "n/a";
-				const reason = turn.cacheMissReason
-					?? (turn.cachedPromptTokens !== undefined ? "—" : "n/a");
-				const prefixMatch = turn.prefixIdenticalMessageCount !== undefined
-					? String(turn.prefixIdenticalMessageCount)
-					: "n/a";
-				const detailShort = turn.cacheMissDetail
-					? turn.cacheMissDetail.length > 80
-						? turn.cacheMissDetail.slice(0, 77) + "..."
-						: turn.cacheMissDetail
-					: "—";
-				const subLabel = turn.isSubagent ? " sub" : "";
-				lines.push([
-					`| ${index + 1}${subLabel}`,
-					turn.modelId.replace(/\|/g, "\\|"),
-					turn.promptTokens,
-					turn.cachedPromptTokens ?? 0,
-					hitPercent,
-					reason,
-					prefixMatch,
-					detailShort.replace(/\|/g, "\\|"),
-					turn.firstTokenLatencyMs ?? "n/a",
-					turn.tokensPerSecond ?? "n/a",
-					context ? `${context.estimatedUsagePercent.toFixed(1)}%` : "n/a",
-					context?.hardCompacted ? "hard" : context?.autoCompacted ? "auto" : "no",
-				].join(" | ") + " |");
-			}
-		} else {
-			lines.push(
-				"| # | Model | Prompt | Cache | TTFT ms | tok/s | Tools | Repair | Reject | Context | Compact |",
-				"| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |",
-			);
-			for (const [index, record] of this._records.entries()) {
-				const turn = record.turn;
-				const context = record.context;
-				lines.push([
-					`| ${index + 1}`,
-					turn.modelId.replace(/\|/g, "\\|"),
-					turn.promptTokens,
-					turn.cachedPromptTokens ?? 0,
-					turn.firstTokenLatencyMs ?? "n/a",
-					turn.tokensPerSecond ?? "n/a",
-					turn.toolCalls,
-					turn.repairedToolCalls,
-					turn.rejectedToolCalls,
-					context ? `${context.estimatedUsagePercent.toFixed(1)}%` : "n/a",
-					context?.hardCompacted ? "hard" : context?.autoCompacted ? "auto" : "no",
-				].join(" | ") + " |");
-			}
-		}
-
-		lines.push("", "This report contains metrics and model ids only. Message and tool-result bodies are not stored.", "");
-		return lines.join("\n");
-	}
 }

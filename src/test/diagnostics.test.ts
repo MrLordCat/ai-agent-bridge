@@ -1,6 +1,6 @@
 import * as assert from "assert";
 
-import { calculateOverallHealth, renderProviderHealthMarkdown } from "../diagnostics/provider-health";
+import { calculateOverallHealth } from "../diagnostics/provider-health";
 import { SessionQualityTracker } from "../diagnostics/session-report";
 import type { LlamaChatContextUsageMetrics, LlamaChatTurnMetrics } from "../llama-provider";
 
@@ -39,16 +39,6 @@ suite("diagnostics", () => {
 			{ id: "cache", label: "Cache", status: "warning" as const, detail: "disabled" },
 		];
 		assert.strictEqual(calculateOverallHealth(checks), "warning");
-		const markdown = renderProviderHealthMarkdown({
-			generatedAt: "2026-07-17T00:00:00.000Z",
-			extensionVersion: "1.3.0",
-			vscodeVersion: "1.129.0",
-			overallStatus: "warning",
-			configurationChecks: checks,
-			sources: [{ key: "local", label: "Local", serverUrl: "http://localhost:8000", modelIds: ["qwen"], checks }],
-		});
-		assert.match(markdown, /Overall: WARNING/);
-		assert.match(markdown, /Local/);
 	});
 
 	test("aggregates session quality without message bodies", () => {
@@ -84,10 +74,9 @@ suite("diagnostics", () => {
 		assert.strictEqual(tracker.summary.cacheByModel[0].modelSegments, 4);
 		assert.strictEqual(tracker.summary.compactedTurns, 1);
 		assert.strictEqual(tracker.summary.repairedToolCalls, 1);
-		assert.doesNotMatch(tracker.renderMarkdown("1.3.0", "1.129.0"), /message body/i);
-	});
+		});
 
-	test("upserts a running turn and replaces it with the finalized snapshot", () => {
+		test("upserts a running turn and replaces it with the finalized snapshot", () => {
 		const tracker = new SessionQualityTracker();
 		tracker.updateTurn(turn({ durationMs: 100, usageEstimated: true, modelTurns: 1 }));
 		tracker.updateTurn(turn({ durationMs: 250, usageEstimated: true, modelTurns: 2 }));
@@ -120,10 +109,9 @@ suite("diagnostics", () => {
 		assert.strictEqual(tracker.summary.cacheWorstHitPercent, 96.7);
 		assert.strictEqual(tracker.summary.cacheHealthyTurns, 1);
 		assert.strictEqual(tracker.summary.cacheStartupMissTurns, 1);
-		assert.match(tracker.renderMarkdown("1.8.47", "1.131.0"), /Cold Codex startup segments recovered separately: 1/);
-	});
+		});
 
-	test("correlates a local subagent turn with the only running Codex runSubagent step", () => {
+		test("correlates a local subagent turn with the only running Codex runSubagent step", () => {
 		const tracker = new SessionQualityTracker();
 		tracker.updateTurn(turn({
 			requestId: "parent-request",

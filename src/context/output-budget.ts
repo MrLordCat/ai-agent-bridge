@@ -1,3 +1,5 @@
+import { clampInteger } from "../utils";
+
 interface OutputTokenBudgetInput {
 	family: string;
 	requestedMaxTokens?: number;
@@ -13,13 +15,6 @@ interface OutputTokenBudget {
 	requestedMaxTokens: number;
 	maxTokens: number;
 	requestProvidedLimit: boolean;
-}
-
-function clampInteger(value: number, minimum: number, maximum: number, fallback: number): number {
-	if (!Number.isFinite(value)) {
-		return fallback;
-	}
-	return Math.max(minimum, Math.min(maximum, Math.floor(value)));
 }
 
 export function resolveOutputTokenBudget(input: OutputTokenBudgetInput): OutputTokenBudget {

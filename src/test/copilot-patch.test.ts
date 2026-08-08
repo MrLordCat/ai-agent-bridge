@@ -31,13 +31,18 @@ suite("Copilot patch", () => {
 
 		assert.ok(COPILOT_PATCH_ID.endsWith(":v21"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
-		assert.ok(patched.includes("this.__llamaTokenCache"));
-		assert.ok(patched.includes("this.__llamaTokenHash"));
+		// The tokenizer memoisation cache lives on the class constructor
+		// (module-scoped, outlives instances), so it is referenced as
+		// `__llamaT.__llamaTokenCache` where __llamaT = this.constructor.
+		assert.ok(patched.includes("__llamaTokenCache"));
+		assert.ok(patched.includes("__llamaTokenHash"));
 		assert.ok(patched.includes("__llamaRounds"));
 		assert.ok(patched.includes("__llamaAgentHistoryRounds"));
+		assert.ok(patched.includes("this._llamaFullTools"));
+		assert.ok(patched.includes("subAgentInvocationId&&Array.isArray(this._llamaFullTools)"));
 		assert.ok(patched.includes("__llamaAgentHistoryTurns"));
-		assert.ok(patched.includes("extension model agent history turn cap"));
-		assert.ok(patched.includes("agent history element cap"));
+		assert.ok(patched.includes("__llamaTurnCap"));
+		assert.ok(patched.includes("let __llamaRounds=this.props.toolCallRounds"));
 		assert.ok(!patched.includes("async _textTokenLength(e){return e?this.languageModel.countTokens(e):0}"));
 		assert.ok(patched.includes("this._llamaToolsSignature"));
 		assert.ok(patched.includes("if(__llamaToolCurrent!==this._llamaToolsSignature)"));

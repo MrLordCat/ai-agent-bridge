@@ -69,7 +69,8 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     private _emittedTextToolCallKeys = new Set<string>();
     private _emittedTextToolCallIds = new Set<string>();
     private _thinkingTagBuffer = "";
-    private _insideThinkingTag = false;
+    /** Open thinking marker family ("<think>", "|thinking|>", "thinking>") or "" when outside a section. */
+    private _thinkingMarker: { open: string; close: string } | "" = "";
     private _emittedThinkingParts = new WeakMap<object, string>();
     private _currentTurnReasoningContent = "";
     private _reasoningScope = "";
@@ -79,6 +80,13 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     private static readonly MAX_REASONING_SCOPES = 12;
     /** Per-conversation character budget for retained reasoning. */
     private static readonly MAX_REASONING_SCOPE_CHARS = 2_000_000;
+
+    /** Thinking markers recognised inside delta.content, with their closing marker. */
+    private static readonly THINKING_MARKERS: ReadonlyArray<{ open: string; close: string }> = [
+        { open: "<think>", close: "</think>" },
+        { open: "|thinking|>", close: "<|/thinking|>" },
+        { open: "thinking>", close: "</thinking>" },
+    ];
 
     /**
      * Binds reasoning storage to a single conversation.
@@ -362,7 +370,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         this._emittedTextToolCallKeys.clear();
         this._emittedTextToolCallIds.clear();
         this._thinkingTagBuffer = "";
-        this._insideThinkingTag = false;
+        this._thinkingMarker = "";
         this._emittedThinkingParts = new WeakMap<object, string>();
 
         const reader = responseBody.getReader();
@@ -435,7 +443,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             this._textToolActive = undefined;
             this._emittedTextToolCallKeys.clear();
             this._thinkingTagBuffer = "";
-            this._insideThinkingTag = false;
+            this._thinkingMarker = "";
         }
 
         return latestUsage;
@@ -470,19 +478,19 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             emittedChars += text.length;
             if (kind === "thinking") {
                 const ThinkingCtor = this.getThinkingConstructor();
-                let part: vscode.LanguageModelResponsePart;
                 if (ThinkingCtor) {
                     const template = thinkingTemplate as unknown as Record<string, unknown> | undefined;
-                    part = new ThinkingCtor(
+                    const part = new ThinkingCtor(
                         text,
                         typeof template?.id === "string" ? template.id : undefined,
                         template?.metadata
                     ) as vscode.LanguageModelResponsePart;
-                } else {
-                    part = new vscode.LanguageModelTextPart(text);
+                    this.rememberThinkingPart(part, text);
+                    progress.report(part);
                 }
-                this.rememberThinkingPart(part, text);
-                progress.report(part);
+                // No native ThinkingPart support: reasoning stays hidden. The
+                // text is already retained in _currentTurnReasoningContent for
+                // follow-up tool requests (see emitThinkingText).
             } else {
                 progress.report(new vscode.LanguageModelTextPart(text));
             }
@@ -854,19 +862,29 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         input: string,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>
     ): { visibleText: string; emittedAny: boolean } {
-        const OPEN = "<think>";
-        const CLOSE = "</think>";
-
         let data = this._thinkingTagBuffer + input;
         let visible = "";
         let emittedAny = false;
         this._thinkingTagBuffer = "";
 
         while (data.length > 0) {
-            if (!this._insideThinkingTag) {
-                const openIndex = data.indexOf(OPEN);
-                if (openIndex === -1) {
-                    const keep = this.longestPartialSuffix(data, OPEN);
+            if (!this._thinkingMarker) {
+                // Outside any thinking section: find the earliest open marker.
+                let earliest = -1;
+                let earliestMarker: { open: string; close: string } | undefined;
+                for (const marker of BaseChatModelProvider.THINKING_MARKERS) {
+                    const markerIndex = data.indexOf(marker.open);
+                    if (markerIndex !== -1 && (earliest === -1 || markerIndex < earliest)) {
+                        earliest = markerIndex;
+                        earliestMarker = marker;
+                    }
+                }
+                if (earliest === -1) {
+                    // No open marker in this chunk; keep the longest partial marker suffix buffered.
+                    let keep = 0;
+                    for (const marker of BaseChatModelProvider.THINKING_MARKERS) {
+                        keep = Math.max(keep, this.longestPartialSuffix(data, marker.open));
+                    }
                     const chunk = keep > 0 ? data.slice(0, data.length - keep) : data;
                     if (chunk) {
                         visible += chunk;
@@ -876,17 +894,19 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
                     break;
                 }
 
-                if (openIndex > 0) {
-                    visible += data.slice(0, openIndex);
+                if (earliest > 0) {
+                    visible += data.slice(0, earliest);
                 }
-                data = data.slice(openIndex + OPEN.length);
-                this._insideThinkingTag = true;
+                const foundMarker = earliestMarker as { open: string; close: string };
+                data = data.slice(earliest + foundMarker.open.length);
+                this._thinkingMarker = foundMarker;
                 continue;
             }
 
-            const closeIndex = data.indexOf(CLOSE);
+            // Inside a thinking section: find the matching close marker.
+            const closeIndex = data.indexOf(this._thinkingMarker.close);
             if (closeIndex === -1) {
-                const keep = this.longestPartialSuffix(data, CLOSE);
+                const keep = this.longestPartialSuffix(data, this._thinkingMarker.close);
                 const chunk = keep > 0 ? data.slice(0, data.length - keep) : data;
                 if (chunk && this.emitThinkingText(progress, chunk)) {
                     emittedAny = true;
@@ -900,8 +920,8 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             if (chunk && this.emitThinkingText(progress, chunk)) {
                 emittedAny = true;
             }
-            data = data.slice(closeIndex + CLOSE.length);
-            this._insideThinkingTag = false;
+            data = data.slice(closeIndex + this._thinkingMarker.close.length);
+            this._thinkingMarker = "";
         }
 
         return { visibleText: visible, emittedAny };
@@ -912,7 +932,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             return;
         }
 
-        if (this._insideThinkingTag) {
+        if (this._thinkingMarker) {
             this.emitThinkingText(progress, this._thinkingTagBuffer);
         } else {
             progress.report(new vscode.LanguageModelTextPart(this._thinkingTagBuffer));

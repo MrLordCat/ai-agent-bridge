@@ -1,5 +1,6 @@
 import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
+import { asRecord } from "../utils";
 
 const MAX_RETAINED_USAGE_SEGMENTS = 128;
 
@@ -92,12 +93,6 @@ interface RolloutEnvelope {
 	timestamp?: unknown;
 	type?: unknown;
 	payload?: unknown;
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" && !Array.isArray(value)
-		? value as Record<string, unknown>
-		: {};
 }
 
 function finiteNonNegative(value: unknown): number {

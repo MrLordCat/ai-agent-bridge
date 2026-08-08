@@ -16,7 +16,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type { LlamaLogSink } from "../logger";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
-import { isCacheControlPart } from "../utils";
+import { asRecord, isCacheControlPart } from "../utils";
 
 const ACTIVE_TURN_TIMEOUT_MS = 90_000;
 const TOOL_CARD_SETTLE_MS = 30;
@@ -1342,10 +1342,6 @@ function emitThinking(
 	if (constructor) {
 		progress.report(new constructor(text) as vscode.LanguageModelResponsePart);
 	}
-}
-
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" ? value as Record<string, unknown> : {};
 }
 
 function asArray(value: unknown): unknown[] {

@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import { asRecord, truncate } from "../utils";
 import type { LlamaLogSink } from "../logger";
 import type { CodexAppServerClient, CodexServerNotification } from "./app-server-client";
 import type { CodexDynamicToolCallResponse } from "./dynamic-tools";
@@ -78,10 +79,6 @@ function deferred<T>(): Deferred<T> {
 	return { promise, resolve, reject };
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" ? value as Record<string, unknown> : {};
-}
-
 function getThreadId(params: unknown): string | undefined {
 	const value = asRecord(params).threadId;
 	return typeof value === "string" ? value : undefined;
@@ -94,10 +91,6 @@ function getTurnId(params: unknown): string | undefined {
 	}
 	const nested = asRecord(record.turn).id;
 	return typeof nested === "string" ? nested : undefined;
-}
-
-function truncate(value: string, maxLength = 240): string {
-	return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
 }
 
 const CODEX_TURN_RECONCILE_POLL_MS = 2_000;
@@ -870,7 +863,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 		}
 		let status: string | undefined;
 		if (item.type === "commandExecution" && typeof item.command === "string") {
-			status = `Running command: ${truncate(item.command)}\n`;
+					status = `Running command: ${truncate(item.command, 240)}\n`;
 		} else if (item.type === "fileChange") {
 			status = "Applying workspace changes...\n";
 		} else if (item.type === "webSearch") {

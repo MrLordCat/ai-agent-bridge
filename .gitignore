@@ -6,3 +6,10 @@ node_modules
 *.vsix
 .DS_Store
 pics
+
+# Временные файлы и снапшоты отладки
+.tmp-*
+*.tmp.md
+scripts/tmp-*
+snapshot-*.html
+live.html

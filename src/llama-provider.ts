@@ -22,7 +22,13 @@ import {
     DEEPSEEK_MAX_OUTPUT_TOKENS,
     DEFAULT_SERVER_URL,
 } from "./constants";
-import { calculateContextBudget, estimateContextUsage, selectContextCompaction } from "./context/context-budget";
+import {
+    calculateContextBudget,
+    COMPACTION_TARGET_RATIO,
+    estimateContextUsage,
+    selectContextCompaction,
+    updateHeuristicCalibration,
+} from "./context/context-budget";
 import { compactMessages } from "./context/message-compaction";
 import { resolveOutputTokenBudget } from "./context/output-budget";
 import { ServerTokenCounter } from "./context/server-token-counter";
@@ -34,7 +40,13 @@ import {
 } from "./context/system-prompt";
 import { summarizeToolResultContent } from "./context/tool-result-summary";
 import { calculatePromptCacheUsage, estimateChatTokenUsage, mergeChatTokenUsage, type ChatTokenUsage } from "./context/usage";
-import { buildCacheDiagnostics, type CachePrefixTelemetry } from "./context/cache-diagnostics";
+import {
+    buildCacheDiagnostics,
+    conversationMessageKey,
+    isSameConversationMessage,
+    normalizeSystemDate,
+    type CachePrefixTelemetry,
+} from "./context/cache-diagnostics";
 import {
     calculateOverallHealth,
     type HealthCheckItem,
@@ -43,7 +55,7 @@ import {
 } from "./diagnostics/provider-health";
 import { BoundedMap, convertMessages, convertTools, stableJsonStringify, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
 import { LlamaLogSink } from "./logger";
-import { buildMemoryQuery, injectSharedMemoryContext } from "./memory/prompt";
+import { buildMemoryQuery, injectAppendOnlySharedMemoryContext } from "./memory/prompt";
 import { getCurrentWorkspaceScopeId } from "./memory/scope";
 import type { SharedMemoryContextProvider, SharedMemoryPromptContext } from "./memory/types";
 import { setSubagentModelProfiles } from "./subagent-guidance";
@@ -65,8 +77,14 @@ import { buildChatCompletionRequest } from "./request/chat-request";
 import { SerialRequestQueue, type ChatRequestSlotLease } from "./transport/request-queue";
 import {
     detectRepeatedToolCallLoop,
+    injectToolCallOnlyNudge,
     injectToolLoopGuard,
+    RECENT_TURN_WINDOW,
+    recordRecentTurnShape,
+    shouldInjectToolCallOnlyNudge,
+    toolCallOnlyDensity,
     ToolCallValidationError,
+    type RecentTurnShape,
     type ToolCallReliabilityMetrics,
 } from "./tools/tool-call-reliability";
 import {
@@ -243,6 +261,10 @@ export interface LlamaChatTurnMetrics {
     schemaRejectedToolCalls: number;
     toolCallRepairRetries: number;
     toolLoopDetected: boolean;
+    /** Tool results whose text indicates the tool failed at execution time. */
+    toolExecutionErrors?: number;
+    /** Which calls failed (name/command/output head) — shown in the Errors tab. */
+    toolExecutionErrorDetails?: Array<{ name?: string; command?: string; head?: string }>;
 }
 
 export interface LlamaChatContextUsageMetrics {
@@ -262,6 +284,8 @@ export interface LlamaChatContextUsageMetrics {
     systemTokens?: number;
     /** Context tokens not attributed to compacted messages or tool schemas. */
     otherTokens?: number;
+    /** Ordered, mutually exclusive local estimate of the actual outgoing prompt. */
+    promptSegments?: LlamaPromptSegment[];
     replyReserveTokens: number;
     cappedTools: number;
     autoCompacted: boolean;
@@ -273,6 +297,27 @@ export interface LlamaChatContextUsageMetrics {
     rawMaxTokens?: number;
     usableMaxTokens?: number;
     categories?: Array<{ name: string; tokens: number }>;
+}
+
+export type LlamaPromptSegmentKind =
+    | "system"
+    | "tools"
+    | "shared_memory"
+    | "guard"
+    | "user"
+    | "user_context"
+    | "assistant"
+    | "reasoning"
+    | "tool_calls"
+    | "tool_results"
+    | "summary"
+    | "other";
+
+export interface LlamaPromptSegment {
+    kind: LlamaPromptSegmentKind;
+    label: string;
+    tokens: number;
+    messageCount?: number;
 }
 
 interface PreparedMessagesForBudget {
@@ -295,8 +340,24 @@ interface CachePrefixSnapshot {
     /** Advertised tool names (sorted) — for a readable diff when toolsMatch fails. */
     toolNames?: string[];
     systemHash?: string;
+	/** systemHash with the "Current date: YYYY-MM-DD" line normalized away,
+	 *  so a midnight date rollover is distinguishable from a real system change. */
+	systemHashNormalized?: string;
     messageParts: string[];
     messageChars: number;
+	/** Provider-only memory/guard messages that are sent but excluded from durable alignment. */
+	ephemeralHash?: string;
+	ephemeralChars?: number;
+    migratedFromPrefix?: boolean;
+}
+
+/** Remove provider-only alignment metadata before serializing a message to the API. */
+function toWireMessage(message: OpenAIChatMessage): OpenAIChatMessage {
+    const wire = { ...message };
+    delete wire.ephemeral;
+    delete wire.providerOverlay;
+    delete wire.sharedMemoryRevisions;
+    return wire;
 }
 
 interface StableToolCatalogSnapshot {
@@ -315,6 +376,13 @@ interface ConversationMessageSnapshot {
     tokenCount: number;
     updatedAt: number;
     migratedFromPrefix?: boolean;
+}
+
+interface CacheBackendSnapshot {
+    via?: string;
+    cfPop?: string;
+    /** Omitted for multi-segment turns whose accumulated usage is not comparable. */
+    promptTokens?: number;
 }
 
 const CACHE_CONTROL_MARKER = /"mimeType"\s*:\s*"cache_control"/g;
@@ -434,7 +502,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly runtimeContextCache = new Map<string, RuntimeContextCacheEntry>();
     private readonly cachePrefixSnapshots = new BoundedMap<string, CachePrefixSnapshot>(32);
     private readonly stableToolCatalogs = new BoundedMap<string, StableToolCatalogSnapshot>(32);
+    /** Count of tool results that indicated execution failures in the current turn. */
+    private lastToolExecutionErrorCount = 0;
+    private diagUserPartsLoggedRequestId: string | undefined;
+    private lastToolExecutionErrorDetails: Array<{ name?: string; command?: string; head?: string }> = [];
     private readonly conversationMessageSnapshots = new BoundedMap<string, ConversationMessageSnapshot>(4);
+    /** Conversation scopes already served since this provider instance started. */
+    private readonly scopesSeenSinceStartup = new Set<string>();
     private readonly chatRequestQueue: SerialRequestQueue;
     private reasoningMapLoaded = false;
     private readonly httpTransport = new OpenAIHttpTransport();
@@ -458,7 +532,23 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
      */
     private readonly lastCompactionSentAtByScope = new Map<string, number>();
     private readonly lastTurnCompactedByScope = new Map<string, boolean>();
+    /** Last server cache counters and route, scoped to one model conversation. */
+    private readonly lastCacheBackendByScope = new BoundedMap<string, CacheBackendSnapshot>(32);
     private readonly lastResponseEndedAtByScope = new Map<string, number>();
+    private readonly recentTurnShapesByScope = new Map<string, RecentTurnShape[]>();
+    /** Consecutive tool-call-only turns per conversation (host-driven agent loops). */
+    private readonly consecutiveToolOnlyTurnsByScope = new Map<string, number>();
+    /**
+     * Shared-memory prompt selected for the active genuine user turn.
+     *
+     * Tool-result rounds are continuations of that turn. Re-running retrieval
+     * on every such round can change the injected message in the middle of the
+     * prompt and invalidate the entire cached assistant/tool suffix after it.
+     * A null value records that retrieval legitimately selected no memory, so
+     * a tool round does not retry retrieval and destabilize the prompt.
+     */
+    private readonly frozenSharedMemoryByScope =
+        new BoundedMap<string, SharedMemoryPromptContext | null>(32);
     /**
      * VS Code counts tokens one message at a time over the whole conversation
      * before every agent round. Each call is a separate RPC, so the aggregate is
@@ -470,6 +560,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private tokenCountMs = 0;
     private deepSeekBalance: { summary: string; fetchedAt: number } | undefined;
     private deepSeekBalanceInflight: Promise<string | undefined> | undefined;
+
+    /**
+     * Scopes whose snapshots changed in THIS extension host. The session-state
+     * file is shared between windows: writing every in-memory snapshot would
+     * clobber another window's newer snapshot with our stale copy, so only
+     * dirty scopes are merged into the file on persist.
+     */
+    private readonly dirtyPrefixScopes = new Set<string>();
+    private readonly dirtyConversationScopes = new Set<string>();
+    private readonly dirtyToolCatalogScopes = new Set<string>();
 
     /**
      * Creates a new Llama.cpp chat model provider.
@@ -902,6 +1002,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
         // Sort tools by name for stable fingerprinting — VS Code can change
         // enumeration order between restarts.
+        const availableNames = new Set((options.tools ?? []).map(tool => tool.name));
         const sortedTools = Array.isArray(config.tools)
             ? [...config.tools].sort((a, b) => {
                 const na = a.function?.name ?? "";
@@ -949,6 +1050,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         if (countUnchanged && !recentActivation && !configChanged) {
             this.stableToolCatalogs.delete(scope);
             this.stableToolCatalogs.set(scope, previous);
+            this.dirtyToolCatalogScopes.add(scope);
             if (previous.fingerprint !== currentFingerprint) {
                 this.log("chat.tools.catalog_stabilized", {
                     requestId,
@@ -967,6 +1069,66 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             };
         }
 
+        // Count changed, but only in "dynamic" tools (MCP servers and GitHub
+        // PR helpers register an unstable set — chrome-devtools swapped 8 tools
+        // and dropped 2 while the stable core stayed identical). If the stable
+        // core (non-dynamic tools) is unchanged, keep the previous list too —
+        // drop tools that are no longer available and append the new dynamic
+        // ones at the end. The stable prefix stays byte-identical, only the
+        // tail rewrites.
+        const isDynamicTool = (name: string): boolean =>
+            name.startsWith("mcp_") || name.startsWith("github-");
+        if (previous && !recentActivation && !configChanged && Array.isArray(config.tools)) {
+            const previousNames = new Set(previous.tools.map(tool => tool.function.name));
+            const currentNames = new Set(sortedTools.map(tool => tool.function.name));
+            const previousStable = [...previousNames].filter(name => !isDynamicTool(name)).sort();
+            const currentStable = [...currentNames].filter(name => !isDynamicTool(name)).sort();
+            const stableCoreUnchanged = previousStable.length === currentStable.length
+                && previousStable.every((name, index) => name === currentStable[index]);
+            if (stableCoreUnchanged) {
+                const stillAvailable = previous.tools.filter(tool =>
+                    availableNames.has(tool.function.name)
+                );
+                const retainedNames = new Set(stillAvailable.map(tool => tool.function.name));
+                const appended = (sortedTools ?? []).filter(tool =>
+                    !retainedNames.has(tool.function.name)
+                );
+                const merged = [...stillAvailable, ...appended];
+                if (merged.length > 0) {
+                    const mergedFingerprint = this.shortHash(stableJsonStringify(merged));
+                    const next: StableToolCatalogSnapshot = {
+                        tools: merged as NonNullable<ReturnType<typeof convertTools>["tools"]>,
+                        toolChoice: config.tool_choice,
+                        fingerprint: mergedFingerprint,
+                        updatedAt: Date.now(),
+                        maxToolsAtSnapshot: configMaxTools,
+                    };
+                    this.stableToolCatalogs.delete(scope);
+                    this.stableToolCatalogs.set(scope, next);
+                    this.dirtyToolCatalogScopes.add(scope);
+                    this.log("chat.tools.catalog_stabilized", {
+                        requestId,
+                        modelId,
+                        retainedToolCount: stillAvailable.length,
+                        currentToolCount: sortedTools.length,
+                        retainedFingerprint: previous.fingerprint,
+                        currentFingerprint: mergedFingerprint,
+                        reason: "stable-core-match",
+                        removedTools: previous.tools
+                            .filter(tool => !availableNames.has(tool.function.name))
+                            .map(tool => tool.function.name)
+                            .sort(),
+                        appendedTools: appended.map(tool => tool.function.name).sort(),
+                    });
+                    return {
+                        ...config,
+                        tools: merged as NonNullable<ReturnType<typeof convertTools>["tools"]>,
+                        tool_choice: config.tool_choice,
+                    };
+                }
+            }
+        }
+
         const next: StableToolCatalogSnapshot = {
             tools: (sortedTools ?? []) as NonNullable<ReturnType<typeof convertTools>["tools"]>,
             toolChoice: config.tool_choice,
@@ -975,6 +1137,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             maxToolsAtSnapshot: configMaxTools,
         };
         this.stableToolCatalogs.set(scope, next);
+        this.dirtyToolCatalogScopes.add(scope);
         if (previous) {
             const previousNames = new Set(previous.tools.map(tool => tool.function.name));
             const currentNames = new Set(sortedTools.map(tool => tool.function.name));
@@ -1005,20 +1168,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
      * stays warm even when VS Code rewrites historical message content between
      * turns.
      *
-     * Two strategies:
-     *
-     * 1. **Byte-level match (fast path).**  If the first N messages match the
-     *    previous snapshot byte-for-byte, N cached copies replace the current
-     *    prefix and only the tail is taken fresh.
-     *
-     * 2. **Aggressive fallback (VS Code rewrite).**  When VS Code rewrites the
-     *    entire history while keeping the message count and tool catalog
-     *    unchanged, every byte-level comparison after index 1 fails.  In that
-     *    case the *entire* previous snapshot is reused as the prefix (truncated
-     *    to `min(prev.length, cur.length)` so we never exceed the budget VS Code
-     *    already approved).  The previous messages were already sent to the API
-     *    and are guaranteed to be in the upstream disk cache, so reusing them
-     *    keeps the prefix warm without changing the conversation semantics.
+     * Messages are aligned position by position. A message is replaced by its
+     * previously sent rendering when it is byte-identical, or when it is
+     * provably the *same* message re-rendered by the host: identical tool call
+     * ids, or identical text once host-regenerated context blocks (workspace
+     * tree, terminals, attachments) are masked out. Alignment stops at the
+     * first message that cannot be proven identical, and the tail is always
+     * taken fresh, so a rewritten history no longer discards the whole cache
+     * and a new turn is never replaced by a stale one.
      *
      * Also stores the current snapshot so the next turn can compare against it,
      * and returns prefix telemetry for cache diagnostics.
@@ -1037,9 +1194,23 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             return { messages, stabilized: false, prefix: { scope: "unavailable" } };
         }
 
-        const messageParts = messages.map(message => stableJsonStringify(message));
+        // Ephemeral provider injections (nudges, loop guards, repair prompts)
+        // are not part of the host history, so they must not pollute the
+        // snapshot: a later turn compares against the host history, which never
+        // contains them.
+        const durableMessages = messages.filter(message => !message.ephemeral);
+        const ephemeralMessages = messages.filter(message => message.ephemeral);
+        const messageParts = durableMessages.map(message => stableJsonStringify(toWireMessage(message)));
         const messageChars = messageParts.reduce((total, part) => total + part.length, 0);
-        const systemHash = messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined;
+        const ephemeralParts = ephemeralMessages.map(message => stableJsonStringify(toWireMessage(message)));
+        const ephemeralChars = ephemeralParts.reduce((total, part) => total + part.length, 0);
+        const ephemeralHash = ephemeralParts.length > 0
+            ? this.shortHash(stableJsonStringify(ephemeralParts))
+            : undefined;
+        const systemHash = durableMessages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined;
+        const systemHashNormalized = durableMessages[0]?.role === "system"
+            ? this.shortHash(normalizeSystemDate(messageParts[0] ?? ""))
+            : undefined;
 
         // --- Store current snapshot for next turn's comparison ---
         const current: CachePrefixSnapshot = {
@@ -1049,12 +1220,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             toolsCount,
             toolNames,
             systemHash,
+            systemHashNormalized,
             messageParts,
             messageChars,
+            ephemeralHash,
+            ephemeralChars,
         };
         const previous = this.cachePrefixSnapshots.get(scope);
-        this.cachePrefixSnapshots.set(scope, current);
-        this.persistPrefixSnapshots();
+        const storeSnapshot = (snapshot: CachePrefixSnapshot): void => {
+            this.cachePrefixSnapshots.set(scope, snapshot);
+            this.dirtyPrefixScopes.add(scope);
+            this.persistPrefixSnapshots();
+        };
 
         // --- Compute prefix telemetry (for cache diagnostics) ---
         let identicalMessagePrefix = 0;
@@ -1100,9 +1277,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             previousToolsCount: previous?.toolsCount,
             removedTools,
             addedTools,
-            systemHash: messages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined,
+            systemHash: durableMessages[0]?.role === "system" ? this.shortHash(messageParts[0] ?? "") : undefined,
+            systemHashNormalized: durableMessages[0]?.role === "system"
+                ? this.shortHash(normalizeSystemDate(messageParts[0] ?? ""))
+                : undefined,
+            previousSystemHashNormalized: previous?.systemHashNormalized,
             systemChanged: previous !== undefined
                 && (previous.systemHash ?? undefined) !== systemHash,
+            firstDivergence: previous !== undefined
+                && identicalMessagePrefix < Math.min(previous.messageParts.length, messageParts.length)
+                ? this.describeMessageDivergence(
+                    previous.messageParts[identicalMessagePrefix] ?? "",
+                    messageParts[identicalMessagePrefix] ?? "",
+                    identicalMessagePrefix
+                )
+                : undefined,
             messageCount: messageParts.length,
             messageChars,
             previousRequestId: previous?.requestId,
@@ -1113,6 +1302,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             identicalMessagePrefix,
             sharedMessagePrefixChars,
             reusableMessagePercent,
+            ephemeralHash,
+            previousEphemeralHash: previous?.ephemeralHash,
+            ephemeralChanged: previous?.ephemeralHash !== undefined
+                ? previous.ephemeralHash !== ephemeralHash
+                : undefined,
+            ephemeralChars,
+            previousEphemeralChars: previous?.ephemeralChars,
         };
 
         // --- Stabilization: reuse previous snapshot when possible ---
@@ -1124,57 +1320,202 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     toolsMatch: previous.toolsHash === toolsHash,
                 });
             }
+            storeSnapshot(current);
             return { messages, stabilized: false, prefix };
         }
 
-        const comparable = Math.min(previous.messageParts.length, messageParts.length);
-        let match = 0;
-        while (
-            match < comparable
-            && previous.messageParts[match] === messageParts[match]
-        ) {
-            match += 1;
+        // The final message carries this turn's new input and is never replaced.
+        const alignable = Math.min(
+            previous.messageParts.length,
+            messageParts.length,
+            Math.max(0, durableMessages.length - 1)
+        );
+        let reuseCount = 0;
+        let restoredCount = 0;
+        while (reuseCount < alignable) {
+            const previousPart = previous.messageParts[reuseCount];
+            if (previousPart === messageParts[reuseCount]) {
+                reuseCount += 1;
+                continue;
+            }
+            if (!this.isHostRerenderOfSameMessage(previousPart, messageParts[reuseCount])) {
+                break;
+            }
+            reuseCount += 1;
+            restoredCount += 1;
         }
 
-        const strategy: "bytes" | "aggressive" | "none" =
-            match >= 3
-                ? "bytes"
-                : match >= 2 && previous.messageParts.length > 2 && comparable > 2
-                    ? "aggressive"
-                    : match >= 2
-                        ? "bytes"
-                        : "none";
-
-        if (strategy === "none") {
+        if (restoredCount === 0) {
+            storeSnapshot(current);
             return { messages, stabilized: false, prefix };
         }
 
-        const reuseCount = strategy === "bytes"
-            ? match
-            : Math.min(previous.messageParts.length, messages.length);
-
-        const stabilized: OpenAIChatMessage[] = [];
+        const stabilizedDurable: OpenAIChatMessage[] = [];
         for (let index = 0; index < reuseCount; index += 1) {
             try {
-                stabilized.push(JSON.parse(previous.messageParts[index]) as OpenAIChatMessage);
+                stabilizedDurable.push(
+                    durableMessages[index].providerOverlay
+                        ? durableMessages[index]
+                        : JSON.parse(previous.messageParts[index]) as OpenAIChatMessage
+                );
             } catch {
-                stabilized.push(messages[index] ?? previous.messageParts[index] as unknown as OpenAIChatMessage);
+                stabilizedDurable.push(durableMessages[index]);
             }
         }
-        for (let index = reuseCount; index < messages.length; index += 1) {
-            stabilized.push(messages[index]);
+        for (let index = reuseCount; index < durableMessages.length; index += 1) {
+            stabilizedDurable.push(durableMessages[index]);
         }
+
+        // The serialized prefix intentionally excludes provider-only messages,
+        // but the live request still needs its current memory/guard injections.
+        // Reinsert each ephemeral message at the same durable offset instead of
+        // indexing the filtered snapshot against the unfiltered request.
+        const stabilized: OpenAIChatMessage[] = [];
+        let durableIndex = 0;
+        for (const message of messages) {
+            if (message.ephemeral) {
+                stabilized.push(message);
+                continue;
+            }
+            stabilized.push(stabilizedDurable[durableIndex] ?? message);
+            durableIndex += 1;
+        }
+
+        // Persist and report the durable prefix that is actually sent. Keeping
+        // the pre-stabilized host rendering here makes the next request restore
+        // that opposite version, producing a reasoning_content flip-flop and a
+        // real cache-prefix rewrite on every turn.
+        const stabilizedParts = stabilizedDurable.map(message => stableJsonStringify(toWireMessage(message)));
+        const stabilizedChars = stabilizedParts.reduce((total, part) => total + part.length, 0);
+        const stabilizedSystemHash = stabilizedDurable[0]?.role === "system"
+            ? this.shortHash(stabilizedParts[0] ?? "")
+            : undefined;
+        const stabilizedSystemHashNormalized = stabilizedDurable[0]?.role === "system"
+            ? this.shortHash(normalizeSystemDate(stabilizedParts[0] ?? ""))
+            : undefined;
+        storeSnapshot({
+            requestId,
+            staticFieldsHash,
+            toolsHash,
+            toolsCount,
+            toolNames,
+            systemHash: stabilizedSystemHash,
+            systemHashNormalized: stabilizedSystemHashNormalized,
+            messageParts: stabilizedParts,
+            messageChars: stabilizedChars,
+            ephemeralHash,
+            ephemeralChars,
+        });
+
+        let stabilizedIdenticalPrefix = 0;
+        let stabilizedSharedPrefixChars = 0;
+        const stabilizedComparable = Math.min(previous.messageParts.length, stabilizedParts.length);
+        while (
+            stabilizedIdenticalPrefix < stabilizedComparable
+            && previous.messageParts[stabilizedIdenticalPrefix] === stabilizedParts[stabilizedIdenticalPrefix]
+        ) {
+            stabilizedSharedPrefixChars += stabilizedParts[stabilizedIdenticalPrefix].length;
+            stabilizedIdenticalPrefix += 1;
+        }
+        if (stabilizedIdenticalPrefix < stabilizedComparable) {
+            const left = previous.messageParts[stabilizedIdenticalPrefix];
+            const right = stabilizedParts[stabilizedIdenticalPrefix];
+            const partialLimit = Math.min(left.length, right.length);
+            let partialChars = 0;
+            while (partialChars < partialLimit && left.charCodeAt(partialChars) === right.charCodeAt(partialChars)) {
+                partialChars += 1;
+            }
+            stabilizedSharedPrefixChars += partialChars;
+        }
+        const stabilizedReusablePercent = previous.messageChars > 0
+            ? Number(((stabilizedSharedPrefixChars / previous.messageChars) * 100).toFixed(1))
+            : undefined;
+        const stabilizedPrefix = {
+            ...prefix,
+            systemHash: stabilizedSystemHash,
+            systemHashNormalized: stabilizedSystemHashNormalized,
+            systemChanged: (previous.systemHash ?? undefined) !== stabilizedSystemHash,
+            firstDivergence: stabilizedIdenticalPrefix < stabilizedComparable
+                ? this.describeMessageDivergence(
+                    previous.messageParts[stabilizedIdenticalPrefix] ?? "",
+                    stabilizedParts[stabilizedIdenticalPrefix] ?? "",
+                    stabilizedIdenticalPrefix
+                )
+                : undefined,
+            messageCount: stabilizedParts.length,
+            messageChars: stabilizedChars,
+            identicalMessagePrefix: stabilizedIdenticalPrefix,
+            sharedMessagePrefixChars: stabilizedSharedPrefixChars,
+            reusableMessagePercent: stabilizedReusablePercent,
+        };
 
         this.log("chat.cache.prefix_stabilized", {
             scope: this.shortHash(scope),
-            strategy,
-            match,
+            strategy: "aligned",
+            match: stabilizedIdenticalPrefix,
+            incomingMatch: identicalMessagePrefix,
+            restoredCount,
             reuseCount,
             previousMessageCount: previous.messageParts.length,
-            currentMessageCount: messages.length,
+            currentMessageCount: durableMessages.length,
             stabilizedMessageCount: stabilized.length,
         });
-        return { messages: stabilized, stabilized: true, prefix };
+        return { messages: stabilized, stabilized: true, prefix: stabilizedPrefix };
+    }
+
+    /** Offset and surrounding text of the first difference, to identify what rewrote a message. */
+    private describeTextDivergence(previous: string, current: string): Record<string, unknown> {
+        const limit = Math.min(previous.length, current.length);
+        let index = 0;
+        while (index < limit && previous.charCodeAt(index) === current.charCodeAt(index)) {
+            index += 1;
+        }
+        return {
+            index,
+            previous: previous.slice(index, index + 120),
+            current: current.slice(index, index + 120),
+        };
+    }
+
+    /** Who the diverging messages are (role, call ids, sizes) so the cause of a prefix break is visible. */
+    private describeMessageDivergence(
+        previousPart: string,
+        currentPart: string,
+        messageIndex: number
+    ): Record<string, unknown> {
+        const describe = (part: string): Record<string, unknown> => {
+            try {
+                const message = JSON.parse(part) as OpenAIChatMessage;
+                return {
+                    role: message.role,
+                    toolCallId: message.tool_call_id,
+                    callIds: (message.tool_calls ?? []).map(call => call.id),
+                    hasReasoning: message.reasoning_content !== undefined,
+                    contentLen: typeof message.content === "string" ? message.content.length : undefined,
+                };
+            } catch {
+                return { parseFailed: true };
+            }
+        };
+        return {
+            messageIndex,
+            ...describe(previousPart),
+            ...this.describeTextDivergence(previousPart, currentPart),
+            currentMessage: describe(currentPart),
+        };
+    }
+
+    /** True when two serialized snapshots describe the same re-rendered entry. */
+    private isHostRerenderOfSameMessage(previousPart: string, currentPart: string): boolean {
+        let previousMessage: OpenAIChatMessage;
+        let currentMessage: OpenAIChatMessage;
+        try {
+            previousMessage = JSON.parse(previousPart) as OpenAIChatMessage;
+            currentMessage = JSON.parse(currentPart) as OpenAIChatMessage;
+        } catch {
+            return false;
+        }
+        return isSameConversationMessage(previousMessage, currentMessage);
     }
 
     private summarizeRequestBodyForLog(requestBody: Record<string, unknown>): Record<string, unknown> {
@@ -1443,7 +1784,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             // model picker so Copilot Chat sees a 12.5% output reservation
             // while the full hard cap still applies to actual API requests.
             const advertisedCap = this.clampInt(
-                this.getConfig().get("deepSeekDefaultMaxOutputTokens", 131072),
+                this.getConfig().get("deepSeekDefaultMaxOutputTokens", 70000),
                 1024,
                 393216,
                 131072
@@ -1616,6 +1957,132 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     /**
+     * Builds an ordered, mutually exclusive prompt layout for cache diagnostics.
+     * Message weights are scaled to the same calibrated estimate used by the
+     * context budget, so their sum equals messageTokens exactly; the tool
+     * catalog remains a separate block inserted after leading system messages.
+     */
+    private buildPromptSegments(
+        messages: OpenAIChatMessage[],
+        toolTokens: number,
+        messageTokens: number
+    ): LlamaPromptSegment[] {
+        type Draft = LlamaPromptSegment & { chars: number };
+        const drafts: Draft[] = [];
+        const push = (
+            kind: LlamaPromptSegmentKind,
+            label: string,
+            chars: number,
+            messageCount?: number
+        ): void => {
+            if (chars <= 0) {
+                return;
+            }
+            const previous = drafts.at(-1);
+            if (previous?.kind === kind && previous.label === label) {
+                previous.chars += chars;
+                previous.messageCount = (previous.messageCount ?? 0) + (messageCount ?? 0);
+                return;
+            }
+            drafts.push({ kind, label, chars, tokens: 0, ...(messageCount ? { messageCount } : {}) });
+        };
+        const contentChars = (message: OpenAIChatMessage): number => {
+            if (typeof message.content === "string") {
+                return message.content.length;
+            }
+            if (!Array.isArray(message.content)) {
+                return 0;
+            }
+            return message.content.reduce((total, part) => {
+                if (part.type === "text" && typeof part.text === "string") {
+                    return total + part.text.length;
+                }
+                return part.type === "image_url" ? total + 1020 : total;
+            }, 0);
+        };
+
+        for (const message of messages) {
+            const baseChars =
+                (message.role?.length ?? 0)
+                + (message.name?.length ?? 0)
+                + (message.tool_call_id?.length ?? 0);
+            const bodyChars = contentChars(message);
+            if (message.providerOverlay === "shared-memory") {
+                const isDelta = typeof message.content === "string"
+                    && message.content.includes("Append-only shared memory update:");
+                push("shared_memory", isDelta ? "Memory delta" : "Shared memory", baseChars + bodyChars, 1);
+                continue;
+            }
+            if (message.ephemeral) {
+                push("guard", "Guards / nudges", baseChars + bodyChars, 1);
+                continue;
+            }
+            if (message.role === "system") {
+                push("system", "System", baseChars + bodyChars, 1);
+                continue;
+            }
+            if (message.role === "tool") {
+                push("tool_results", "Tool results", baseChars + bodyChars, 1);
+                continue;
+            }
+            if (
+                message.role === "user"
+                && typeof message.content === "string"
+                && message.content.startsWith("Conversation summary (")
+            ) {
+                push("summary", "Compaction summary", baseChars + bodyChars, 1);
+                continue;
+            }
+            if (message.role === "user") {
+                const hasContext = typeof message.content === "string"
+                    && /<(?:workspace_info|environment_info|context|attachments)>/.test(message.content);
+                push(
+                    hasContext ? "user_context" : "user",
+                    hasContext ? "User + host context" : "User",
+                    baseChars + bodyChars,
+                    1
+                );
+                continue;
+            }
+            if (message.role === "assistant") {
+                push("assistant", "Assistant", baseChars + bodyChars, 1);
+                if (typeof message.reasoning_content === "string") {
+                    push("reasoning", "Reasoning", message.reasoning_content.length);
+                }
+                if (message.tool_calls?.length) {
+                    push("tool_calls", "Tool calls", stableJsonStringify(message.tool_calls).length);
+                }
+                continue;
+            }
+            push("other", "Other messages", baseChars + bodyChars, 1);
+        }
+
+        const totalChars = drafts.reduce((sum, draft) => sum + draft.chars, 0);
+        let allocated = 0;
+        for (let index = 0; index < drafts.length; index += 1) {
+            const tokens = index === drafts.length - 1
+                ? Math.max(0, messageTokens - allocated)
+                : Math.max(0, Math.floor(messageTokens * drafts[index].chars / Math.max(1, totalChars)));
+            drafts[index].tokens = tokens;
+            allocated += tokens;
+        }
+
+        const segments: LlamaPromptSegment[] = drafts
+            .filter(draft => draft.tokens > 0)
+            .map(({ chars: _chars, ...segment }) => segment);
+        if (toolTokens > 0) {
+            const firstNonSystem = segments.findIndex(segment => segment.kind !== "system");
+            const insertAt = firstNonSystem >= 0 ? firstNonSystem : segments.length;
+            segments.splice(insertAt, 0, {
+                kind: "tools",
+                label: "Tool catalog",
+                tokens: toolTokens,
+            });
+        }
+        return segments;
+    }
+
+    /**
      * Save user-attached images to temporary files and return modified messages
      * with text instructions pointing to the saved files.
      * Used when the model provider doesn't support inline image_url content blocks.
@@ -1710,15 +2177,109 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         let sanitizedMessages = 0;
         let truncatedMessages = 0;
         let omittedChars = 0;
-        const nextMessages = messages.map(message => {
+        // Tool EXECUTION errors (not schema rejects): VS Code returns the
+        // failure as text in the tool result (tracebacks, "Command exited with
+        // code 1", edit mismatch messages). They previously passed silently —
+        // surface them so the Errors tab can show editing/terminal failures.
+        // Patterns are deliberately narrow:
+        // - edit mismatches are explicit phrases only;
+        // - "Command exited with code N" is only real when it ENDS the tool
+        //   result (terminal output) — inside a read_file result it is just
+        //   source code that happens to contain that phrase;
+        // - exit code 1 is the conventional "nothing found" status of
+        //   grep/rg/find and floods the report with false positives, so it
+        //   only counts when the output also shows a real failure signal
+        //   (compiler/test errors, tracebacks, explicit failure words).
+        const TOOL_EDIT_ERROR = /(replacement failed|replacement not found|could not find matching text to replace|did not find the|no such text|edit mismatch)/i;
+        const TOOL_COMMAND_ERROR_END = /command exited with code [2-9]\d*\s*$/i;
+        const TOOL_COMMAND_ERROR_ONE = /command exited with code 1\s*$/i;
+        // Word-boundary anchors keep camelCase identifiers like
+        // `lastToolExecutionErrorCount` from matching "error" as a failure
+        // signal — the exit-code-1 gate exists for real compiler/test output.
+        const TOOL_FAILURE_SIGNAL = /(\berror\b|\bfailed\b|\bfailure\b|\bexception\b|\btraceback\b|\bcannot\b|\bunable\b|syntaxerror|referenceerror|typeerror|rangeerror)/i;
+        const TOOL_COMMAND_ERROR_MID = /(tool execution failed|failed with exit code|process exited with code [2-9]\d*)/i;
+        const TOOL_TRACEBACK = /(Traceback \(most recent call last\)|ReferenceError:|TypeError:|SyntaxError:|RangeError:|ERR_|EPERM|EACCES|ENOENT)/i;
+        const TOOL_RESULT_MARKER = "[tool_result";
+        // Map tool call ids back to the calls that produced them, so the
+        // report can show exactly which command failed instead of only the
+        // output tail.
+        const toolCallById = new Map<string, { name?: string; command?: string }>();
+        for (const message of messages) {
+            if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) {
+                continue;
+            }
+            for (const call of message.tool_calls) {
+                if (typeof call?.id !== "string" || !call.id) {
+                    continue;
+                }
+                let command: string | undefined;
+                if (typeof call.function?.arguments === "string") {
+                    try {
+                        const args = JSON.parse(call.function.arguments) as Record<string, unknown>;
+                        if (typeof args?.command === "string") {
+                            command = args.command;
+                        } else if (typeof args?.query === "string") {
+                            command = `${call.function?.name ?? "tool"} query=${args.query}`;
+                        }
+                    } catch {
+                        // Unparseable arguments — fall back to the name only.
+                    }
+                }
+                toolCallById.set(call.id, { name: call.function?.name, command });
+            }
+        }
+        // The last user query (no tool-result text) marks where THIS turn's
+        // fresh messages start. VS Code mutates and reorders history between
+        // turns, and injected system/memory messages shift indexes, so neither
+        // snapshot positions nor call-id sets are reliable — but every tool
+        // result this turn always sits AFTER the query that started the turn,
+        // and historical results always sit BEFORE it.
+        let lastUserQueryIndex = -1;
+        messages.forEach((message, index) => {
+            if (
+                message.role === "user"
+                && typeof message.content === "string"
+                && !message.content.includes(TOOL_RESULT_MARKER)
+                && !message.content.includes("Conversation summary")
+            ) {
+                lastUserQueryIndex = index;
+            }
+        });
+        let toolExecutionErrors = 0;
+        const errorDetails: Array<{ name?: string; command?: string; head: string }> = [];
+        const nextMessages = messages.map((message, index) => {
             const content = message.content;
             if (typeof content !== "string") {
                 return message;
             }
 
-            const isToolResult = message.role === "tool" || (message.role === "user" && content.includes("[tool_result"));
-            if (!isToolResult) {
-                return message;
+            // Count only tool results produced after this turn's query: older
+            // results were already counted in their own turn, and counting
+            // them again would make the error count grow monotonically with
+            // every turn of a long conversation.
+            const isFresh = lastUserQueryIndex >= 0 && index > lastUserQueryIndex;
+            const isToolResult = message.role === "tool" || (message.role === "user" && content.includes(TOOL_RESULT_MARKER));
+            if (isFresh && isToolResult && !content.includes("successfully edited")
+                && !content.startsWith("The following files were successfully")) {
+                const head = content.slice(0, 500);
+                const tail = content.slice(-120);
+                // Count a message once even if several patterns match.
+                const commandFailed = TOOL_COMMAND_ERROR_END.test(tail)
+                    || TOOL_COMMAND_ERROR_MID.test(head)
+                    || (TOOL_COMMAND_ERROR_ONE.test(tail) && TOOL_FAILURE_SIGNAL.test(head));
+                if (TOOL_EDIT_ERROR.test(head) || commandFailed || TOOL_TRACEBACK.test(head)) {
+                    toolExecutionErrors += 1;
+                    const callInfo = typeof message.tool_call_id === "string"
+                        ? toolCallById.get(message.tool_call_id)
+                        : undefined;
+                    if (errorDetails.length < 5) {
+                        errorDetails.push({
+                            name: callInfo?.name,
+                            command: callInfo?.command,
+                            head: head.slice(0, 140),
+                        });
+                    }
+                }
             }
 
             let nextContent = content;
@@ -1733,7 +2294,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 }
             }
 
-            if (maxChars <= 0 || nextContent.length <= maxChars) {
+            // Only tool output may be summarized away. A large system prompt is
+            // instructions, not a tool result: rewriting it changes behaviour and
+            // invalidates the whole cached prefix behind it.
+            if (maxChars <= 0 || !isToolResult || nextContent.length <= maxChars) {
                 if (nextContent !== content) {
                     return { ...message, content: nextContent };
                 }
@@ -1753,6 +2317,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             });
         }
 
+        if (toolExecutionErrors > 0) {
+            this.log("chat.tool_results.execution_errors", {
+                requestId,
+                toolExecutionErrors,
+            });
+        }
+        this.lastToolExecutionErrorCount = toolExecutionErrors;
+        this.lastToolExecutionErrorDetails = errorDetails;
+
         if (truncatedMessages > 0) {
             this.log("chat.tool_results.truncated", {
                 requestId,
@@ -1769,6 +2342,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private static readonly PREFIX_STATE_KEY = "llamacpp.prefix_snapshots";
     private static readonly PREFIX_STATE_VERSION_KEY = "llamacpp.prefix_snapshots.version";
     private static readonly CONTINUATION_STATE_KEY = "llamacpp.continuation_snapshots.v1";
+    private static readonly SESSION_STATE_PERSIST_THROTTLE_MS = 2_000;
+    private lastSessionStatePersistAt = 0;
+    private sessionStatePersistPending = false;
 
     private loadPersistedReasoningMap(): void {
         if (this.reasoningMapLoaded || !this.globalState) {
@@ -1957,27 +2533,82 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
     }
 
-    private async persistSessionState(): Promise<void> {
+    private async persistSessionState(force = false): Promise<void> {
         if (!this.globalState) {
             return;
         }
+        // The hot path (prefix stabilization) calls this once per attempt;
+        // serializing megabytes of snapshots on every attempt blocks the
+        // extension host. Throttle intermediate writes and flush for real
+        // at the end of each turn (persistContinuationState).
+        const now = Date.now();
+        if (!force && now - this.lastSessionStatePersistAt < LlamaCppChatModelProvider.SESSION_STATE_PERSIST_THROTTLE_MS) {
+            this.sessionStatePersistPending = true;
+            return;
+        }
+        this.lastSessionStatePersistAt = now;
+        this.sessionStatePersistPending = false;
         try {
             const filePath = this.sessionStateFilePath();
             if (!filePath) {
                 return;
             }
-            const prefixSnapshots: Record<string, CachePrefixSnapshot> = {};
+            // Merge with the current file instead of replacing it wholesale:
+            // the file is shared between windows, and every window holds only
+            // its own in-memory copy of the other scopes (loaded at startup,
+            // possibly stale). Writing everything would roll back snapshots
+            // another window just persisted. Only scopes changed in THIS host
+            // are applied; scopes deleted here are removed from the file.
+            let fileState: {
+                prefixSnapshots?: Record<string, CachePrefixSnapshot>;
+                conversations?: Record<string, ConversationMessageSnapshot>;
+                toolCatalogs?: Record<string, StableToolCatalogSnapshot>;
+            } = {};
+            try {
+                const raw = fs.readFileSync(filePath, "utf8");
+                if (raw) {
+                    fileState = JSON.parse(raw) as typeof fileState;
+                }
+            } catch {
+                // Fresh or unreadable file — start from an empty state.
+            }
+
+            const prefixSnapshots: Record<string, CachePrefixSnapshot> = { ...(fileState.prefixSnapshots ?? {}) };
             for (const [scope, snapshot] of this.cachePrefixSnapshots) {
-                prefixSnapshots[scope] = snapshot;
+                if (this.dirtyPrefixScopes.has(scope)) {
+                    prefixSnapshots[scope] = snapshot;
+                }
             }
-            const conversations: Record<string, ConversationMessageSnapshot> = {};
+            for (const scope of this.dirtyPrefixScopes) {
+                if (this.cachePrefixSnapshots.get(scope) === undefined) {
+                    delete prefixSnapshots[scope];
+                }
+            }
+
+            const conversations: Record<string, ConversationMessageSnapshot> = { ...(fileState.conversations ?? {}) };
             for (const [scope, snapshot] of this.conversationMessageSnapshots) {
-                conversations[scope] = snapshot;
+                if (this.dirtyConversationScopes.has(scope)) {
+                    conversations[scope] = snapshot;
+                }
             }
-            const toolCatalogs: Record<string, StableToolCatalogSnapshot> = {};
+            for (const scope of this.dirtyConversationScopes) {
+                if (this.conversationMessageSnapshots.get(scope) === undefined) {
+                    delete conversations[scope];
+                }
+            }
+
+            const toolCatalogs: Record<string, StableToolCatalogSnapshot> = { ...(fileState.toolCatalogs ?? {}) };
             for (const [scope, snapshot] of this.stableToolCatalogs) {
-                toolCatalogs[scope] = snapshot;
+                if (this.dirtyToolCatalogScopes.has(scope)) {
+                    toolCatalogs[scope] = snapshot;
+                }
             }
+            for (const scope of this.dirtyToolCatalogScopes) {
+                if (this.stableToolCatalogs.get(scope) === undefined) {
+                    delete toolCatalogs[scope];
+                }
+            }
+
             const payload = JSON.stringify({ prefixSnapshots, conversations, toolCatalogs });
             const tmpPath = filePath + ".tmp";
             fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -1999,7 +2630,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private async persistPrefixSnapshots(): Promise<void> {
-        await this.persistSessionState();
+        await this.persistSessionState(false);
     }
 
     private isOpenAIChatMessage(value: unknown): value is OpenAIChatMessage {
@@ -2035,11 +2666,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             tokenCount: Math.max(0, Math.floor(tokenCount)),
             updatedAt: Date.now(),
         });
+        this.dirtyConversationScopes.add(scope);
     }
 
     private deleteConversationMessageSnapshot(scope: string | undefined): void {
         if (scope) {
             this.conversationMessageSnapshots.delete(scope);
+            // Keep the deletion visible to the shared file: a stale entry here
+            // would be loaded by the next window and misalign its prefix.
+            this.dirtyConversationScopes.add(scope);
         }
     }
 
@@ -2120,7 +2755,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private async persistContinuationState(): Promise<void> {
-        await this.persistSessionState();
+        // End-of-turn flush: write immediately even if the throttle skipped
+        // intermediate prefix snapshots.
+        await this.persistSessionState(true);
     }
 
     protected async processStreamingResponse(
@@ -2202,54 +2839,261 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     /**
+     * Removes reasoning text from assistant message content when the host
+     * already serialized it into the visible text. Serialized ThinkingParts
+     * cross the extension-host boundary as plain objects that are
+     * indistinguishable from text parts, so convertMessages places them into
+     * `content` while injectStoredReasoningContent restores the same text into
+     * `reasoning_content` — keeping both would double the prompt size on
+     * every follow-up tool call.
+     */
+    private stripReasoningDuplicatesFromContent(messages: OpenAIChatMessage[]): OpenAIChatMessage[] {
+        return messages.map(message => {
+            if (
+                message.role !== "assistant"
+                || !message.reasoning_content
+                || typeof message.content !== "string"
+            ) {
+                return message;
+            }
+            const reasoning = message.reasoning_content;
+            const content = message.content;
+            const maxCommon = Math.min(content.length, reasoning.length);
+            let common = 0;
+            while (common < maxCommon && content.charCodeAt(common) === reasoning.charCodeAt(common)) {
+                common += 1;
+            }
+            // Require a substantial prefix match: at least 100 characters, or
+            // the full reasoning when it is shorter. Real answers that merely
+            // start similarly are never touched.
+            const required = Math.min(100, reasoning.length);
+            if (common < required) {
+                return message;
+            }
+            const stripped = content.slice(common);
+            return stripped === content ? message : { ...message, content: stripped };
+        });
+    }
+
+    /**
+     * Restores reasoning_content on assistant tool-call messages that lost it
+     * when the host rewrote the history between turns: a rewritten message is
+     * taken from the source instead of the snapshot, and the per-call-id map
+     * may no longer cover its (possibly regenerated) call ids. The snapshot
+     * holds the reasoning these messages were sent with, so carrying it over
+     * by call id keeps the prompt weight stable across turns instead of
+     * saw-toothing by a few thousand tokens. Unknown call ids never receive
+     * foreign reasoning.
+     */
+    private restoreReasoningFromSnapshot(
+        messages: OpenAIChatMessage[],
+        snapshot: OpenAIChatMessage[]
+    ): OpenAIChatMessage[] {
+        if (!snapshot.length) {
+            return messages;
+        }
+        const snapshotCallIds = new Map<string, string>();
+        for (const message of snapshot) {
+            if (
+                message.role !== "assistant"
+                || typeof message.reasoning_content !== "string"
+                || !message.reasoning_content
+                || !message.tool_calls?.length
+            ) {
+                continue;
+            }
+            for (const call of message.tool_calls) {
+                if (call.id) {
+                    snapshotCallIds.set(call.id, message.reasoning_content);
+                }
+            }
+        }
+        if (!snapshotCallIds.size) {
+            return messages;
+        }
+        return messages.map(message => {
+            if (
+                message.role !== "assistant"
+                || !message.tool_calls?.length
+                || message.reasoning_content
+            ) {
+                return message;
+            }
+            const reasoning = message.tool_calls
+                .map(call => snapshotCallIds.get(call.id))
+                .find((value): value is string => Boolean(value));
+            if (!reasoning) {
+                return message;
+            }
+            return { ...message, reasoning_content: reasoning };
+        });
+    }
+
+    /**
+     * Replaces rewritten tail messages with the snapshot versions the host
+     * already saw. When VS Code rewrites the history between turns (truncated
+     * tool results, regenerated attachments), findSnapshotAlignment moves the
+     * pivot back and the tail would come from the source in its rewritten
+     * form — changing already-sent content, which makes the upstream prompt
+     * weight and the cache prefix jump. Messages identified by call id as
+     * already sent are restored to their snapshot version; genuinely new
+     * messages (unknown call ids) stay as the host provided them.
+     */
+    private stabilizeTailFromSnapshot(
+        tail: OpenAIChatMessage[],
+        snapshotPrefix: OpenAIChatMessage[]
+    ): OpenAIChatMessage[] {
+        const snapshotById = new Map<string, OpenAIChatMessage>();
+        for (const message of snapshotPrefix) {
+            if (message.role === "tool" && message.tool_call_id) {
+                snapshotById.set(message.tool_call_id, message);
+            }
+            for (const call of message.tool_calls ?? []) {
+                if (call.id) {
+                    snapshotById.set(call.id, message);
+                }
+            }
+        }
+        if (!snapshotById.size) {
+            return tail;
+        }
+        return tail.map(message => {
+            if (message.role === "tool" && message.tool_call_id) {
+                return snapshotById.get(message.tool_call_id) ?? message;
+            }
+            if (message.role === "assistant" && message.tool_calls?.length) {
+                const snapshotVersion = snapshotById.get(message.tool_calls[0].id);
+                if (snapshotVersion && message.tool_calls.every(call => snapshotById.has(call.id))) {
+                    return snapshotVersion;
+                }
+            }
+            return message;
+        });
+    }
+
+    /**
      * Find messages in `source` that were added after `snapshot` was taken.
      * Uses the last non-system message of the snapshot as a pivot to locate
      * the cut point in the source.  If the pivot cannot be found the snapshot
      * is considered stale and the entire source is returned.
      */
-    private findNewMessagesAfterSnapshot(
+    /**
+     * Number of trailing snapshot messages that must appear contiguously in
+     * the source before we treat the snapshot as the stable prefix.
+     *
+     * After a VS Code restart the conversation history is rebuilt: early and
+     * middle messages can change (attachments materialize, content becomes
+     * complete), but the trailing messages that were actually sent on the last
+     * request usually survive byte-identical. A single-message pivot breaks on
+     * the first rewritten tail message and we fall back to the full source
+     * (history "inflates" and the upstream cache misses). Requiring a short
+     * contiguous run (a K-gram) keeps the snapshot usable when only a few tail
+     * messages were rewritten.
+     */
+    private static readonly SNAPSHOT_PIVOT_GRAM = 3;
+
+    /** How far back the pivot may move when the host drops its own trailing messages. */
+    private static readonly SNAPSHOT_PIVOT_MAX_REWIND = 24;
+
+    private findSnapshotAlignment(
         source: OpenAIChatMessage[],
         snapshot: OpenAIChatMessage[]
-    ): OpenAIChatMessage[] {
-        // Walk backwards through the snapshot to find a non-system pivot
-        let pivotIdx = snapshot.length - 1;
-        while (pivotIdx >= 0 && snapshot[pivotIdx].role === "system") {
-            pivotIdx--;
+    ): { snapshotPrefix: number; newMessages: OpenAIChatMessage[] } | undefined {
+        // Shared-memory overlays exist only in the provider snapshot. Match the
+        // host-owned projection, but map a successful pivot back to the full
+        // snapshot index so every earlier overlay keeps its exact position.
+        const sourceHost = source
+            .map((message, originalIndex) => ({ message, originalIndex }))
+            .filter(entry => entry.message.providerOverlay === undefined);
+        const snapshotHost = snapshot
+            .map((message, originalIndex) => ({ message, originalIndex }))
+            .filter(entry => entry.message.providerOverlay === undefined);
+
+        // Walk backwards through the host projection to find a non-system pivot tail.
+        let pivotTailEnd = snapshotHost.length;
+        while (pivotTailEnd > 0 && snapshotHost[pivotTailEnd - 1].message.role === "system") {
+            pivotTailEnd--;
         }
-        if (pivotIdx < 0) {
-            return [...source];
+        if (pivotTailEnd === 0) {
+            return undefined;
         }
 
-        const pivot = snapshot[pivotIdx];
-        for (let srcIdx = source.length - 1; srcIdx >= 0; srcIdx--) {
-            if (source[srcIdx].role === pivot.role && this.messagesContentEqual(source[srcIdx], pivot)) {
-                return source.slice(srcIdx + 1);
+        const gram = Math.min(LlamaCppChatModelProvider.SNAPSHOT_PIVOT_GRAM, pivotTailEnd);
+        const sourceKeys = sourceHost.map((entry, index) => conversationMessageKey(entry.message, index));
+        const snapshotKeys = snapshotHost.map((entry, index) => conversationMessageKey(entry.message, index));
+        const sourcePositions = new Map<string, number[]>();
+        sourceKeys.forEach((key, index) => {
+            const positions = sourcePositions.get(key);
+            if (positions) {
+                positions.push(index);
+            } else {
+                sourcePositions.set(key, [index]);
+            }
+        });
+
+        // The host drops trailing messages of its own accord (an interrupted
+        // answer, a trimmed window), so the snapshot tail may no longer exist in
+        // the source. Walk the pivot backwards a bounded distance to find the
+        // deepest still-shared point instead of discarding the whole snapshot.
+        const earliestEnd = Math.max(gram, pivotTailEnd - LlamaCppChatModelProvider.SNAPSHOT_PIVOT_MAX_REWIND);
+        for (let end = pivotTailEnd; end >= earliestEnd; end -= 1) {
+            const gramStart = end - gram;
+            const candidates = sourcePositions.get(snapshotKeys[end - 1]) ?? [];
+            for (let candidate = candidates.length - 1; candidate >= 0; candidate -= 1) {
+                const srcIdx = candidates[candidate] - (gram - 1);
+                if (srcIdx < 0) {
+                    continue;
+                }
+                let matched = true;
+                for (let k = 0; k < gram; k += 1) {
+                    if (sourceKeys[srcIdx + k] !== snapshotKeys[gramStart + k]) {
+                        matched = false;
+                        break;
+                    }
+                }
+                if (matched) {
+                    const snapshotPrefix = snapshotHost[end - 1].originalIndex + 1;
+                    const sourceCut = sourceHost[srcIdx + gram - 1].originalIndex + 1;
+                    return { snapshotPrefix, newMessages: source.slice(sourceCut) };
+                }
             }
         }
 
-        // Snapshot pivot not found in source — snapshot is stale
-        return [...source];
+        return undefined;
     }
 
-    private messagesContentEqual(a: OpenAIChatMessage, b: OpenAIChatMessage): boolean {
-        if (a.role !== b.role) {
-            return false;
+    /** True when the tail re-sends a tool call the snapshot already contains. */
+    private tailRepeatsSnapshotCalls(
+        snapshot: readonly OpenAIChatMessage[],
+        tail: readonly OpenAIChatMessage[]
+    ): boolean {
+        const known = new Set<string>();
+        for (const message of snapshot) {
+            if (message.tool_call_id) {
+                known.add(message.tool_call_id);
+            }
+            for (const call of message.tool_calls ?? []) {
+                known.add(call.id);
+            }
         }
-        const aContent = typeof a.content === "string" ? a.content : JSON.stringify(a.content);
-        const bContent = typeof b.content === "string" ? b.content : JSON.stringify(b.content);
-        return aContent === bContent;
+        return tail.some(message =>
+            (message.tool_call_id !== undefined && known.has(message.tool_call_id))
+            || (message.tool_calls ?? []).some(call => known.has(call.id))
+        );
     }
 
     private compactOpenAiMessages(
         messages: OpenAIChatMessage[],
         tokenBudget: number,
         keepLastCount: number,
-        label: string
+        label: string,
+        maxToolResultChars?: number
     ): OpenAIChatMessage[] {
         return compactMessages(messages, {
             tokenBudget,
             keepLastCount,
             label,
+            maxToolResultChars,
             // Use the same calibrated estimate as the compaction trigger and the
             // context-usage metrics. Without calibration the raw heuristic often
             // stays under the budget while the calibrated count is already over
@@ -2260,6 +3104,91 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
             ),
         });
+    }
+
+    private messageChars(messages: OpenAIChatMessage[]): number {
+        let total = 0;
+        for (const message of messages) {
+            if (typeof message.content === "string") {
+                total += message.content.length;
+            }
+        }
+        return total;
+    }
+
+    /**
+     * Best-effort diagnostics: persists a JSON snapshot of every compaction
+     * (auto-compact and overflow retry) into <globalStorage>/compactions/ so
+     * the summary quality and the retained tail can be inspected afterwards.
+     * Rotation keeps only the newest 20 snapshots. Never throws.
+     */
+    private async saveCompactionSnapshot(input: {
+        requestId: string;
+        cause: string;
+        targetTokens: number;
+        before: { messageCount: number; tokenEstimate: number; chars: number };
+        after: { messageCount: number; tokenEstimate: number; chars: number };
+        messages: OpenAIChatMessage[];
+    }): Promise<void> {
+        try {
+            if (!this.storagePath) {
+                return;
+            }
+            const dir = path.join(this.storagePath, "compactions");
+            await fs.promises.mkdir(dir, { recursive: true });
+            const summary = input.messages.find(
+                message => typeof message.content === "string" && message.content.includes("Conversation summary")
+            );
+            const tail = input.messages.slice(-2).map(message => ({
+                role: message.role,
+                sample: typeof message.content === "string"
+                    ? message.content.slice(0, 300)
+                    : "(non-string content)",
+            }));
+            const truncatedToolResults = input.messages.filter(
+                message =>
+                    typeof message.content === "string"
+                    && message.content.includes("[tool result truncated during compaction")
+            ).length;
+            const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+            const fileName = `compaction-${stamp}-${input.requestId.slice(0, 8)}.json`;
+            await fs.promises.writeFile(
+                path.join(dir, fileName),
+                JSON.stringify(
+                    {
+                        ts: new Date().toISOString(),
+                        requestId: input.requestId,
+                        cause: input.cause,
+                        targetTokens: input.targetTokens,
+                        before: input.before,
+                        after: input.after,
+                        keptMessageCount: input.after.messageCount,
+                        truncatedToolResults,
+                        summarySample: typeof summary?.content === "string"
+                            ? summary.content.slice(0, 400)
+                            : undefined,
+                        tail,
+                    },
+                    null,
+                    2
+                ),
+                "utf8"
+            );
+            // Rotation: keep only the newest 20 snapshots.
+            const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+            const files = entries
+                .filter(entry => entry.isFile() && entry.name.startsWith("compaction-") && entry.name.endsWith(".json"))
+                .map(entry => entry.name)
+                .sort();
+            while (files.length > 20) {
+                const oldest = files.shift();
+                if (oldest) {
+                    await fs.promises.unlink(path.join(dir, oldest)).catch(() => undefined);
+                }
+            }
+        } catch {
+            // Snapshot persistence is best-effort diagnostics; never fail a chat.
+        }
     }
 
     private isContextOverflowError(status: number, text: string): boolean {
@@ -2840,6 +3769,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // cannot evict entries that this conversation's cached prefix depends on.
         const conversationScope = this.cachePrefixScope(requestModelId, options);
         this.setReasoningScope(conversationScope);
+        const isFirstRequestForScope = conversationScope !== undefined
+            ? !this.scopesSeenSinceStartup.has(conversationScope)
+            : false;
+        if (conversationScope) {
+            this.scopesSeenSinceStartup.add(conversationScope);
+        }
         // Large chats hand the provider hundreds of messages per request. The gap
         // since this conversation's last completed response measures how much
         // time VS Code (chat view rendering + request plumbing) adds between
@@ -2887,6 +3822,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             toolResultMode: "user",
             supportsImageInput: imageInputSupported,
         });
+        // Loop detection needs the assistant tool_calls. The "user" inspection
+        // conversion strips them (stripAllToolCalls), so convert a separate
+        // copy in "tool" mode — this matches what the server actually sees.
+        const loopInspectionMessages = convertMessages(processedMessages, {
+            toolResultMode: "tool",
+            supportsImageInput: imageInputSupported,
+        });
 
         let firstOutputAt: number | undefined;
         let emittedParts = 0;
@@ -2901,10 +3843,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             this.getModelListCacheTtlMs()
         );
         const contextLength = this.resolveRuntimeContextLengthForRequest(model, runtimeContextLength, source);
-        const contextUtil = this.clampNumber(cfg.get("contextUtilization", 0.85), 0.5, 0.95, 0.85);
+        const contextUtil = this.clampNumber(cfg.get("contextUtilization", 0.94), 0.5, 0.95, 0.94);
         const hardContextUtil = this.clampNumber(cfg.get("hardContextUtilization", 0.72), 0.4, 0.9, 0.72);
         const keepLastTurns = this.clampInt(cfg.get("compactKeepLastTurns", 12), 2, 64, 12);
-        const hardKeepLastTurns = this.clampInt(cfg.get("hardCompactKeepLastTurns", 6), 1, 32, 6);
         const maxOutputCap = this.getConfiguredMaxOutputTokens();
         const minReplyReserve = this.clampInt(cfg.get("minReplyReserveTokens", 1536), 256, 32768, 1536);
         const replyReservePercent = this.clampNumber(cfg.get("replyReservePercent", 0.07), 0.03, 0.25, 0.07);
@@ -2921,7 +3862,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         );
         const cachePrompt = this.getCachePromptEnabled();
         const maxToolResultChars = this.getMaxToolResultChars();
-        const autoCompact = cfg.get<boolean>("autoCompact", true) !== false;
+        const compactMaxToolResultChars = this.clampInt(
+            cfg.get("compactMaxToolResultChars", 8000),
+            1000,
+            Math.max(1000, maxToolResultChars),
+            8000
+        );
+        const autoCompact = cfg.get<boolean>("autoCompact", false) !== false;
         const accurateTokenCounting = cfg.get<boolean>("accurateTokenCounting", true) !== false;
         const tokenizerTimeoutMs = this.clampInt(cfg.get("tokenizerTimeoutMs", 10000), 1000, 30000, 10000);
         const retryOnOverflow = cfg.get<boolean>("retryOnContextOverflow", true) !== false;
@@ -2933,6 +3880,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             1
         );
         const toolCallOnlyAutoretry = cfg.get<boolean>("toolCallOnlyAutoretry", true) !== false;
+        const toolLoopForceTextThreshold = this.clampInt(
+            cfg.get("toolLoopForceTextThreshold", 12),
+            6,
+            40,
+            12
+        );
         const toolCallOnlyAutoretryThreshold = this.clampInt(
             cfg.get("toolCallOnlyAutoretryThreshold", 3),
             2,
@@ -2944,6 +3897,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const toolCallRepairMaxAttempts = this.clampInt(cfg.get("toolCallRepairMaxAttempts", 1), 0, 2, 1);
         const toolLoopProtection = cfg.get<boolean>("toolLoopProtection", true) !== false;
         const toolLoopDetectionThreshold = this.clampInt(cfg.get("toolLoopDetectionThreshold", 3), 2, 10, 3);
+        const maxModelTurnsPerRequest = this.clampInt(cfg.get("maxModelTurnsPerRequest", 6), 2, 20, 6);
         const configuredContinuationPrompt = String(
             cfg.get(
                 "emptyResponseContinuationPrompt",
@@ -3001,7 +3955,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 contextUtil,
                 hardContextUtil,
                 keepLastTurns,
-                hardKeepLastTurns,
                 maxOutputCap,
                 minReplyReserve,
                 maxTools,
@@ -3012,6 +3965,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 cachePrompt,
                 cacheWriteGraceMs,
                 maxToolResultChars,
+                compactMaxToolResultChars,
                 runtimeContextLength,
                 autoCompact,
                 accurateTokenCounting,
@@ -3026,6 +3980,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 toolCallRepairMaxAttempts,
                 toolLoopProtection,
                 toolLoopDetectionThreshold,
+                maxModelTurnsPerRequest,
                 emptyResponseContinuationPrompt,
                 requestedThinkingMode,
                 thinkingMode,
@@ -3068,37 +4023,124 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             requestId
         );
         const toolLoopDetection = toolLoopProtection
-            ? detectRepeatedToolCallLoop(inspectionMessages, toolLoopDetectionThreshold)
+            ? detectRepeatedToolCallLoop(loopInspectionMessages, toolLoopDetectionThreshold)
             : undefined;
         if (toolLoopDetection) {
             this.log("chat.tools.loop_detected", { requestId, ...toolLoopDetection });
         }
 
+        // Cross-turn tool-call pacing: when tool-call-only turns dominate a
+        // recent window (>=4 of the last 8), the model is silently crawling —
+        // inject a one-shot "pause and summarize" nudge into the next request.
+        const toolCallOnlyNudgeThreshold = Math.max(4, toolCallOnlyAutoretryThreshold);
+        let toolCallOnlyNudgeMessage: string | undefined;
+        if (toolCallOnlyAutoretry && conversationScope) {
+            const recentShapes = this.recentTurnShapesByScope.get(conversationScope) ?? [];
+            if (shouldInjectToolCallOnlyNudge(recentShapes, toolCallOnlyNudgeThreshold)) {
+                toolCallOnlyNudgeMessage =
+                    "You have been making tool calls without a meaningful text response for several turns. " +
+                    "Pause, summarize what you have accomplished so far, and state your next plan clearly before making more tool calls.";
+                this.recentTurnShapesByScope.delete(conversationScope);
+                this.log("chat.response.tool_call_only_nudge_cross_turn", {
+                    requestId,
+                    window: RECENT_TURN_WINDOW,
+                    toolCallOnlyTurns: toolCallOnlyDensity(recentShapes),
+                    threshold: toolCallOnlyNudgeThreshold,
+                });
+            }
+        }
+
         let sharedMemoryContext: SharedMemoryPromptContext | undefined;
         if (sharedMemoryEnabled && sharedMemoryAutoInject && this.sharedMemory) {
             try {
-                sharedMemoryContext = await this.sharedMemory.buildPromptContext(
-                    buildMemoryQuery(inspectionMessages),
-                    sharedMemoryMaxTokens,
-                    {
-                        workspaceId: getCurrentWorkspaceScopeId(),
-                        modelId: requestModelId,
-                    }
+                const frozen = conversationScope
+                    ? this.frozenSharedMemoryByScope.get(conversationScope)
+                    : undefined;
+                const persistedOverlayToolContext = Boolean(
+                    isToolRound
+                    && frozen === undefined
+                    && conversationScope
+                    && this.getConversationMessageSnapshot(conversationScope)?.messages.some(
+                        message => message.providerOverlay === "shared-memory"
+                    )
                 );
+                const reuseFrozenToolContext = isToolRound && frozen !== undefined;
+                if (persistedOverlayToolContext) {
+                    // The exact memory text is already carried by the persisted
+                    // sent-message snapshot. Do not retrieve a possibly changed
+                    // selection in the middle of the resumed agent turn.
+                    sharedMemoryContext = undefined;
+                    if (conversationScope) {
+                        this.frozenSharedMemoryByScope.set(conversationScope, null);
+                    }
+                } else if (reuseFrozenToolContext) {
+                    sharedMemoryContext = frozen ?? undefined;
+                } else {
+                    sharedMemoryContext = await this.sharedMemory.buildPromptContext(
+                        buildMemoryQuery(inspectionMessages),
+                        sharedMemoryMaxTokens,
+                        {
+                            workspaceId: getCurrentWorkspaceScopeId(),
+                            modelId: requestModelId,
+                        }
+                    );
+                    if (conversationScope) {
+                        this.frozenSharedMemoryByScope.set(
+                            conversationScope,
+                            sharedMemoryContext ?? null
+                        );
+                    }
+                }
                 this.log("chat.memory.context", {
                     requestId,
                     enabled: true,
+                    source: persistedOverlayToolContext
+                        ? "persisted-overlay-tool-turn"
+                        : reuseFrozenToolContext
+                            ? "frozen-tool-turn"
+                            : "retrieved-user-turn",
                     entryCount: sharedMemoryContext?.entryCount ?? 0,
                     entryIds: sharedMemoryContext?.entryIds ?? [],
+                    scopeCounts: sharedMemoryContext?.scopeCounts ?? {},
                     estimatedTokens: sharedMemoryContext?.estimatedTokens ?? 0,
                     expiredEntryCount: sharedMemoryContext?.expiredEntryCount ?? 0,
                 });
             } catch (error) {
                 this.logError("chat.memory.context_error", error, { requestId });
             }
+        } else if (conversationScope) {
+            // A later settings change must not revive a block selected before
+            // memory injection was disabled.
+            this.frozenSharedMemoryByScope.delete(conversationScope);
         }
 
+        // Fresh-message detection inside truncateToolResultMessages locates
+        // this turn's query (last plain user message) in the very array it
+        // analyses, so injected system/memory messages or VS Code history
+        // mutations between turns can never shift the boundary.
+        // Set later once the consecutive tool-only count is known; the closure
+        // below reads it when messages are actually converted (per attempt).
+        let forceTextStopMessage: string | undefined;
         const convertForMode = (mode: ToolResultMode): OpenAIChatMessage[] => {
+            // TEMP diagnostics: inspect the raw parts of the last user message
+            // to find why its text sometimes vanishes on the first turn call.
+            if (this.diagUserPartsLoggedRequestId !== requestId) {
+                this.diagUserPartsLoggedRequestId = requestId;
+                const lastUser = [...processedMessages].reverse().find(m => m.role === vscode.LanguageModelChatMessageRole.User);
+                if (lastUser) {
+                    const parts = (lastUser.content ?? []).map((part, i) => {
+                        const p = part as { constructor?: { name?: string }; value?: unknown; text?: unknown };
+                        const ctor = p?.constructor?.name ?? "?";
+                        const value = p?.value !== undefined ? String(p.value) : p?.text !== undefined ? String(p.text) : "";
+                        return { i, ctor, chars: value.length, head: value.slice(0, 80) };
+                    });
+                    this.log("chat.diag.user_parts", {
+                        requestId,
+                        partCount: parts.length,
+                        parts: parts.slice(-6),
+                    });
+                }
+            }
             const converted = convertMessages(processedMessages, {
                 toolResultMode: mode,
                 supportsImageInput: imageInputSupported,
@@ -3110,10 +4152,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             });
             const withReasoning = this.injectStoredReasoningContent(converted);
             const withKnowledge = injectKnowledgeSystemPrompt(withReasoning, knowledgeSystemPrompt);
-            const withMemory = injectSharedMemoryContext(withKnowledge, sharedMemoryContext?.text);
-            const withLoopGuard = injectToolLoopGuard(withMemory, toolLoopDetection);
+            const withLoopGuard = injectToolLoopGuard(withKnowledge, toolLoopDetection);
+            const withToolCallNudge = injectToolCallOnlyNudge(withLoopGuard, toolCallOnlyNudgeMessage);
+            const withForceTextStop = injectToolCallOnlyNudge(withToolCallNudge, forceTextStopMessage);
             return this.truncateToolResultMessages(
-                withLoopGuard,
+                withForceTextStop,
                 maxToolResultChars,
                 requestId
             );
@@ -3122,15 +4165,41 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const initialToolResultMode: ToolResultMode = toolResultModeConfig === "user" ? "user" : "tool";
         let activeToolResultMode: ToolResultMode = initialToolResultMode;
 
+        // Host-driven agent loops run one request per tool call, so per-request
+        // guards (maxModelTurnsPerRequest) never see them. When a conversation
+        // has made only tool calls for N consecutive turns, send the next
+        // request WITHOUT tools: the model is forced to answer in text, which
+        // breaks the loop.
+        const consecutiveToolOnlyTurns = conversationScope
+            ? this.consecutiveToolOnlyTurnsByScope.get(conversationScope) ?? 0
+            : 0;
+        const forceTextTurn = toolCallOnlyAutoretry
+            && conversationScope !== undefined
+            && consecutiveToolOnlyTurns >= toolLoopForceTextThreshold;
+        if (forceTextTurn) {
+            forceTextStopMessage =
+                `Tool loop guard: the last ${consecutiveToolOnlyTurns} turns made tool calls without a text answer. ` +
+                "Tools are disabled for this turn — respond in text now: summarize what has been done " +
+                "and state what you will do next. Do not attempt to call tools.";
+            this.log("chat.response.tool_force_text", {
+                requestId,
+                consecutiveToolOnlyTurns,
+                threshold: toolLoopForceTextThreshold,
+            });
+        }
+
         // apiDirect mode already caps tools inside convertTools via apiDirectMaxTools.
         // Classic mode applies the request-level maxToolsPerRequest cap here.
         const cappedToolConfig: ReturnType<typeof convertTools> = {
             ...toolConfig,
-            tools: toolCallingModeConfig === "apiDirect"
-                ? toolConfig.tools
-                : Array.isArray(toolConfig.tools) && maxTools > 0
-                    ? toolConfig.tools.slice(0, maxTools)
-                    : toolConfig.tools,
+            tools: forceTextTurn
+                ? []
+                : toolCallingModeConfig === "apiDirect"
+                    ? toolConfig.tools
+                    : Array.isArray(toolConfig.tools) && maxTools > 0
+                        ? toolConfig.tools.slice(0, maxTools)
+                        : toolConfig.tools,
+            tool_choice: forceTextTurn ? undefined : toolConfig.tool_choice,
         };
 
         if (
@@ -3154,7 +4223,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             modelMaxOutputTokens: model.maxOutputTokens,
             hardCap: maxOutputCap,
             localDefault: this.clampInt(cfg.get("localDefaultMaxOutputTokens", 32768), 1024, 131072, 32768),
-            deepSeekDefault: this.clampInt(cfg.get("deepSeekDefaultMaxOutputTokens", 131072), 1024, 393216, 131072),
+            deepSeekDefault: this.clampInt(cfg.get("deepSeekDefaultMaxOutputTokens", 70000), 1024, 393216, 70000),
             deepSeekMaximum: DEEPSEEK_MAX_OUTPUT_TOKENS,
         });
         const { defaultMaxTokens: defaultMaxOutputTokens, requestedMaxTokens } = outputBudget;
@@ -3241,6 +4310,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 if (retryState.timeoutHandle) {
                     clearTimeout(retryState.timeoutHandle);
                 }
+                cancellationSubscription.dispose();
                 reject(new vscode.CancellationError());
             });
             retryState.timeoutHandle = setTimeout(() => {
@@ -3351,8 +4421,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             // not when the raw source history is large.
             let effectiveMessages: OpenAIChatMessage[];
             let snapshotStale = false;
+            let snapshotRebuildReason: string | undefined;
             const conversationSnapshot = this.getConversationMessageSnapshot(conversationScope);
             const snapshotMessages = conversationSnapshot?.messages;
+            // After a VS Code restart the conversation id may be regenerated, so
+            // the persisted snapshot is not found and the full source history
+            // would be counted. Skipping the proactive compaction on the very
+            // first request of a scope avoids rewriting a still-valid upstream
+            // cache prefix right after a restart; the overflow path still
+            // protects us if the server actually rejects the request.
             const rebuildOverCompactedMigration = Boolean(
                 conversationSnapshot?.migratedFromPrefix
                 && snapshotMessages
@@ -3362,6 +4439,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             if (rebuildOverCompactedMigration) {
                 this.deleteConversationMessageSnapshot(conversationScope);
                 effectiveMessages = sourceMessages;
+                snapshotRebuildReason = "migrated-from-prefix";
                 this.log("chat.messages.snapshot_migration_rebuild", {
                     requestId,
                     migratedMessages: snapshotMessages?.length ?? 0,
@@ -3370,38 +4448,128 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     softInputTarget,
                 });
             } else if (snapshotMessages && snapshotMessages.length > 0) {
-                const newMessages = this.findNewMessagesAfterSnapshot(sourceMessages, snapshotMessages);
-                // When findNewMessagesAfterSnapshot returns all source messages
-                // (pivot not found), the snapshot is stale — for example a
-                // subagent injected tool messages between turns and reshuffled
+                const alignment = this.findSnapshotAlignment(sourceMessages, snapshotMessages);
+                const reusedSnapshot = alignment
+                    ? snapshotMessages.slice(0, alignment.snapshotPrefix)
+                    : snapshotMessages;
+                const newMessages = alignment?.newMessages ?? sourceMessages;
+                // When no shared pivot exists the snapshot is stale — for example
+                // a subagent injected tool messages between turns and reshuffled
                 // the history.  Discard the snapshot so we avoid double-counting
                 // messages and triggering an unnecessary compaction.
-                if (newMessages.length >= sourceMessages.length) {
+                // Additionally, when the tail repeats tool calls the snapshot
+                // already holds, chaining it would duplicate history — treat the
+                // snapshot as stale and use the raw source instead. A snapshot
+                // that is merely LONGER than the source is not a duplicate: the
+                // host trims its own history window between turns, and dropping
+                // the snapshot for that reason rewrites a still-valid prefix.
+                const effectiveIfChained = reusedSnapshot.length + newMessages.length;
+                const rewrittenHistory = alignment !== undefined
+                    && this.tailRepeatsSnapshotCalls(reusedSnapshot, newMessages);
+                if (rewrittenHistory) {
                     this.log("chat.messages.snapshot_stale", {
                         requestId,
-                        reason: "pivot_not_found_after_subagent_or_injection",
+                        reason: "rewritten_history_would_duplicate",
                         snapshotMessages: snapshotMessages.length,
                         sourceMessages: sourceMessages.length,
+                        newMessages: newMessages.length,
+                        effectiveIfChained,
                     });
+                }
+                if (alignment === undefined || rewrittenHistory) {
                     this.deleteConversationMessageSnapshot(conversationScope);
                     effectiveMessages = sourceMessages;
+                    snapshotRebuildReason = alignment === undefined
+                        ? "alignment-not-found"
+                        : "rewritten-history-would-duplicate";
                     // When the snapshot is stale we cannot trust the heuristic
                     // token count — counting all source messages always
                     // over-estimates.  Defer compaction until the server
                     // actually reports an overflow.
                     snapshotStale = true;
                 } else {
-                    effectiveMessages = [...snapshotMessages, ...newMessages];
+                    if (alignment.snapshotPrefix < snapshotMessages.length) {
+                        this.log("chat.messages.snapshot_rewound", {
+                            requestId,
+                            snapshotMessages: snapshotMessages.length,
+                            reusedSnapshot: reusedSnapshot.length,
+                            newMessages: newMessages.length,
+                            pivotIndex: alignment.snapshotPrefix,
+                            rewoundCount: snapshotMessages.length - alignment.snapshotPrefix,
+                        });
+                    }
+                    effectiveMessages = [
+                        ...reusedSnapshot,
+                        ...this.stabilizeTailFromSnapshot(newMessages, reusedSnapshot),
+                    ];
                 }
             } else {
                 effectiveMessages = sourceMessages;
             }
+
+            // Restore reasoning_content on assistant tool-call messages that the
+            // host rewrote between turns (the per-call-id map may no longer
+            // cover a rewritten call id). The snapshot holds the reasoning they
+            // were sent with, so carrying it over keeps the prompt weight
+            // stable instead of saw-toothing. Runs before stripping so content
+            // duplicates are removed after restoration too.
+            effectiveMessages = this.restoreReasoningFromSnapshot(
+                effectiveMessages,
+                snapshotMessages ?? []
+            );
+            // Reasoning text that the host serialized into assistant content is
+            // stripped here as well: snapshot-reused messages bypass
+            // convertForMode, so without this pass duplicates that predate the
+            // fix would be re-sent and re-persisted forever.
+            effectiveMessages = this.stripReasoningDuplicatesFromContent(effectiveMessages);
+
+            // Shared memory is live request context, not durable conversation
+            // history. Inject it only after snapshot alignment: on tool rounds
+            // its insertion point can be far before the alignment pivot, so an
+            // earlier injection would be silently omitted from newMessages.
+            effectiveMessages = injectAppendOnlySharedMemoryContext(
+                effectiveMessages,
+                sharedMemoryContext
+            );
 
             let preparedMessages = effectiveMessages;
             let counted = await countMessages(preparedMessages);
             let messageTokenCount = counted.tokens;
             const initialMessageCount = sourceMessages.length;
             const initialTokenEstimate = messageTokenCount;
+
+            // Diagnostics for reasoning weight: reasoning_content is restored
+            // per tool-call id and can fluctuate when the host rewrites the
+            // history between turns (re-sent without the field when the map
+            // does not cover a rewritten call id). These counters make that
+            // visible on every request.
+            let reasoningMsgCount = 0;
+            let reasoningChars = 0;
+            let ephemeralMsgCount = 0;
+            let ephemeralChars = 0;
+            let sharedMemoryMsgCount = 0;
+            let sharedMemoryChars = 0;
+            for (const budgetMessage of preparedMessages) {
+                if (budgetMessage.providerOverlay === "shared-memory") {
+                    sharedMemoryMsgCount += 1;
+                    if (typeof budgetMessage.content === "string") {
+                        sharedMemoryChars += budgetMessage.content.length;
+                    }
+                }
+                if (budgetMessage.ephemeral) {
+                    ephemeralMsgCount += 1;
+                    if (typeof budgetMessage.content === "string") {
+                        ephemeralChars += budgetMessage.content.length;
+                    }
+                }
+                if (
+                    typeof budgetMessage.reasoning_content === "string"
+                    && budgetMessage.reasoning_content.length > 0
+                ) {
+                    reasoningMsgCount += 1;
+                    reasoningChars += budgetMessage.reasoning_content.length;
+                }
+            }
 
             this.log("chat.messages.initial", {
                 requestId,
@@ -3410,22 +4578,39 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 promptTokens: counted.promptTokens,
                 messageCount: preparedMessages.length,
                 sourceMessageCount: sourceMessages.length,
+                reasoningMsgCount,
+                reasoningChars,
+                ephemeralMsgCount,
+                ephemeralChars,
+                sharedMemoryMsgCount,
+                sharedMemoryChars,
+                sharedMemoryExpected: Boolean(sharedMemoryContext?.text),
             });
 
             const compactionDecision = selectContextCompaction({
                 messageTokens: messageTokenCount,
-                autoCompact: autoCompact && !snapshotStale,
+                autoCompact: autoCompact && !snapshotStale && !(isFirstRequestForScope && !snapshotMessages?.length),
                 softInputTarget,
-                hardInputTarget,
                 overflowRetry: false,
             });
             if (compactionDecision.kind === "auto") {
                 const compactStartedAt = Date.now();
+                const beforeCompactionCount = preparedMessages.length;
+                const beforeCompactionTokens = messageTokenCount;
+                const beforeCompactionChars = this.messageChars(preparedMessages);
                 preparedMessages = this.compactOpenAiMessages(
                     preparedMessages,
                     compactionDecision.target,
                     keepLastTurns,
-                    "Conversation summary (auto-compact)"
+                    "Conversation summary (auto-compact)",
+                    compactMaxToolResultChars
+                );
+                // Compaction may summarize/drop old provider overlays. Rebuild
+                // the current memory checkpoint inside the already rewritten
+                // message region; compaction is the intentional cache boundary.
+                preparedMessages = injectAppendOnlySharedMemoryContext(
+                    preparedMessages,
+                    sharedMemoryContext
                 );
                 counted = await countMessages(preparedMessages);
                 messageTokenCount = counted.tokens;
@@ -3439,12 +4624,33 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     target: compactionDecision.target,
                     compactDurationMs: Date.now() - compactStartedAt,
                 });
+                void this.saveCompactionSnapshot({
+                    requestId,
+                    cause: "auto-compact",
+                    targetTokens: compactionDecision.target,
+                    before: {
+                        messageCount: beforeCompactionCount,
+                        tokenEstimate: beforeCompactionTokens,
+                        chars: beforeCompactionChars,
+                    },
+                    after: {
+                        messageCount: preparedMessages.length,
+                        tokenEstimate: messageTokenCount,
+                        chars: this.messageChars(preparedMessages),
+                    },
+                    messages: preparedMessages,
+                });
             } else if (snapshotStale) {
                 // Snapshot was stale — rebuild it from the current messages so
                 // the next turn can use incremental counting instead of falling
-                // back to the full source again.
+                // back to the full source again. The full host history becomes
+                // the new prefix immediately: it is sent as-is and the next
+                // turn's stabilization pins it against DeepSeek's cache.
                 this.log("chat.messages.snapshot_rebuilt", {
                     requestId,
+                    reason: snapshotRebuildReason ?? "unknown",
+                    snapshotMessages: snapshotMessages?.length,
+                    sourceMessages: sourceMessages.length,
                     messageCount: preparedMessages.length,
                     tokenEstimate: messageTokenCount,
                 });
@@ -3518,10 +4724,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         .filter(Boolean)
                     : []
             );
-            requestBody.messages = stabilized.messages;
+            requestBody.messages = stabilized.messages.map(toWireMessage);
             this.setConversationMessageSnapshot(
                 conversationScope,
-                stabilized.messages,
+                stabilized.messages.filter(message => !message.ephemeral),
                 prepared.finalTokenEstimate
             );
             latestCachePrefix = stabilized.prefix as CachePrefixTelemetry;
@@ -3562,6 +4768,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 messageCountAfterCompact: prepared.finalMessageCount,
                 toolTokens: toolTokenCount,
                 systemTokens: systemTokensEstimate || undefined,
+                promptSegments: this.buildPromptSegments(
+                    stabilized.messages,
+                    toolTokenCount,
+                    prepared.finalTokenEstimate
+                ),
                 replyReserveTokens: replyReserve,
                 cappedTools,
                 autoCompacted: prepared.autoCompacted,
@@ -3637,28 +4848,51 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         messageTokens: prepared.finalTokenEstimate,
                         autoCompact,
                         softInputTarget,
-                        hardInputTarget,
                         overflowRetry: true,
                     });
-                    const hardTarget = overflowCompaction.kind === "hard"
-                        ? overflowCompaction.target
-                        : hardInputTarget;
+                    // Single compaction scheme: an overflow retry uses the same
+                    // soft target (~60% of the current size) as proactive
+                    // compaction — no separate hard tier.
+                    const overflowTarget = overflowCompaction.kind === "none"
+                        ? Math.max(1, Math.floor(prepared.finalTokenEstimate * COMPACTION_TARGET_RATIO))
+                        : overflowCompaction.target;
                     const compactStartedAt = Date.now();
-                    const overflowMessages = this.compactOpenAiMessages(
+                    let overflowMessages = this.compactOpenAiMessages(
                         prepared.messages,
-                        hardTarget,
-                        hardKeepLastTurns,
-                        "Conversation summary (overflow retry)"
+                        overflowTarget,
+                        keepLastTurns,
+                        "Conversation summary (overflow retry)",
+                        compactMaxToolResultChars
                     );
-                    requestBody.messages = overflowMessages;
+                    overflowMessages = injectAppendOnlySharedMemoryContext(
+                        overflowMessages,
+                        sharedMemoryContext
+                    );
+                    requestBody.messages = overflowMessages.map(toWireMessage);
 
                     const overflowCount = await countMessages(overflowMessages);
                     const overflowMessageTokens = overflowCount.tokens;
                     this.setConversationMessageSnapshot(
                         conversationScope,
-                        overflowMessages,
+                        overflowMessages.filter(message => !message.ephemeral),
                         overflowMessageTokens
                     );
+                    void this.saveCompactionSnapshot({
+                        requestId,
+                        cause: "overflow-retry",
+                        targetTokens: overflowTarget,
+                        before: {
+                            messageCount: prepared.messages.length,
+                            tokenEstimate: prepared.finalTokenEstimate,
+                            chars: this.messageChars(prepared.messages),
+                        },
+                        after: {
+                            messageCount: overflowMessages.length,
+                            tokenEstimate: overflowMessageTokens,
+                            chars: this.messageChars(overflowMessages),
+                        },
+                        messages: overflowMessages,
+                    });
                     const {
                         estimatedUsedTokens: overflowEstimatedUsedTokens,
                         estimatedFreeTokens: overflowEstimatedFreeTokens,
@@ -3675,7 +4909,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                             ...latestContextUsage,
                             messageTokensAfterCompact: overflowMessageTokens,
                             messageCountAfterCompact: overflowMessages.length,
-                            hardInputTarget: hardTarget,
+                            hardInputTarget: overflowTarget,
                             hardCompacted: true,
                             estimatedUsedTokens: overflowEstimatedUsedTokens,
                             estimatedFreeTokens: overflowEstimatedFreeTokens,
@@ -3689,7 +4923,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     this.log("chat.request.overflow_retry", {
                         requestId,
                         attemptNo,
-                        hardTarget,
+                        overflowTarget,
                         compactDurationMs: Date.now() - compactStartedAt,
                         retryMessageCount: Array.isArray(requestBody.messages)
                             ? requestBody.messages.length
@@ -3844,6 +5078,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             let continuationRetryCount = 0;
             let consecutiveToolCallOnlyTurns = 0;
             let toolCallRepairRetryCount = 0;
+            // Reset per-turn counters — they must reflect only THIS turn's
+            // activity, not the accumulated history.
+            this.lastToolExecutionErrorCount = 0;
+            this.lastToolExecutionErrorDetails = [];
             const reliabilityMetrics: ToolCallReliabilityMetrics = {
                 accepted: 0,
                 repaired: 0,
@@ -3921,6 +5159,30 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     },
                 };
 
+                // Hard safety net: never let one request run more than
+                // maxModelTurnsPerRequest model rounds, even when every retry
+                // path (repair, empty-retry, tool-call nudge) keeps continuing.
+                const stopAfterMaxTurns = (): boolean => {
+                    if (modelTurns <= maxModelTurnsPerRequest) {
+                        return false;
+                    }
+                    finalAttempt = attempt;
+                    const stopText = `[agent loop guard] Stopped after ${maxModelTurnsPerRequest} model rounds without a final text answer; see the latest log for details.`;
+                    measuredProgress.report(new vscode.LanguageModelTextPart(stopText));
+                    this.log("chat.response.max_turns_stop", {
+                        requestId,
+                        attemptNo: attempt.attemptNo,
+                        toolResultMode: activeToolResultMode,
+                        maxModelTurnsPerRequest,
+                        modelTurns,
+                        emittedParts,
+                        emittedToolCallParts,
+                        outputChars,
+                        thinkingChars,
+                    });
+                    return true;
+                };
+
                 this.configureToolCallReliability(cappedToolConfig.tools, {
                     repairEnabled: toolCallRepairEnabled,
                     validateSchema: validateToolCallSchema,
@@ -3942,10 +5204,24 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         error instanceof ToolCallValidationError &&
                         toolCallRepairEnabled &&
                         toolCallRepairRetryCount < toolCallRepairMaxAttempts &&
-                        roundOutputChars === 0 &&
                         roundToolCallParts === 0 &&
                         !token.isCancellationRequested;
                     if (!canRetryToolCall) {
+                        if (error instanceof ToolCallValidationError) {
+                            this.log("chat.tools.validation_unrecoverable", {
+                                requestId,
+                                attemptNo: attempt.attemptNo,
+                                kind: error.kind,
+                                toolName: error.toolName,
+                                reason: error.message,
+                                roundOutputChars,
+                                roundToolCallParts,
+                                retryCount: toolCallRepairRetryCount,
+                                retryLimit: toolCallRepairMaxAttempts,
+                                repairEnabled: toolCallRepairEnabled,
+                                cancelled: token.isCancellationRequested,
+                            });
+                        }
                         throw error;
                     }
 
@@ -3961,19 +5237,26 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         kind: error.kind,
                         toolName: error.toolName,
                         reason: error.message,
+                        roundOutputChars,
+                        roundToolCallParts,
                     });
                     sourceMessages = [
                         ...sourceMessages,
                         {
                             role: "user",
+                            ephemeral: true,
                             content: [
                                 "Your previous tool call was rejected before execution.",
                                 `Reason: ${error.message}`,
                                 `Available tools: ${allowedNames || "none"}.`,
-                                "Retry once with an exact available tool name and a valid JSON object that follows its schema. Do not repeat the malformed call.",
+                                "Some partial text may already have been streamed; do not repeat it.",
+                                "Retry once with only the corrected tool call: use an exact available tool name and a valid JSON object that follows its schema. Do not repeat the malformed call.",
                             ].join("\n"),
                         },
                     ];
+                    if (stopAfterMaxTurns()) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -4006,9 +5289,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         ...sourceMessages,
                         {
                             role: "user",
+                            ephemeral: true,
                             content: emptyResponseContinuationPrompt,
                         },
                     ];
+                    if (stopAfterMaxTurns()) {
+                        break;
+                    }
                     continue;
                 }
 
@@ -4058,11 +5345,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                             ...sourceMessages,
                             {
                                 role: "user",
+                                ephemeral: true,
                                 content:
                                     "You have been making tool calls without any text response for several turns. " +
                                     "Please pause, summarize what you have accomplished so far, and state your next plan clearly before making more tool calls.",
                             },
                         ];
+                        if (stopAfterMaxTurns()) {
+                            break;
+                        }
                         continue;
                     }
                 } else {
@@ -4102,14 +5393,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     const toolTokens = latestContextUsage?.toolTokens ?? 0;
                     const serverMessageTokens = Math.max(1, reportedUsage.prompt_tokens - toolTokens);
                     const ratio = serverMessageTokens / Math.max(1, messageTokens);
-                    const clamped = Math.max(0.2, Math.min(3.0, ratio));
                     const previousFactor = this.heuristicCalibration;
-                    this.heuristicCalibration = previousFactor * 0.7 + clamped * 0.3;
+                    const observedFactorTarget = Math.max(0.2, Math.min(3.0, previousFactor * ratio));
+                    this.heuristicCalibration = updateHeuristicCalibration(previousFactor, ratio);
                     this.log("chat.heuristic.calibrate", {
                         requestId,
                         previousFactor: +previousFactor.toFixed(3),
                         newFactor: +this.heuristicCalibration.toFixed(3),
                         ratio: +ratio.toFixed(3),
+                        observedFactorTarget: +observedFactorTarget.toFixed(3),
                         serverTokens: reportedUsage.prompt_tokens,
                         messageEstimate: messageTokens,
                     });
@@ -4131,6 +5423,25 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             if (conversationScope) {
                 this.lastTurnCompactedByScope.set(conversationScope, latestAutoCompacted);
             }
+            if (conversationScope) {
+                // Record this turn's shape for the cross-turn tool-call pacing
+                // guard (tool-call-only turn = tool calls, no visible text).
+                const turnShape: RecentTurnShape =
+                    outputChars === 0 && emittedToolCallParts > 0 ? "toolOnly" : "text";
+                const priorShapes = this.recentTurnShapesByScope.get(conversationScope) ?? [];
+                this.recentTurnShapesByScope.set(
+                    conversationScope,
+                    recordRecentTurnShape(priorShapes, turnShape)
+                );
+                const consecutive = this.consecutiveToolOnlyTurnsByScope.get(conversationScope) ?? 0;
+                this.consecutiveToolOnlyTurnsByScope.set(
+                    conversationScope,
+                    turnShape === "toolOnly" ? consecutive + 1 : 0
+                );
+            }
+            const previousCacheBackend = conversationScope
+                ? this.lastCacheBackendByScope.get(conversationScope)
+                : undefined;
             const cacheDiagnostics = usageSource === "server"
                 ? buildCacheDiagnostics({
                     provider: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
@@ -4140,8 +5451,28 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     prefix: latestCachePrefix,
                     autoCompacted: latestAutoCompacted,
                     previousTurnCompacted,
+                    firstRequestSinceStartup: isFirstRequestForScope,
+                    backend: {
+                        currentVia: latestBackendVia,
+                        previousVia: previousCacheBackend?.via,
+                        currentCfPop: latestBackendCfPop,
+                        previousCfPop: previousCacheBackend?.cfPop,
+                        // Accumulated usage from an internal retry/continuation is
+                        // not comparable with a single previous request.
+                        previousPromptTokens: modelTurns === 1
+                            ? previousCacheBackend?.promptTokens
+                            : undefined,
+                    },
                 })
                 : undefined;
+
+            if (conversationScope && usageSource === "server") {
+                this.lastCacheBackendByScope.set(conversationScope, {
+                    via: latestBackendVia,
+                    cfPop: latestBackendCfPop,
+                    promptTokens: modelTurns === 1 ? reportedUsage.prompt_tokens : undefined,
+                });
+            }
 
             if (cacheDiagnostics) {
                 this.log("chat.cache.report", cacheDiagnostics);
@@ -4193,6 +5524,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 schemaRejectedToolCalls: reliabilityMetrics.schemaRejected,
                 toolCallRepairRetries: toolCallRepairRetryCount,
                 toolLoopDetected: reliabilityMetrics.loopDetected,
+                toolExecutionErrors: this.lastToolExecutionErrorCount,
+                toolExecutionErrorDetails: this.lastToolExecutionErrorDetails.length > 0
+                    ? this.lastToolExecutionErrorDetails
+                    : undefined,
             };
 
             this.log("chat.turn.complete", {
@@ -4324,9 +5659,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             try {
                 const config = this.getConfig();
                 const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
-                const endpoint = isDeepSeekEndpoint(serverUrl)
-                    ? `${serverUrl}/user/balance`
-                    : `${serverUrl}/user/balance`;
+                const endpoint = `${serverUrl}/user/balance`;
                 const response = await this.httpTransport.request(endpoint, {
                     method: "GET",
                     headers: {

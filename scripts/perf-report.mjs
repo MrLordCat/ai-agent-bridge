@@ -27,7 +27,7 @@ function parseArgs(argv) {
   let i = 0;
   while (i < argv.length) {
     const a = argv[i];
-    if (a === "--chat") args.chat = argv[++i] || "";
+    if (a === "--chat") {args.chat = argv[++i] || "";}
     else if (a === "--since") {
       const v = argv[++i] || "";
       args.since = v.includes("T") || v.includes("-") ? Date.parse(v) : (() => {
@@ -36,21 +36,21 @@ function parseArgs(argv) {
         d.setHours(h, m || 0, 0, 0);
         return d.getTime();
       })();
-    } else if (a === "--last") args.last = Number(argv[++i]) || Infinity;
-    else if (a === "--json") args.json = true;
-    else if (!a.startsWith("-")) args.dir = a;
+    } else if (a === "--last") {args.last = Number(argv[++i]) || Infinity;}
+    else if (a === "--json") {args.json = true;}
+    else if (!a.startsWith("-")) {args.dir = a;}
     i++;
   }
   return args;
 }
 
 function median(values) {
-  if (!values.length) return undefined;
+  if (!values.length) {return undefined;}
   const s = [...values].sort((a, b) => a - b);
   return s[Math.floor(s.length / 2)];
 }
 function pct(values, p) {
-  if (!values.length) return undefined;
+  if (!values.length) {return undefined;}
   const s = [...values].sort((a, b) => a - b);
   return s[Math.min(s.length - 1, Math.floor((p / 100) * s.length))];
 }
@@ -139,7 +139,7 @@ async function main() {
         const lb = b2.turns.at(-1)?.ts ?? "";
         return la.localeCompare(lb);
       }).at(-1);
-      if (chat) chat.compactions++;
+      if (chat) {chat.compactions++;}
     }
   }
 
@@ -151,8 +151,8 @@ async function main() {
     return ta.localeCompare(tb);
   })) {
     let turns = chat.turns.filter((t) => !cutoff || Date.parse(t.ts) >= cutoff);
-    if (args.chat && !key.startsWith(args.chat)) continue;
-    if (!turns.length) continue;
+    if (args.chat && !key.startsWith(args.chat)) {continue;}
+    if (!turns.length) {continue;}
     turns = turns.slice(-args.last);
     const gaps = turns.map((t) => t.gap).filter((v) => typeof v === "number");
     const durs = turns.map((t) => t.dur).filter((v) => typeof v === "number");

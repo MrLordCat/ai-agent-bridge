@@ -7,7 +7,7 @@ import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_CONTINUATION_TTL_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
 import { setSubagentModelProfiles } from "../subagent-guidance";
-import { formatShortResetTime } from "../utils";
+import { asRecord, formatShortResetTime, normalizeCopilotTurnIndex, truncate } from "../utils";
 import { CodexAppServerClient, CodexAppServerError, type CodexServerRequest } from "./app-server-client";
 import {
 	buildCodexDynamicTools,
@@ -424,14 +424,6 @@ export function canResumeCodexToolTurn(
 		&& stored.processGeneration === current.processGeneration;
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-	return value && typeof value === "object" ? value as Record<string, unknown> : {};
-}
-
-function truncate(value: string, maxLength = 1200): string {
-	return value.length <= maxLength ? value : `${value.slice(0, maxLength)}...`;
-}
-
 export function mapCodexTokenUsageMetrics(
 	modelId: string,
 	usage: CodexThreadTokenUsage,
@@ -537,11 +529,6 @@ export function mergeCodexTurnSteps(
 	return [...merged.values()]
 		.sort((left, right) => Date.parse(left.startedAt) - Date.parse(right.startedAt))
 		.map((step, index) => ({ ...step, index: index + 1 }));
-}
-
-function normalizeCopilotTurnIndex(value: unknown): number | undefined {
-	const numeric = typeof value === "number" ? value : Number.NaN;
-	return Number.isSafeInteger(numeric) && numeric >= 0 ? numeric : undefined;
 }
 
 export class CodexChatModelProvider implements vscode.LanguageModelChatProvider, vscode.Disposable {
@@ -1399,7 +1386,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					threadId,
 					turnId: failedTurnId,
 					trigger,
-					errorMessage: truncate(error.message),
+					errorMessage: truncate(error.message, 1200),
 				}, "warn");
 				if (interrupt) {
 					try {
