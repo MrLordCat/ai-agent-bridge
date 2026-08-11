@@ -1,5 +1,5 @@
 const SENSITIVE_KEY = /^(?:api[_-]?key|authorization|password|secret|token)$/i;
-const SIGNAL_LINE = /\b(?:error|warning|warn|failed|failure|status|exit(?:\s+code)?|diagnostic|modified|created|deleted)\b|(?:[A-Za-z]:\\|\/[\w.-]+\/)/i;
+const SIGNAL_LINE = /\b(?:error|warning|warn|failed|failure|success|successful|passed|passing|status|exit(?:\s+code)?|diagnostic|modified|created|deleted|compiled|built)\b|(?:[A-Za-z]:\\|\/[\w.-]+\/)/i;
 
 // Detect pure base64 content (image data, binary blobs) that produces
 // meaningless summaries when treated as text.

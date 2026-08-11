@@ -1,10 +1,12 @@
-# Local LLM Chat Provider for VS Code
+# AI Agent Bridge for VS Code
 
-**One native VS Code Chat workflow for local models, DeepSeek, Codex, and Claude.**
+**Bridge local models, DeepSeek, Codex, and Claude into one native VS Code agent workflow.**
 
-**Stable release: 1.9.0.** This release consolidates the 1.8.x provider,
-session-reuse, native-tool, cache/context, and diagnostics hardening into the
-recommended stable baseline.
+**Stable release: 1.11.0. Current local development build: 1.11.15.** The stable
+line includes durable provider sessions, native tools, cache-aware context,
+shared memory, and live diagnostics. Development patches add semantic DeepSeek
+compaction, uninterrupted long-running agent flows, and centralized management
+of multiple API providers.
 
 This extension contributes every enabled source to the normal VS Code model
 picker. The selected model keeps the existing Chat UI, workspace context,
@@ -19,9 +21,9 @@ The `llamacpp.*` setting and command namespace remains for compatibility.
 The project has five concrete goals:
 
 1. **Use one editor workflow for different compute sources.** Move between a
-   local OpenAI-compatible server, DeepSeek API models, a ChatGPT-backed Codex
-   runtime, and Claude Agent SDK sessions without replacing the global Copilot
-   endpoint.
+   local OpenAI-compatible server, multiple independent API gateways/accounts,
+   DeepSeek API models, a ChatGPT-backed Codex runtime, and Claude Agent SDK
+   sessions without replacing the global Copilot endpoint.
 2. **Keep actions visible and controlled by VS Code.** Subscription runtimes do
    not receive a hidden shell or file-edit backdoor. Model actions return as
    native tool calls and use the active VS Code approval policy.
@@ -39,18 +41,22 @@ The project has five concrete goals:
 
 | Capability | What it provides |
 |---|---|
-| Unified model picker | Local, DeepSeek, Codex, and Claude models appear beside other VS Code Chat models. Provider prefixes route requests internally and are never sent upstream. |
+| Unified model picker | Local, custom API, DeepSeek, Codex, and Claude models appear beside other VS Code Chat models. Provider prefixes route requests internally and are never sent upstream. |
+| Central API Provider Manager | A dedicated Quick Access webview can add, edit, enable, disable, and delete multiple OpenAI-compatible endpoints/accounts. Metadata is global; each API key stays in VS Code SecretStorage. |
 | Native agent tools | File, search, terminal, diagnostics, MCP, and other registered tools execute through VS Code tool cards with normal confirmation and cancellation behavior. Availability still depends on the current VS Code/Copilot installation and workspace policy. |
 | Model-specific reasoning controls | Local thinking modes, DeepSeek reasoning, Codex effort levels such as `xhigh`, and Claude thinking profiles are mapped to the selected backend. |
 | Durable subscription sessions | Codex threads and Claude sessions persist in `workspaceState`, can reattach after reload, and can continue in a clean chat when the visible transcript becomes too large. |
-| Cache-aware context handling | Deterministic tool/schema ordering, exact continuation matching, bounded results, and provider-aware compaction reduce prefix churn and oversized cold starts. |
+| Cache-aware context handling | Deterministic tool/schema ordering, exact continuation matching, bounded results, and provider-aware compaction reduce prefix churn and oversized cold starts. Local/DeepSeek HTTP history can compact to 25–90% retained. |
+| Semantic compaction | An opt-in paid `deepseek-v4-flash` pass merges a deterministic turn digest into a structured engineering handoff while preserving objectives, decisions, verification, failed approaches, and exact next work. |
+| Manual recovery compaction | For AI Agent Bridge models, Copilot's native **Compact Conversation** button creates a provider-owned clean snapshot immediately. It summarizes every old turn, removes historical reasoning/repetition poison, and keeps Copilot's native behavior for other providers. |
+| Reasoning loop recovery | Exact multi-kilobyte repetition in streamed private reasoning is stopped, the poisoned chain is rebuilt as a clean provider summary, and one bounded retry continues from the last verified state. |
 | Shared memory | Workspace, project, and global memory can be retrieved by models through explicit native tools and inspected from Quick Access. |
-| Live diagnostics | Provider Health checks connectivity; Session Quality updates during active Codex and Claude turns and shows model/tool steps, provider-specific cache, usage, latency, context, and compaction; Usage Experiments compare matched baseline and delegated tasks. |
-| Guarded Copilot integration | Patch v16 adds controls absent from the stable provider API, preserves an exact backup, validates bundle compatibility, and can restore the original bundle. |
+| Live diagnostics | Provider Health checks connectivity; Session Quality covers Local, DeepSeek, Codex, and Claude turns and shows model/tool steps, provider-specific cache, usage, latency, context, and compaction; Usage Experiments compare matched baseline and delegated tasks. |
+| Guarded Copilot integration | Patch v22 adds controls absent from the stable provider API, routes manual recovery compaction, preserves an exact backup, validates bundle compatibility, and can restore the original bundle. |
 
 ## How Requests Flow
 
-### Local and DeepSeek
+### HTTP API sources (Local, DeepSeek, and custom profiles)
 
 ```text
 VS Code Chat model picker
@@ -109,6 +115,9 @@ current-context value without indicating a context overflow.
 
 - Use a local model for private or high-volume mechanical work, and delegate a
   bounded reasoning task to DeepSeek when its API is configured.
+- Connect OpenAI, OpenRouter, or another compatible gateway as independent API
+   profiles and switch among their discovered models without replacing the
+   built-in local or DeepSeek source.
 - Use Codex with a high reasoning effort for implementation while retaining the
   same VS Code tools and approval cards used by other contributed models.
 - Resume a durable Codex or Claude provider session in a clean chat instead of
@@ -121,51 +130,58 @@ current-context value without indicating a context overflow.
 | Source | Models | Best For |
 |---|---|---|
 | Local OpenAI-compatible server | Whatever the configured server advertises | Private or high-volume work, local vision-capable models, and bounded mechanical tasks. The server must be running. |
+| Custom API profiles | Models returned by each enabled OpenAI-compatible `/models` endpoint | Multiple gateways, vendors, or accounts with independent URLs, credentials, request formats, model families, and context limits. |
 | DeepSeek API | Models returned by the configured DeepSeek endpoint | API-backed reasoning and implementation with explicit key storage and usage tracking. |
 | Codex (ChatGPT account) | Models discovered from the installed Codex app-server | Subscription-backed coding with configurable reasoning effort and native VS Code tools. The catalog can change with account and runtime availability. |
 | Claude (Agent SDK) | Supported Claude subscription profiles | Long-running analysis, implementation, and review through durable Agent SDK sessions. |
 
-All sources appear together in the native picker — `(Local)`, `(DeepSeek)`, `(Codex)`, `(Claude)`.
+All sources appear together in the native picker. Custom entries use the profile
+name you assign; built-in entries retain `(Local)`, `(DeepSeek)`, `(Codex)`, and `(Claude)`.
 Internal prefixes route requests, never sent upstream.
 
 ## Quick Start
 
 1. Install the extension and run `Developer: Reload Window`.
-2. Open `Local LLM: Open Sidebar` and enable only the sources you intend to use.
-3. Configure the source, run `Local LLM: Refresh Models`, then select the model
+2. Open `AI Agent Bridge: Open Sidebar` and enable only the sources you intend to use.
+3. Configure the source, run `AI Agent Bridge: Refresh Models`, then select the model
    from the normal VS Code Chat picker.
 
 **Local:** start an OpenAI-compatible server such as `llama-server`, then set
-its URL with `Local LLM: Set Local Server URL`.
+its URL with `AI Agent Bridge: Set Local Server URL`.
 
-**DeepSeek:** run `Local LLM: Configure DeepSeek`, store the API key in VS Code
+**Custom APIs:** open Quick Access → `API Providers` → `Manage API Providers`,
+add a profile, choose its API format and model family, then refresh models. A
+base URL may already end in `/v1` (for example `https://openrouter.ai/api/v1`).
+
+**DeepSeek:** run `AI Agent Bridge: Configure DeepSeek`, store the API key in VS Code
 SecretStorage, then refresh models.
 
 **Codex:** install the official Codex runtime (the official OpenAI extension can
-provide it), then run `Local LLM: Sign In to Codex Subscription`. API-key auth
+provide it), then run `AI Agent Bridge: Sign In to Codex Subscription`. API-key auth
 does not substitute for the required ChatGPT account mode.
 
 **Claude:** the VSIX includes the supported platform runtime. Sign in, then run
-`Local LLM: Sign In to Claude Subscription`.
+`AI Agent Bridge: Sign In to Claude Subscription`.
 
 ## Important Commands
 
 | Command | Purpose |
 |---|---|
-| `Local LLM: Open Sidebar` | Quick Access with connections, provider context sliders, behavior, memory, diagnostics |
-| `Local LLM: Refresh Models` | Refresh every enabled source |
-| `Local LLM: Configure DeepSeek` | Store DeepSeek API key |
-| `Local LLM: Sign In to Codex Subscription` | Authenticate Codex app-server |
-| `Local LLM: Sign In to Claude Subscription` | Authenticate Claude Code runtime |
-| `Local LLM: Continue Latest Codex Thread in New Chat` | Resume durable Codex thread in clean transcript |
-| `Local LLM: Continue Latest Claude Session in New Chat` | Resume durable Claude session in clean transcript |
-| `Local LLM: Run Provider Health Check` | Probe all sources and runtime features |
-| `Local LLM: Open Session Quality Report` | Live cache, usage segments, model/tool steps, latency, context, compaction, and reliability |
-| `Local LLM: Start Baseline Usage Experiment` | Record the baseline side of a matched usage comparison |
-| `Local LLM: Start Delegated Usage Experiment` | Record the delegated side of a matched usage comparison |
-| `Local LLM: Open Shared Memory` | Inspect/edit durable shared memory |
-| `Local LLM: Apply Copilot Chat Patch` | Enable native Thinking Effort, context budgets, session resume |
-| `Local LLM: Restore Original Copilot Chat` | Restore exact pre-patch bundle backup |
+| `AI Agent Bridge: Open Sidebar` | Quick Access with connections, provider context sliders, behavior, memory, diagnostics |
+| `AI Agent Bridge: Manage API Providers` | Add, edit, enable, disable, or delete OpenAI-compatible API profiles |
+| `AI Agent Bridge: Refresh Models` | Refresh every enabled source |
+| `AI Agent Bridge: Configure DeepSeek` | Store DeepSeek API key |
+| `AI Agent Bridge: Sign In to Codex Subscription` | Authenticate Codex app-server |
+| `AI Agent Bridge: Sign In to Claude Subscription` | Authenticate Claude Code runtime |
+| `AI Agent Bridge: Continue Latest Codex Thread in New Chat` | Resume durable Codex thread in clean transcript |
+| `AI Agent Bridge: Continue Latest Claude Session in New Chat` | Resume durable Claude session in clean transcript |
+| `AI Agent Bridge: Run Provider Health Check` | Probe all sources and runtime features |
+| `AI Agent Bridge: Open Session Quality Report` | Live cache, usage segments, model/tool steps, latency, context, compaction, and reliability |
+| `AI Agent Bridge: Start Baseline Usage Experiment` | Record the baseline side of a matched usage comparison |
+| `AI Agent Bridge: Start Delegated Usage Experiment` | Record the delegated side of a matched usage comparison |
+| `AI Agent Bridge: Open Shared Memory` | Inspect/edit durable shared memory |
+| `AI Agent Bridge: Apply Copilot Chat Patch` | Enable native Thinking Effort, context budgets, session resume |
+| `AI Agent Bridge: Restore Original Copilot Chat` | Restore exact pre-patch bundle backup |
 
 All settings use `llamacpp.*`. Source availability, tool catalogs, and approval
 behavior remain subject to the installed VS Code/Copilot versions, workspace
@@ -173,15 +189,17 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Security and Data Boundaries
 
-- DeepSeek keys are stored in VS Code SecretStorage; logs redact known secrets.
+- DeepSeek and custom API keys are stored in VS Code SecretStorage; profile
+   metadata contains no credentials, saved keys are never displayed by the
+   manager, and logs redact authorization headers.
 - Codex and Claude authentication is owned by their official runtimes. This
    extension asks those runtimes for account status and never reads credential
    files directly.
 - Codex internal action items are denied. Claude tools are restricted to the
    allowlisted native VS Code MCP namespace.
 - Session-quality records contain metrics and identifiers, not prompt or tool
-   result bodies. Live Markdown and JSON reports are written to extension-owned
-   global storage.
+   result bodies. Compaction diagnostics separately keep bounded summary/tail
+   samples for quality audits. Reports are written to extension-owned global storage.
 - The optional Copilot patch changes a versioned installed bundle. It is not a
    Marketplace API, so every update must be revalidated; the command creates a
    backup and `Restore Original Copilot Chat` reverses it.
@@ -198,12 +216,20 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
    needed.
 - Model IDs and service limits are discovered at runtime and should not be
    treated as a permanent catalog promised by the extension.
+- Custom API profiles currently target OpenAI-compatible Bearer-token services
+   with `/models` and streaming `/chat/completions`. Vendor-specific schemes such
+   as Azure `api-key` headers/deployment URLs require a future compatibility profile.
+- DeepSeek semantic summaries are opt-in paid API calls. Deterministic local
+   summarization remains the fallback when disabled or unavailable.
+- A 25% compaction target is intentionally aggressive: fixed system, tool,
+   memory, and reply-reserve costs mean total prompt occupancy remains higher.
 
 ## Documentation
 
 | Document | Contents |
 |---|---|
 | [Architecture](docs/ARCHITECTURE.md) | Runtime boundaries, request flow, invariants |
+| [API Providers](docs/API_PROVIDERS.md) | Multi-endpoint setup, request formats, storage, and compatibility boundaries |
 | [Codex Subscription](docs/CODEX_SUBSCRIPTION.md) | Authentication, app-server flow, security model |
 | [Claude Subscription](docs/CLAUDE_SUBSCRIPTION.md) | Agent SDK sessions, native VS Code tools, cache/context metrics |
 | [Copilot Chat Integration](docs/COPILOT_PATCH.md) | Patch mechanics, auto-update, fail-closed guarantees |
@@ -220,7 +246,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 npm install
 npm run compile
 npm run lint
-npm test              # 283 extension-host tests in the current 1.9.3 dev patch
+npm test              # 380 extension-host tests in the current 1.11.12 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

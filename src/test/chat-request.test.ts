@@ -108,4 +108,27 @@ suite("chat request profiles", () => {
 		assert.ok(!("cache_prompt" in request));
 		assert.ok(!("reasoning_effort" in request));
 	});
+
+	test("builds a clean standard OpenAI-compatible request profile", () => {
+		const request = buildChatCompletionRequest({
+			model: "gpt-5",
+			family: "openai",
+			protocol: "openai",
+			maxTokens: 8192,
+			temperature: 0.7,
+			cachePrompt: true,
+			thinkingMode: "deep",
+			reasoningBudget: 8192,
+			tools,
+			toolChoice: "auto",
+		});
+
+		assert.strictEqual(request.temperature, 0.7);
+		assert.strictEqual(request.tool_choice, "auto");
+		assert.ok(!("cache_prompt" in request));
+		assert.ok(!("chat_template_kwargs" in request));
+		assert.ok(!("thinking_budget_tokens" in request));
+		assert.ok(!("thinking" in request));
+		assert.ok(!("reasoning_effort" in request));
+	});
 });

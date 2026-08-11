@@ -6,6 +6,8 @@ import { isDeepSeekEndpoint } from "../transport/openai-http";
 
 const MODEL_SOURCE_SEPARATOR = "::";
 
+export type ApiRequestProtocol = "openai" | "deepseek" | "llamacpp";
+
 export interface ChatModelSource {
 	key: string;
 	label: string;
@@ -14,6 +16,7 @@ export interface ChatModelSource {
 	familyOverride?: string;
 	contextLengthOverride?: number;
 	contextLengthFallback?: number;
+	protocol?: ApiRequestProtocol;
 }
 
 export interface LlamaCppModelInfo {
@@ -40,6 +43,7 @@ export interface ModelSourceConfiguration {
 	localContextLength: number;
 	deepSeekEnabled: boolean;
 	deepSeekContextLength: number;
+	apiSources?: readonly ChatModelSource[];
 }
 
 export function normalizeServerUrl(serverUrl: string): string {
@@ -66,6 +70,9 @@ export function inferModelFamily(modelId: string): string {
 	const lower = modelId.toLowerCase();
 	if (lower.includes("deepseek")) {
 		return "deepseek";
+	}
+	if (/\b(?:gpt|openai|o[134](?:\b|-))/.test(lower)) {
+		return "openai";
 	}
 	if (lower.includes("qwen")) {
 		return "qwen";
@@ -94,13 +101,17 @@ export function resolveModelFamily(modelId: string, familyOverride: string | und
 export function createModelSources(configuration: ModelSourceConfiguration): ChatModelSource[] {
 	const sources: ChatModelSource[] = [];
 	const seenUrls = new Set<string>();
-	const addSource = (source: ChatModelSource): void => {
+	const seenKeys = new Set<string>();
+	const addSource = (source: ChatModelSource, deduplicateUrl = true): void => {
 		const serverUrl = normalizeServerUrl(source.serverUrl);
 		const urlKey = serverUrl.toLowerCase();
-		if (seenUrls.has(urlKey)) {
+		if (seenKeys.has(source.key) || (deduplicateUrl && seenUrls.has(urlKey))) {
 			return;
 		}
-		seenUrls.add(urlKey);
+		seenKeys.add(source.key);
+		if (deduplicateUrl) {
+			seenUrls.add(urlKey);
+		}
 		sources.push({ ...source, serverUrl });
 	};
 	const primaryIsDeepSeek = isDeepSeekEndpoint(configuration.primaryServerUrl);
@@ -112,6 +123,7 @@ export function createModelSources(configuration: ModelSourceConfiguration): Cha
 		apiKey: primaryIsDeepSeek ? configuration.deepSeekApiKey : configuration.primaryApiKey,
 		familyOverride: primaryIsDeepSeek ? "deepseek" : undefined,
 		contextLengthOverride: primaryIsDeepSeek ? configuration.deepSeekContextLength : undefined,
+		protocol: primaryIsDeepSeek ? "deepseek" : "llamacpp",
 	});
 
 	if (configuration.localEnabled) {
@@ -121,6 +133,7 @@ export function createModelSources(configuration: ModelSourceConfiguration): Cha
 			serverUrl: configuration.localServerUrl,
 			familyOverride: "auto",
 			contextLengthFallback: configuration.localContextLength,
+			protocol: "llamacpp",
 		});
 	}
 
@@ -132,7 +145,14 @@ export function createModelSources(configuration: ModelSourceConfiguration): Cha
 			apiKey: configuration.deepSeekApiKey,
 			familyOverride: "deepseek",
 			contextLengthOverride: configuration.deepSeekContextLength,
+			protocol: "deepseek",
 		});
+	}
+
+	for (const source of configuration.apiSources ?? []) {
+		// API profiles are identity-based rather than URL-based. Two accounts may
+		// intentionally use the same gateway with different credentials/catalogs.
+		addSource(source, false);
 	}
 
 	return sources;

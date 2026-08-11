@@ -112,7 +112,7 @@ codex.chat.thread_reuse_miss events categorize reuse failures without logging
 conversation ids, text, or hashes.
 
 If the native VS Code transcript has already become too large, run
-`Local LLM: Continue Latest Codex Thread in New Chat`. The command arms the
+`AI Agent Bridge: Continue Latest Codex Thread in New Chat`. The command arms the
 newest durable completed Codex thread for 24 hours and opens a clean chat.
 Keep the same Codex model selected and send the next user message there. The
 provider resumes the inner Codex thread but does not serialize the old VS Code
@@ -138,7 +138,7 @@ usage are emitted through the normal language-model response stream.
 
 ## Live Diagnostics
 
-`Local LLM: Open Session Quality Report` updates while a Codex turn is running.
+`AI Agent Bridge: Open Session Quality Report` updates while a Codex turn is running.
 One logical user turn is upserted instead of duplicated across native tool
 result rounds. The report includes:
 
@@ -184,12 +184,12 @@ The provider resolves the executable in this order:
 2. Codex bundled with the official `openai.chatgpt` VS Code extension
 3. `codex` on `PATH`
 
-Use `Local LLM: Sign In to Codex Subscription` for a managed browser OAuth
+Use `AI Agent Bridge: Sign In to Codex Subscription` for a managed browser OAuth
 flow. An existing ChatGPT session created with `codex login` is shared
 automatically. Signing out from the extension also signs out that shared local
 Codex CLI session.
 
-Use `Local LLM: Show Codex Subscription Status` to verify the ChatGPT plan and
+Use `AI Agent Bridge: Show Codex Subscription Status` to verify the ChatGPT plan and
 current Codex rate-limit window. OAuth tokens and the account email are not
 shown or written to extension logs.
 
@@ -225,8 +225,8 @@ turn if an internal action still appears. There is intentionally no opt-out.
 
 ### No Codex models in the picker
 
-Run `Local LLM: Show Codex Subscription Status`. A valid state is
-`Connected (<plan>)`. Then run `Local LLM: Refresh Models`.
+Run `AI Agent Bridge: Show Codex Subscription Status`. A valid state is
+`Connected (<plan>)`. Then run `AI Agent Bridge: Refresh Models`.
 
 If the status says `API auth blocked`, run `codex logout`, then sign in with a
 ChatGPT account through `codex login` or the extension command. This provider
@@ -276,7 +276,7 @@ model window, selected working target, message budget and every reserve, plus
 original/final character counts and omitted or truncated content. Images
 belonging to omitted history messages are not resent.
 
-Patch v16 additionally caps terminal and native tool data before VS Code writes
+Patch v21 additionally caps terminal and native tool data before VS Code writes
 it into its own chat-session snapshots. This prevents future transcript growth;
 it does not shrink sessions that were already persisted. Use the Codex rollover
 command above to leave an existing oversized chat while preserving the latest

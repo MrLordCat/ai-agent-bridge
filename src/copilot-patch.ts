@@ -4,7 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v21";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v22";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v2";
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
@@ -333,7 +333,9 @@ export function patchCopilotBundle(source: string): string {
 	classSource = classSource.replace(
 		methodSignature,
 		`async makeChatRequest2({${signatureMatch[1]}${signatureMatch[2]},modelCapabilities:__llamaModelCapabilities},${signatureMatch[3]}){` +
-			`let __llamaConversationId=__llamaConversationMetadata(${telemetryVariable});`
+			`let __llamaConversationId=__llamaConversationMetadata(${telemetryVariable});` +
+			`globalThis.__llamaLastChatVendor=this.languageModel.vendor;` +
+			`globalThis.__llamaLastConversationId=__llamaConversationId;`
 	);
 
 	classSource = replaceOnce(
@@ -364,6 +366,12 @@ export function patchCopilotBundle(source: string): string {
 		/(function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*)\)\{if\(typeof \2\?\.turnIndex!="string"\|\|!\/\^\\d\+\$\/\.test\(\2\.turnIndex\)\)return;let ([A-Za-z_$][\w$]*)=Number\.parseInt\(\2\.turnIndex,10\);return Number\.isSafeInteger\(\3\)\?\3:void 0\})(function [A-Za-z_$][\w$]*)/,
 		'$1function __llamaConversationMetadata(n){let e=n?.conversationId;return typeof e==="string"&&e.length>0&&e.length<=256?e:void 0}$4',
 		"extension endpoint Copilot conversation identity"
+	);
+	patched = replacePatternOnce(
+		patched,
+		/([A-Za-z_$][\w$]*)\.commands\.registerCommand\("github\.copilot\.chat\.compact",\(\)=>\1\.commands\.executeCommand\("workbench\.action\.chat\.open",\{query:"\/compact",preserveInput:!0\}\)\)/,
+		'$1.commands.registerCommand("github.copilot.chat.compact",()=>globalThis.__llamaLastChatVendor==="llamacpp"&&typeof globalThis.__llamaLastConversationId==="string"?$1.commands.executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId):$1.commands.executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0}))',
+		"provider-owned explicit compaction"
 	);
 	patched = replacePatternOnce(
 		patched,

@@ -1,5 +1,6 @@
 import { toDeepSeekReasoningEffort, type ThinkingMode } from "../reasoning";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
+import type { ApiRequestProtocol } from "../model-sources/source-routing";
 
 export type OpenAIToolChoice = "auto" | {
 	type: "function";
@@ -9,6 +10,7 @@ export type OpenAIToolChoice = "auto" | {
 export interface BuildChatCompletionRequestInput {
 	model: string;
 	family: string;
+	protocol?: ApiRequestProtocol;
 	maxTokens: number;
 	temperature: number;
 	cachePrompt: boolean;
@@ -34,7 +36,10 @@ export type ChatCompletionRequestBody = Record<string, unknown> & {
 export function buildChatCompletionRequest(
 	input: BuildChatCompletionRequestInput
 ): ChatCompletionRequestBody {
-	const isDeepSeek = input.family === "deepseek";
+	const isDeepSeek = input.protocol === "deepseek"
+		|| (input.protocol === undefined && input.family === "deepseek");
+	const isLlamaCpp = input.protocol === "llamacpp"
+		|| (input.protocol === undefined && !isDeepSeek);
 	const isDeepSeekThinkingRequest = isDeepSeek && input.thinkingMode !== "off";
 	const request: ChatCompletionRequestBody = {
 		model: input.model,
@@ -70,7 +75,7 @@ export function buildChatCompletionRequest(
 		if (reasoningEffort) {
 			request.reasoning_effort = reasoningEffort;
 		}
-	} else {
+	} else if (isLlamaCpp) {
 		request.cache_prompt = input.cachePrompt;
 		request.chat_template_kwargs = {
 			enable_thinking: input.thinkingMode !== "off",

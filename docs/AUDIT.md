@@ -78,7 +78,7 @@ documentation, packaging, and release reproducibility.
 
 ## Guarded Copilot Integration
 
-Patch v16 supplies controls not currently exposed by the stable provider API:
+Patch v22 supplies controls not currently exposed by the stable provider API:
 native effort selection, provider output/context handling, stable conversation
 identity, deterministic tool signatures, bounded persisted tool payloads, and
 provider-owned compaction. It validates unique bundle anchors, syntax, and

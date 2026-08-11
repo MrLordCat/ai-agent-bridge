@@ -236,7 +236,7 @@ export class CodexAppServerClient implements vscode.Disposable {
 				{
 					clientInfo: {
 						name: "llama-vscode-chat",
-						title: "Local LLM Chat Provider",
+						title: "AI Agent Bridge",
 						version: this.clientVersion,
 					},
 					capabilities: {

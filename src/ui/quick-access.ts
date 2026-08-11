@@ -2,6 +2,10 @@ import * as vscode from "vscode";
 
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
 import {
+	DEFAULT_COMPACTION_TARGET_RATIO,
+	normalizeCompactionTargetRatio,
+} from "../context/context-budget";
+import {
 	getCopilotPatchStatus,
 	findCopilotBundle,
 } from "../copilot-patch";
@@ -37,6 +41,11 @@ export interface QuickAccessUsageLimit {
 	id: string;
 	label: string;
 	description: string;
+}
+
+export interface QuickAccessApiProviderSummary {
+	total: number;
+	enabled: number;
 }
 
 interface QuickAccessItemOptions {
@@ -341,7 +350,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getCodexUsageLimitReset: () => string | undefined = () => undefined,
 		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
 		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
-		private readonly getMemoryContextTokens: () => number = () => 0
+		private readonly getMemoryContextTokens: () => number = () => 0,
+		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 })
 	) {}
 
 	refresh(): void {
@@ -365,6 +375,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const localServerUrl = String(config.get("localServerUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
 		const localServerEnabled = config.get<boolean>("enableLocalServer", true) !== false;
 		const deepSeekEnabled = config.get<boolean>("enableDeepSeek", true) !== false;
+		const deepSeekCompactionSummary = config.get<boolean>("deepSeekCompactionSummary", false) === true;
+		const compactionTargetRatio = normalizeCompactionTargetRatio(
+			config.get("compactionTargetRatio", DEFAULT_COMPACTION_TARGET_RATIO)
+		);
 		const deepSeekContextLength = Number(config.get("deepSeekContextLength", 258_400)) || 258_400;
 		const deepSeekMaxOutputTokens = Number(config.get("deepSeekDefaultMaxOutputTokens", 70_000)) || 70_000;
 		const codexEnabled = config.get<boolean>("enableCodexSubscription", true) !== false;
@@ -423,6 +437,26 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const subagentProfiles = this.getSubagentProfiles();
 		const tokenUsageHistory = this.getTokenUsageHistory();
 		const usageExperiments = this.getUsageExperiments();
+		const apiProviderSummary = this.getApiProviderSummary();
+
+		const apiProviders = new QuickAccessItem("apiProviders", "API Providers", {
+			description: apiProviderSummary.total > 0
+				? `${apiProviderSummary.enabled}/${apiProviderSummary.total} active`
+				: "Add sources",
+			icon: new vscode.ThemeIcon("server-environment"),
+			tooltip: "Manage multiple OpenAI-compatible API endpoints and credentials. API keys are stored in VS Code SecretStorage.",
+			children: [
+				new QuickAccessItem("apiProviders.manage", "Manage API Providers", {
+					description: apiProviderSummary.total > 0 ? `${apiProviderSummary.total} configured` : "Add, edit or remove",
+					icon: new vscode.ThemeIcon("server-process"),
+					command: command("llamacpp.openApiProviders", "Manage API Providers"),
+				}),
+				new QuickAccessItem("apiProviders.refresh", "Refresh Model Catalogs", {
+					icon: new vscode.ThemeIcon("refresh"),
+					command: command("llamacpp.refreshModels", "Refresh Models"),
+				}),
+			],
+		});
 
 		const local = new QuickAccessItem("local", "Local LLM", {
 			description: localServerEnabled ? formatEndpointLabel(localServerUrl) : "Off",
@@ -476,6 +510,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					tooltip: "Open the DeepSeek sliders to set max output tokens per request. Reasoning counts toward the budget.",
 					icon: new vscode.ThemeIcon("output"),
 					command: command("llamacpp.openContextControl", "Open DeepSeek Max Output Slider"),
+				}),
+				new QuickAccessItem("deepseek.compactionSummary", "AI Compaction Summaries", {
+					description: deepSeekCompactionSummary ? "On (paid)" : "Off",
+					tooltip: "Use deepseek-v4-flash for semantic summaries when local or DeepSeek HTTP history is compacted. Each compaction makes a separate paid API request; failures use the local fallback. Claude and Codex keep their native compaction paths.",
+					icon: toggleIcon(deepSeekCompactionSummary),
+					command: command("llamacpp.toggleDeepSeekCompactionSummary", "Toggle DeepSeek Compaction Summaries"),
 				}),
 				new QuickAccessItem("deepseek.settings", "Connection", {
 					description: formatEndpointLabel(serverUrl),
@@ -798,6 +838,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("symbol-numeric"),
 					command: command("llamacpp.setReasoningBudget", "Set Reasoning Budget"),
 				}),
+				new QuickAccessItem("modelBehavior.compactionTarget", "Compaction Target", {
+					description: `${Math.round(compactionTargetRatio * 100)}% retained`,
+					tooltip: "Share of the current message context retained by proactive and overflow compaction. 25% is extreme compression and works best with DeepSeek AI summaries.",
+					icon: new vscode.ThemeIcon("fold-down"),
+					command: command("llamacpp.setCompactionTargetRatio", "Set Compaction Target"),
+				}),
 				new QuickAccessItem("modelBehavior.toolCalling", "Tool Calling", {
 					description: toolCallingMode,
 					icon: new vscode.ThemeIcon("tools"),
@@ -915,6 +961,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			],
 		});
 
-		return [local, deepSeek, codex, claude, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
+		return [apiProviders, local, deepSeek, codex, claude, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
 	}
 }

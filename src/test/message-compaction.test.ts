@@ -183,7 +183,99 @@ suite("message compaction", () => {
                         m => typeof m.content === "string" && m.content.startsWith("Conversation summary"),
                 );
                 assert.strictEqual(summaryMessage?.role, "user", "summary must use the user role so system+tools stay cached");
+		assert.match(
+			String(summaryMessage?.content),
+			/Built fix in src\/foo\.ts/,
+			"repeated compaction must preserve durable facts from the previous summary"
+		);
         });
+
+	test("excludes provider overlays and ephemeral guards from summaries", () => {
+		const messages: OpenAIChatMessage[] = [
+			{ role: "system", content: "Stable system prompt" },
+			{ role: "user", content: "Implement durable compaction state in src/context/message-compaction.ts" },
+			{
+				role: "user",
+				content: "SHARED MEMORY OVERLAY MUST NOT BE SUMMARIZED",
+				providerOverlay: "shared-memory",
+			},
+			{
+				role: "user",
+				content: "EPHEMERAL LOOP GUARD MUST NOT BE SUMMARIZED",
+				ephemeral: true,
+			},
+		];
+		for (let index = 0; index < 12; index += 1) {
+			messages.push(
+				{ role: "user", content: `follow-up ${index} ${"x".repeat(120)}` },
+				{ role: "assistant", content: `result ${index} ${"y".repeat(120)}` },
+			);
+		}
+
+		const compacted = compactMessages(messages, {
+			tokenBudget: 600,
+			keepLastCount: 2,
+			label: "Conversation summary (auto-compact)",
+			estimateTokens: items => items.reduce(
+				(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+				0
+			),
+		});
+		const summary = String(compacted.find(message =>
+			typeof message.content === "string" && message.content.startsWith("Conversation summary")
+		)?.content);
+		assert.match(summary, /durable compaction state/);
+		assert.doesNotMatch(summary, /SHARED MEMORY OVERLAY/);
+		assert.doesNotMatch(summary, /EPHEMERAL LOOP GUARD/);
+	});
+
+	test("enforces the final token budget even when the newest turn is oversized", () => {
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+			0
+		);
+		const compacted = compactMessages([
+			{ role: "system", content: "stable" },
+			{ role: "user", content: `latest request ${"x".repeat(10_000)}` },
+		], {
+			tokenBudget: 300,
+			keepLastCount: 2,
+			label: "Conversation summary (auto-compact)",
+			estimateTokens,
+		});
+
+		assert.ok(estimateTokens(compacted) <= 300);
+		assert.match(String(compacted.at(-1)?.content), /^latest request/);
+	});
+
+	test("reaches a 25 percent target while preserving a summary and complete recent turn", () => {
+		const messages: OpenAIChatMessage[] = [{ role: "system", content: "stable" }];
+		for (let index = 0; index < 80; index += 1) {
+			messages.push(
+				{ role: "user", content: `request-${index} ${"u".repeat(120)}` },
+				{ role: "assistant", content: `answer-${index} ${"a".repeat(120)}` },
+			);
+		}
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+			0
+		);
+		const tokenBudget = Math.floor(estimateTokens(messages) * 0.25);
+		const compacted = compactMessages(messages, {
+			tokenBudget,
+			keepLastCount: 12,
+			label: "Conversation summary (auto-compact)",
+			summaryContent: "## Objective\nPreserve the durable task.\n## Open work\nContinue.",
+			estimateTokens,
+		});
+
+		assert.ok(estimateTokens(compacted) <= tokenBudget);
+		assert.ok(compacted.some(message =>
+			typeof message.content === "string" && message.content.includes("Preserve the durable task")
+		));
+		assert.strictEqual(compacted.at(-2)?.role, "user");
+		assert.strictEqual(compacted.at(-1)?.role, "assistant");
+	});
 
         test("fills a large target with recent history instead of only the minimum tail", () => {
                 const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
@@ -212,6 +304,106 @@ suite("message compaction", () => {
 			compacted.filter(message => message.role !== "system").length > 60,
 			"expected substantially more than the fixed 12-message minimum"
 		);
+	});
+
+	test("fills the target inside an oversized user turn without orphaning tool results", () => {
+		const messages: OpenAIChatMessage[] = [
+			{ role: "system", content: "Stable system prompt" },
+			{ role: "user", content: "Implement a large feature" },
+		];
+		for (let index = 0; index < 48; index += 1) {
+			messages.push(
+				{
+					role: "assistant",
+					content: `step-${index} ${"a".repeat(280)}`,
+					tool_calls: [{
+						id: `call-${index}`,
+						type: "function",
+						function: { name: "read_file", arguments: "{}" },
+					}],
+				},
+				{
+					role: "tool",
+					tool_call_id: `call-${index}`,
+					name: "read_file",
+					content: `result-${index} ${"r".repeat(280)}`,
+				}
+			);
+		}
+		messages.push(
+			{ role: "user", content: "Continue from the latest verified state" },
+			{ role: "assistant", content: "Continuing" }
+		);
+
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum
+				+ (typeof message.content === "string" ? message.content.length : 0)
+				+ (message.reasoning_content?.length ?? 0),
+			0
+		);
+		const tokenBudget = Math.floor(estimateTokens(messages) * 0.5);
+		const compacted = compactMessages(messages, {
+			tokenBudget,
+			keepLastCount: 18,
+			label: "Conversation summary (auto-compact)",
+			summaryContent: "## Objective\nKeep the feature implementation moving.",
+			estimateTokens,
+		});
+
+		const used = estimateTokens(compacted);
+		assert.ok(used <= tokenBudget, `expected ${used} to fit within ${tokenBudget}`);
+		assert.ok(used >= tokenBudget * 0.8, `expected transaction splitting to fill the target, got ${used}`);
+
+		const retainedCallIds = new Set<string>();
+		for (const message of compacted) {
+			for (const call of message.tool_calls ?? []) {
+				retainedCallIds.add(call.id);
+			}
+			if (message.role === "tool") {
+				assert.ok(
+					message.tool_call_id && retainedCallIds.has(message.tool_call_id),
+					`orphaned tool result ${message.tool_call_id ?? "unknown"}`
+				);
+			}
+		}
+		assert.ok(compacted.some(message => message.role === "tool"), "expected recent tool transactions to survive");
+	});
+
+	test("manual recovery summarizes every old turn and keeps only the control turn raw", () => {
+		const brokenReasoning = "(А: ".repeat(5_000);
+		const messages: OpenAIChatMessage[] = [
+			{ role: "system", content: "Stable system prompt" },
+			{ role: "user", content: "Implement the feature" },
+			{
+				role: "assistant",
+				reasoning_content: brokenReasoning,
+				tool_calls: [{
+					id: "call-1",
+					type: "function",
+					function: { name: "read_file", arguments: "{}" },
+				}],
+			},
+			{ role: "tool", tool_call_id: "call-1", name: "read_file", content: "result" },
+			{ role: "user", content: "AI Agent Bridge: force provider context compaction now." },
+		];
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum
+				+ (typeof message.content === "string" ? message.content.length : 0)
+				+ (message.reasoning_content?.length ?? 0),
+			0
+		);
+		const compacted = compactMessages(messages, {
+			tokenBudget: estimateTokens(messages) + 1_000,
+			keepLastCount: 12,
+			label: "Conversation summary (manual compact)",
+			estimateTokens,
+			forceKeepLastTurnOnly: true,
+		});
+
+		assert.deepStrictEqual(compacted.map(message => message.role), ["system", "user", "user"]);
+		assert.match(String(compacted[1].content), /Conversation summary \(manual compact\)/);
+		assert.strictEqual(compacted.at(-1)?.content, "AI Agent Bridge: force provider context compaction now.");
+		assert.ok(!compacted.some(message => message.reasoning_content?.includes("(А:")));
 	});
 
 	test("keeps many turns when early tool results are huge (skewed token distribution)", () => {

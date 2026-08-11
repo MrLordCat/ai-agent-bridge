@@ -40,10 +40,45 @@ suite("quick access", () => {
 
 		assert.deepStrictEqual(
 			root.map(labelOf),
-			["Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
+			["API Providers", "Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
 		);
 		assert.ok(root.every(item => item.collapsibleState === vscode.TreeItemCollapsibleState.Collapsed));
 		assert.ok(root.every(item => item.id?.startsWith("llamacpp.quickAccess.")));
+	});
+
+	test("opens centralized API provider management from Quick Access", async () => {
+		const provider = new LlamaQuickActionsProvider(
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => emptyTokenUsageHistorySummary(),
+			() => emptyUsageExperimentSummary(),
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => ({ total: 3, enabled: 2 })
+		);
+		const apiProviders = (await getItems(provider)).find(item => labelOf(item) === "API Providers");
+		assert.strictEqual(apiProviders?.description, "2/3 active");
+		const manage = (await getItems(provider, apiProviders)).find(item => labelOf(item) === "Manage API Providers");
+		assert.strictEqual(manage?.command?.command, "llamacpp.openApiProviders");
 	});
 
 	test("keeps detailed diagnostics inside the collapsed group", async () => {
@@ -85,6 +120,10 @@ suite("quick access", () => {
 		const knowledge = children.find(item => labelOf(item) === "Knowledge Verification");
 		assert.ok(knowledge);
 		assert.strictEqual(knowledge.command?.command, "llamacpp.setKnowledgeMode");
+		const compactionTarget = children.find(item => labelOf(item) === "Compaction Target");
+		assert.ok(compactionTarget);
+		assert.strictEqual(compactionTarget.description, "75% retained");
+		assert.strictEqual(compactionTarget.command?.command, "llamacpp.setCompactionTargetRatio");
 	});
 
 	test("shows expired memory separately with estimated context tokens", async () => {
@@ -166,6 +205,9 @@ suite("quick access", () => {
 		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.openContextControl");
 		assert.strictEqual(deepSeekOutput?.description, "70.0K");
 		assert.strictEqual(deepSeekOutput?.command?.command, "llamacpp.openContextControl");
+		const semanticCompaction = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "AI Compaction Summaries");
+		assert.strictEqual(semanticCompaction?.description, "Off");
+		assert.strictEqual(semanticCompaction?.command?.command, "llamacpp.toggleDeepSeekCompactionSummary");
 		assert.strictEqual(claudeLimit?.description, "258.4K target / 1M max");
 		assert.strictEqual(claudeLimit?.command?.command, "llamacpp.openContextControl");
 		const codexTarget = (await getItems(provider, codex)).find(item => labelOf(item) === "Working Context");

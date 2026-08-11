@@ -13,6 +13,7 @@ suite("model source routing", () => {
 		assert.deepStrictEqual(parseProviderModelId(id), { sourceKey: "local", modelId: "Qwen3-Coder.gguf" });
 		assert.strictEqual(resolveModelFamily("Qwen3-Coder.gguf", "auto", "llama"), "qwen");
 		assert.strictEqual(resolveModelFamily("anything", "deepseek", "auto"), "deepseek");
+		assert.strictEqual(resolveModelFamily("gpt-5", "auto", "llama"), "openai");
 	});
 
 	test("keeps local and DeepSeek sources available without duplicate endpoints", () => {
@@ -31,6 +32,7 @@ suite("model source routing", () => {
 		assert.strictEqual(sources[1].serverUrl, "http://localhost:8000");
 		assert.strictEqual(sources[1].contextLengthFallback, 131072);
 		assert.strictEqual(sources[2].contextLengthOverride, 258400);
+		assert.strictEqual(sources[2].protocol, "deepseek");
 	});
 
 	test("does not advertise one URL twice", () => {
@@ -45,5 +47,38 @@ suite("model source routing", () => {
 
 		assert.strictEqual(sources.length, 1);
 		assert.strictEqual(sources[0].key, "primary");
+	});
+
+	test("keeps multiple API profiles on one endpoint isolated by source key", () => {
+		const sources = createModelSources({
+			primaryServerUrl: "http://localhost:8000",
+			localEnabled: false,
+			localServerUrl: "http://localhost:8000",
+			localContextLength: 65536,
+			deepSeekEnabled: false,
+			deepSeekContextLength: 258400,
+			apiSources: [
+				{
+					key: "api-account-a",
+					label: "Account A",
+					serverUrl: "https://openrouter.ai/api/v1/",
+					apiKey: "a",
+					protocol: "openai",
+				},
+				{
+					key: "api-account-b",
+					label: "Account B",
+					serverUrl: "https://openrouter.ai/api/v1",
+					apiKey: "b",
+					protocol: "openai",
+				},
+			],
+		});
+
+		assert.deepStrictEqual(
+			sources.map(source => source.key),
+			["primary", "api-account-a", "api-account-b"]
+		);
+		assert.strictEqual(sources[2].serverUrl, "https://openrouter.ai/api/v1");
 	});
 });

@@ -68,6 +68,14 @@ function collectTurnErrors(records: readonly SessionTurnRecord[] | undefined): A
 		if (turn.toolLoopDetected) {
 			push(turnIndex, turn, "tool_loop", "tool call loop detected — repeated identical calls were stopped");
 		}
+		if (turn.reasoningLoopDetected) {
+			push(
+				turnIndex,
+				turn,
+				"reasoning_loop",
+				`reasoning repetition loop detected — stream stopped${turn.reasoningLoopRetries ? ` and retried ${turn.reasoningLoopRetries} time(s) from a clean summary` : ""}`
+			);
+		}
 		if (typeof turn.toolExecutionErrors === "number" && turn.toolExecutionErrors > 0) {
 			const callLines = Array.isArray(turn.toolExecutionErrorDetails) && turn.toolExecutionErrorDetails.length > 0
 				? turn.toolExecutionErrorDetails.map(d => {
@@ -411,7 +419,7 @@ tr.turn-row.open { border-bottom-color: transparent; }
 .gap-hist-count { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
 .gap-hist-label { color: var(--dim); font-size: 9px; letter-spacing: .03em; white-space: nowrap; }
 .spark { display: flex; align-items: flex-end; gap: 2px; min-height: 52px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 7px; background: var(--surface); overflow-x: auto; }
-.spark-bar { width: 10px; flex: 0 0 auto; border-radius: 2px 2px 0 0; min-height: 3px; }
+.spark-bar { flex: 1 1 0; min-width: 2px; max-width: 26px; border-radius: 2px 2px 0 0; min-height: 3px; }
 .spark-good { background: var(--good); opacity: .8; }
 .spark-warn { background: var(--warn); }
 .spark-bad { background: var(--bad); }
@@ -615,9 +623,6 @@ function render() {
 	const d = DATA;
 	const s = d.summary;
 	let h = "";
-	const missTurns = Math.max(0, s.turnsWithCacheReport - s.cacheHealthyTurns);
-	const startupMissTurns = s.cacheStartupMissTurns ?? 0;
-	const seriousIssues = s.rejectedToolCalls + s.toolLoopsDetected + s.overflowRetries;
 
 	// Header
 	h += '<main class="page">';
@@ -632,7 +637,43 @@ function render() {
 	h += '<button id="tab-btn-health" class="tab-btn" role="tab" aria-selected="false" data-tab="health">Health</button>';
 
 	h += '</nav>';
-	h += '<div id="tab-cache" class="tab-panel" data-panel="cache">';
+	h += '<div id="tab-cache" class="tab-panel" data-panel="cache"></div>';
+	h += '<div id="tab-perf" class="tab-panel" data-panel="perf" hidden></div>';
+	h += '<div id="tab-errors" class="tab-panel" data-panel="errors" hidden></div>';
+	h += '<div id="tab-health" class="tab-panel" data-panel="health" hidden></div>';
+	h += '</main>';
+	document.getElementById("app").innerHTML = h;
+	renderActiveTab();
+	restoreTabState();
+	bindHealthActions();
+}
+
+// Live updates render only the active tab; switching tabs lazily builds the
+// rest from the already-shipped DATA. A single turn can fire many live
+// updates, so this keeps a full DOM rebuild (all four tabs, the whole turns
+// table) off the hot path.
+function renderActiveTab() {
+	const d = DATA;
+	const name = document.querySelector(".tab-btn.active")?.getAttribute("data-tab") || "cache";
+	const panel = document.getElementById("tab-" + name);
+	if (!panel || panel.getAttribute("data-rendered") === "1") {
+		return;
+	}
+	let h = "";
+	if (name === "cache") h = renderCacheTab(d);
+	else if (name === "perf") h = renderPerfTab(d);
+	else if (name === "errors") h = renderErrorsTab(d);
+	else if (name === "health") h = renderHealthTab(d);
+	panel.innerHTML = h;
+	panel.setAttribute("data-rendered", "1");
+}
+
+function renderCacheTab(d) {
+	const s = d.summary;
+	const missTurns = Math.max(0, s.turnsWithCacheReport - s.cacheHealthyTurns);
+	const startupMissTurns = s.cacheStartupMissTurns ?? 0;
+	const seriousIssues = s.rejectedToolCalls + s.toolLoopsDetected + s.overflowRetries;
+	let h = "";
 
 	// Primary health metrics
 	h += '<section class="metric-grid" aria-label="Session summary">';
@@ -784,7 +825,11 @@ function render() {
 			const detailId = "detail-" + detailKey;
 			const cacheIssue = typeof hit === "number" && hit < 90;
 			const critical = Boolean(
-				r.rejectedToolCalls || r.toolLoopDetected || r.retriedAfterOverflow || r.safetyStopReason
+				r.rejectedToolCalls
+				|| r.toolLoopDetected
+				|| r.reasoningLoopDetected
+				|| r.retriedAfterOverflow
+				|| r.safetyStopReason
 			);
 			const reasonIssue = Boolean(r.cacheMissReason && r.cacheMissReason !== "healthy" && r.cacheMissReason !== "cold_start");
 			const issue = critical || cacheIssue || reasonIssue;
@@ -1069,6 +1114,7 @@ function render() {
 				if (IS_STATEFUL(r)) h += '<div class="kv"><span class="k">Processed across segments</span><span class="v">' + FMT(r.promptTokens) + ' input · ' + FMT(r.outputTokens) + ' output</span></div>';
 				if (IS_CLAUDE(r) && c.rawMaxTokens !== undefined) h += '<div class="kv"><span class="k">Provider raw / SDK usable</span><span class="v">' + FMT(c.rawMaxTokens) + ' / ' + FMT(c.usableMaxTokens) + '</span></div>';
 				h += '<div class="kv"><span class="k">Messages</span><span class="v">' + FMT(c.messageTokensAfterCompact) + ' tok (' + c.messageCountAfterCompact + ' msgs) → was ' + FMT(c.messageTokensBeforeCompact) + ' (' + c.messageCountBeforeCompact + ')</span></div>';
+				if (c.compactionTargetTokens !== undefined) h += '<div class="kv"><span class="k">Compaction target / fill / retained</span><span class="v">' + FMT(c.compactionTargetTokens) + ' / ' + FMT(c.compactionTargetFillPercent) + '% / ' + FMT(c.compactionRetainedPercent) + '%</span></div>';
 				h += '<div class="kv"><span class="k">Reply reserve</span><span class="v">' + FMT(c.replyReserveTokens) + ' (' + FMT1((c.replyReserveTokens / c.contextLength) * 100) + '% of ctx)</span></div>';
 				h += '<div class="kv"><span class="k">Tool tokens</span><span class="v">' + FMT(c.toolTokens) + ' (' + c.cappedTools + ' tools)</span></div>';
 				h += '<div class="kv"><span class="k">System / history / output</span><span class="v">' + FMT(c.otherTokens ?? 0) + '</span></div>';
@@ -1111,7 +1157,8 @@ function render() {
 			h += '<div class="kv"><span class="k">Repaired</span><span class="v">' + (r.repairedToolCalls ?? 0) + '</span></div>';
 			h += '<div class="kv"><span class="k">Rejected</span><span class="v">' + (r.rejectedToolCalls ?? 0) + ' (schema: ' + (r.schemaRejectedToolCalls ?? 0) + ')</span></div>';
 			h += '<div class="kv"><span class="k">Repair retries</span><span class="v">' + (r.toolCallRepairRetries ?? 0) + '</span></div>';
-			h += '<div class="kv"><span class="k">Loop detected</span><span class="v">' + (r.toolLoopDetected ? "⚠️ yes" : "no") + '</span></div>';
+			h += '<div class="kv"><span class="k">Tool loop detected</span><span class="v">' + (r.toolLoopDetected ? "⚠️ yes" : "no") + '</span></div>';
+			h += '<div class="kv"><span class="k">Reasoning loop detected</span><span class="v">' + (r.reasoningLoopDetected ? "⚠️ yes" : "no") + (r.reasoningLoopRetries ? ' · retries ' + r.reasoningLoopRetries : '') + '</span></div>';
 			if (r.averageToolDurationMs !== undefined) h += '<div class="kv"><span class="k">Round-trip avg / p95 / max</span><span class="v">' + DURATION(r.averageToolDurationMs) + ' / ' + DURATION(r.p95ToolDurationMs) + ' / ' + DURATION(r.maximumToolDurationMs) + '</span></div>';
 			if (r.toolDurationTotalMs !== undefined) h += '<div class="kv"><span class="k">Tool wait total</span><span class="v">' + DURATION(r.toolDurationTotalMs) + '</span></div>';
 			if (r.toolCallBreakdown && Object.keys(r.toolCallBreakdown).length) {
@@ -1192,23 +1239,7 @@ function render() {
 		h += '<div class="empty">No turns recorded yet. Start a model turn to see live metrics here.</div>';
 	}
 	h += '</div>'; // tab-cache
-
-	h += '<div id="tab-perf" class="tab-panel" data-panel="perf" hidden>';
-	h += renderPerfTab(d);
-	h += '</div>';
-
-	h += '<div id="tab-errors" class="tab-panel" data-panel="errors" hidden>';
-	h += renderErrorsTab(d);
-	h += '</div>';
-
-	h += '<div id="tab-health" class="tab-panel" data-panel="health" hidden>';
-	h += renderHealthTab(d);
-	h += '</div>';
-
-	h += '</main>';
-	document.getElementById("app").innerHTML = h;
-	restoreTabState();
-	bindHealthActions();
+	return h;
 }
 
 const ERROR_KIND_LABEL = {
@@ -1439,9 +1470,10 @@ function renderPerfTab(d) {
 		h += '</div></section>';
 	}
 
-	// Sparkline of recent tool gaps
+	// Sparkline of recent tool gaps. Bars stretch to fill the track (dynamic
+	// count: a few pauses fill the full row, many pauses stay narrow).
 	if (gaps.length > 1) {
-		const recent = gaps.slice(-40);
+		const recent = gaps.slice(-80);
 		const maxGap = Math.max(...recent, 1);
 		h += '<section class="section"><div class="section-heading"><h2>Recent gaps</h2><span class="section-note">last ' + recent.length + ' tool-round pauses — each bar is one pause</span></div><div class="spark">';
 		for (const g of recent) {
@@ -1504,6 +1536,8 @@ function switchTab(name) {
 	document.querySelectorAll(".tab-panel").forEach(p => {
 		p.hidden = p.getAttribute("data-panel") !== name;
 	});
+	renderActiveTab();
+	if (name === "cache") applyTurnFilters();
 	if (name === "perf") applyPerfFilters();
 	if (name === "errors") applyErrorFilters();
 	if (name === "health") bindHealthActions();
@@ -1748,9 +1782,9 @@ function restoreViewState(state) {
 	}
 	applyTurnFilters();
 	applyErrorFilters();
+	restoreTabState(state);
 	restoreOpenRows(state.openRows);
 	restoreOpenStructureDetails(state.openStructureDetails || new Set());
-	restoreTabState(state);
 	restoreOpenTurnAnchor(state.turnAnchor);
 }
 
@@ -1822,6 +1856,7 @@ function formatTurnText(r) {
 		lines.push("── Context ──");
 		lines.push("Budget: " + fmt(c.contextLength) + " total / " + fmt(c.inputBudget) + " usable");
 		lines.push("Messages: " + fmt(c.messageTokensAfterCompact) + " tok (" + fmt(c.messageCountAfterCompact) + " msgs) ← was " + fmt(c.messageTokensBeforeCompact) + " (" + fmt(c.messageCountBeforeCompact) + ")");
+		if (c.compactionTargetTokens !== undefined) lines.push("Compaction target/fill/retained: " + fmt(c.compactionTargetTokens) + " / " + fmt(c.compactionTargetFillPercent) + "% / " + fmt(c.compactionRetainedPercent) + "%");
 		lines.push("Reply reserve: " + fmt(c.replyReserveTokens) + " (" + (c.replyReserveTokens / c.contextLength * 100).toFixed(1) + "%)");
 		lines.push("Tool tokens: " + fmt(c.toolTokens) + " (" + fmt(c.cappedTools) + " tools)");
 		lines.push("System/history/output: " + fmt(c.otherTokens));
@@ -1845,7 +1880,12 @@ function formatTurnText(r) {
 	lines.push("Repaired: " + fmt(r.repairedToolCalls));
 	lines.push("Rejected: " + fmt(r.rejectedToolCalls) + " (schema: " + fmt(r.schemaRejectedToolCalls) + ")");
 	lines.push("Repair retries: " + fmt(r.toolCallRepairRetries));
-	lines.push("Loop detected: " + (r.toolLoopDetected ? "⚠️ yes" : "no"));
+	lines.push("Tool loop detected: " + (r.toolLoopDetected ? "⚠️ yes" : "no"));
+	lines.push(
+		"Reasoning loop detected: "
+		+ (r.reasoningLoopDetected ? "⚠️ yes" : "no")
+		+ (r.reasoningLoopRetries ? " (retries: " + r.reasoningLoopRetries + ")" : "")
+	);
 	lines.push("Tool wait total: " + fmt(r.toolDurationTotalMs) + " ms");
 	lines.push("Tool round-trip avg/p95/max: " + fmt(r.averageToolDurationMs) + " / " + fmt(r.p95ToolDurationMs) + " / " + fmt(r.maximumToolDurationMs) + " ms");
 	if (r.toolCallBreakdown) lines.push("Breakdown: " + Object.entries(r.toolCallBreakdown).map(function(entry) { return entry[0] + " ×" + entry[1]; }).join(" · "));
@@ -1887,17 +1927,63 @@ function formatTurnText(r) {
 	return lines.join("\\n");
 }
 
+// Coalesce live updates: keep-alive pings often carry identical data, and a
+// single running turn can fire many updates in quick succession. Skip renders
+// when the data is unchanged and otherwise render at most once per second
+// with the freshest snapshot.
+var LAST_RENDER_KEY = "";
+var RENDER_TIMER = null;
+var PENDING_UPDATE = null;
+var UPDATE_COALESCE_MS = 1000;
+
+function dataKey(d) {
+	const recs = d.records || [];
+	const last = recs.length ? recs[recs.length - 1] : null;
+	const keepAlive = d.providerHealth && d.providerHealth.claudeCacheKeepAlive;
+	return [
+		d.summary.turns || 0,
+		recs.length,
+		d.errors ? d.errors.length : 0,
+		d.summary.promptTokens || 0,
+		last ? last.requestId + ":" + (last.lifecyclePhase || "") + ":" + (last.outputTokens || 0) : "",
+		keepAlive ? keepAlive.state : "",
+	].join("|");
+}
+
+function applyUpdate(data) {
+	const key = dataKey(data);
+	if (key === LAST_RENDER_KEY) {
+		return;
+	}
+	LAST_RENDER_KEY = key;
+	const viewState = captureViewState();
+	DATA = data;
+	try {
+		render();
+	} catch (err) {
+		showError(err);
+	}
+	restoreViewState(viewState);
+}
+
 // Listen for live-update messages from the extension.
 window.addEventListener("message", function(e) {
 	if (e.data && e.data.type === "update") {
-		var viewState = captureViewState();
-		DATA = e.data.data;
-		try {
-			render();
-		} catch (err) {
-			showError(err);
+		if (dataKey(e.data.data) === LAST_RENDER_KEY) {
+			return;
 		}
-		restoreViewState(viewState);
+		PENDING_UPDATE = e.data.data;
+		if (RENDER_TIMER) {
+			return;
+		}
+		RENDER_TIMER = setTimeout(function() {
+			RENDER_TIMER = null;
+			const data = PENDING_UPDATE;
+			PENDING_UPDATE = null;
+			if (data) {
+				applyUpdate(data);
+			}
+		}, UPDATE_COALESCE_MS);
 	}
 });
 

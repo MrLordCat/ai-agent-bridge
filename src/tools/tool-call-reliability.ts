@@ -567,49 +567,15 @@ export function injectToolLoopGuard(
 	];
 }
 
-export type RecentTurnShape = "toolOnly" | "text";
-
-export const RECENT_TURN_WINDOW = 8;
-
-export function recordRecentTurnShape(
-	queue: readonly RecentTurnShape[],
-	shape: RecentTurnShape,
-	window = RECENT_TURN_WINDOW
-): RecentTurnShape[] {
-	const next = [...queue, shape];
-	return next.length > window ? next.slice(next.length - window) : next;
-}
-
-export function toolCallOnlyDensity(queue: readonly RecentTurnShape[]): number {
-	return queue.reduce((count, shape) => (shape === "toolOnly" ? count + 1 : count), 0);
-}
-
 /**
- * Cross-turn tool-call pacing guard: nudge only when tool-call-only turns
- * clearly dominate a full recent window (e.g. 5 of the last 8 turns), so
- * normal agentic work with occasional tool calls is never disturbed.
+ * Recovery prompt used only when one provider request internally produces
+ * several tool-call-only generations. It deliberately asks for the next
+ * action, not a progress review: ordinary host-driven agent workflows consist
+ * of many successful tool-only turns and must remain uninterrupted.
  */
-export function shouldInjectToolCallOnlyNudge(
-	queue: readonly RecentTurnShape[],
-	threshold: number
-): boolean {
-	return queue.length >= RECENT_TURN_WINDOW && toolCallOnlyDensity(queue) >= threshold;
-}
-
-export function injectToolCallOnlyNudge(
-	messages: readonly OpenAIChatMessage[],
-	message: string | undefined
-): OpenAIChatMessage[] {
-	const next = messages.map(entry => ({ ...entry }));
-	if (!message) {
-		return next;
-	}
-	return [
-		...next,
-		{
-			role: "user",
-			ephemeral: true,
-			content: message,
-		},
-	];
-}
+export const TOOL_CALL_CONTINUATION_PROMPT = [
+	"Continue executing the current task through the available tools while actionable work remains.",
+	"Use the existing results and make the next useful tool call.",
+	"Return a final text answer only after the requested work is complete, or report the exact blocker when no safe action remains.",
+	"Do not repeat an identical tool call with unchanged arguments.",
+].join(" ");

@@ -1,7 +1,9 @@
 import * as assert from "assert";
 
+import type { ClaudeLiveTurnUpdate } from "../claude/claude-provider";
 import { calculateOverallHealth } from "../diagnostics/provider-health";
 import { SessionQualityTracker } from "../diagnostics/session-report";
+import { updateClaudeSessionQuality } from "../extension";
 import type { LlamaChatContextUsageMetrics, LlamaChatTurnMetrics } from "../llama-provider";
 
 function turn(overrides: Partial<LlamaChatTurnMetrics> = {}): LlamaChatTurnMetrics {
@@ -33,6 +35,42 @@ function turn(overrides: Partial<LlamaChatTurnMetrics> = {}): LlamaChatTurnMetri
 }
 
 suite("diagnostics", () => {
+	test("preserves Claude logical-turn timestamps in Session Quality", () => {
+		const tracker = new SessionQualityTracker();
+		const startedAt = "2026-08-09T14:51:16.878Z";
+		const update: ClaudeLiveTurnUpdate = {
+			requestId: "claude-request",
+			modelId: "claude::claude-opus-5",
+			phase: "completed",
+			startedAt,
+			durationMs: 1_000,
+			outputChars: 0,
+			thinkingChars: 0,
+			usageSegments: [],
+			steps: [],
+			toolCalls: 0,
+			toolNames: {},
+			toolDuration: {
+				count: 0,
+				totalMs: 0,
+				averageMs: 0,
+				maximumMs: 0,
+				p95Ms: 0,
+			},
+			context: {
+				sessionMode: "warm",
+				inputMode: "user-turn",
+				messageCount: 1,
+				toolCount: 0,
+				toolSchemaTokens: 0,
+			},
+		};
+
+		updateClaudeSessionQuality(tracker, update);
+
+		assert.strictEqual(tracker.records[0]?.turn.startedAtMs, Date.parse(startedAt));
+	});
+
 	test("calculates and renders provider health", () => {
 		const checks = [
 			{ id: "models", label: "Models", status: "pass" as const, detail: "1 model" },

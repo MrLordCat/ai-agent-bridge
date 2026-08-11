@@ -246,7 +246,7 @@ function updateCodexSessionQuality(
 	}
 }
 
-function updateClaudeSessionQuality(
+export function updateClaudeSessionQuality(
 	tracker: SessionQualityTracker,
 	update: ClaudeLiveTurnUpdate
 ): void {
@@ -336,6 +336,7 @@ function updateClaudeSessionQuality(
 	const lifecyclePhase: LlamaChatTurnMetrics["lifecyclePhase"] = update.phase === "cancelled"
 		? "interrupted"
 		: update.phase;
+	const parsedStartedAtMs = Date.parse(update.startedAt);
 	// Claude segments report cache read/write from the Anthropic API, but never
 	// explain WHY a cold segment happened. Derive the reason from the session
 	// lifecycle: a fresh SDK session (or a restored one) is the only way to
@@ -354,6 +355,7 @@ function updateClaudeSessionQuality(
 		modelId: update.modelId,
 		providerKind: "claude",
 		lifecyclePhase,
+		startedAtMs: Number.isFinite(parsedStartedAtMs) ? parsedStartedAtMs : undefined,
 		terminalDetail: update.terminalDetail,
 		sessionMode: update.context.sessionMode,
 		conversationKey: update.context.conversationKey,

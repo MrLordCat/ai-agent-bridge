@@ -44,7 +44,7 @@ async function applyPatch(
 		await context.globalState.update(LAST_FAILURE_KEY, undefined);
 		if (result.changed) {
 			await offerReload(
-				"Local LLM patched native model controls and bounded stored chat tool output. Reload the window to activate them.",
+				"AI Agent Bridge patched native model controls and bounded stored chat tool output. Reload the window to activate them.",
 				output
 			);
 		} else if (userInitiated) {
@@ -75,7 +75,7 @@ async function applyPatch(
 		}
 		await context.globalState.update(LAST_FAILURE_KEY, failureSignature);
 		const choice = await vscode.window.showWarningMessage(
-			"Local LLM could not update the Copilot Chat patch for this VS Code build. The original bundle was not modified.",
+			"AI Agent Bridge could not update the Copilot Chat patch for this VS Code build. The original bundle was not modified.",
 			"Show Log",
 			"Disable Auto-Patch"
 		);
@@ -139,7 +139,7 @@ async function restorePatch(output: vscode.OutputChannel): Promise<void> {
 }
 
 export function registerCopilotPatchIntegration(context: vscode.ExtensionContext): void {
-	const output = vscode.window.createOutputChannel("Local LLM Copilot Patch");
+	const output = vscode.window.createOutputChannel("AI Agent Bridge Copilot Patch");
 	context.subscriptions.push(
 		output,
 		vscode.commands.registerCommand("llamacpp.applyCopilotPatch", () => applyPatch(context, output, true)),

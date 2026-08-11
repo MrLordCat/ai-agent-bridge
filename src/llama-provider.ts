@@ -24,12 +24,31 @@ import {
 } from "./constants";
 import {
     calculateContextBudget,
-    COMPACTION_TARGET_RATIO,
+    DEFAULT_COMPACTION_TARGET_RATIO,
     estimateContextUsage,
+    normalizeCompactionTargetRatio,
     selectContextCompaction,
     updateHeuristicCalibration,
 } from "./context/context-budget";
-import { compactMessages } from "./context/message-compaction";
+import {
+    compactMessages,
+    compactMessagesDetailed,
+    isCompactionSummary,
+} from "./context/message-compaction";
+import {
+    MANUAL_COMPACTION_EXPIRY_MS,
+    MANUAL_COMPACTION_TRIGGER,
+    normalizeManualCompactionConversationId,
+    sanitizeManualCompactionHistory,
+} from "./context/manual-compaction";
+import {
+    ReasoningRepetitionDetector,
+    ReasoningRepetitionError,
+} from "./context/reasoning-repetition";
+import {
+    DEEPSEEK_COMPACTION_SUMMARY_MAX_CHARS,
+    requestDeepSeekCompactionSummary,
+} from "./context/deepseek-compaction-summary";
 import { resolveOutputTokenBudget } from "./context/output-budget";
 import { ServerTokenCounter } from "./context/server-token-counter";
 import {
@@ -77,14 +96,9 @@ import { buildChatCompletionRequest } from "./request/chat-request";
 import { SerialRequestQueue, type ChatRequestSlotLease } from "./transport/request-queue";
 import {
     detectRepeatedToolCallLoop,
-    injectToolCallOnlyNudge,
     injectToolLoopGuard,
-    RECENT_TURN_WINDOW,
-    recordRecentTurnShape,
-    shouldInjectToolCallOnlyNudge,
-    toolCallOnlyDensity,
+    TOOL_CALL_CONTINUATION_PROMPT,
     ToolCallValidationError,
-    type RecentTurnShape,
     type ToolCallReliabilityMetrics,
 } from "./tools/tool-call-reliability";
 import {
@@ -261,6 +275,8 @@ export interface LlamaChatTurnMetrics {
     schemaRejectedToolCalls: number;
     toolCallRepairRetries: number;
     toolLoopDetected: boolean;
+    reasoningLoopDetected?: boolean;
+    reasoningLoopRetries?: number;
     /** Tool results whose text indicates the tool failed at execution time. */
     toolExecutionErrors?: number;
     /** Which calls failed (name/command/output head) — shown in the Errors tab. */
@@ -277,6 +293,12 @@ export interface LlamaChatContextUsageMetrics {
     hardInputTarget: number;
     messageTokensBeforeCompact: number;
     messageTokensAfterCompact: number;
+    /** Configured retained-message budget for the compaction that ran. */
+    compactionTargetTokens?: number;
+    /** Final message tokens as a percentage of compactionTargetTokens. */
+    compactionTargetFillPercent?: number;
+    /** Final message tokens as a percentage of the pre-compaction messages. */
+    compactionRetainedPercent?: number;
     messageCountBeforeCompact: number;
     messageCountAfterCompact: number;
     toolTokens: number;
@@ -326,6 +348,7 @@ interface PreparedMessagesForBudget {
     finalTokenEstimate: number;
     initialMessageCount: number;
     finalMessageCount: number;
+    compactionTargetTokens?: number;
     autoCompacted: boolean;
     hardCompacted: boolean;
     hardTarget: number;
@@ -535,9 +558,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     /** Last server cache counters and route, scoped to one model conversation. */
     private readonly lastCacheBackendByScope = new BoundedMap<string, CacheBackendSnapshot>(32);
     private readonly lastResponseEndedAtByScope = new Map<string, number>();
-    private readonly recentTurnShapesByScope = new Map<string, RecentTurnShape[]>();
-    /** Consecutive tool-call-only turns per conversation (host-driven agent loops). */
-    private readonly consecutiveToolOnlyTurnsByScope = new Map<string, number>();
     /**
      * Shared-memory prompt selected for the active genuine user turn.
      *
@@ -570,6 +590,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly dirtyPrefixScopes = new Set<string>();
     private readonly dirtyConversationScopes = new Set<string>();
     private readonly dirtyToolCatalogScopes = new Set<string>();
+    private readonly pendingManualCompactions = new Map<string, number>();
 
     /**
      * Creates a new Llama.cpp chat model provider.
@@ -584,7 +605,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         private readonly logger?: LlamaLogSink,
         private readonly sharedMemory?: SharedMemoryContextProvider,
         private readonly globalState?: vscode.Memento,
-        private readonly storagePath?: string
+        private readonly storagePath?: string,
+        private readonly getApiModelSources?: () => Promise<readonly ChatModelSource[]>
     ) {
         super(secrets);
         this.chatRequestQueue = new SerialRequestQueue(event => {
@@ -601,6 +623,65 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         this.serverTokenCounter.clear();
         this.log("models.refresh.requested");
         this._onDidChangeLanguageModelChatInformation.fire();
+    }
+
+    /**
+     * Arms one provider-owned manual compaction for a Copilot conversation.
+     * The following internal control turn consumes the flag. Requiring both a
+     * known persisted snapshot and a short expiry prevents an ordinary user
+     * prompt from accidentally entering recovery mode.
+     */
+    armManualCompaction(conversationId: unknown): boolean {
+        const normalized = normalizeManualCompactionConversationId(conversationId);
+        if (!normalized) {
+            return false;
+        }
+        const suffix = `\0${normalized}`;
+        const hasSnapshot = [...this.conversationMessageSnapshots.keys()].some(scope => scope.endsWith(suffix));
+        if (!hasSnapshot) {
+            return false;
+        }
+        this.pendingManualCompactions.set(normalized, Date.now() + MANUAL_COMPACTION_EXPIRY_MS);
+        return true;
+    }
+
+    getMostRecentConversationId(): string | undefined {
+        let latest: { conversationId: string; updatedAt: number } | undefined;
+        for (const [scope, snapshot] of this.conversationMessageSnapshots) {
+            const separator = scope.lastIndexOf("\0");
+            if (separator < 0) {
+                continue;
+            }
+            const conversationId = normalizeManualCompactionConversationId(scope.slice(separator + 1));
+            if (conversationId && (!latest || snapshot.updatedAt > latest.updatedAt)) {
+                latest = { conversationId, updatedAt: snapshot.updatedAt };
+            }
+        }
+        return latest?.conversationId;
+    }
+
+    private consumeManualCompaction(
+        conversationId: unknown,
+        messages: readonly LanguageModelChatMessage[]
+    ): boolean {
+        const normalized = normalizeManualCompactionConversationId(conversationId);
+        if (!normalized) {
+            return false;
+        }
+        const expiresAt = this.pendingManualCompactions.get(normalized);
+        if (expiresAt === undefined || expiresAt < Date.now()) {
+            this.pendingManualCompactions.delete(normalized);
+            return false;
+        }
+        const latest = messages.at(-1);
+        const hasTrigger = latest?.content.some(part =>
+            part instanceof vscode.LanguageModelTextPart && part.value.includes(MANUAL_COMPACTION_TRIGGER)
+        ) === true;
+        if (!hasTrigger) {
+            return false;
+        }
+        this.pendingManualCompactions.delete(normalized);
+        return true;
     }
 
     async runHealthCheck(extensionVersion: string, token: CancellationToken): Promise<ProviderHealthReport> {
@@ -700,8 +781,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         detail: "DeepSeek does not expose llama.cpp /apply-template and /tokenize; conservative preflight estimation is expected.",
                     }
                 );
-            } else if (models.length > 0) {
-                const runtimeContext = await this.fetchRuntimeContextLength(source.serverUrl, source.apiKey);
+            } else if (models.length > 0 && source.protocol === "llamacpp") {
+                const runtimeContext = await this.fetchRuntimeContextLength(source, source.apiKey);
                 checks.push({
                     id: "runtime-context",
                     label: "Runtime context",
@@ -1626,8 +1707,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         );
     }
 
-    private getSourceCacheKey(serverUrl: string, apiKeyPresent: boolean): string {
-        return `${this.normalizeServerUrl(serverUrl)}|key=${apiKeyPresent ? "1" : "0"}`;
+    private getSourceCacheKey(sourceKey: string, serverUrl: string, apiKeyPresent: boolean): string {
+        return `${sourceKey}|${this.normalizeServerUrl(serverUrl)}|key=${apiKeyPresent ? "1" : "0"}`;
     }
 
     private parsePositiveInt(value: unknown): number | undefined {
@@ -2763,12 +2844,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     protected async processStreamingResponse(
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken
+        token: vscode.CancellationToken,
+        thinkingTextInspector?: (text: string) => void
     ): Promise<ChatTokenUsage | undefined> {
         // Restore persisted reasoning entries before streaming adds new ones,
         // so persistReasoningMap writes a merged set rather than overwriting.
         this.loadPersistedReasoningMap();
-        const result = await super.processStreamingResponse(responseBody, progress, token);
+        const result = await super.processStreamingResponse(responseBody, progress, token, thinkingTextInspector);
         this.persistReasoningMap();
         // Persist both the exact sent-message continuation and tool catalog.
         // A fresh Extension Host can then resume the same prompt instead of
@@ -3094,16 +3176,132 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             keepLastCount,
             label,
             maxToolResultChars,
-            // Use the same calibrated estimate as the compaction trigger and the
-            // context-usage metrics. Without calibration the raw heuristic often
-            // stays under the budget while the calibrated count is already over
-            // it, so the fast path returns the messages unchanged and records a
-            // no-op "micro-compaction" on every turn.
             estimateTokens: candidate => Math.max(
                 1,
                 Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
             ),
         });
+    }
+
+    private async compactOpenAiMessagesWithSemanticSummary(
+        messages: OpenAIChatMessage[],
+        tokenBudget: number,
+        keepLastCount: number,
+        label: string,
+        maxToolResultChars: number | undefined,
+        requestId: string,
+        cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop",
+        token: CancellationToken,
+        forceKeepLastTurnOnly = false
+    ): Promise<OpenAIChatMessage[]> {
+        const estimateTokens = (candidate: OpenAIChatMessage[]): number => Math.max(
+            1,
+            Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
+        );
+        const baseOptions = {
+            tokenBudget,
+            keepLastCount,
+            label,
+            maxToolResultChars,
+            forceKeepLastTurnOnly,
+            // Use the same calibrated estimate as the compaction trigger and the
+            // context-usage metrics. Without calibration the raw heuristic often
+            // stays under the budget while the calibrated count is already over
+            // it, so the fast path returns the messages unchanged and records a
+            // no-op "micro-compaction" on every turn.
+            estimateTokens,
+        };
+        const fallback = compactMessagesDetailed(messages, baseOptions);
+        const useDeepSeekSummary = this.getConfig().get<boolean>("deepSeekCompactionSummary", false) === true;
+        if (!useDeepSeekSummary || !fallback.didCompact) {
+            return fallback.messages;
+        }
+
+        // At aggressive targets a fixed 16K-character summary can consume most
+        // of a small working budget. Keep the durable handoff within roughly
+        // 15% of the token target (using four chars/token), with a 4K floor and
+        // the global 16K quality ceiling.
+        const semanticSummaryMaxChars = Math.max(
+            4_000,
+            Math.min(DEEPSEEK_COMPACTION_SUMMARY_MAX_CHARS, Math.floor(tokenBudget * 0.6))
+        );
+        // Reserve the full allowed semantic-summary size before choosing the
+        // dropped prefix. This keeps one paid request sufficient: replacing the
+        // placeholder with the real summary cannot silently drop additional
+        // unsummarized turns.
+        const planned = compactMessagesDetailed(messages, {
+            ...baseOptions,
+            summaryContent: "x".repeat(semanticSummaryMaxChars),
+        });
+        const meaningfulDroppedMessages = planned.droppedMessages.filter(message =>
+            message.providerOverlay !== "shared-memory" && message.ephemeral !== true
+        );
+        if (meaningfulDroppedMessages.length === 0) {
+            return fallback.messages;
+        }
+
+        const apiKey = await this.getCompactionDeepSeekApiKey();
+        if (!apiKey) {
+            this.log("chat.compaction.deepseek_summary.fallback", {
+                requestId,
+                cause,
+                reason: "api-key-missing",
+            });
+            return fallback.messages;
+        }
+
+        const startedAt = Date.now();
+        this.log("chat.compaction.deepseek_summary.start", {
+            requestId,
+            cause,
+            droppedMessages: meaningfulDroppedMessages.length,
+            previousSummary: Boolean(planned.previousSummary),
+        });
+        try {
+            const generated = await requestDeepSeekCompactionSummary({
+                apiKey,
+                userAgent: this.userAgent,
+                previousSummary: planned.previousSummary,
+                droppedMessages: meaningfulDroppedMessages,
+                maxSummaryChars: semanticSummaryMaxChars,
+                cancellation: token,
+            });
+            const semantic = compactMessagesDetailed(messages, {
+                ...baseOptions,
+                summaryContent: generated.content,
+            });
+            this.log("chat.compaction.deepseek_summary.complete", {
+                requestId,
+                cause,
+                durationMs: Date.now() - startedAt,
+                inputChars: generated.inputChars,
+                outputChars: generated.content.length,
+                promptTokens: generated.usage?.promptTokens,
+                completionTokens: generated.usage?.completionTokens,
+                totalTokens: generated.usage?.totalTokens,
+                droppedMessages: semantic.droppedMessages.length,
+                plannedDroppedMessages: meaningfulDroppedMessages.length,
+                summaryMaxChars: semanticSummaryMaxChars,
+                inputTotalTurns: generated.inputDiagnostics?.totalTurns,
+                inputSelectedTurns: generated.inputDiagnostics?.selectedTurns,
+                inputOmittedTurns: generated.inputDiagnostics?.omittedTurns,
+                inputSelectedReasonCounts: generated.inputDiagnostics?.selectedReasonCounts,
+                inputRejectedApproachTurns: generated.inputDiagnostics?.rejectedApproachTurns,
+                inputSelectedRejectedApproachTurns: generated.inputDiagnostics?.selectedRejectedApproachTurns,
+                summarySectionChars: generated.summaryDiagnostics?.sectionChars,
+                summaryEmptySections: generated.summaryDiagnostics?.emptySections,
+                summaryDuplicateLines: generated.summaryDiagnostics?.duplicateLines,
+            });
+            return semantic.messages;
+        } catch (error) {
+            this.log("chat.compaction.deepseek_summary.fallback", {
+                requestId,
+                cause,
+                durationMs: Date.now() - startedAt,
+                reason: error instanceof Error ? error.message : String(error),
+            });
+            return fallback.messages;
+        }
     }
 
     private messageChars(messages: OpenAIChatMessage[]): number {
@@ -3231,16 +3429,34 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private async captureRawStream(
         stream: ReadableStream<Uint8Array>,
         requestId: string,
-        token: CancellationToken
+        token: CancellationToken,
+        stopToken?: CancellationToken
     ): Promise<void> {
         const reader = stream.getReader();
         const decoder = new TextDecoder();
         let chunkIndex = 0;
         const maxLoggedStreamChunkChars = this.getMaxLoggedStreamChunkChars();
+        let userCancellationSubscription: vscode.Disposable | undefined;
+        let stopSubscription: vscode.Disposable | undefined;
+        const cancellationSignal = new Promise<"cancelled">(resolve => {
+            userCancellationSubscription = token.onCancellationRequested(() => resolve("cancelled"));
+            stopSubscription = stopToken?.onCancellationRequested(() => resolve("cancelled"));
+            if (token.isCancellationRequested || stopToken?.isCancellationRequested) {
+                resolve("cancelled");
+            }
+        });
 
         try {
-            while (!token.isCancellationRequested) {
-                const { done, value } = await reader.read();
+            while (!token.isCancellationRequested && !stopToken?.isCancellationRequested) {
+                const outcome = await Promise.race([
+                    reader.read().then(result => ({ type: "read" as const, result })),
+                    cancellationSignal.then(() => ({ type: "cancelled" as const })),
+                ]);
+                if (outcome.type === "cancelled") {
+                    await reader.cancel("Raw stream capture stopped").catch(() => undefined);
+                    break;
+                }
+                const { done, value } = outcome.result;
                 if (done) {
                     break;
                 }
@@ -3278,11 +3494,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             this.log("chat.stream.end", {
                 requestId,
                 chunkCount: chunkIndex,
-                cancelled: token.isCancellationRequested,
+                cancelled: token.isCancellationRequested || stopToken?.isCancellationRequested === true,
             });
         } catch (error) {
             this.logError("chat.stream.capture_failed", error, { requestId, chunkIndex });
         } finally {
+            userCancellationSubscription?.dispose();
+            stopSubscription?.dispose();
             reader.releaseLock();
         }
     }
@@ -3295,9 +3513,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return cached.serverUrl === serverUrl && cached.apiKeyPresent === apiKeyPresent;
     }
 
-    private getFreshCachedModels(serverUrl: string, apiKeyPresent: boolean, ttlMs: number): LlamaCppModelInfo[] | undefined {
-        const cached = this.modelListCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
+    private getFreshCachedModels(source: ChatModelSource, apiKeyPresent: boolean, ttlMs: number): LlamaCppModelInfo[] | undefined {
+        const cached = this.modelListCache.get(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent));
+        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, source.serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
@@ -3308,18 +3526,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return cached.models;
     }
 
-    private getAnyCachedModels(serverUrl: string, apiKeyPresent: boolean): LlamaCppModelInfo[] | undefined {
-        const cached = this.modelListCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (!cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
+    private getAnyCachedModels(source: ChatModelSource, apiKeyPresent: boolean): LlamaCppModelInfo[] | undefined {
+        const cached = this.modelListCache.get(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent));
+        if (!cached || !this.isCacheStillValid(cached, source.serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
         return cached.models;
     }
 
-    private cacheModels(serverUrl: string, apiKeyPresent: boolean, models: LlamaCppModelInfo[]): void {
-        this.modelListCache.set(this.getSourceCacheKey(serverUrl, apiKeyPresent), {
-            serverUrl,
+    private cacheModels(source: ChatModelSource, apiKeyPresent: boolean, models: LlamaCppModelInfo[]): void {
+        this.modelListCache.set(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent), {
+            serverUrl: source.serverUrl,
             apiKeyPresent,
             fetchedAt: Date.now(),
             models,
@@ -3327,12 +3545,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private getFreshCachedRuntimeContextLength(
-        serverUrl: string,
+        source: ChatModelSource,
         apiKeyPresent: boolean,
         ttlMs: number
     ): number | undefined {
-        const cached = this.runtimeContextCache.get(this.getSourceCacheKey(serverUrl, apiKeyPresent));
-        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, serverUrl, apiKeyPresent)) {
+        const cached = this.runtimeContextCache.get(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent));
+        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, source.serverUrl, apiKeyPresent)) {
             return undefined;
         }
 
@@ -3343,17 +3561,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return cached.contextLength;
     }
 
-    private cacheRuntimeContextLength(serverUrl: string, apiKeyPresent: boolean, contextLength: number): void {
-        this.runtimeContextCache.set(this.getSourceCacheKey(serverUrl, apiKeyPresent), {
-            serverUrl,
+    private cacheRuntimeContextLength(source: ChatModelSource, apiKeyPresent: boolean, contextLength: number): void {
+        this.runtimeContextCache.set(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent), {
+            serverUrl: source.serverUrl,
             apiKeyPresent,
             fetchedAt: Date.now(),
             contextLength: this.clampInt(contextLength, 4096, MAX_CONTEXT_LENGTH, DEFAULT_CONTEXT_LENGTH),
         });
     }
 
-    private async fetchRuntimeContextLength(serverUrl: string, apiKey?: string): Promise<number | undefined> {
-        if (!this.shouldProbeRuntimeSlots(serverUrl)) {
+    private async fetchRuntimeContextLength(source: ChatModelSource, apiKey?: string): Promise<number | undefined> {
+        const serverUrl = source.serverUrl;
+        if (source.protocol !== "llamacpp" || !this.shouldProbeRuntimeSlots(serverUrl)) {
             this.log("models.runtime_context.slots_skipped", {
                 endpoint: `${serverUrl}/slots`,
                 reason: "provider_not_llamacpp",
@@ -3440,29 +3659,30 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private async getRuntimeContextLengthWithCache(
-        serverUrl: string,
+        source: ChatModelSource,
         apiKey: string | undefined,
         apiKeyPresent: boolean,
         ttlMs: number
     ): Promise<number | undefined> {
-        const cached = this.getFreshCachedRuntimeContextLength(serverUrl, apiKeyPresent, ttlMs);
+        const cached = this.getFreshCachedRuntimeContextLength(source, apiKeyPresent, ttlMs);
         if (cached !== undefined) {
             return cached;
         }
 
-        const runtimeContextLength = await this.fetchRuntimeContextLength(serverUrl, apiKey);
+        const runtimeContextLength = await this.fetchRuntimeContextLength(source, apiKey);
         if (runtimeContextLength !== undefined) {
-            this.cacheRuntimeContextLength(serverUrl, apiKeyPresent, runtimeContextLength);
+            this.cacheRuntimeContextLength(source, apiKeyPresent, runtimeContextLength);
         }
         return runtimeContextLength;
     }
 
     private async fetchModelsWithInflightCache(
-        serverUrl: string,
+        source: ChatModelSource,
         apiKey: string | undefined,
         apiKeyPresent: boolean
     ): Promise<LlamaCppModelInfo[]> {
-        const cacheKey = this.getSourceCacheKey(serverUrl, apiKeyPresent);
+        const serverUrl = source.serverUrl;
+        const cacheKey = this.getSourceCacheKey(source.key, serverUrl, apiKeyPresent);
         const currentInflight = this.modelListInflight.get(cacheKey);
         if (currentInflight && currentInflight.serverUrl === serverUrl && currentInflight.apiKeyPresent === apiKeyPresent) {
             this.log("models.request.inflight_join", { serverUrl, apiKeyPresent });
@@ -3487,6 +3707,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const configuredServerUrl = await this.getServerUrl();
         const apiKey = await this.getApiKey();
         const deepSeekApiKey = await this.getDeepSeekApiKey();
+        const apiSources = await this.getApiModelSources?.() ?? [];
         return createModelSources({
             primaryServerUrl: configuredServerUrl,
             primaryApiKey: apiKey,
@@ -3496,6 +3717,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             localContextLength: this.getConfiguredLocalContextLength(),
             deepSeekEnabled: cfg.get<boolean>("enableDeepSeek", true) !== false,
             deepSeekContextLength: this.getConfiguredDeepSeekContextLength(),
+            apiSources,
         });
     }
 
@@ -3526,6 +3748,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 contextLengthOverride: this.isDeepSeekServer(legacyServerUrl)
                     ? this.getConfiguredDeepSeekContextLength()
                     : undefined,
+                protocol: this.isDeepSeekServer(legacyServerUrl) ? "deepseek" : "llamacpp",
             },
             modelId: parsed.modelId,
         };
@@ -3613,13 +3836,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         await Promise.all(sources.map(async source => {
             const apiKeyPresent = Boolean(source.apiKey);
             const runtimeContextLength = await this.getRuntimeContextLengthWithCache(
-                source.serverUrl,
+                source,
                 source.apiKey,
                 apiKeyPresent,
                 modelListCacheTtlMs
             );
 
-            const cachedModels = this.getFreshCachedModels(source.serverUrl, apiKeyPresent, modelListCacheTtlMs);
+            const cachedModels = this.getFreshCachedModels(source, apiKeyPresent, modelListCacheTtlMs);
             if (cachedModels) {
                 const entries = cachedModels.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                 allEntries.push(...entries);
@@ -3649,8 +3872,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             });
 
             try {
-                const models = await this.fetchModelsWithInflightCache(source.serverUrl, source.apiKey, apiKeyPresent);
-                this.cacheModels(source.serverUrl, apiKeyPresent, models);
+                const models = await this.fetchModelsWithInflightCache(source, source.apiKey, apiKeyPresent);
+                this.cacheModels(source, apiKeyPresent, models);
                 const entries = models.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                 allEntries.push(...entries);
                 this.log("models.request.success", {
@@ -3672,7 +3895,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     serverUrl: source.serverUrl,
                     silent: options.silent,
                 });
-                const staleModels = this.getAnyCachedModels(source.serverUrl, apiKeyPresent);
+                const staleModels = this.getAnyCachedModels(source, apiKeyPresent);
                 if (staleModels) {
                     const entries = staleModels.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                     allEntries.push(...entries);
@@ -3768,6 +3991,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // Reasoning must be looked up and stored per conversation so a parallel chat
         // cannot evict entries that this conversation's cached prefix depends on.
         const conversationScope = this.cachePrefixScope(requestModelId, options);
+        const manualCompactionRequested = this.consumeManualCompaction(
+            (options.modelOptions as Record<string, unknown> | undefined)?._copilotConversationId,
+            messages
+        );
         this.setReasoningScope(conversationScope);
         const isFirstRequestForScope = conversationScope !== undefined
             ? !this.scopesSeenSinceStartup.has(conversationScope)
@@ -3837,7 +4064,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         let emittedToolCallParts = 0;
 
         const runtimeContextLength = await this.getRuntimeContextLengthWithCache(
-            serverUrl,
+            source,
             apiKey,
             apiKeyPresent,
             this.getModelListCacheTtlMs()
@@ -3869,6 +4096,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             8000
         );
         const autoCompact = cfg.get<boolean>("autoCompact", false) !== false;
+            const compactionTargetRatio = normalizeCompactionTargetRatio(
+                cfg.get("compactionTargetRatio", DEFAULT_COMPACTION_TARGET_RATIO)
+            );
+        const deepSeekCompactionSummary = cfg.get<boolean>("deepSeekCompactionSummary", false) === true;
         const accurateTokenCounting = cfg.get<boolean>("accurateTokenCounting", true) !== false;
         const tokenizerTimeoutMs = this.clampInt(cfg.get("tokenizerTimeoutMs", 10000), 1000, 30000, 10000);
         const retryOnOverflow = cfg.get<boolean>("retryOnContextOverflow", true) !== false;
@@ -3880,12 +4111,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             1
         );
         const toolCallOnlyAutoretry = cfg.get<boolean>("toolCallOnlyAutoretry", true) !== false;
-        const toolLoopForceTextThreshold = this.clampInt(
-            cfg.get("toolLoopForceTextThreshold", 12),
-            6,
-            40,
-            12
-        );
         const toolCallOnlyAutoretryThreshold = this.clampInt(
             cfg.get("toolCallOnlyAutoretryThreshold", 3),
             2,
@@ -3897,6 +4122,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const toolCallRepairMaxAttempts = this.clampInt(cfg.get("toolCallRepairMaxAttempts", 1), 0, 2, 1);
         const toolLoopProtection = cfg.get<boolean>("toolLoopProtection", true) !== false;
         const toolLoopDetectionThreshold = this.clampInt(cfg.get("toolLoopDetectionThreshold", 3), 2, 10, 3);
+        const reasoningLoopProtection = cfg.get<boolean>("reasoningLoopProtection", true) !== false;
+        const reasoningLoopMinChars = this.clampInt(cfg.get("reasoningLoopMinChars", 4096), 2048, 32768, 4096);
+        const reasoningLoopRetryMaxAttempts = this.clampInt(
+            cfg.get("reasoningLoopRetryMaxAttempts", 1),
+            0,
+            2,
+            1
+        );
         const maxModelTurnsPerRequest = this.clampInt(cfg.get("maxModelTurnsPerRequest", 6), 2, 20, 6);
         const configuredContinuationPrompt = String(
             cfg.get(
@@ -3968,6 +4201,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 compactMaxToolResultChars,
                 runtimeContextLength,
                 autoCompact,
+                    compactionTargetRatio,
+                deepSeekCompactionSummary,
                 accurateTokenCounting,
                 tokenizerTimeoutMs,
                 retryOnOverflow,
@@ -3980,6 +4215,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 toolCallRepairMaxAttempts,
                 toolLoopProtection,
                 toolLoopDetectionThreshold,
+                reasoningLoopProtection,
+                reasoningLoopMinChars,
+                reasoningLoopRetryMaxAttempts,
                 maxModelTurnsPerRequest,
                 emptyResponseContinuationPrompt,
                 requestedThinkingMode,
@@ -4027,27 +4265,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             : undefined;
         if (toolLoopDetection) {
             this.log("chat.tools.loop_detected", { requestId, ...toolLoopDetection });
-        }
-
-        // Cross-turn tool-call pacing: when tool-call-only turns dominate a
-        // recent window (>=4 of the last 8), the model is silently crawling —
-        // inject a one-shot "pause and summarize" nudge into the next request.
-        const toolCallOnlyNudgeThreshold = Math.max(4, toolCallOnlyAutoretryThreshold);
-        let toolCallOnlyNudgeMessage: string | undefined;
-        if (toolCallOnlyAutoretry && conversationScope) {
-            const recentShapes = this.recentTurnShapesByScope.get(conversationScope) ?? [];
-            if (shouldInjectToolCallOnlyNudge(recentShapes, toolCallOnlyNudgeThreshold)) {
-                toolCallOnlyNudgeMessage =
-                    "You have been making tool calls without a meaningful text response for several turns. " +
-                    "Pause, summarize what you have accomplished so far, and state your next plan clearly before making more tool calls.";
-                this.recentTurnShapesByScope.delete(conversationScope);
-                this.log("chat.response.tool_call_only_nudge_cross_turn", {
-                    requestId,
-                    window: RECENT_TURN_WINDOW,
-                    toolCallOnlyTurns: toolCallOnlyDensity(recentShapes),
-                    threshold: toolCallOnlyNudgeThreshold,
-                });
-            }
         }
 
         let sharedMemoryContext: SharedMemoryPromptContext | undefined;
@@ -4114,13 +4331,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             this.frozenSharedMemoryByScope.delete(conversationScope);
         }
 
-        // Fresh-message detection inside truncateToolResultMessages locates
-        // this turn's query (last plain user message) in the very array it
-        // analyses, so injected system/memory messages or VS Code history
-        // mutations between turns can never shift the boundary.
-        // Set later once the consecutive tool-only count is known; the closure
-        // below reads it when messages are actually converted (per attempt).
-        let forceTextStopMessage: string | undefined;
         const convertForMode = (mode: ToolResultMode): OpenAIChatMessage[] => {
             // TEMP diagnostics: inspect the raw parts of the last user message
             // to find why its text sometimes vanishes on the first turn call.
@@ -4153,10 +4363,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const withReasoning = this.injectStoredReasoningContent(converted);
             const withKnowledge = injectKnowledgeSystemPrompt(withReasoning, knowledgeSystemPrompt);
             const withLoopGuard = injectToolLoopGuard(withKnowledge, toolLoopDetection);
-            const withToolCallNudge = injectToolCallOnlyNudge(withLoopGuard, toolCallOnlyNudgeMessage);
-            const withForceTextStop = injectToolCallOnlyNudge(withToolCallNudge, forceTextStopMessage);
             return this.truncateToolResultMessages(
-                withForceTextStop,
+                withLoopGuard,
                 maxToolResultChars,
                 requestId
             );
@@ -4165,41 +4373,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const initialToolResultMode: ToolResultMode = toolResultModeConfig === "user" ? "user" : "tool";
         let activeToolResultMode: ToolResultMode = initialToolResultMode;
 
-        // Host-driven agent loops run one request per tool call, so per-request
-        // guards (maxModelTurnsPerRequest) never see them. When a conversation
-        // has made only tool calls for N consecutive turns, send the next
-        // request WITHOUT tools: the model is forced to answer in text, which
-        // breaks the loop.
-        const consecutiveToolOnlyTurns = conversationScope
-            ? this.consecutiveToolOnlyTurnsByScope.get(conversationScope) ?? 0
-            : 0;
-        const forceTextTurn = toolCallOnlyAutoretry
-            && conversationScope !== undefined
-            && consecutiveToolOnlyTurns >= toolLoopForceTextThreshold;
-        if (forceTextTurn) {
-            forceTextStopMessage =
-                `Tool loop guard: the last ${consecutiveToolOnlyTurns} turns made tool calls without a text answer. ` +
-                "Tools are disabled for this turn — respond in text now: summarize what has been done " +
-                "and state what you will do next. Do not attempt to call tools.";
-            this.log("chat.response.tool_force_text", {
-                requestId,
-                consecutiveToolOnlyTurns,
-                threshold: toolLoopForceTextThreshold,
-            });
-        }
-
         // apiDirect mode already caps tools inside convertTools via apiDirectMaxTools.
         // Classic mode applies the request-level maxToolsPerRequest cap here.
         const cappedToolConfig: ReturnType<typeof convertTools> = {
             ...toolConfig,
-            tools: forceTextTurn
-                ? []
-                : toolCallingModeConfig === "apiDirect"
-                    ? toolConfig.tools
-                    : Array.isArray(toolConfig.tools) && maxTools > 0
-                        ? toolConfig.tools.slice(0, maxTools)
-                        : toolConfig.tools,
-            tool_choice: forceTextTurn ? undefined : toolConfig.tool_choice,
+            tools: toolCallingModeConfig === "apiDirect"
+                ? toolConfig.tools
+                : Array.isArray(toolConfig.tools) && maxTools > 0
+                    ? toolConfig.tools.slice(0, maxTools)
+                    : toolConfig.tools,
+            tool_choice: toolConfig.tool_choice,
         };
 
         if (
@@ -4270,6 +4453,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const requestBody = buildChatCompletionRequest({
             model: requestModelId,
             family: resolvedFamily,
+            protocol: source.protocol,
             maxTokens,
             temperature,
             cachePrompt,
@@ -4408,8 +4592,80 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             };
         };
 
+        const compactWithCurrentMemory = async (
+            sourceMessages: OpenAIChatMessage[],
+            targetTokens: number,
+            label: string,
+            cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop",
+            forceKeepLastTurnOnly = false
+        ): Promise<{
+            messages: OpenAIChatMessage[];
+            counted: { tokens: number; source: "server" | "heuristic"; promptTokens?: number };
+            correctionRounds: number;
+        }> => {
+            // Shared memory is a live provider overlay. Remove every historical
+            // checkpoint from the compaction source, reserve room for the current
+            // selection, then inject one fresh checkpoint after the cache boundary.
+            // This prevents memory text from polluting summaries and from pushing
+            // the post-injection request back above the target.
+            const historyWithoutMemory = sourceMessages.filter(message => message.providerOverlay !== "shared-memory");
+            const withoutMemory = forceKeepLastTurnOnly
+                ? sanitizeManualCompactionHistory(historyWithoutMemory)
+                : historyWithoutMemory;
+            const memoryReserveTokens = sharedMemoryContext?.text
+                ? Math.max(256, Math.ceil(sharedMemoryContext.text.length / 4 * this.heuristicCalibration) + 256)
+                : 0;
+            let conversationBudget = Math.max(1, targetTokens - memoryReserveTokens);
+            let compacted = await this.compactOpenAiMessagesWithSemanticSummary(
+                withoutMemory,
+                conversationBudget,
+                keepLastTurns,
+                label,
+                compactMaxToolResultChars,
+                requestId,
+                cause,
+                token,
+                forceKeepLastTurnOnly
+            );
+            let withMemory = injectAppendOnlySharedMemoryContext(compacted, sharedMemoryContext);
+            let counted = await countMessages(withMemory);
+            let correctionRounds = 0;
+            while (counted.tokens > targetTokens && correctionRounds < 3) {
+                correctionRounds += 1;
+                const overshoot = counted.tokens - targetTokens;
+                conversationBudget = Math.max(1, conversationBudget - overshoot - 128);
+                const existingSummary = compacted.find(isCompactionSummary);
+                compacted = compactMessages(withoutMemory, {
+                    tokenBudget: conversationBudget,
+                    keepLastCount: keepLastTurns,
+                    label,
+                    maxToolResultChars: compactMaxToolResultChars,
+                    summaryContent: typeof existingSummary?.content === "string" ? existingSummary.content : undefined,
+                    forceKeepLastTurnOnly,
+                    estimateTokens: candidate => Math.max(
+                        1,
+                        Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
+                    ),
+                });
+                withMemory = injectAppendOnlySharedMemoryContext(compacted, sharedMemoryContext);
+                counted = await countMessages(withMemory);
+            }
+            if (correctionRounds > 0) {
+                this.log("chat.compaction.post_overlay_correction", {
+                    requestId,
+                    cause,
+                    targetTokens,
+                    finalTokens: counted.tokens,
+                    memoryReserveTokens,
+                    correctionRounds,
+                });
+            }
+            return { messages: withMemory, counted, correctionRounds };
+        };
+
         const prepareMessagesForBudget = async (sourceMessages: OpenAIChatMessage[]): Promise<PreparedMessagesForBudget> => {
             let autoCompacted = false;
+            let compactionTargetTokens: number | undefined;
             const hardCompacted = false;
             const hardTarget = hardInputTarget;
 
@@ -4587,46 +4843,53 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 sharedMemoryExpected: Boolean(sharedMemoryContext?.text),
             });
 
-            const compactionDecision = selectContextCompaction({
-                messageTokens: messageTokenCount,
-                autoCompact: autoCompact && !snapshotStale && !(isFirstRequestForScope && !snapshotMessages?.length),
-                softInputTarget,
-                overflowRetry: false,
-            });
+            const compactionDecision = manualCompactionRequested
+                ? {
+                    kind: "auto" as const,
+                    target: Math.max(1, Math.floor(messageTokenCount * compactionTargetRatio)),
+                }
+                : selectContextCompaction({
+                    messageTokens: messageTokenCount,
+                    autoCompact: autoCompact && !snapshotStale && !(isFirstRequestForScope && !snapshotMessages?.length),
+                    softInputTarget,
+                    overflowRetry: false,
+                    targetRatio: compactionTargetRatio,
+                });
             if (compactionDecision.kind === "auto") {
+                compactionTargetTokens = compactionDecision.target;
                 const compactStartedAt = Date.now();
                 const beforeCompactionCount = preparedMessages.length;
                 const beforeCompactionTokens = messageTokenCount;
                 const beforeCompactionChars = this.messageChars(preparedMessages);
-                preparedMessages = this.compactOpenAiMessages(
+                const compactionCause = manualCompactionRequested ? "manual" as const : "auto-compact" as const;
+                const compactionLabel = manualCompactionRequested
+                    ? "Conversation summary (manual compact)"
+                    : "Conversation summary (auto-compact)";
+                const compacted = await compactWithCurrentMemory(
                     preparedMessages,
                     compactionDecision.target,
-                    keepLastTurns,
-                    "Conversation summary (auto-compact)",
-                    compactMaxToolResultChars
+                    compactionLabel,
+                    compactionCause,
+                    manualCompactionRequested
                 );
-                // Compaction may summarize/drop old provider overlays. Rebuild
-                // the current memory checkpoint inside the already rewritten
-                // message region; compaction is the intentional cache boundary.
-                preparedMessages = injectAppendOnlySharedMemoryContext(
-                    preparedMessages,
-                    sharedMemoryContext
-                );
-                counted = await countMessages(preparedMessages);
+                preparedMessages = compacted.messages;
+                counted = compacted.counted;
                 messageTokenCount = counted.tokens;
                 autoCompacted = true;
-                this.log("chat.messages.auto_compact", {
+                this.log(manualCompactionRequested ? "chat.messages.manual_compact" : "chat.messages.auto_compact", {
                     requestId,
                     tokenEstimate: messageTokenCount,
                     tokenCountSource: counted.source,
                     promptTokens: counted.promptTokens,
                     messageCount: preparedMessages.length,
                     target: compactionDecision.target,
+                    targetFillPercent: Number(((messageTokenCount / compactionDecision.target) * 100).toFixed(1)),
+                    retainedPercent: Number(((messageTokenCount / beforeCompactionTokens) * 100).toFixed(1)),
                     compactDurationMs: Date.now() - compactStartedAt,
                 });
                 void this.saveCompactionSnapshot({
                     requestId,
-                    cause: "auto-compact",
+                    cause: compactionCause,
                     targetTokens: compactionDecision.target,
                     before: {
                         messageCount: beforeCompactionCount,
@@ -4662,6 +4925,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 finalTokenEstimate: messageTokenCount,
                 initialMessageCount,
                 finalMessageCount: preparedMessages.length,
+                compactionTargetTokens,
                 autoCompacted,
                 hardCompacted,
                 hardTarget,
@@ -4764,6 +5028,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 hardInputTarget: prepared.hardTarget,
                 messageTokensBeforeCompact: prepared.initialTokenEstimate,
                 messageTokensAfterCompact: prepared.finalTokenEstimate,
+                compactionTargetTokens: prepared.compactionTargetTokens,
+                compactionTargetFillPercent: prepared.compactionTargetTokens
+                    ? Number(((prepared.finalTokenEstimate / prepared.compactionTargetTokens) * 100).toFixed(1))
+                    : undefined,
+                compactionRetainedPercent: prepared.autoCompacted && prepared.initialTokenEstimate > 0
+                    ? Number(((prepared.finalTokenEstimate / prepared.initialTokenEstimate) * 100).toFixed(1))
+                    : undefined,
                 messageCountBeforeCompact: prepared.initialMessageCount,
                 messageCountAfterCompact: prepared.finalMessageCount,
                 toolTokens: toolTokenCount,
@@ -4784,6 +5055,44 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             };
             this.log("chat.context.usage", latestContextUsage);
             this._onDidUpdateContextUsage.fire(latestContextUsage);
+
+            if (manualCompactionRequested) {
+                await this.persistSessionState(true);
+                const confirmation = [
+                    "Provider context compacted and cleaned.",
+                    `Messages: ${prepared.initialMessageCount} → ${prepared.finalMessageCount}.`,
+                    `Estimated message tokens: ${prepared.initialTokenEstimate} → ${prepared.finalTokenEstimate}.`,
+                    "Historical reasoning and raw tool chatter were replaced by the compaction summary. Send the next message to continue from the clean snapshot.",
+                ].join(" ");
+                const stream = [
+                    `data: ${JSON.stringify({ choices: [{ delta: { content: confirmation } }] })}`,
+                    `data: ${JSON.stringify({
+                        choices: [{ delta: {}, finish_reason: "stop" }],
+                        usage: { prompt_tokens: 0, completion_tokens: Math.max(1, Math.ceil(confirmation.length / 4)), total_tokens: Math.max(1, Math.ceil(confirmation.length / 4)) },
+                    })}`,
+                    "data: [DONE]",
+                    "",
+                ].join("\n\n");
+                this.log("chat.compaction.manual.complete", {
+                    requestId,
+                    conversationKey: typeof (options.modelOptions as Record<string, unknown> | undefined)?._copilotConversationId === "string"
+                        ? this.shortHash(String((options.modelOptions as Record<string, unknown>)._copilotConversationId))
+                        : undefined,
+                    beforeMessages: prepared.initialMessageCount,
+                    afterMessages: prepared.finalMessageCount,
+                    beforeTokens: prepared.initialTokenEstimate,
+                    afterTokens: prepared.finalTokenEstimate,
+                });
+                return {
+                    ok: true,
+                    response: new Response(stream, {
+                        status: 200,
+                        headers: { "content-type": "text/event-stream" },
+                    }),
+                    retriedAfterOverflow: false,
+                    attemptNo,
+                };
+            }
 
             this.log("chat.request.send", {
                 requestId,
@@ -4849,28 +5158,25 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         autoCompact,
                         softInputTarget,
                         overflowRetry: true,
+                            targetRatio: compactionTargetRatio,
                     });
                     // Single compaction scheme: an overflow retry uses the same
-                    // soft target (~60% of the current size) as proactive
-                    // compaction — no separate hard tier.
+                        // configured target as proactive compaction — no separate
+                        // hard tier.
                     const overflowTarget = overflowCompaction.kind === "none"
-                        ? Math.max(1, Math.floor(prepared.finalTokenEstimate * COMPACTION_TARGET_RATIO))
+                            ? Math.max(1, Math.floor(prepared.finalTokenEstimate * compactionTargetRatio))
                         : overflowCompaction.target;
                     const compactStartedAt = Date.now();
-                    let overflowMessages = this.compactOpenAiMessages(
+                    const overflowCompacted = await compactWithCurrentMemory(
                         prepared.messages,
                         overflowTarget,
-                        keepLastTurns,
                         "Conversation summary (overflow retry)",
-                        compactMaxToolResultChars
+                        "overflow-retry"
                     );
-                    overflowMessages = injectAppendOnlySharedMemoryContext(
-                        overflowMessages,
-                        sharedMemoryContext
-                    );
+                    const overflowMessages = overflowCompacted.messages;
                     requestBody.messages = overflowMessages.map(toWireMessage);
 
-                    const overflowCount = await countMessages(overflowMessages);
+                    const overflowCount = overflowCompacted.counted;
                     const overflowMessageTokens = overflowCount.tokens;
                     this.setConversationMessageSnapshot(
                         conversationScope,
@@ -5078,6 +5384,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             let continuationRetryCount = 0;
             let consecutiveToolCallOnlyTurns = 0;
             let toolCallRepairRetryCount = 0;
+            let reasoningLoopRetryCount = 0;
+            let reasoningLoopDetected = false;
             // Reset per-turn counters — they must reflect only THIS turn's
             // activity, not the accumulated history.
             this.lastToolExecutionErrorCount = 0;
@@ -5115,13 +5423,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 let roundOutputChars = 0;
                 let roundThinkingChars = 0;
                 let roundToolCallParts = 0;
+                const reasoningRepetitionDetector = reasoningLoopProtection
+                    ? new ReasoningRepetitionDetector({
+                        minTotalChars: reasoningLoopMinChars,
+                        minRepeatedChars: Math.max(1024, Math.floor(reasoningLoopMinChars * 0.75)),
+                    })
+                    : undefined;
 
                 let responseBody = attempt.response.body;
                 let streamLogTask: Promise<void> | undefined;
+                let streamCaptureStop: vscode.CancellationTokenSource | undefined;
                 if (this.logger?.shouldLogStreamChunks()) {
                     const [processingStream, loggingStream] = responseBody.tee();
                     responseBody = processingStream;
-                    streamLogTask = this.captureRawStream(loggingStream, requestId, token);
+                    streamCaptureStop = new vscode.CancellationTokenSource();
+                    streamLogTask = this.captureRawStream(loggingStream, requestId, token, streamCaptureStop.token);
                     this.log("chat.stream.capture_started", {
                         requestId,
                         attemptNo: attempt.attemptNo,
@@ -5194,12 +5510,112 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     this.outputLimitHintSetting = resolvedFamily === "deepseek"
                         ? "llamacpp.deepSeekDefaultMaxOutputTokens"
                         : "llamacpp.maxOutputTokensCap";
-                    roundServerUsage = await this.processStreamingResponse(responseBody, measuredProgress, token);
+                    roundServerUsage = await this.processStreamingResponse(
+                        responseBody,
+                        measuredProgress,
+                        token,
+                        text => {
+                            const detection = reasoningRepetitionDetector?.append(text);
+                            if (detection) {
+                                throw new ReasoningRepetitionError(detection);
+                            }
+                        }
+                    );
                     await streamLogTask;
+                    streamCaptureStop?.dispose();
                     mergeReliabilityMetrics(this.consumeToolCallReliabilityMetrics());
                 } catch (error) {
+                    streamCaptureStop?.cancel();
                     await streamLogTask;
+                    streamCaptureStop?.dispose();
                     mergeReliabilityMetrics(this.consumeToolCallReliabilityMetrics());
+                    if (error instanceof ReasoningRepetitionError) {
+                        reasoningLoopDetected = true;
+                        const canRetryReasoning =
+                            reasoningLoopRetryCount < reasoningLoopRetryMaxAttempts
+                            && roundOutputChars === 0
+                            && roundToolCallParts === 0
+                            && !token.isCancellationRequested;
+                        this.log("chat.reasoning.repetition_detected", {
+                            requestId,
+                            attemptNo: attempt.attemptNo,
+                            totalChars: error.detection.totalChars,
+                            repeatedChars: error.detection.repeatedChars,
+                            unitChars: error.detection.unitChars,
+                            repetitions: error.detection.repetitions,
+                            roundOutputChars,
+                            roundThinkingChars,
+                            roundToolCallParts,
+                            retryCount: reasoningLoopRetryCount,
+                            retryLimit: reasoningLoopRetryMaxAttempts,
+                            willRetry: canRetryReasoning,
+                        });
+
+                        if (!canRetryReasoning) {
+                            finalAttempt = attempt;
+                            measuredProgress.report(new vscode.LanguageModelTextPart(
+                                "[reasoning loop guard] Repetitive private reasoning was stopped before it could consume the remaining output budget. Run Compact Conversation or retry from the last verified state."
+                            ));
+                            this.log("chat.reasoning.repetition_stopped", {
+                                requestId,
+                                attemptNo: attempt.attemptNo,
+                                retryCount: reasoningLoopRetryCount,
+                                retryLimit: reasoningLoopRetryMaxAttempts,
+                            });
+                            break;
+                        }
+
+                        reasoningLoopRetryCount += 1;
+                        const recoveryPrompt: OpenAIChatMessage = {
+                            role: "user",
+                            ephemeral: true,
+                            content: [
+                                "An internal reasoning repetition loop was detected and stopped.",
+                                "Continue from the compacted verified state and complete the next concrete step.",
+                                "Do not reproduce the previous private reasoning or discuss the loop unless it blocks the task.",
+                            ].join("\n"),
+                        };
+                        const recoverySource = [...sourceMessages, recoveryPrompt];
+                        const recoveryBefore = await countMessages(recoverySource);
+                        const recoveryTarget = Math.max(1, Math.min(softInputTarget, recoveryBefore.tokens));
+                        const recoveryCompacted = await compactWithCurrentMemory(
+                            recoverySource,
+                            recoveryTarget,
+                            "Conversation summary (reasoning-loop recovery)",
+                            "reasoning-loop",
+                            true
+                        );
+                        sourceMessages = recoveryCompacted.messages;
+                        void this.saveCompactionSnapshot({
+                            requestId,
+                            cause: "reasoning-loop",
+                            targetTokens: recoveryTarget,
+                            before: {
+                                messageCount: recoverySource.length,
+                                tokenEstimate: recoveryBefore.tokens,
+                                chars: this.messageChars(recoverySource),
+                            },
+                            after: {
+                                messageCount: sourceMessages.length,
+                                tokenEstimate: recoveryCompacted.counted.tokens,
+                                chars: this.messageChars(sourceMessages),
+                            },
+                            messages: sourceMessages,
+                        });
+                        this.log("chat.reasoning.repetition_retry", {
+                            requestId,
+                            attemptNo: attempt.attemptNo,
+                            retryCount: reasoningLoopRetryCount,
+                            beforeMessages: recoverySource.length,
+                            afterMessages: sourceMessages.length,
+                            beforeTokens: recoveryBefore.tokens,
+                            afterTokens: recoveryCompacted.counted.tokens,
+                        });
+                        if (stopAfterMaxTurns()) {
+                            break;
+                        }
+                        continue;
+                    }
                     const canRetryToolCall =
                         error instanceof ToolCallValidationError &&
                         toolCallRepairEnabled &&
@@ -5314,7 +5730,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     });
                 } else if (roundOutputChars === 0 && roundToolCallParts > 0) {
                     consecutiveToolCallOnlyTurns += 1;
-                    const shouldNudge =
+                    const shouldContinue =
                         toolCallOnlyAutoretry &&
                         consecutiveToolCallOnlyTurns >= toolCallOnlyAutoretryThreshold &&
                         !token.isCancellationRequested;
@@ -5329,12 +5745,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         thinkingChars,
                         roundThinkingChars,
                         consecutiveToolCallOnlyTurns,
-                        toolCallOnlyNudge: shouldNudge,
+                        toolCallOnlyContinuation: shouldContinue,
                     });
 
-                    if (shouldNudge) {
+                    if (shouldContinue) {
                         consecutiveToolCallOnlyTurns = 0;
-                        this.log("chat.response.tool_call_only_nudge", {
+                        this.log("chat.response.tool_call_only_continue", {
                             requestId,
                             attemptNo: attempt.attemptNo,
                             toolResultMode: activeToolResultMode,
@@ -5346,9 +5762,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                             {
                                 role: "user",
                                 ephemeral: true,
-                                content:
-                                    "You have been making tool calls without any text response for several turns. " +
-                                    "Please pause, summarize what you have accomplished so far, and state your next plan clearly before making more tool calls.",
+                                content: TOOL_CALL_CONTINUATION_PROMPT,
                             },
                         ];
                         if (stopAfterMaxTurns()) {
@@ -5422,22 +5836,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 : false;
             if (conversationScope) {
                 this.lastTurnCompactedByScope.set(conversationScope, latestAutoCompacted);
-            }
-            if (conversationScope) {
-                // Record this turn's shape for the cross-turn tool-call pacing
-                // guard (tool-call-only turn = tool calls, no visible text).
-                const turnShape: RecentTurnShape =
-                    outputChars === 0 && emittedToolCallParts > 0 ? "toolOnly" : "text";
-                const priorShapes = this.recentTurnShapesByScope.get(conversationScope) ?? [];
-                this.recentTurnShapesByScope.set(
-                    conversationScope,
-                    recordRecentTurnShape(priorShapes, turnShape)
-                );
-                const consecutive = this.consecutiveToolOnlyTurnsByScope.get(conversationScope) ?? 0;
-                this.consecutiveToolOnlyTurnsByScope.set(
-                    conversationScope,
-                    turnShape === "toolOnly" ? consecutive + 1 : 0
-                );
             }
             const previousCacheBackend = conversationScope
                 ? this.lastCacheBackendByScope.get(conversationScope)
@@ -5524,6 +5922,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 schemaRejectedToolCalls: reliabilityMetrics.schemaRejected,
                 toolCallRepairRetries: toolCallRepairRetryCount,
                 toolLoopDetected: reliabilityMetrics.loopDetected,
+                reasoningLoopDetected,
+                reasoningLoopRetries: reasoningLoopRetryCount,
                 toolExecutionErrors: this.lastToolExecutionErrorCount,
                 toolExecutionErrorDetails: this.lastToolExecutionErrorDetails.length > 0
                     ? this.lastToolExecutionErrorDetails
@@ -5629,6 +6029,16 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
     private async getDeepSeekApiKey(): Promise<string | undefined> {
         return (await this.secrets.get("llamacpp.deepSeekApiKey")) ?? (await this.getApiKey());
+    }
+
+    private async getCompactionDeepSeekApiKey(): Promise<string | undefined> {
+        const dedicated = await this.secrets.get("llamacpp.deepSeekApiKey");
+        if (dedicated) {
+            return dedicated;
+        }
+        // A primary API key is valid for DeepSeek only when the primary endpoint
+        // itself is DeepSeek. Never send a local/private server key to DeepSeek.
+        return this.isDeepSeekServer(await this.getServerUrl()) ? await this.getApiKey() : undefined;
     }
 
     /**

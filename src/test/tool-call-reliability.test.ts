@@ -2,17 +2,12 @@ import * as assert from "assert";
 
 import {
 	detectRepeatedToolCallLoop,
-	injectToolCallOnlyNudge,
 	injectToolLoopGuard,
-	RECENT_TURN_WINDOW,
-	recordRecentTurnShape,
-	shouldInjectToolCallOnlyNudge,
-	toolCallOnlyDensity,
 	parseToolArguments,
+	TOOL_CALL_CONTINUATION_PROMPT,
 	ToolCallReliabilityGuard,
 	validateToolArguments,
 } from "../tools/tool-call-reliability";
-import type { RecentTurnShape } from "../tools/tool-call-reliability";
 import type { OpenAIFunctionToolDef } from "../types";
 
 const tool: OpenAIFunctionToolDef = {
@@ -181,49 +176,10 @@ suite("tool call reliability", () => {
 		assert.ok(String(guarded.at(-1)?.content).includes("Do not repeat"));
 	});
 
-	test("records turn shapes with a rolling window", () => {
-		const shapes: RecentTurnShape[] = [
-			"text", "toolOnly", "text", "toolOnly", "toolOnly",
-			"toolOnly", "toolOnly", "toolOnly", "toolOnly", "text",
-		];
-		let queue: RecentTurnShape[] = [];
-		for (const shape of shapes) {
-			queue = recordRecentTurnShape(queue, shape);
-		}
-		assert.strictEqual(queue.length, RECENT_TURN_WINDOW);
-		assert.strictEqual(toolCallOnlyDensity(queue), 6);
-	});
-
-	test("nudges only when tool-call-only turns dominate a full window", () => {
-		// 5 of last 8 -> nudge with the default-derived threshold 4.
-		const dominant: RecentTurnShape[] = [
-			"toolOnly", "toolOnly", "text", "toolOnly", "toolOnly",
-			"toolOnly", "text", "toolOnly",
-		];
-		assert.strictEqual(toolCallOnlyDensity(dominant), 6);
-		assert.ok(shouldInjectToolCallOnlyNudge(dominant, 4));
-		// 3 of last 8 -> no nudge.
-		const sparse: RecentTurnShape[] = [
-			"text", "toolOnly", "text", "text", "toolOnly",
-			"text", "toolOnly", "text",
-		];
-		assert.ok(!shouldInjectToolCallOnlyNudge(sparse, 4));
-		// Partial window (< 8 turns) never nudges.
-		const partial = sparse.slice(0, 5);
-		assert.ok(!shouldInjectToolCallOnlyNudge(partial, 4));
-	});
-
-	test("injects the pacing nudge only when a message is provided", () => {
-		const calls = [
-			{ role: "assistant" as const, content: "ok", tool_calls: [] as never[] },
-		];
-		const without = injectToolCallOnlyNudge(calls, undefined);
-		assert.strictEqual(without.length, 1);
-		assert.notStrictEqual(without[0], calls[0]);
-		const withMessage = injectToolCallOnlyNudge(calls, "Pause and summarize.");
-		assert.strictEqual(withMessage.length, 2);
-		assert.strictEqual(withMessage.at(-1)?.role, "user");
-		assert.strictEqual(withMessage.at(-1)?.ephemeral, true);
-		assert.strictEqual(withMessage.at(-1)?.content, "Pause and summarize.");
+	test("continuation recovery never asks for an interim review", () => {
+		assert.match(TOOL_CALL_CONTINUATION_PROMPT, /Continue executing the current task/);
+		assert.match(TOOL_CALL_CONTINUATION_PROMPT, /next useful tool call/);
+		assert.match(TOOL_CALL_CONTINUATION_PROMPT, /only after the requested work is complete/);
+		assert.doesNotMatch(TOOL_CALL_CONTINUATION_PROMPT, /pause|summar|review|recap|plan/i);
 	});
 });

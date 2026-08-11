@@ -28,6 +28,13 @@ consecutive identical name/argument signatures. At the configured threshold it
 adds a guard requiring the model to use the existing result, inspect an error,
 change approach, or state the blocker. It does not silently suppress execution.
 
+Reasoning-loop protection is separate from tool-loop protection. It inspects
+only private streamed reasoning and stops an exact periodic suffix after several
+kilobytes. When no visible answer or tool call has been emitted, the provider
+rebuilds the chain as a clean summary and retries once. If recovery also loops,
+the turn ends with a bounded guard message rather than consuming the full output
+allowance.
+
 Relevant settings:
 
 ```json
@@ -36,13 +43,16 @@ Relevant settings:
   "llamacpp.validateToolCallSchema": true,
   "llamacpp.toolCallRepairMaxAttempts": 1,
   "llamacpp.toolLoopProtection": true,
-  "llamacpp.toolLoopDetectionThreshold": 3
+  "llamacpp.toolLoopDetectionThreshold": 3,
+  "llamacpp.reasoningLoopProtection": true,
+  "llamacpp.reasoningLoopMinChars": 4096,
+  "llamacpp.reasoningLoopRetryMaxAttempts": 1
 }
 ```
 
 ## Provider Health Check
 
-Run `Local LLM: Run Provider Health Check` from the Command Palette or Quick
+Run `AI Agent Bridge: Run Provider Health Check` from the Command Palette or Quick
 Access. It performs read-only, non-generating checks:
 
 - model discovery for each configured source;
@@ -60,7 +70,7 @@ configuration is active, and `INFO` records expected provider-specific behavior.
 
 ## Session Quality Report
 
-Run `Local LLM: Open Session Quality Report` to open the live webview for
+Run `AI Agent Bridge: Open Session Quality Report` to open the live webview for
 metrics accumulated since extension activation or the last reset. It updates
 without replacing the webview document, preserving expanded rows and active
 model/search/issues-only filters. Turn details use stable request ids, so a new
@@ -75,7 +85,7 @@ preserved across updates.
 - first-model-event, first-visible-text, and generation throughput metrics;
 - tool calls, native tool duration/breakdown, deterministic repairs,
   rejections, and correction retries;
-- detected tool loops;
+- detected tool and reasoning loops, including clean-context retry counts;
 - provider compaction and context-overflow retries;
 - per-turn model id, transport, context budget, and exact/estimated source;
 - Codex and Claude model usage segments and ordered live model/tool step
@@ -91,13 +101,13 @@ preserved across updates.
 Reports contain metrics and model ids only. They do not retain message or tool
 result bodies. Markdown and JSON snapshots are updated automatically under
 `<globalStorage>/reports/`, so a completed run remains inspectable outside the
-webview. Use `Local LLM: Reset Session Metrics` before a controlled test.
+webview. Use `AI Agent Bridge: Reset Session Metrics` before a controlled test.
 
 ## Usage Experiments
 
-Use `Local LLM: Start Baseline Usage Experiment` and `Local LLM: Start
+Use `AI Agent Bridge: Start Baseline Usage Experiment` and `AI Agent Bridge: Start
 Delegated Usage Experiment` with the exact same task label to compare two
-routing strategies. Stop each run with `Local LLM: Stop and Export Usage
+routing strategies. Stop each run with `AI Agent Bridge: Stop and Export Usage
 Experiment`; the tracker records bounded provider usage samples and exports a
 Markdown/JSON comparison. This is intended for controlled repeated tasks, not
 for comparing unrelated prompts or different model/effort settings.

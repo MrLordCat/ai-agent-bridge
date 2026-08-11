@@ -14,6 +14,7 @@ import {
 	classifyClaudeResumeFailure,
 	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
+	createLatestUserMessage,
 	findLatestPersistedClaudeConversation,
 	findPersistedClaudeConversation,
 	resolveClaudeResumeFallbackDecision,
@@ -423,11 +424,11 @@ suite("Claude subscription provider", () => {
 		assert.strictEqual(findPersistedClaudeConversation([entry], {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
-			runtimeKey: "runtime-b",
+			runtimeKey: "runtime-a",
 			copilotTurnIndex: 10,
 			userSignatures: ["user-a", "user-b"],
 			now: AVAILABILITY_NOW,
-		}), undefined);
+		})?.sdkSessionId, entry.sdkSessionId);
 		assert.strictEqual(findPersistedClaudeConversation([{ ...entry, lastUsedAt: AVAILABILITY_NOW - 8 * 24 * 60 * 60_000 }], {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
@@ -455,6 +456,30 @@ suite("Claude subscription provider", () => {
 			userSignatures: ["rewritten-a"],
 			now: AVAILABILITY_NOW,
 		})?.sdkSessionId, entry.sdkSessionId);
+		// A mid-turn notification or retry resends the same copilotTurnIndex
+		// with a truncated/rewritten transcript (fewer signatures). It must
+		// still restore the persisted session instead of cold-replaying the
+		// whole chat — the exact conversationId pins the record to this chat.
+		assert.strictEqual(findPersistedClaudeConversation([{
+			...entry,
+			copilotTurnIndex: 29,
+			userSignatures: ["sig-1", "sig-2", "sig-3", "sig-4"],
+		}], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-a",
+			copilotTurnIndex: 29,
+			userSignatures: ["sig-1"],
+			now: AVAILABILITY_NOW,
+		})?.sdkSessionId, entry.sdkSessionId);
+		assert.strictEqual(findPersistedClaudeConversation([{ ...entry, copilotTurnIndex: 30 }], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-a",
+			copilotTurnIndex: 29,
+			userSignatures: ["user-a", "user-b"],
+			now: AVAILABILITY_NOW,
+		})?.sdkSessionId, entry.sdkSessionId);
 		assert.strictEqual(findPersistedClaudeConversation([{
 			...entry,
 			copilotTurnIndex: undefined,
@@ -465,7 +490,7 @@ suite("Claude subscription provider", () => {
 			copilotTurnIndex: 20,
 			userSignatures: ["user-a"],
 			now: AVAILABILITY_NOW,
-		}), undefined);
+		})?.sdkSessionId, entry.sdkSessionId);
 	});
 
 	test("selects the newest non-stale Claude session for an explicit rollover", () => {
@@ -561,6 +586,45 @@ suite("Claude subscription provider", () => {
 		assert.ok(prepared.text.includes("first"));
 		assert.ok(prepared.text.includes("second"));
 		assert.ok(prepared.text.includes("latest"));
+	});
+
+	test("skips orphan tool-result tails when building the latest user message", () => {
+		// VS Code can deliver an already-executed tool result after the user
+		// stopped the turn; the provider then restores the session and must
+		// append the user's real task, not a JSON blob of the tool result.
+		const messages = [
+			vscode.LanguageModelChatMessage.User("old task"),
+			vscode.LanguageModelChatMessage.Assistant("done"),
+			vscode.LanguageModelChatMessage.User("new task: move the tower"),
+			vscode.LanguageModelChatMessage.Assistant("ok"),
+			vscode.LanguageModelChatMessage.User([
+				new vscode.LanguageModelToolResultPart("call-1", [
+					new vscode.LanguageModelTextPart("file content"),
+				]),
+			]),
+		];
+		const built = createLatestUserMessage(messages);
+		const content = built.message.content as Array<{ type: string; text?: string }>;
+
+		assert.strictEqual(content.length, 1);
+		assert.strictEqual(content[0].type, "text");
+		assert.ok(content[0].text?.includes("new task: move the tower"));
+		assert.ok(!content[0].text?.includes("file content"));
+	});
+
+	test("falls back to Continue when the tail has no real user content", () => {
+		const built = createLatestUserMessage([
+			vscode.LanguageModelChatMessage.User([
+				new vscode.LanguageModelToolResultPart("call-1", [
+					new vscode.LanguageModelTextPart("result"),
+				]),
+			]),
+		]);
+		const content = built.message.content as Array<{ type: string; text?: string }>;
+
+		assert.strictEqual(content.length, 1);
+		assert.strictEqual(content[0].type, "text");
+		assert.strictEqual(content[0].text, "Continue.");
 	});
 
 	test("builds separate 5h, weekly, and model-scoped usage limits", () => {

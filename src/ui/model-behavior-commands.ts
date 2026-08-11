@@ -1,6 +1,10 @@
 import * as vscode from "vscode";
 
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET } from "../constants";
+import {
+	DEFAULT_COMPACTION_TARGET_RATIO,
+	normalizeCompactionTargetRatio,
+} from "../context/context-budget";
 import { formatCompactTokenCount } from "../provider-metrics";
 import type { ThinkingMode } from "../reasoning";
 
@@ -88,7 +92,7 @@ async function pickThinkingMode(current: ThinkingMode): Promise<ThinkingMode | u
 			...option,
 			detail: option.value === current ? "Current" : undefined,
 		})),
-		{ title: "Local LLM Thinking Mode", ignoreFocusOut: true }
+		{ title: "AI Agent Bridge Thinking Mode", ignoreFocusOut: true }
 	);
 	return picked?.value;
 }
@@ -101,7 +105,7 @@ async function pickToolResultMode(current: ToolResultMode): Promise<ToolResultMo
 	];
 	const picked = await vscode.window.showQuickPick(
 		options.map(option => ({ ...option, detail: option.value === current ? "Current" : undefined })),
-		{ title: "Local LLM Tool Result Mode", ignoreFocusOut: true }
+		{ title: "AI Agent Bridge Tool Result Mode", ignoreFocusOut: true }
 	);
 	return picked?.value;
 }
@@ -113,7 +117,7 @@ async function pickToolCallingMode(current: ToolCallingMode): Promise<ToolCallin
 	];
 	const picked = await vscode.window.showQuickPick(
 		options.map(option => ({ ...option, detail: option.value === current ? "Current" : undefined })),
-		{ title: "Local LLM Tool Calling Mode", ignoreFocusOut: true }
+		{ title: "AI Agent Bridge Tool Calling Mode", ignoreFocusOut: true }
 	);
 	return picked?.value;
 }
@@ -126,7 +130,30 @@ async function pickKnowledgeMode(current: KnowledgeMode): Promise<KnowledgeMode 
 	];
 	const picked = await vscode.window.showQuickPick(
 		options.map(option => ({ ...option, detail: option.value === current ? "Current" : undefined })),
-		{ title: "Local LLM Knowledge Verification", ignoreFocusOut: true }
+		{ title: "AI Agent Bridge Knowledge Verification", ignoreFocusOut: true }
+	);
+	return picked?.value;
+}
+
+async function pickCompactionTargetRatio(current: number): Promise<number | undefined> {
+	const options = [
+		{ label: "25% retained", description: "Extreme: reduce current history by about 75%; best with AI summaries", value: 0.25 },
+		{ label: "35% retained", description: "Very aggressive: maximize headroom while keeping a larger recent tail", value: 0.35 },
+		{ label: "50% retained", description: "Aggressive: reduce current history by about 50%", value: 0.5 },
+		{ label: "60% retained", description: "More headroom with moderate context loss", value: 0.6 },
+		{ label: "75% retained", description: "Default: reduce current history by about 25%", value: 0.75 },
+		{ label: "85% retained", description: "Gentle: preserve more context but compact more often", value: 0.85 },
+	];
+	const picked = await vscode.window.showQuickPick(
+		options.map(option => ({
+			...option,
+			detail: Math.abs(option.value - current) < 0.001 ? "Current" : undefined,
+		})),
+		{
+			title: "AI Agent Bridge Compaction Target",
+			placeHolder: "Select how much of the current message context to retain",
+			ignoreFocusOut: true,
+		}
 	);
 	return picked?.value;
 }
@@ -151,6 +178,21 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			967_000,
 			refresh
 		),
+		vscode.commands.registerCommand("llamacpp.setCompactionTargetRatio", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const current = normalizeCompactionTargetRatio(
+				config.get("compactionTargetRatio", DEFAULT_COMPACTION_TARGET_RATIO)
+			);
+			const next = await pickCompactionTargetRatio(current);
+			if (next === undefined) {
+				return;
+			}
+			await config.update("compactionTargetRatio", next, vscode.ConfigurationTarget.Global);
+			refresh();
+			vscode.window.showInformationMessage(
+				`AI Agent Bridge compaction target: ${Math.round(next * 100)}% of current context retained`
+			);
+		}),
 		vscode.commands.registerCommand("llamacpp.setThinkingMode", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 			const current = String(config.get("thinkingMode", "auto")) as ThinkingMode;
@@ -160,13 +202,13 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			}
 			await config.update("thinkingMode", next, vscode.ConfigurationTarget.Global);
 			refresh();
-			vscode.window.showInformationMessage(`Local LLM thinking mode: ${next}`);
+			vscode.window.showInformationMessage(`AI Agent Bridge thinking mode: ${next}`);
 		}),
 		vscode.commands.registerCommand("llamacpp.setReasoningBudget", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 			const current = Number(config.get("reasoningBudget", DEFAULT_LOCAL_REASONING_BUDGET));
 			const value = await vscode.window.showInputBox({
-				title: "Local LLM Reasoning Cap",
+				title: "AI Agent Bridge Reasoning Cap",
 				prompt: "Maximum hidden reasoning tokens for local models; DeepSeek uses High or Max effort",
 				value: Number.isFinite(current) ? String(current) : String(DEFAULT_LOCAL_REASONING_BUDGET),
 				ignoreFocusOut: true,
@@ -184,7 +226,7 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			const parsed = Math.max(256, Math.min(65536, Number(value)));
 			await config.update("reasoningBudget", parsed, vscode.ConfigurationTarget.Global);
 			refresh();
-			vscode.window.showInformationMessage(`Local LLM reasoning cap: ${parsed} tokens`);
+			vscode.window.showInformationMessage(`AI Agent Bridge reasoning cap: ${parsed} tokens`);
 		}),
 		vscode.commands.registerCommand("llamacpp.setToolResultMode", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -195,7 +237,7 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			}
 			await config.update("toolResultMode", next, vscode.ConfigurationTarget.Global);
 			refresh();
-			vscode.window.showInformationMessage(`Local LLM tool result mode: ${next}`);
+			vscode.window.showInformationMessage(`AI Agent Bridge tool result mode: ${next}`);
 		}),
 		vscode.commands.registerCommand("llamacpp.setToolCallingMode", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -206,7 +248,7 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			}
 			await config.update("toolCallingMode", next, vscode.ConfigurationTarget.Global);
 			refresh();
-			vscode.window.showInformationMessage(`Local LLM tool calling mode: ${next}`);
+			vscode.window.showInformationMessage(`AI Agent Bridge tool calling mode: ${next}`);
 		}),
 		vscode.commands.registerCommand("llamacpp.setKnowledgeMode", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
@@ -217,7 +259,7 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			}
 			await config.update("knowledgeMode", next, vscode.ConfigurationTarget.Global);
 			refresh();
-			vscode.window.showInformationMessage(`Local LLM knowledge verification: ${next}`);
+			vscode.window.showInformationMessage(`AI Agent Bridge knowledge verification: ${next}`);
 		}),
 	];
 }

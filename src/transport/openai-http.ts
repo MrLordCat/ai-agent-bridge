@@ -16,15 +16,19 @@ export function isDeepSeekEndpoint(serverUrl: string): boolean {
 }
 
 export function getChatCompletionsEndpoint(serverUrl: string): string {
-	return isDeepSeekEndpoint(serverUrl)
-		? `${serverUrl}/chat/completions`
-		: `${serverUrl}/v1/chat/completions`;
+	return `${getOpenAiApiRoot(serverUrl)}/chat/completions`;
 }
 
 export function getModelsEndpoint(serverUrl: string): string {
-	return isDeepSeekEndpoint(serverUrl)
-		? `${serverUrl}/models`
-		: `${serverUrl}/v1/models`;
+	return `${getOpenAiApiRoot(serverUrl)}/models`;
+}
+
+function getOpenAiApiRoot(serverUrl: string): string {
+	const normalized = serverUrl.trim().replace(/\/+$/, "");
+	if (isDeepSeekEndpoint(normalized) || /\/v\d+(?:\.\d+)?$/i.test(normalized)) {
+		return normalized;
+	}
+	return `${normalized}/v1`;
 }
 
 export function isTransientHttpStatus(status: number): boolean {

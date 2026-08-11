@@ -1,11 +1,11 @@
-# Local LLM Chat Provider Fork
+# AI Agent Bridge — Fork Changes
 
 ## Product Direction
 
 This repository is an independent continuation of the original llama.cpp chat
-provider. Its goal is one efficient VS Code Chat integration for local
-OpenAI-compatible servers and DeepSeek, without switching a single global URL
-back and forth.
+provider. Its goal is one efficient native VS Code agent integration for local
+OpenAI-compatible servers, DeepSeek, Codex, and Claude without replacing the
+editor's global Copilot endpoint.
 
 Compatibility identifiers remain under `llamacpp.*` so existing settings,
 commands, and model selections continue to work. User-facing ownership,

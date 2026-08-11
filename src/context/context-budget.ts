@@ -32,14 +32,14 @@ interface ContextCompactionDecisionInput {
 	autoCompact: boolean;
 	softInputTarget: number;
 	overflowRetry: boolean;
+	targetRatio?: number;
 }
 
 /**
  * Chooses whether to compact for a request. A single soft scheme is used in
  * every case: proactively when the context passes the soft target, and
- * unconditionally on a confirmed overflow retry. Both compact to 75% of the
- * current size (COMPACTION_TARGET_RATIO), so the logic stays simple and the
- * prompt cache is only rewritten when a rewrite is actually needed.
+ * unconditionally on a confirmed overflow retry. Both use the configured
+ * target ratio, so proactive and overflow compaction have identical behavior.
  */
 export function selectContextCompaction(
 	input: ContextCompactionDecisionInput
@@ -47,22 +47,29 @@ export function selectContextCompaction(
 	if (input.overflowRetry || (input.autoCompact && input.messageTokens > input.softInputTarget)) {
 		return {
 			kind: "auto",
-			target: Math.max(1, Math.floor(input.messageTokens * COMPACTION_TARGET_RATIO)),
+			target: Math.max(1, Math.floor(input.messageTokens * normalizeCompactionTargetRatio(input.targetRatio))),
 		};
 	}
 	return { kind: "none" };
 }
 
 /**
- * How much of the current context a compaction should retain. A single soft
- * scheme is used for both proactive compaction and overflow retries: it keeps
- * ~75% of the current message tokens (a ~25% reduction). Compacting to exactly
- * the trigger threshold would re-trigger on the very next turn (a
- * micro-compaction), so the 25% reduction doubles as the headroom that makes
- * one compaction last for many turns. Raised from 0.6 (2026-08-07): a 40%
- * reduction was eating too much working context for agent chats.
+ * How much of the current message context a compaction should retain. The
+ * default keeps 75% (a 25% reduction), while users can select an extreme 25%
+ * target (a 75% reduction). Ratios outside the supported range are clamped so a malformed
+ * setting cannot erase nearly all history or leave no useful headroom.
  */
-export const COMPACTION_TARGET_RATIO = 0.75;
+export const DEFAULT_COMPACTION_TARGET_RATIO = 0.75;
+export const MIN_COMPACTION_TARGET_RATIO = 0.25;
+export const MAX_COMPACTION_TARGET_RATIO = 0.9;
+
+export function normalizeCompactionTargetRatio(value: unknown): number {
+	const parsed = typeof value === "number" ? value : Number(value);
+	if (!Number.isFinite(parsed)) {
+		return DEFAULT_COMPACTION_TARGET_RATIO;
+	}
+	return Math.max(MIN_COMPACTION_TARGET_RATIO, Math.min(MAX_COMPACTION_TARGET_RATIO, parsed));
+}
 
 /** Updates the heuristic token multiplier from the latest server observation. */
 export function updateHeuristicCalibration(

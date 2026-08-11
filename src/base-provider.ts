@@ -73,6 +73,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     private _thinkingMarker: { open: string; close: string } | "" = "";
     private _emittedThinkingParts = new WeakMap<object, string>();
     private _currentTurnReasoningContent = "";
+    private _thinkingTextInspector: ((text: string) => void) | undefined;
     private _reasoningScope = "";
     private readonly _reasoningByScope = new Map<string, Map<string, string>>();
 
@@ -355,7 +356,8 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
     protected async processStreamingResponse(
         responseBody: ReadableStream<Uint8Array>,
         progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-        token: vscode.CancellationToken
+        token: vscode.CancellationToken,
+        thinkingTextInspector?: (text: string) => void
     ): Promise<ChatTokenUsage | undefined> {
         // The previous turn's reasoning has already been injected into the outgoing
         // request by this point. Start a fresh buffer for the response that follows.
@@ -372,12 +374,14 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         this._thinkingTagBuffer = "";
         this._thinkingMarker = "";
         this._emittedThinkingParts = new WeakMap<object, string>();
+        this._thinkingTextInspector = thinkingTextInspector;
 
         const reader = responseBody.getReader();
         const decoder = new TextDecoder();
         const coalescedProgress = this.createTextCoalescingProgress(progress);
         let buffer = "";
         let latestUsage: ChatTokenUsage | undefined;
+        let streamCompleted = false;
         let cancellationSubscription: vscode.Disposable | undefined;
         const cancellationSignal = new Promise<"cancelled">(resolve => {
             cancellationSubscription = token.onCancellationRequested(() => resolve("cancelled"));
@@ -426,10 +430,14 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             await this.flushActiveTextToolCall(coalescedProgress.progress);
             this.flushThinkingBuffers(coalescedProgress.progress);
             coalescedProgress.flush();
+            streamCompleted = true;
         } finally {
             cancellationSubscription?.dispose();
-            if (token.isCancellationRequested) {
-                await reader.cancel("VS Code chat request cancelled").catch(() => undefined);
+            if (!streamCompleted) {
+                const reason = token.isCancellationRequested
+                    ? "VS Code chat request cancelled"
+                    : "Response processing stopped by provider guard";
+                await reader.cancel(reason).catch(() => undefined);
             }
             coalescedProgress.flush();
             reader.releaseLock();
@@ -444,6 +452,7 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
             this._emittedTextToolCallKeys.clear();
             this._thinkingTagBuffer = "";
             this._thinkingMarker = "";
+            this._thinkingTextInspector = undefined;
         }
 
         return latestUsage;
@@ -604,24 +613,29 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         const deltaObj = choice.delta as Record<string, unknown> | undefined;
 
         // report thinking progress if backend provides it and host supports it
-        try {
-            const thinkingCandidates: unknown[] = [
-                (choice as Record<string, unknown> | undefined)?.thinking,
-                (choice as Record<string, unknown> | undefined)?.reasoning,
-                (choice as Record<string, unknown> | undefined)?.reasoning_content,
-                (deltaObj as Record<string, unknown> | undefined)?.thinking,
-                (deltaObj as Record<string, unknown> | undefined)?.reasoning,
-                (deltaObj as Record<string, unknown> | undefined)?.reasoning_content,
-            ];
+        const thinkingCandidates: unknown[] = [
+            (choice as Record<string, unknown> | undefined)?.thinking,
+            (choice as Record<string, unknown> | undefined)?.reasoning,
+            (choice as Record<string, unknown> | undefined)?.reasoning_content,
+            (deltaObj as Record<string, unknown> | undefined)?.thinking,
+            (deltaObj as Record<string, unknown> | undefined)?.reasoning,
+            (deltaObj as Record<string, unknown> | undefined)?.reasoning_content,
+        ];
 
-            for (const candidate of thinkingCandidates) {
+        for (const candidate of thinkingCandidates) {
+            try {
                 const extracted = this.extractThinkingPayload(candidate);
                 if (extracted.text && this.emitThinkingText(progress, extracted.text, extracted.id, extracted.metadata)) {
                     emitted = true;
                 }
+            } catch (error) {
+                // Provider guards deliberately throw from emitThinkingText.
+                // Parsing failures remain ignorable, but guard errors must stop
+                // the upstream reader instead of being swallowed here.
+                if (error instanceof Error && error.name === "ReasoningRepetitionError") {
+                    throw error;
+                }
             }
-        } catch {
-            // ignore errors here temporarily
         }
         if (deltaObj?.content) {
             const content = String(deltaObj.content);
@@ -704,6 +718,8 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
         if (!text) {
             return false;
         }
+
+        this._thinkingTextInspector?.(text);
 
         // Always retain reasoning for the next tool-result request. VS Code may render
         // a native ThinkingPart but omit it from the LanguageModelChatRequestMessage

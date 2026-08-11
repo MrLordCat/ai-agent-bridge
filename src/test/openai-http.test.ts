@@ -13,6 +13,8 @@ suite("OpenAI HTTP transport", () => {
 		assert.strictEqual(getModelsEndpoint("http://localhost:8000"), "http://localhost:8000/v1/models");
 		assert.strictEqual(getChatCompletionsEndpoint("https://api.deepseek.com"), "https://api.deepseek.com/chat/completions");
 		assert.strictEqual(getModelsEndpoint("https://api.deepseek.com"), "https://api.deepseek.com/models");
+		assert.strictEqual(getChatCompletionsEndpoint("https://api.openai.com/v1/"), "https://api.openai.com/v1/chat/completions");
+		assert.strictEqual(getModelsEndpoint("https://openrouter.ai/api/v1"), "https://openrouter.ai/api/v1/models");
 	});
 
 	test("posts serialized chat requests through the injected fetch implementation", async () => {

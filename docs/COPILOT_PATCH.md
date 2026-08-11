@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. `scripts/patch-copilot-chat.mjs` is a thin development
 CLI over that same implementation, so runtime and repository commands cannot
-drift apart. Patch v19 makes the following changes:
+drift apart. Patch v22 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -76,8 +76,9 @@ drift apart. Patch v19 makes the following changes:
   the provider can sanitize and budget them;
 - automatic background and foreground LLM summarization and wrapper-owned
   truncation are disabled for contributed `llamacpp` models. Provider-specific
-  compaction remains authoritative, while the explicit Compact Conversation
-  command remains available;
+  compaction remains authoritative. The explicit Compact Conversation command
+  routes the active stable conversation id to a one-shot provider recovery
+  compaction; non-`llamacpp` conversations keep Copilot's native `/compact`;
 - Copilot's stable conversation id is forwarded through provider-private
   `modelOptions` so completed Codex threads can be reused even when Copilot
   rewrites generated history. The id is never written to extension logs.
@@ -128,9 +129,9 @@ most once per VS Code build.
 
 Command Palette exposes:
 
-- `Local LLM: Apply Copilot Chat Patch`;
-- `Local LLM: Show Copilot Chat Patch Status`;
-- `Local LLM: Restore Original Copilot Chat`.
+- `AI Agent Bridge: Apply Copilot Chat Patch`;
+- `AI Agent Bridge: Show Copilot Chat Patch Status`;
+- `AI Agent Bridge: Restore Original Copilot Chat`.
 
 The repository CLI remains useful before installing a VSIX or for recovery:
 
@@ -202,13 +203,13 @@ override.
 
 ### Thinking Effort Is Missing
 
-Run `Local LLM: Show Copilot Chat Patch Status`. If the patch is applied, reload
+Run `AI Agent Bridge: Show Copilot Chat Patch Status`. If the patch is applied, reload
 all VS Code windows and start a new chat session with a model from this provider.
 
 ### VS Code Was Updated
 
 The new installation has a new Copilot bundle. With auto-patch enabled, activate
-Local LLM once and accept its reload prompt. Otherwise run `Local LLM: Apply
+AI Agent Bridge once and accept its reload prompt. Otherwise run `AI Agent Bridge: Apply
 Copilot Chat Patch`. Do not copy a patched bundle from an older VS Code build.
 
 ### Patch Guardian Keeps Offering Changes

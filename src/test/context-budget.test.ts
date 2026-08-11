@@ -113,6 +113,49 @@ suite("context budget", () => {
 		}), { kind: "none" });
 	});
 
+	test("supports aggressive 25 and 50 percent compaction targets", () => {
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 110000,
+			autoCompact: true,
+			softInputTarget: 101171,
+			overflowRetry: false,
+			targetRatio: 0.25,
+		}), { kind: "auto", target: 27500 });
+
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 110000,
+			autoCompact: true,
+			softInputTarget: 101171,
+			overflowRetry: false,
+			targetRatio: 0.5,
+		}), { kind: "auto", target: 55000 });
+
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 101000,
+			autoCompact: true,
+			softInputTarget: 101171,
+			overflowRetry: true,
+			targetRatio: 0.5,
+		}), { kind: "auto", target: 50500 });
+	});
+
+	test("clamps unsafe compaction target ratios", () => {
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 1000,
+			autoCompact: true,
+			softInputTarget: 900,
+			overflowRetry: false,
+			targetRatio: 0.1,
+		}), { kind: "auto", target: 250 });
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 1000,
+			autoCompact: true,
+			softInputTarget: 900,
+			overflowRetry: false,
+			targetRatio: 1,
+		}), { kind: "auto", target: 900 });
+	});
+
 	test("auto-compaction lands below the trigger to avoid micro-compactions", () => {
 		// Compacting to exactly the soft target re-triggers on the next turn.
 		// The 0.75 ratio keeps 75% of the current size (~25% reduction), which

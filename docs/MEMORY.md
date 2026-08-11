@@ -104,8 +104,8 @@ a consolidated current checkpoint if older deltas are summarized.
   Workspace deletion is rejected if the entry belongs to another project.
 
 VS Code asks for confirmation before extension tools execute. Users can inspect
-or edit the file with `Local LLM: Open Shared Memory` and remove all entries
-with `Local LLM: Clear Shared Memory`.
+or edit the file with `AI Agent Bridge: Open Shared Memory` and remove all entries
+with `AI Agent Bridge: Clear Shared Memory`.
 
 ## Limits
 

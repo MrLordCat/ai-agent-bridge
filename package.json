@@ -1,14 +1,14 @@
 {
 	"name": "llama-vscode-chat",
 	"publisher": "mrlordcat",
-	"displayName": "Local LLM Chat Provider",
-	"description": "Use local models, DeepSeek, Codex, and Claude subscriptions in VS Code Chat with native tools, context control, and diagnostics.",
+	"displayName": "AI Agent Bridge",
+	"description": "Bridge local models, DeepSeek, Codex, and Claude subscriptions into native VS Code Chat with tools, subagents, memory, context control, and diagnostics.",
 	"icon": "assets/logo.png",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/MrLordCat/llama-vscode-chat.git"
+		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.11.0",
+	"version": "1.11.15",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -21,9 +21,9 @@
 		"theme": "dark"
 	},
 	"badges": [],
-	"homepage": "https://github.com/MrLordCat/llama-vscode-chat",
+	"homepage": "https://github.com/MrLordCat/ai-agent-bridge",
 	"bugs": {
-		"url": "https://github.com/MrLordCat/llama-vscode-chat/issues"
+		"url": "https://github.com/MrLordCat/ai-agent-bridge/issues"
 	},
 	"license": "MIT",
 	"activationEvents": [
@@ -34,7 +34,7 @@
 		"languageModelChatProviders": [
 			{
 				"vendor": "llamacpp",
-				"displayName": "Local LLM",
+				"displayName": "AI Agent Bridge",
 				"managementCommand": "llamacpp.manage"
 			}
 		],
@@ -42,7 +42,7 @@
 			"activitybar": [
 				{
 					"id": "llamacpp-sidebar",
-					"title": "Local LLM",
+					"title": "AI Agent Bridge",
 					"icon": "assets/activity-icon.svg"
 				}
 			]
@@ -57,7 +57,7 @@
 			]
 		},
 		"configuration": {
-			"title": "Local LLM Provider",
+			"title": "AI Agent Bridge",
 			"properties": {
 				"llamacpp.serverUrl": {
 					"type": "string",
@@ -294,10 +294,10 @@
 				},
 				"llamacpp.claudeMaxAgentTurns": {
 					"type": "number",
-					"default": 24,
-					"minimum": 1,
+					"default": 0,
+					"minimum": 0,
 					"maximum": 200,
-					"description": "Maximum Claude Agent SDK model segments in one outer VS Code turn. Stops runaway tool loops before they exhaust the subscription window."
+					"description": "Maximum Claude Agent SDK model segments in one outer VS Code turn. Set to 0 to disable this segment cap; the cumulative-input circuit breaker remains active."
 				},
 				"llamacpp.claudeMaxCumulativeInputTokens": {
 					"type": "number",
@@ -336,6 +336,18 @@
 					"type": "boolean",
 					"default": false,
 					"description": "Compact chat history proactively before reaching the context limit. Disabled by default: history is sent as-is and compaction only happens when the server confirms a context overflow (see retryOnContextOverflow), avoiding cache-prefix rewrites from double compaction."
+				},
+				"llamacpp.compactionTargetRatio": {
+					"type": "number",
+					"default": 0.75,
+					"minimum": 0.25,
+					"maximum": 0.9,
+					"description": "Share of the current message context retained when proactive or overflow compaction runs. Set 0.25 to retain about 25% and free roughly 75%; extreme targets work best with DeepSeek AI summaries and may keep less raw recent history."
+				},
+				"llamacpp.deepSeekCompactionSummary": {
+					"type": "boolean",
+					"default": false,
+					"description": "Use deepseek-v4-flash to generate a semantic summary when the extension compacts local or DeepSeek HTTP chat history. Each compaction makes a separate paid DeepSeek API request. Disabled by default; failures safely fall back to deterministic local summarization. Claude and Codex keep their provider-native compaction paths."
 				},
 				"llamacpp.accurateTokenCounting": {
 					"type": "boolean",
@@ -376,21 +388,22 @@
 				"llamacpp.toolCallOnlyAutoretry": {
 					"type": "boolean",
 					"default": true,
-					"description": "Automatically inject a task-summary nudge when the model makes tool calls without text: several consecutive rounds within one request, or tool-call-only turns dominating the recent 8-turn window across requests."
+					"description": "Within a single provider request, recover from several tool-call-only generations by asking for the next useful tool call. Normal tool-only turns across VS Code requests remain uninterrupted and never trigger a progress review."
 				},
 				"llamacpp.toolCallOnlyAutoretryThreshold": {
 					"type": "number",
 					"default": 3,
 					"minimum": 2,
 					"maximum": 10,
-					"description": "Number of tool-call-only turns that triggers the task-summary nudge: consecutive within one request, or within the recent 8-turn window across requests (effective floor of 4)."
+					"description": "Number of consecutive tool-call-only generations within one provider request that triggers the continue-execution recovery prompt."
 				},
 				"llamacpp.toolLoopForceTextThreshold": {
 					"type": "number",
 					"default": 12,
 					"minimum": 6,
 					"maximum": 40,
-					"description": "After this many consecutive tool-call-only turns across requests (host-driven agent loop), the next request is sent WITHOUT tools so the model is forced to answer in text, breaking the loop. Set to a high value to effectively disable."
+					"description": "Deprecated compatibility setting. Productive cross-request tool flows no longer disable tools based only on their length; actual identical-call loops are handled by toolLoopProtection.",
+					"deprecationMessage": "No longer used. Configure toolLoopProtection and toolLoopDetectionThreshold for actual repeated-call loops."
 				},
 				"llamacpp.toolCallRepairEnabled": {
 					"type": "boolean",
@@ -420,6 +433,25 @@
 					"minimum": 2,
 					"maximum": 10,
 					"description": "Number of consecutive identical tool calls that activates loop protection."
+				},
+				"llamacpp.reasoningLoopProtection": {
+					"type": "boolean",
+					"default": true,
+					"description": "Stop exact multi-kilobyte repetition loops in streamed model reasoning, rebuild a clean provider summary, and retry once before returning a bounded stop message."
+				},
+				"llamacpp.reasoningLoopMinChars": {
+					"type": "number",
+					"default": 4096,
+					"minimum": 2048,
+					"maximum": 32768,
+					"description": "Minimum streamed reasoning volume before exact periodic repetition detection can stop a response. Larger values reduce sensitivity for highly repetitive technical output."
+				},
+				"llamacpp.reasoningLoopRetryMaxAttempts": {
+					"type": "number",
+					"default": 1,
+					"minimum": 0,
+					"maximum": 2,
+					"description": "Maximum clean-context retries after a streamed reasoning repetition loop. A retry summarizes the old chain and keeps only an internal recovery instruction as raw history."
 				},
 				"llamacpp.maxModelTurnsPerRequest": {
 					"type": "number",
@@ -862,211 +894,224 @@
 		"commands": [
 			{
 				"command": "llamacpp.openSidebar",
-				"title": "Local LLM: Open Sidebar"
+				"title": "AI Agent Bridge: Open Sidebar"
 			},
 			{
 				"command": "llamacpp.manage",
-				"title": "Local LLM: Manage Primary Server"
+				"title": "AI Agent Bridge: Manage Primary Server"
 			},
 			{
 				"command": "llamacpp.setLocalServerUrl",
-				"title": "Local LLM: Set Local Server URL"
+				"title": "AI Agent Bridge: Set Local Server URL"
 			},
 			{
 				"command": "llamacpp.toggleLocalServer",
-				"title": "Local LLM: Toggle Local Server Source"
+				"title": "AI Agent Bridge: Toggle Local Server Source"
 			},
 			{
 				"command": "llamacpp.toggleDeepSeek",
-				"title": "Local LLM: Toggle DeepSeek Source"
+				"title": "AI Agent Bridge: Toggle DeepSeek Source"
+			},
+			{
+				"command": "llamacpp.toggleDeepSeekCompactionSummary",
+				"title": "AI Agent Bridge: Toggle DeepSeek Compaction Summaries"
 			},
 			{
 				"command": "llamacpp.configureDeepSeek",
-				"title": "Local LLM: Configure DeepSeek"
+				"title": "AI Agent Bridge: Configure DeepSeek"
 			},
 			{
 				"command": "llamacpp.setDeepSeekContextLength",
-				"title": "Local LLM: Set DeepSeek Maximum Context"
+				"title": "AI Agent Bridge: Set DeepSeek Maximum Context"
 			},
 			{
 				"command": "llamacpp.toggleCodexSubscription",
-				"title": "Local LLM: Toggle Codex Subscription Source"
+				"title": "AI Agent Bridge: Toggle Codex Subscription Source"
 			},
 			{
 				"command": "llamacpp.toggleCodexDeferredTools",
-				"title": "Local LLM: Toggle Codex Deferred Tools"
+				"title": "AI Agent Bridge: Toggle Codex Deferred Tools"
 			},
 			{
 				"command": "llamacpp.codexSignIn",
-				"title": "Local LLM: Sign In to Codex Subscription"
+				"title": "AI Agent Bridge: Sign In to Codex Subscription"
 			},
 			{
 				"command": "llamacpp.codexSignOut",
-				"title": "Local LLM: Sign Out of Codex Subscription"
+				"title": "AI Agent Bridge: Sign Out of Codex Subscription"
 			},
 			{
 				"command": "llamacpp.codexShowStatus",
-				"title": "Local LLM: Show Codex Subscription Status"
+				"title": "AI Agent Bridge: Show Codex Subscription Status"
 			},
 			{
 				"command": "llamacpp.codexContinueLatestInNewChat",
-				"title": "Local LLM: Continue Latest Codex Thread in New Chat"
+				"title": "AI Agent Bridge: Continue Latest Codex Thread in New Chat"
 			},
 			{
 				"command": "llamacpp.toggleClaudeSubscription",
-				"title": "Local LLM: Toggle Claude Subscription Source"
+				"title": "AI Agent Bridge: Toggle Claude Subscription Source"
 			},
 			{
 				"command": "llamacpp.claudeSignIn",
-				"title": "Local LLM: Sign In to Claude Subscription"
+				"title": "AI Agent Bridge: Sign In to Claude Subscription"
 			},
 			{
 				"command": "llamacpp.claudeSignOut",
-				"title": "Local LLM: Sign Out of Claude Subscription"
+				"title": "AI Agent Bridge: Sign Out of Claude Subscription"
 			},
 			{
 				"command": "llamacpp.claudeShowStatus",
-				"title": "Local LLM: Show Claude Subscription Status"
+				"title": "AI Agent Bridge: Show Claude Subscription Status"
 			},
 			{
 				"command": "llamacpp.claudeContinueLatestInNewChat",
-				"title": "Local LLM: Continue Latest Claude Session in New Chat"
+				"title": "AI Agent Bridge: Continue Latest Claude Session in New Chat"
 			},
 			{
 				"command": "llamacpp.setClaudeContextLength",
-				"title": "Local LLM: Set Claude Working Context"
+				"title": "AI Agent Bridge: Set Claude Working Context"
 			},
 			{
 				"command": "llamacpp.openContextControl",
-				"title": "Local LLM: Open Provider Context Control"
+				"title": "AI Agent Bridge: Open Provider Context Control"
 			},
 			{
 				"command": "llamacpp.setApiKey",
-				"title": "Local LLM: Set Primary API Key"
+				"title": "AI Agent Bridge: Set Primary API Key"
 			},
 			{
 				"command": "llamacpp.openSettings",
-				"title": "Local LLM: Open Settings",
+				"title": "AI Agent Bridge: Open Settings",
 				"icon": "$(settings-gear)"
 			},
 			{
 				"command": "llamacpp.openMemory",
-				"title": "Local LLM: Open Shared Memory"
+				"title": "AI Agent Bridge: Open Shared Memory"
+			},
+			{
+				"command": "llamacpp.openApiProviders",
+				"title": "AI Agent Bridge: Manage API Providers",
+				"icon": "$(server-process)"
 			},
 			{
 				"command": "llamacpp.clearMemory",
-				"title": "Local LLM: Clear Shared Memory"
+				"title": "AI Agent Bridge: Clear Shared Memory"
 			},
 			{
 				"command": "llamacpp.setThinkingMode",
-				"title": "Local LLM: Set Thinking Mode"
+				"title": "AI Agent Bridge: Set Thinking Mode"
+			},
+			{
+				"command": "llamacpp.setCompactionTargetRatio",
+				"title": "AI Agent Bridge: Set Compaction Target"
 			},
 			{
 				"command": "llamacpp.setReasoningBudget",
-				"title": "Local LLM: Set Local Reasoning Cap"
+				"title": "AI Agent Bridge: Set Local Reasoning Cap"
 			},
 			{
 				"command": "llamacpp.setToolResultMode",
-				"title": "Local LLM: Set Tool Result Mode"
+				"title": "AI Agent Bridge: Set Tool Result Mode"
 			},
 			{
 				"command": "llamacpp.setToolCallingMode",
-				"title": "Local LLM: Set Tool Calling Mode"
+				"title": "AI Agent Bridge: Set Tool Calling Mode"
 			},
 			{
 				"command": "llamacpp.setKnowledgeMode",
-				"title": "Local LLM: Set Knowledge Verification"
+				"title": "AI Agent Bridge: Set Knowledge Verification"
 			},
 			{
 				"command": "llamacpp.refreshModels",
-				"title": "Local LLM: Refresh Models",
+				"title": "AI Agent Bridge: Refresh Models",
 				"icon": "$(refresh)"
 			},
 			{
 				"command": "llamacpp.openCopilotModelPicker",
-				"title": "Local LLM: Choose Chat Model",
+				"title": "AI Agent Bridge: Choose Chat Model",
 				"icon": "$(comment-discussion)"
 			},
 			{
 				"command": "llamacpp.applyCopilotPatch",
-				"title": "Local LLM: Apply Copilot Chat Patch"
+				"title": "AI Agent Bridge: Apply Copilot Chat Patch"
 			},
 			{
 				"command": "llamacpp.copilotPatchStatus",
-				"title": "Local LLM: Show Copilot Chat Patch Status"
+				"title": "AI Agent Bridge: Show Copilot Chat Patch Status"
 			},
 			{
 				"command": "llamacpp.restoreCopilotPatch",
-				"title": "Local LLM: Restore Original Copilot Chat"
+				"title": "AI Agent Bridge: Restore Original Copilot Chat"
 			},
 			{
 				"command": "llamacpp.openLogsFolder",
-				"title": "Local LLM: Open Logs Folder"
+				"title": "AI Agent Bridge: Open Logs Folder"
 			},
 			{
 				"command": "llamacpp.runHealthCheck",
-				"title": "Local LLM: Run Provider Health Check"
+				"title": "AI Agent Bridge: Run Provider Health Check"
 			},
 			{
 				"command": "llamacpp.openSessionReport",
-				"title": "Local LLM: Open Session Quality Report"
+				"title": "AI Agent Bridge: Open Session Quality Report"
 			},
 			{
 				"command": "llamacpp.resetSessionReport",
-				"title": "Local LLM: Reset Session Metrics"
+				"title": "AI Agent Bridge: Reset Session Metrics"
 			},
 			{
 				"command": "llamacpp.clearTokenUsageHistory",
-				"title": "Local LLM: Clear Token Usage History"
+				"title": "AI Agent Bridge: Clear Token Usage History"
 			},
 			{
 				"command": "llamacpp.startBaselineUsageExperiment",
-				"title": "Local LLM: Start Baseline Usage Experiment"
+				"title": "AI Agent Bridge: Start Baseline Usage Experiment"
 			},
 			{
 				"command": "llamacpp.startDelegatedUsageExperiment",
-				"title": "Local LLM: Start Delegated Usage Experiment"
+				"title": "AI Agent Bridge: Start Delegated Usage Experiment"
 			},
 			{
 				"command": "llamacpp.stopUsageExperiment",
-				"title": "Local LLM: Stop and Export Usage Experiment"
+				"title": "AI Agent Bridge: Stop and Export Usage Experiment"
 			},
 			{
 				"command": "llamacpp.exportUsageExperiment",
-				"title": "Local LLM: Export Usage Experiment Report"
+				"title": "AI Agent Bridge: Export Usage Experiment Report"
 			},
 			{
 				"command": "llamacpp.clearUsageExperiments",
-				"title": "Local LLM: Clear Usage Experiments"
+				"title": "AI Agent Bridge: Clear Usage Experiments"
 			},
 			{
 				"command": "llamacpp.openLatestLog",
-				"title": "Local LLM: Open Latest Log"
+				"title": "AI Agent Bridge: Open Latest Log"
 			},
 			{
 				"command": "llamacpp.copyLatestLogPath",
-				"title": "Local LLM: Copy Latest Log Path"
+				"title": "AI Agent Bridge: Copy Latest Log Path"
 			},
 			{
 				"command": "llamacpp.toggleFileLogging",
-				"title": "Local LLM: Toggle File Logging"
+				"title": "AI Agent Bridge: Toggle File Logging"
 			},
 			{
 				"command": "llamacpp.toggleStreamChunkLogging",
-				"title": "Local LLM: Toggle Stream Chunk Logging"
+				"title": "AI Agent Bridge: Toggle Stream Chunk Logging"
 			},
 			{
 				"command": "llamacpp.togglePerformanceStatusBar",
-				"title": "Local LLM: Toggle Performance Status Bar"
+				"title": "AI Agent Bridge: Toggle Performance Status Bar"
 			},
 			{
 				"command": "llamacpp.toggleContextUsageStatusBar",
-				"title": "Local LLM: Toggle Context Usage Status Bar"
+				"title": "AI Agent Bridge: Toggle Context Usage Status Bar"
 			},
 			{
 				"command": "llamacpp.toggleClaudeCacheKeepAlive",
-				"title": "Local LLM: Toggle Claude Cache Keep-Alive",
-				"category": "Local LLM"
+				"title": "AI Agent Bridge: Toggle Claude Cache Keep-Alive",
+				"category": "AI Agent Bridge"
 			}
 		],
 		"menus": {

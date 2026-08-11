@@ -1,5 +1,122 @@
 # Changelog
 
+## 1.11.15 (dev) - 2026-08-11
+
+- **Live Report webview renders much less often**: live updates now render
+  only the active tab (the other three tabs are built lazily on switch), skip
+  renders when the payload is unchanged (keep-alive pings), and coalesce
+  bursts of updates to at most one render per second with the freshest data.
+  Previously every turn event rebuilt all four tabs and the whole DOM from
+  scratch.
+
+## 1.11.14 (dev) - 2026-08-11
+
+- **Memory UI restored in the quick access view and command palette**: the
+  Shared Memory entry again shows the approximate context tokens the memory
+  consumes, `llamacpp.openMemory` reopens the memory manager panel with
+  global/workspace scopes, and the panel refreshes on memory changes.
+- **Performance tab sparkline is dynamic**: the recent-gaps bars now stretch
+  to fill the track (up to 80 pauses, each bar 2–26px) instead of leaving
+  the right half of the row empty at fixed 10px bars.
+
+## 1.11.13 (dev) - 2026-08-10
+
+- **Claude durable restore no longer requires conversation progress**: a
+  mid-turn notification, retry, or rewritten transcript resends the same
+  copilot turn with a truncated message list, which failed the old
+  "advancement" signature check and fell through to a full cold replay
+  (563K fresh input tokens, ~503K cache writes — an instant 5h rate-limit
+  burn). The persisted session is now restored on the exact conversation id
+  alone; the model resumes warm from the SDK fork instead of re-sending the
+  whole transcript.
+
+## 1.11.12 (dev) - 2026-08-10
+
+- **Claude follow-up context fix**: a stopped Claude turn could make the next
+  request append an orphan tool result (a JSON blob) as the "latest user
+  message" when the durable session was restored after an interruption, so
+  the model answered the previous task instead of the new one. The latest
+  user message now skips trailing tool-result-only messages and always
+  carries the user's real text.
+- **Claude durable checkpoints advance through tool chains**: the persisted
+  resume point now follows long multi-round agent turns instead of staying
+  at the last clean turn, so a stop/restart mid-chain restores the recent
+  session (with the user's latest task) rather than a days-old checkpoint.
+
+## 1.11.11 (dev) - 2026-08-09
+
+- **Claude long turns restored**: the `claudeMaxAgentTurns` manifest default now matches the provider default of `0`, so the Agent SDK no longer receives an accidental `maxTurns=24` cap. The independent 2M cumulative-input circuit breaker remains enabled; users can still opt into a positive segment cap.
+- **Claude diagnostic timestamps**: Session Quality now carries the Agent SDK logical-turn start time into the stored turn record, so safety-stop rows show their real time instead of `never`.
+- **Regression coverage**: manifest tests pin the disabled-by-default segment cap, and diagnostics tests verify Claude ISO timestamps reach Session Quality as milliseconds.
+
+## 1.11.10 (dev) - 2026-08-09
+
+- **Target-faithful compaction**: automatic compaction can split an oversized user turn at complete assistant/tool transaction boundaries. A 50% retained target no longer collapses to a ~16% tail merely because one tool-heavy turn is too large to keep whole; assistant tool calls remain paired with every retained tool result.
+- **Streaming reasoning loop guard**: exact multi-kilobyte repetition in private reasoning is stopped before it consumes the remaining output budget. Detection is conservative, reasoning-only, enabled by default, and configurable through `reasoningLoopProtection` and `reasoningLoopMinChars`.
+- **Clean recovery retry**: after a reasoning loop, the provider cancels both processing and optional raw-log stream branches, removes historical reasoning through provider-owned recovery compaction, and retries once from a structured summary. A second loop returns a bounded stop message instead of running indefinitely.
+- **Diagnostics**: Session Quality marks reasoning loops and retry counts separately from repeated tool-call loops; compaction and recovery snapshots retain only bounded summary/tail samples.
+- **Regression coverage**: tests cover target fill inside one large tool turn, orphan-free tool transactions, exact/varied reasoning streams, raw SSE guard propagation, and end-to-end clean-summary retry.
+
+## 1.11.9 (dev) - 2026-08-09
+
+- **Reload-safe manual recovery**: AI Agent Bridge restores the most recent persisted HTTP conversation identity when the Extension Host starts. The Compact Conversation button can therefore trigger provider-owned cleanup immediately after `Developer: Reload Window`, before another request has refreshed the Copilot bridge state.
+
+## 1.11.8 (dev) - 2026-08-09
+
+- **Provider-owned Compact Conversation**: Copilot patch v22 routes the native context-usage Compact button to AI Agent Bridge when the active conversation uses a contributed `llamacpp` model. Other providers retain Copilot's original `/compact` behavior.
+- **Immediate recovery snapshot**: manual compaction runs below the automatic threshold, uses the configured 25–90% target, invokes the optional DeepSeek semantic summary, persists the new snapshot, and returns a local confirmation without spending a main-model request.
+- **Poisoned-context cleanup**: unlike automatic compaction, recovery mode keeps only its newest control turn verbatim. All prior turns cross the summary boundary, historical `reasoning_content` is removed, and long exact repetition tails serialized as assistant text are replaced with a bounded notice.
+- **Safe routing**: the Copilot patch forwards the stable private conversation id to a one-shot, 60-second provider command. Unknown/stale conversations fall back to native Copilot compaction; raw conversation ids are not logged.
+- **Regression coverage**: tests cover bundle routing/fallback, one-shot conversation binding, full provider flow without a main endpoint call, strict raw-tail replacement, and removal of repetitive historical reasoning.
+
+## 1.11.7 (dev) - 2026-08-09
+
+- **Central API Provider Manager**: Quick Access now opens a dedicated CRUD webview for any number of OpenAI-compatible API profiles. Each profile has its own name, base URL, request format, model family, context length, enabled state, and optional API key.
+- **Secure centralized storage**: profile metadata is global across workspaces, while credentials are stored only in VS Code SecretStorage. Saved keys are never sent back to the webview; deleting a profile also deletes its secret.
+- **Multi-account routing**: every enabled profile contributes its `/models` catalog to the shared VS Code picker. Source IDs and model/runtime caches are isolated per profile, including multiple accounts on the same gateway URL.
+- **API compatibility profiles**: standard OpenAI requests omit llama.cpp-only thinking/cache fields, DeepSeek native and llama.cpp payloads remain available explicitly, and versioned base URLs such as `.../api/v1` no longer receive a duplicate `/v1` segment.
+- **Compatibility**: the existing Local LLM and dedicated DeepSeek configuration remain unchanged and can be used alongside custom API profiles.
+
+## 1.11.6 (dev) - 2026-08-09
+
+- **AI Agent Bridge branding**: the extension display name, Activity Bar container, Settings title, Command Palette category, status bars, dialogs, output channels, and Codex client title now reflect the multi-provider product instead of the original local-only name. Compatibility identifiers (`llamacpp.*`, `mrlordcat.llama-vscode-chat`, patch markers, and VSIX basename) remain unchanged.
+- **README audit**: the main documentation now identifies stable 1.11.0 and dev 1.11.6, current patch v21, 359 tests, all-provider diagnostics, semantic DeepSeek compaction, 25–90% retained targets, paid-summary boundaries, and bounded compaction diagnostic samples.
+- **Repository metadata**: manifest repository, homepage, and issue URLs point to `MrLordCat/ai-agent-bridge`; user-facing command references throughout the documentation use the new `AI Agent Bridge:` prefix.
+
+## 1.11.5 (dev) - 2026-08-09
+
+- **Deeper context reduction**: `compactionTargetRatio` now supports 25–90% retained instead of 50–90%. Quick Access adds 25% (extreme) and 35% (very aggressive) presets; the existing 75% default is unchanged.
+- **Failure-aware primary digest**: rejected hypotheses, corrected analysis mistakes, and approaches that did not solve the problem receive an independent evidence lane under input pressure. Runtime logs now expose total/selected/omitted turns, selection-reason counts, and rejected-approach coverage.
+- **Less redundant, better-scoped summaries**: the Flash contract separates durable outcomes from verification evidence, forbids promoting partial checks into whole-chain proof, and requires rejected approaches to remain visible. Summary diagnostics report section sizes, empty sections, and exact duplicate lines.
+- **Target-aware summary size**: semantic-summary space scales down for aggressive/small targets instead of always reserving 16K characters, while retaining a 4K handoff floor and 16K ceiling.
+
+## 1.11.4 (dev) - 2026-08-09
+
+- **Uninterrupted agent flow**: removed the cross-request tool-density guard that treated four tool-only turns in an eight-turn window as a stalled agent and injected `Pause, summarize...`. Productive DeepSeek/local tool workflows can now continue until the task is complete, the model reports a real blocker, or VS Code reaches its configured request limit.
+- **No count-based forced reviews**: removed the fallback that disabled every tool after a fixed number of host-driven tool turns and forced a text recap. `toolLoopForceTextThreshold` remains registered only as a deprecated compatibility setting.
+- **Actual-loop protection retained**: identical consecutive tool name + arguments still trigger the dedicated reliability guard. The intra-request tool-only recovery now asks for the next useful tool call and explicitly reserves final text for completion or a genuine blocker.
+- **Regression coverage**: the continuation contract is tested to contain no pause, summary, review, recap, or planning trigger while preserving repeated-call protection.
+
+## 1.11.3 (dev) - 2026-08-09
+
+- **Higher-quality Flash compaction input**: the deterministic pre-summary now groups complete turns and reserves independent evidence lanes for the original objective, high-signal milestones, evenly spaced timeline coverage, and the recent working tail. Long conversations no longer collapse to only the first user message plus the newest events before they reach `deepseek-v4-flash`.
+- **Cleaner engineering evidence**: tool calls are paired with their results and arguments, repeated narration is deduplicated, successful test/build outcomes are retained, and additional volatile VS Code blocks are omitted. English and Russian decisions, failures, verification, constraints, and requirement changes receive explicit priority.
+- **Stricter semantic merge**: the Flash prompt distinguishes requested/planned work from completed and verified work, preserves unresolved failures, and applies later evidence only when it explicitly supersedes earlier status. Previous structured summaries retain every section under tight input budgets, and malformed out-of-order output falls back safely.
+- **Regression coverage**: tests exercise pressured middle-history retention, Russian milestones, tool-result pairing, duplicate removal, structured-summary clipping, prompt status discipline, and section-order validation.
+
+## 1.11.2 (dev) - 2026-08-09
+
+- **Configurable compaction target**: `llamacpp.compactionTargetRatio` now controls how much of the current message context is retained by both proactive compaction and confirmed-overflow retries. The existing behavior remains the default at 75%; the setting is safely clamped to 50–90%.
+- **Quick Access presets**: `Model Behavior → Compaction Target` offers 50%, 60%, 75%, and 85% retained. Selecting 50% compresses the current history to half its estimated token size, providing substantially more headroom at the cost of a more aggressive summary.
+- **Regression coverage**: tests verify the 50% target for proactive and overflow paths, safe ratio bounds, and the Quick Access entry.
+
+## 1.11.1 (dev) - 2026-08-09
+
+- **Opt-in semantic compaction**: `deepseek-v4-flash` can now merge the previous summary with newly dropped turns into a structured engineering handoff (objective, completed work, decisions, files/symbols, verification, failed approaches, constraints, and open work). It uses a separate tool-free, thinking-disabled request and is disabled by default because every compaction is a paid DeepSeek API call.
+- **Quick Access control**: `DeepSeek → AI Compaction Summaries` switches the paid summarizer on or off and clearly shows `On (paid)` / `Off`. API errors, missing keys, invalid output, cancellation, and timeouts automatically fall back to the deterministic local summary.
+- **Compaction correctness**: repeated compaction preserves the previous summary; Shared Memory overlays, ephemeral guards, reasoning, and volatile VS Code metadata are excluded from summary input; the semantic-summary budget is reserved before the request; post-memory-injection correction keeps the final request within its target.
+- **Regression coverage**: 352 passing tests, including request shape, response validation, metadata redaction, previous-summary retention, strict final budgets, and the Quick Access toggle. ESLint is clean.
+
 ## 1.11.0 (stable) - 2026-08-08
 
 Stability release: stable context and 98%+ cache hit rate, memory management through a UI, and a full code audit. 97 dev patches (1.10.1–1.10.97) after stable 1.10.0.

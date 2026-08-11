@@ -5,6 +5,8 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { LlamaCppChatModelProvider, stripCacheControlArtifacts } from "../llama-provider";
 import { injectSharedMemoryContext } from "../memory/prompt";
+import { MANUAL_COMPACTION_TRIGGER } from "../context/manual-compaction";
+import { ReasoningRepetitionDetector, ReasoningRepetitionError } from "../context/reasoning-repetition";
 import { ToolCallValidationError, type ToolCallReliabilityMetrics } from "../tools/tool-call-reliability";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
 import { convertMessages, convertTools, validateRequest } from "../utils";
@@ -126,7 +128,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 }>>;
                 getRuntimeContextLengthWithCache: () => Promise<number | undefined>;
                 fetchModelsWithInflightCache: (
-                    serverUrl: string,
+                    source: { serverUrl: string },
                     apiKey: string | undefined,
                     apiKeyPresent: boolean
                 ) => Promise<Array<{ id: string }>>;
@@ -155,8 +157,8 @@ suite("Llama.cpp Chat Provider Extension", () => {
                     },
                 ];
                 providerAny.getRuntimeContextLengthWithCache = async () => undefined;
-                providerAny.fetchModelsWithInflightCache = async serverUrl =>
-                    serverUrl.includes("deepseek")
+                providerAny.fetchModelsWithInflightCache = async source =>
+                    source.serverUrl.includes("deepseek")
                         ? [{ id: "deepseek-v4-pro" }]
                         : [{ id: "qwen3-local" }];
 
@@ -456,8 +458,8 @@ suite("Llama.cpp Chat Provider Extension", () => {
             };
 
             const longToolPayload = "tool-payload-very-long-1234567890".repeat(40);
-            // tokenBudget must be low enough that messages exceed it,
-            // otherwise compactMessages returns them as-is (no summary).
+            // Keep the target below the large source payload but high enough
+            // for the redacted summary itself under strict final-budget rules.
             const compacted = providerAny.compactOpenAiMessages(
                 [
                     { role: "system", content: "sys" },
@@ -473,7 +475,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                     },
                     { role: "user", content: "latest" },
                 ],
-                10,
+                300,
                 1,
                 "Conversation summary (auto-compact)"
             );
@@ -483,6 +485,110 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.ok(summary!.content!.includes("[tool_result read_file]"));
             assert.ok(summary!.content!.includes("[tool_calls] read_file"));
             assert.ok(!summary!.content!.includes(longToolPayload.slice(0, 80)));
+        });
+
+        test("arms manual compaction only for a known conversation and consumes its control turn once", () => {
+            const providerAny = provider as unknown as {
+                setConversationMessageSnapshot: (scope: string, messages: OpenAIChatMessage[], tokens: number) => void;
+                consumeManualCompaction: (conversationId: unknown, messages: readonly vscode.LanguageModelChatMessage[]) => boolean;
+            };
+            providerAny.setConversationMessageSnapshot(
+                "deepseek-v4-flash\0manual-conversation",
+                [{ role: "user", content: "existing task" }],
+                10
+            );
+
+            assert.strictEqual(provider.armManualCompaction("unknown-conversation"), false);
+            assert.strictEqual(provider.armManualCompaction("manual-conversation"), true);
+            assert.strictEqual(provider.getMostRecentConversationId(), "manual-conversation");
+            assert.strictEqual(providerAny.consumeManualCompaction(
+                "manual-conversation",
+                [vscode.LanguageModelChatMessage.User("ordinary user request")]
+            ), false);
+            assert.strictEqual(providerAny.consumeManualCompaction(
+                "manual-conversation",
+                [vscode.LanguageModelChatMessage.User(MANUAL_COMPACTION_TRIGGER)]
+            ), true);
+            assert.strictEqual(providerAny.consumeManualCompaction(
+                "manual-conversation",
+                [vscode.LanguageModelChatMessage.User(MANUAL_COMPACTION_TRIGGER)]
+            ), false);
+        });
+
+        test("manual compact rebuilds the provider snapshot without calling the main model endpoint", async () => {
+            const isolated = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent");
+            const isolatedAny = isolated as unknown as {
+                getModelSources: () => Promise<Array<{
+                    key: string;
+                    label: string;
+                    serverUrl: string;
+                    familyOverride?: string;
+                    contextLengthOverride?: number;
+                    protocol?: "deepseek";
+                }>>;
+                getRuntimeContextLengthWithCache: () => Promise<number | undefined>;
+                acquireChatRequestSlot: () => Promise<{ release: () => void; waitMs: number }>;
+                sendChatCompletion: () => Promise<Response>;
+                setConversationMessageSnapshot: (scope: string, messages: OpenAIChatMessage[], tokens: number) => void;
+                getConversationMessageSnapshot: (scope: string) => { messages: OpenAIChatMessage[] } | undefined;
+            };
+            let endpointCalls = 0;
+            isolatedAny.getModelSources = async () => [{
+                key: "deepseek",
+                label: "DeepSeek",
+                serverUrl: "https://api.deepseek.com",
+                familyOverride: "deepseek",
+                contextLengthOverride: 290_816,
+                protocol: "deepseek",
+            }];
+            isolatedAny.getRuntimeContextLengthWithCache = async () => 290_816;
+            isolatedAny.acquireChatRequestSlot = async () => ({ release: () => undefined, waitMs: 0 });
+            isolatedAny.sendChatCompletion = async () => {
+                endpointCalls += 1;
+                throw new Error("manual compaction must not call the main endpoint");
+            };
+            const conversationId = "manual-live-conversation";
+            const scope = `deepseek-v4-flash\0${conversationId}`;
+            isolatedAny.setConversationMessageSnapshot(scope, [{ role: "user", content: "existing task" }], 10);
+            assert.strictEqual(isolated.armManualCompaction(conversationId), true);
+            const reported: vscode.LanguageModelResponsePart[] = [];
+
+            await isolated.provideLanguageModelChatResponse(
+                {
+                    id: "deepseek::deepseek-v4-flash",
+                    name: "DeepSeek V4 Flash",
+                    family: "deepseek",
+                    version: "1",
+                    maxInputTokens: 220_000,
+                    maxOutputTokens: 70_000,
+                    capabilities: {},
+                } as unknown as vscode.LanguageModelChatInformation,
+                [
+                    vscode.LanguageModelChatMessage.User("existing task"),
+                    vscode.LanguageModelChatMessage.Assistant("(А: ".repeat(5_000)),
+                    vscode.LanguageModelChatMessage.User(MANUAL_COMPACTION_TRIGGER),
+                ],
+                {
+                    modelOptions: { _copilotConversationId: conversationId },
+                    tools: [],
+                    toolMode: vscode.LanguageModelChatToolMode.Auto,
+                },
+                { report: part => reported.push(part) },
+                new vscode.CancellationTokenSource().token
+            );
+
+            assert.strictEqual(endpointCalls, 0);
+            const confirmation = reported
+                .filter((part): part is vscode.LanguageModelTextPart => part instanceof vscode.LanguageModelTextPart)
+                .map(part => part.value)
+                .join("");
+            assert.match(confirmation, /Provider context compacted and cleaned/);
+            const snapshot = isolatedAny.getConversationMessageSnapshot(scope);
+            assert.ok(snapshot);
+            assert.strictEqual(snapshot!.messages.at(-1)?.content, MANUAL_COMPACTION_TRIGGER);
+            assert.ok(!snapshot!.messages.some(message =>
+                typeof message.content === "string" && message.content.includes("(А: (А: (А:")
+            ));
         });
 
         test("truncates oversized tool results", () => {
@@ -2201,6 +2307,43 @@ suite("Llama.cpp Chat Provider Extension", () => {
             });
         });
 
+        test("propagates a reasoning repetition guard from the raw SSE stream", async () => {
+            const providerAny = provider as unknown as {
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken,
+                    thinkingTextInspector?: (text: string) => void
+                ) => Promise<void>;
+            };
+            const detector = new ReasoningRepetitionDetector();
+            const reasoning = "(А: ".repeat(1_200);
+            const payload = `data: ${JSON.stringify({
+                choices: [{ delta: { reasoning_content: reasoning } }],
+            })}\n\ndata: [DONE]\n\n`;
+            const stream = new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.enqueue(new TextEncoder().encode(payload));
+                    controller.close();
+                },
+            });
+
+            await assert.rejects(
+                providerAny.processStreamingResponse(
+                    stream,
+                    { report: () => undefined },
+                    new vscode.CancellationTokenSource().token,
+                    text => {
+                        const detection = detector.append(text);
+                        if (detection) {
+                            throw new ReasoningRepetitionError(detection);
+                        }
+                    }
+                ),
+                error => error instanceof ReasoningRepetitionError
+            );
+        });
+
         test("coalesces many small text deltas before reporting progress", async () => {
             const providerAny = provider as unknown as {
                 processStreamingResponse: (
@@ -2646,6 +2789,125 @@ suite("Llama.cpp Chat Provider Extension", () => {
             );
             assert.strictEqual(textParts.length, 1);
             assert.strictEqual(textParts[0].value, "Recovered response");
+        });
+
+        test("stops a reasoning repetition loop and retries from a clean summary", async () => {
+            const providerAny = provider as unknown as {
+                getServerUrl: () => Promise<string>;
+                getApiKey: () => Promise<string | undefined>;
+                getRuntimeContextLengthWithCache: () => Promise<number | undefined>;
+                acquireChatRequestSlot: (
+                    requestId: string,
+                    queueTimeoutMs: number,
+                    token: vscode.CancellationToken
+                ) => Promise<{ release: () => void; waitMs: number }>;
+                sendChatCompletion: (
+                    serverUrl: string,
+                    headers: Record<string, string>,
+                    requestBody: Record<string, unknown>,
+                    timeoutMs: number,
+                    token: vscode.CancellationToken
+                ) => Promise<Response>;
+                processStreamingResponse: (
+                    responseBody: ReadableStream<Uint8Array>,
+                    progress: vscode.Progress<vscode.LanguageModelResponsePart>,
+                    token: vscode.CancellationToken,
+                    thinkingTextInspector?: (text: string) => void
+                ) => Promise<void>;
+            };
+            const originals = {
+                getServerUrl: providerAny.getServerUrl,
+                getApiKey: providerAny.getApiKey,
+                getRuntimeContextLengthWithCache: providerAny.getRuntimeContextLengthWithCache,
+                acquireChatRequestSlot: providerAny.acquireChatRequestSlot,
+                sendChatCompletion: providerAny.sendChatCompletion,
+                processStreamingResponse: providerAny.processStreamingResponse,
+            };
+            const config = vscode.workspace.getConfiguration("llamacpp");
+            const previousAccurateCounting = config.inspect<boolean>("accurateTokenCounting")?.globalValue;
+            const sentRequestBodies: Array<Record<string, unknown>> = [];
+            const reportedParts: vscode.LanguageModelResponsePart[] = [];
+            const completedTurns: Array<{ reasoningLoopDetected?: boolean; reasoningLoopRetries?: number }> = [];
+            const completionSubscription = provider.onDidCompleteChatTurn(metrics => completedTurns.push(metrics));
+            let streamInvocation = 0;
+            const emptyResponse = () => new Response(new ReadableStream<Uint8Array>({
+                start(controller) {
+                    controller.close();
+                },
+            }), { status: 200 });
+
+            try {
+                await config.update("accurateTokenCounting", false, vscode.ConfigurationTarget.Global);
+                providerAny.getServerUrl = async () => "http://localhost:8000";
+                providerAny.getApiKey = async () => undefined;
+                providerAny.getRuntimeContextLengthWithCache = async () => 65536;
+                providerAny.acquireChatRequestSlot = async () => ({ release: () => undefined, waitMs: 0 });
+                providerAny.sendChatCompletion = async (_url, _headers, body) => {
+                    sentRequestBodies.push(JSON.parse(JSON.stringify(body)) as Record<string, unknown>);
+                    return emptyResponse();
+                };
+                providerAny.processStreamingResponse = async (_body, progress) => {
+                    streamInvocation += 1;
+                    if (streamInvocation === 1) {
+                        throw new ReasoningRepetitionError({
+                            totalChars: 4096,
+                            repeatedChars: 3072,
+                            unitChars: 4,
+                            repetitions: 768,
+                        });
+                    }
+                    progress.report(new vscode.LanguageModelTextPart("Recovered after reasoning cleanup"));
+                };
+
+                await provider.provideLanguageModelChatResponse(
+                    {
+                        id: "test-model",
+                        name: "test-model",
+                        family: "llama",
+                        version: "1",
+                        maxInputTokens: 32768,
+                        maxOutputTokens: 4096,
+                        capabilities: {},
+                    } as unknown as vscode.LanguageModelChatInformation,
+                    [vscode.LanguageModelChatMessage.User("Continue the implementation")],
+                    { modelOptions: {}, tools: [], toolMode: vscode.LanguageModelChatToolMode.Auto },
+                    { report: part => reportedParts.push(part) },
+                    new vscode.CancellationTokenSource().token
+                );
+            } finally {
+                completionSubscription.dispose();
+                providerAny.getServerUrl = originals.getServerUrl;
+                providerAny.getApiKey = originals.getApiKey;
+                providerAny.getRuntimeContextLengthWithCache = originals.getRuntimeContextLengthWithCache;
+                providerAny.acquireChatRequestSlot = originals.acquireChatRequestSlot;
+                providerAny.sendChatCompletion = originals.sendChatCompletion;
+                providerAny.processStreamingResponse = originals.processStreamingResponse;
+                await config.update(
+                    "accurateTokenCounting",
+                    previousAccurateCounting,
+                    vscode.ConfigurationTarget.Global
+                );
+            }
+
+            assert.strictEqual(sentRequestBodies.length, 2, "expected one clean-context retry");
+            const retryMessages = sentRequestBodies[1].messages as Array<{
+                role?: string;
+                content?: string;
+                reasoning_content?: string;
+            }>;
+            assert.ok(retryMessages.some(message =>
+                message.content?.includes("Conversation summary (reasoning-loop recovery)")
+            ));
+            assert.ok(retryMessages.some(message =>
+                message.content?.includes("internal reasoning repetition loop was detected")
+            ));
+            assert.ok(retryMessages.every(message => message.reasoning_content === undefined));
+            assert.ok(reportedParts.some(part =>
+                part instanceof vscode.LanguageModelTextPart
+                && part.value === "Recovered after reasoning cleanup"
+            ));
+            assert.strictEqual(completedTurns.at(-1)?.reasoningLoopDetected, true);
+            assert.strictEqual(completedTurns.at(-1)?.reasoningLoopRetries, 1);
         });
 
         test("retries a rejected tool call after partial text with a bounded correction prompt", async () => {

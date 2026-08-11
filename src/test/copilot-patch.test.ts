@@ -29,7 +29,7 @@ suite("Copilot patch", () => {
 		);
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v21"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v22"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
 		// The tokenizer memoisation cache lives on the class constructor
 		// (module-scoped, outlives instances), so it is referenced as
@@ -49,6 +49,10 @@ suite("Copilot patch", () => {
 		assert.ok(!patched.includes("er._llamaToolsSignature"));
 		assert.ok(!patched.includes("er._toolsStable"));
 		assert.ok(patched.includes('this.endpoint.modelProvider!=="llamacpp"'));
+		assert.ok(patched.includes("__llamaLastChatVendor"));
+		assert.ok(patched.includes("__llamaLastConversationId"));
+		assert.ok(patched.includes('executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId)'));
+		assert.ok(patched.includes('executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0})'));
 		assert.match(
 			patched,
 			/modelProvider==="llamacpp"\|\|[^?]{1,80}\?Number\.MAX_SAFE_INTEGER/

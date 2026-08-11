@@ -232,22 +232,15 @@ suite("session quality panel", () => {
 		}).renderHtml;
 		const html = renderHtml.call(SessionQualityPanel.prototype, data);
 
-		assert.match(html, /class="metric-grid"/);
+		// Static shell: header, tabs and empty lazy tab containers.
 		assert.match(html, /class="live-pill"/);
-		assert.match(html, /Claude cache keep-alive/);
-		assert.match(html, /Last success/);
-		assert.match(html, /Protected session/);
-		assert.match(html, /lastResultCacheHitPercent/);
-		assert.match(html, /id="turn-search"/);
-		assert.match(html, /id="issues-filter"/);
-		assert.match(html, /class="detail-grid"/);
-		assert.match(html, /Model usage segments/);
-		assert.match(html, /Codex session &amp; cache/);
-		assert.match(html, /Processed blend/);
-		assert.match(html, /Shared memory/);
-		assert.match(html, /Reasoning/);
-		assert.match(html, /Tool results/);
-		assert.match(html, /estimated block split/);
+		assert.match(html, /class="tabs"/);
+		assert.match(html, /data-tab="cache"/);
+		assert.match(html, /data-tab="perf"/);
+		assert.match(html, /id="tab-cache"/);
+		assert.match(html, /id="tab-perf"/);
+		assert.match(html, /id="tab-errors"/);
+		assert.match(html, /id="tab-health"/);
 		assert.match(html, /const detailKey = String\(r\.requestId/);
 		assert.match(html, /const detailId = "detail-" \+ detailKey/);
 		assert.match(html, /"struct-details-" \+ detailKey/);
@@ -259,43 +252,112 @@ suite("session quality panel", () => {
 		assert.match(html, /captureOpenTurnAnchor/);
 		assert.match(html, /restoreOpenTurnAnchor\(state\.turnAnchor\)/);
 		assert.ok(!html.includes('const detailId = "detail-" + i;'));
-		assert.match(html, /Final \/ continuation segment/);
-		assert.match(html, /Delegated VS Code tools/);
+		assert.match(html, /compactTurnRecord/);
+		assert.match(html, /lastResultCacheHitPercent/);
+		assert.match(html, /step.status === 'timed_out'/);
 		assert.match(html, /cold Codex startup/);
 		assert.match(html, /continuation cache health recovered above 90%/);
-		assert.match(html, /Claude session &amp; cache/);
-		assert.match(html, /Resume failure/);
-		assert.match(html, /Failure stage/);
-		assert.match(html, /Original SDK error/);
-		assert.match(html, /Fallback decision/);
-		assert.match(html, /Estimated cold replay/);
-		assert.match(html, /Turn guard/);
-		assert.match(html, /Safety stop/);
 		assert.match(html, /resumeFallbackDecision: r\.resumeFallbackDecision/);
-		assert.match(html, /Claude SDK context snapshot/);
-		assert.match(html, /Cache creation/);
 		assert.match(html, /cacheWriteInputTokens":512/);
-		assert.match(html, /Claude.*live steps/);
-		assert.match(html, /step.status === 'timed_out'/);
 		assert.match(html, /"toolCallBreakdown":\{"read_file":1\}/);
 		assert.match(html, /"metricsSource":"rollout"/);
-		assert.match(html, /compactTurnRecord/);
+		assert.match(html, /Gap distribution/);
+		assert.match(html, /spark-bar/);
+		assert.match(html, /perf-chat-filter/);
 		assert.match(html, /Alt\+click: full JSON/);
 		assert.match(html, /aria-expanded="false"/);
 		assert.ok(!html.includes("</script><script>bad()"));
 
-		// Performance tab
-		assert.match(html, /class="tabs"/);
-		assert.match(html, /data-tab="cache"/);
-		assert.match(html, /data-tab="perf"/);
-		assert.match(html, /id="tab-perf"/);
-		assert.match(html, /Gap med \/ p95/);
-		assert.match(html, /Gap distribution/);
-		assert.match(html, /spark-bar/);
-		assert.match(html, /perf-chat-filter/);
-
 		const scriptMatch = html.match(/<script>([\s\S]*)<\/script>/);
 		assert.ok(scriptMatch, "expected an embedded dashboard script");
 		assert.doesNotThrow(() => new Script(scriptMatch[1]));
+
+		// Execute the dashboard script against a minimal DOM stub so the tab
+		// render helpers can be invoked directly (no jsdom dependency). Live
+		// updates build only the active tab, so the cache tab (default) and the
+		// performance tab content are verified through their render functions.
+		let lastFake: Record<string, unknown> | undefined;
+		const fakeElement = () => {
+			const el: Record<string, unknown> = {
+				innerHTML: "",
+				dataset: {},
+				textContent: "",
+				value: "",
+				hidden: false,
+				style: {},
+				className: "",
+				classList: {
+					toggle: () => undefined,
+					add: () => undefined,
+					remove: () => undefined,
+					contains: () => false,
+				},
+				setAttribute: () => undefined,
+				getAttribute: () => null,
+				addEventListener: () => undefined,
+				appendChild: () => undefined,
+				getBoundingClientRect: () => ({ top: 0, bottom: 0 }),
+			};
+			lastFake = el;
+			return el;
+		};
+		const sandbox: Record<string, unknown> = {
+			console,
+			setTimeout,
+			clearTimeout,
+			document: {
+				getElementById: () => fakeElement(),
+				createElement: () => fakeElement(),
+				querySelector: () => null,
+				querySelectorAll: () => [],
+				addEventListener: () => undefined,
+			},
+		};
+		sandbox.window = sandbox;
+		sandbox.addEventListener = () => undefined;
+		new Script(scriptMatch[1]).runInNewContext(sandbox);
+		if (lastFake?.textContent?.toString().startsWith("Error:")) {
+			assert.fail(lastFake.textContent.toString());
+		}
+		const call = (name: string): string => {
+			const fn = sandbox[name] as (value: unknown) => string;
+			assert.strictEqual(typeof fn, "function", `expected script function ${name}`);
+			return fn(data);
+		};
+
+		// Cache tab (rendered by default on load).
+		const cacheHtml = call("renderCacheTab");
+		assert.match(cacheHtml, /class="metric-grid"/);
+		assert.match(cacheHtml, /Claude cache keep-alive/);
+		assert.match(cacheHtml, /Last success/);
+		assert.match(cacheHtml, /Protected session/);
+		assert.match(cacheHtml, /id="turn-search"/);
+		assert.match(cacheHtml, /id="issues-filter"/);
+		assert.match(cacheHtml, /class="detail-grid"/);
+		assert.match(cacheHtml, /Model usage segments/);
+		assert.match(cacheHtml, /Codex session &amp; cache/);
+		assert.match(cacheHtml, /Processed blend/);
+		assert.match(cacheHtml, /Shared memory/);
+		assert.match(cacheHtml, /Reasoning/);
+		assert.match(cacheHtml, /Tool results/);
+		assert.match(cacheHtml, /estimated block split/);
+		assert.match(cacheHtml, /Final \/ continuation segment/);
+		assert.match(cacheHtml, /Delegated VS Code tools/);
+		assert.match(cacheHtml, /Claude session &amp; cache/);
+		assert.match(cacheHtml, /Cache creation/);
+		assert.match(cacheHtml, /Resume failure/);
+		assert.match(cacheHtml, /Failure stage/);
+		assert.match(cacheHtml, /Original SDK error/);
+		assert.match(cacheHtml, /Fallback decision/);
+		assert.match(cacheHtml, /Estimated cold replay/);
+		assert.match(cacheHtml, /Turn guard/);
+		assert.match(cacheHtml, /Safety stop/);
+		assert.match(cacheHtml, /Claude SDK context snapshot/);
+		assert.match(cacheHtml, /Claude.*live steps/);
+
+		// Performance tab (lazily rendered on switch).
+		const perfHtml = call("renderPerfTab");
+		assert.match(perfHtml, /Gap med \/ p95/);
+		assert.match(perfHtml, /Turn timeline/);
 	});
 });

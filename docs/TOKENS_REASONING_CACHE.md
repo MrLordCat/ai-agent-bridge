@@ -27,14 +27,18 @@ There are two independent compaction layers:
   input target. It does not run inference.
 - Copilot Chat can generate an LLM summary of its outer conversation history.
 
-Patch v16 makes Copilot use the complete `maxInputTokens + maxOutputTokens`
+Patch v22 makes Copilot use the complete `maxInputTokens + maxOutputTokens`
 window for this provider, ignores smaller stale session and global summary
 threshold overrides, and avoids reserving Copilot's full raw tool catalog
 before the provider selects its bounded subset. The temporary Agent renderer
 is allowed to pass raw tool results through to the provider, where they are
 sanitized, counted, and deterministically compacted. Copilot-owned automatic
 summarization and truncation are disabled for `llamacpp`; the explicit Compact
-Conversation command remains available. A stable conversation id and
+Conversation command triggers provider-owned recovery compaction immediately.
+It summarizes every old turn, removes historical reasoning and exact repetition
+tails, retains only the clean control turn verbatim, and persists the replacement
+snapshot without calling the main model endpoint. Other providers retain native
+Copilot `/compact` behavior. A stable conversation id and
 deterministic tool signatures let durable subscription sessions survive
 renderer history rewrites without weakening their validation rules.
 
@@ -101,15 +105,22 @@ that prefix in several ways:
   rather than rewriting the first system message.
 - Raw tool results are sanitized and capped before budgeting.
 - Compaction copies messages, runs only near the configured soft target, and
-  removes whole conversation turns instead of breaking tool-call/result pairs.
-- Auto-compaction lands at 75% of the soft input target
-  (`COMPACTION_TARGET_RATIO`), not exactly at the trigger threshold. Compacting
-  to the threshold would re-trigger on the very next turn (a micro-compaction),
-  and each real compaction rewrites the prefix and loses the upstream prompt
-  cache. Landing below the trigger leaves real headroom: one compaction buys
-  roughly 30% context reduction and dozens of turns before the next one.
+  removes history only at safe boundaries. Oversized user turns can be split
+  between complete assistant/tool transactions; an assistant tool call always
+  stays paired with its retained tool results.
+- Auto-compaction uses `compactionTargetRatio` (25–90%) as the retained message
+  budget relative to the current message context. It chooses the earliest safe
+  transaction boundary that fits, so normal results land close to the target
+  instead of collapsing to a tiny tail when one user turn contains hundreds of
+  tool messages. Fixed tool-schema and reply-reserve tokens remain outside this
+  retained-message ratio.
 - Compaction and trigger use the same calibrated token estimate, so a turn is
   never recorded as "auto-compacted" when the history was returned unchanged.
+- `reasoningLoopProtection` watches only streamed private reasoning for an exact
+  periodic suffix spanning several kilobytes. On detection it cancels the
+  upstream response, rebuilds a reasoning-free summary, and retries at most
+  `reasoningLoopRetryMaxAttempts` times (one by default). Varied technical text
+  and visible assistant output are not classified by this guard.
 - Claude keeps the Anthropic prompt-cache TTL warm while you are idle:
   `claudeCacheKeepAliveEnabled` (toggle in Quick Access > Claude) runs a
   minimal "reply ok" turn every `claudeCacheKeepAliveMs` (45 min default) on
