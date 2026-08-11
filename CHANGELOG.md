@@ -1,5 +1,52 @@
 # Changelog
 
+## 1.12.0 (stable) - 2026-08-11
+
+Stability release: Claude context safety that stops cold replays and
+rate-limit burns, provider-owned compaction with semantic summaries,
+centralized API profiles, and a lighter Live Report. 15 dev patches
+(1.11.1-1.11.15) after stable 1.11.0.
+
+### Key improvements
+
+- **Claude context safety (no more rate-limit burns)**: the durable session
+  restore now matches on the exact conversation id alone, so a mid-turn
+  notification, retry, or rewritten transcript can no longer fall through to
+  a full cold replay of the entire chat (563K fresh input tokens in one
+  request was measured before the fix). New user text always lands as a
+  distinct user message — never as an orphan tool result — and the persisted
+  checkpoint advances through long tool chains, so stop/restart mid-turn
+  resumes the fresh session instead of a days-old one.
+- **Provider-owned Compact Conversation**: the native context-usage Compact
+  button now routes to the extension for contributed models. Recovery runs
+  below the automatic threshold with a configurable 25-90% retained target,
+  cleans poisoned/looped context, persists a new snapshot immediately, and
+  survives `Developer: Reload Window`.
+- **Opt-in semantic summaries**: `deepseek-v4-flash` can merge the previous
+  summary with newly dropped turns into a structured engineering handoff
+  (objective, completed work, decisions, files, verification, failed
+  approaches, constraints, open work) — disabled by default, controlled from
+  Quick Access, with safe fallback to the deterministic summary.
+- **Centralized API Provider Manager**: any number of OpenAI-compatible API
+  profiles with per-profile model catalogs in the shared VS Code picker;
+  credentials live only in SecretStorage and never return to the UI.
+- **Long-running agent flows are uninterrupted**: the cross-request
+  tool-density guard that forced "pause and summarize" was removed;
+  real repeated-call loops are still stopped, and a streaming reasoning
+  loop guard cuts multi-kilobyte thinking repetition before it burns the
+  output budget.
+- **Memory manager UI restored**: Shared Memory in Quick Access again shows
+  its context-token footprint; the memory panel with global/workspace scopes
+  is back and refreshes live.
+- **Live Report is light**: the Performance sparkline is dynamic (bars
+  stretch to fill the track, up to 80 pauses) and the webview now renders
+  only the active tab, skips unchanged keep-alive payloads, and coalesces
+  update bursts to at most one render per second.
+- **Tests**: 380 passing, pinned to VS Code 1.131 (copilot-patch patterns
+  are incompatible with 1.132+).
+
+---
+
 ## 1.11.15 (dev) - 2026-08-11
 
 - **Live Report webview renders much less often**: live updates now render

@@ -2,11 +2,11 @@
 
 **Bridge local models, DeepSeek, Codex, and Claude into one native VS Code agent workflow.**
 
-**Stable release: 1.11.0. Current local development build: 1.11.15.** The stable
-line includes durable provider sessions, native tools, cache-aware context,
-shared memory, and live diagnostics. Development patches add semantic DeepSeek
-compaction, uninterrupted long-running agent flows, and centralized management
-of multiple API providers.
+**Stable release: 1.12.0.** This release consolidates the 1.11.x development
+patches: Claude context-safety fixes that eliminate cold replays and
+rate-limit burns, provider-owned Compact Conversation with opt-in semantic
+summaries, centralized management of multiple API providers, the shared
+memory manager UI, and a much lighter Live Report webview.
 
 This extension contributes every enabled source to the normal VS Code model
 picker. The selected model keeps the existing Chat UI, workspace context,
