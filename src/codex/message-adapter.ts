@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as os from "node:os";
 import * as vscode from "vscode";
 
 import { bytesToBase64, isCacheControlPart } from "../utils";
@@ -740,4 +741,193 @@ export function compactCodexMessages(
 		tokenEstimateBefore,
 		tokenEstimateAfter,
 	};
+}
+/**
+ * Prompt-attached images: VS Code does not deliver file attachments into
+ * subagent prompts (the child request carries only text), so a parent agent
+ * that renders screenshots and references them by path gets a model that
+ * cannot see them. These helpers find image paths inside the latest user
+ * message - markdown destinations, file:// URLs, and bare Windows/Unix
+ * paths - so the provider can attach the actual pixels.
+ */
+export const MAX_PROMPT_IMAGES = 8;
+export const MAX_PROMPT_IMAGE_BYTES = 20 * 1024 * 1024;
+
+const PROMPT_IMAGE_EXTENSION = /\.(png|jpe?g|webp|gif)(?:[?#][^\s|"<>]*)?$/i;
+
+function stripImagePathSurroundings(value: string): string {
+	const trimmed = value.trim();
+	const first = trimmed[0];
+	const last = trimmed[trimmed.length - 1];
+	if (
+		(first === "\"" && last === "\"")
+		|| (first === "'" && last === "'")
+		|| (first === "\u0060" && last === "\u0060")
+	) {
+		return trimmed.slice(1, -1);
+	}
+	return trimmed;
+}
+
+/**
+ * Extracts local image file paths from a prompt text. Returns unique paths in
+ * encounter order; skips non-image extensions, remote URLs, and data URIs.
+ */
+export function extractImagePathsFromText(text: string): string[] {
+	const found = new Map<string, number>();
+	const addCandidate = (raw: string, position: number): void => {
+		let candidate = stripImagePathSurroundings(raw);
+		if (!candidate || candidate.length > 4096) {
+			return;
+		}
+		// Trailing punctuation from surrounding prose: "(see C:/tmp/x.png)".
+		candidate = candidate.replace(/[)\].,;:!?]+$/, "");
+		if (!PROMPT_IMAGE_EXTENSION.test(candidate)) {
+			return;
+		}
+		const decoded = candidate.startsWith("file://")
+			? decodeURIComponent(candidate).replace(/^file:\/\/\//, "")
+			: candidate;
+		if (!found.has(decoded)) {
+			found.set(decoded, position);
+		}
+	};
+
+	// Markdown destinations: [label](path) and ![alt](path).
+	const markdownLink = /!?\[[^\]]*\]\(\s*<?([^)>]+)>?\s*\)/g;
+	for (const match of text.matchAll(markdownLink)) {
+		addCandidate(match[1], match.index);
+	}
+
+	// Obsidian-style embeds: ![[path.png]] and [[path.png]].
+	const embedLink = /!?\[\[\s*([^[\]]+?)\s*\]\]/g;
+	for (const match of text.matchAll(embedLink)) {
+		addCandidate(match[1], match.index);
+	}
+
+	// Quoted paths with spaces: "D:/Power Towers/Assets/x.JPEG".
+	const quotedImage = /["']([^"']+\.(?:png|jpe?g|webp|gif)(?:[?#][^"']*)?)["']/gi;
+	for (const match of text.matchAll(quotedImage)) {
+		addCandidate(match[1], match.index);
+	}
+
+	// At-file mentions: @C:/tmp/x.png or @/tmp/x.png.
+	const atFile = /@((?:file:\/\/)?(?:[A-Za-z]:)?[^\s|@"<>`]+\.(?:png|jpe?g|webp|gif)(?:[?#][^\s|@"<>`]*)?)/gi;
+	for (const match of text.matchAll(atFile)) {
+		addCandidate(match[1], match.index);
+	}
+
+	// file:// URLs (percent-encoded or not).
+	const fileUrl = /file:\/\/[^\s|"<>`]+/gi;
+	for (const match of text.matchAll(fileUrl)) {
+		addCandidate(match[0], match.index);
+	}
+
+	// Bare Windows drive paths: C:/tmp/x.png or C:\\tmp\\x.png.
+	const windowsPath = /\b[A-Za-z]:[\\/][^\s|"<>`]+/g;
+	for (const match of text.matchAll(windowsPath)) {
+		addCandidate(match[0], match.index);
+	}
+
+	// Bare Unix paths: /d/GitHub/x.png or /tmp/x.png. The lookbehind also
+	// rejects the internal slashes of file:// URLs (next to ':' or '/').
+	const unixPath = /(?<![\w:/])\/[^\s|"<>`]+/g;
+	for (const match of text.matchAll(unixPath)) {
+		addCandidate(match[0], match.index);
+	}
+
+	// Deduplicated, ordered by first occurrence in the prompt.
+	return [...found.entries()]
+		.sort((left, right) => left[1] - right[1])
+		.map(([path]) => path);
+}
+
+/**
+ * Extracts inline base64 data-URI images (data:image/png;base64,...) from a
+ * prompt text so the provider can attach them as real image blocks instead of
+ * leaving a huge opaque base64 string in the conversation text. Base64 may be
+ * wrapped across lines (agents paste wrapped base64), so newlines inside the
+ * payload are accepted.
+ */
+export function extractImageDataUrisFromText(text: string): string[] {
+	const found: string[] = [];
+	const dataUri = /data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/=\n]+)/gi;
+	for (const match of text.matchAll(dataUri)) {
+		const uri = match[0].replace(/\r?\n/g, "");
+		if (!found.includes(uri)) {
+			found.push(uri);
+		}
+	}
+	return found.slice(0, MAX_PROMPT_IMAGES);
+}
+
+/**
+ * Collects image paths referenced by the latest user message of a request
+ * (the active prompt - for subagents this is the parent agent's prompt).
+ * Bounded to MAX_PROMPT_IMAGES entries; only text parts are scanned.
+ */
+export function collectPromptImagePaths(
+	messages: readonly vscode.LanguageModelChatRequestMessage[],
+	maxImages = MAX_PROMPT_IMAGES
+): string[] {
+	if (messages.length === 0 || maxImages <= 0) {
+		return [];
+	}
+	const latestUser = [...messages].reverse().find(message => message.role === vscode.LanguageModelChatMessageRole.User);
+	if (!latestUser) {
+		return [];
+	}
+	const text = latestUser.content
+		.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : "")
+		.join("\n");
+	return extractImagePathsFromText(text).slice(0, maxImages);
+}
+
+/** Returns the concatenated text of the latest user message (the active prompt). */
+export function latestUserPromptText(
+	messages: readonly vscode.LanguageModelChatRequestMessage[]
+): string {
+	if (messages.length === 0) {
+		return "";
+	}
+	const latestUser = [...messages].reverse().find(message => message.role === vscode.LanguageModelChatMessageRole.User);
+	if (!latestUser) {
+		return "";
+	}
+	return latestUser.content
+		.map(part => part instanceof vscode.LanguageModelTextPart ? part.value : "")
+		.join("\n");
+}
+
+/**
+ * Resolves a prompt image path into concrete filesystem candidates in order
+ * of likelihood. Agents frequently write paths the way git-bash renders them
+ * (`/tmp/x.png`, `/c/tmp/x.png`, `C:/tmp/x.png`) while the file actually
+ * lives under the OS temp directory or a drive root.
+ */
+export function resolveLocalImagePath(candidate: string, tmpDir = os.tmpdir()): string[] {
+	const variants: string[] = [];
+	const add = (value: string): void => {
+		if (!variants.includes(value)) {
+			variants.push(value);
+		}
+	};
+	add(candidate);
+
+	// git-bash /d/GitHub/x.png → D:/GitHub/x.png and /c/... → C:/...
+	const msys = /^\/([a-zA-Z])\/(.+)$/.exec(candidate);
+	if (msys) {
+		add(`${msys[1].toUpperCase()}:/${msys[2]}`);
+	}
+
+	// /tmp/x.png and C:/tmp/x.png (or C:\tmp\x.png) → OS temp dir.
+	const tmpRest = /^\/tmp\/(.+)$/.exec(candidate);
+	if (tmpRest) {
+		add(`${tmpDir.replace(/[\\/]+$/, "")}/${tmpRest[1]}`);
+	}
+	const winTmpRest = /^[cC]:[\\/]tmp[\\/](.+)$/.exec(candidate);
+	if (winTmpRest) {
+		add(`${tmpDir.replace(/[\\/]+$/, "")}/${winTmpRest[1]}`);
+	}
+	return variants;
 }

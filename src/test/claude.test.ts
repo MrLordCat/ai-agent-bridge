@@ -15,6 +15,7 @@ import {
 	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
 	createLatestUserMessage,
+	estimateClaudeRecoveryTokens,
 	findLatestPersistedClaudeConversation,
 	findPersistedClaudeConversation,
 	resolveClaudeResumeFallbackDecision,
@@ -27,6 +28,8 @@ import {
 import { buildClaudeModelAvailability } from "../claude/availability";
 import {
 	ClaudeAgentSession,
+	ClaudeAssistantCheckpointTracker,
+	classifyClaudeResumeBoundary,
 	createClaudeNativeContextUsage,
 	createClaudeNativeUsage,
 	isClaudeVsCodeToolName,
@@ -174,6 +177,45 @@ suite("Claude subscription provider", () => {
 			classifyClaudeResumeFailure(new Error("Claude API error: rate_limit (429)")).reason,
 			"rate_limit"
 		);
+		assert.strictEqual(
+			classifyClaudeResumeFailure(new Error("Claude produced no activity for 90 seconds")).reason,
+			"timeout"
+		);
+	});
+
+	test("advances Claude resume checkpoints only after a logical turn completes", () => {
+		const tracker = new ClaudeAssistantCheckpointTracker();
+		tracker.recordFragment("thinking-fragment");
+		tracker.recordFragment("tool-use-fragment");
+		assert.strictEqual(tracker.stableFragmentId, undefined);
+
+		assert.strictEqual(tracker.completeLogicalTurn(), "tool-use-fragment");
+		tracker.recordFragment("next-turn-thinking");
+		assert.strictEqual(tracker.stableFragmentId, "tool-use-fragment");
+	});
+
+	test("rejects an incomplete tool-use fragment as a Claude resume boundary", () => {
+		assert.strictEqual(classifyClaudeResumeBoundary({
+			type: "assistant",
+			message: {
+				role: "assistant",
+				stop_reason: "tool_use",
+				content: [{ type: "thinking", thinking: "" }],
+			},
+		}), "boundary_incomplete");
+		assert.strictEqual(classifyClaudeResumeBoundary({
+			type: "assistant",
+			message: {
+				role: "assistant",
+				stop_reason: "end_turn",
+				content: [{ type: "text", text: "done" }],
+			},
+		}), "ok");
+	});
+
+	test("uses a conservative Claude recovery estimate", () => {
+		assert.strictEqual(estimateClaudeRecoveryTokens(4_000, 12_000), 48_000);
+		assert.strictEqual(estimateClaudeRecoveryTokens(0, 0), 16_000);
 	});
 
 	test("allows only tools hosted by the native VS Code MCP server", () => {
@@ -437,6 +479,18 @@ suite("Claude subscription provider", () => {
 			userSignatures: ["user-a", "user-b"],
 			now: AVAILABILITY_NOW,
 		}), undefined);
+		assert.strictEqual(findPersistedClaudeConversation([{
+			...entry,
+			quarantinedAt: AVAILABILITY_NOW - 1_000,
+			quarantineReason: "timeout:no activity",
+		}], {
+			conversationId: "conversation-1",
+			modelId: "claude-opus-5",
+			runtimeKey: "runtime-a",
+			copilotTurnIndex: 11,
+			userSignatures: ["user-a", "user-b"],
+			now: AVAILABILITY_NOW,
+		}), undefined);
 		assert.strictEqual(findPersistedClaudeConversation([{ ...entry, copilotTurnIndex: undefined }], {
 			conversationId: "conversation-1",
 			modelId: "claude-opus-5",
@@ -515,6 +569,14 @@ suite("Claude subscription provider", () => {
 			lastUsedAt: AVAILABILITY_NOW - 30_000,
 		};
 
+		assert.strictEqual(
+			findLatestPersistedClaudeConversation([
+				stale,
+				older,
+				{ ...newest, quarantinedAt: AVAILABILITY_NOW - 1_000 },
+			], AVAILABILITY_NOW)?.conversationId,
+			"older"
+		);
 		assert.strictEqual(
 			findLatestPersistedClaudeConversation([stale, older, newest], AVAILABILITY_NOW)?.conversationId,
 			"newest"

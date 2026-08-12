@@ -1,4 +1,7 @@
 import * as assert from "assert";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 import type { ClaudeChatModelProvider } from "../claude/claude-provider";
@@ -14,6 +17,8 @@ import {
 	diffCodexThreadUsage,
 	findLatestCodexUserTail,
 	intersectCodexThreadTools,
+	isCompleteImageDataUri,
+	findTempImageWithPrefix,
 	mapCodexTokenUsageMetrics,
 	mergeCodexTurnSteps,
 	normalizeCodexRuntimeCwd,
@@ -27,12 +32,17 @@ import {
 	CODEX_NATIVE_TOOL_NAMESPACE,
 } from "../codex/dynamic-tools";
 import {
+	collectPromptImagePaths,
 	createCodexConversationAnchor,
 	convertCodexToolResult,
+	extractImageDataUrisFromText,
+	extractImagePathsFromText,
 	findCodexConversationTail,
 	findCodexToolContinuation,
 	findCodexToolContinuations,
 	matchCodexConversationTail,
+	MAX_PROMPT_IMAGES,
+	resolveLocalImagePath,
 	serializeCodexConversation,
 } from "../codex/message-adapter";
 import {
@@ -436,6 +446,104 @@ suite("Codex subscription provider", () => {
 		assert.ok(input.text.includes("result"));
 		assert.ok(input.text.length < 2_000);
 		assert.ok(!input.text.includes("large history"));
+	});
+
+	test("extracts local image paths referenced by a prompt", () => {
+		assert.deepStrictEqual(
+			extractImagePathsFromText("see ![turret](C:/tmp/turretshots/sci-fi-turret.png) please"),
+			["C:/tmp/turretshots/sci-fi-turret.png"]
+		);
+		assert.deepStrictEqual(
+			extractImagePathsFromText("check file:///d%3A/tmp/shot.png and [x](file:///d:/tmp/a.webp)"),
+			["d:/tmp/shot.png", "d:/tmp/a.webp"]
+		);
+		assert.deepStrictEqual(
+			extractImagePathsFromText('open "D:/Power Towers/Assets/x.JPEG" and C:\\tmp\\y.gif'),
+			["D:/Power Towers/Assets/x.JPEG", "C:\\tmp\\y.gif"]
+		);
+		assert.deepStrictEqual(
+			extractImagePathsFromText("render /tmp/preview.png and /d/GitHub/logo.png"),
+			["/tmp/preview.png", "/d/GitHub/logo.png"]
+		);
+		// Backticks, @-mentions, Obsidian embeds, and trailing punctuation.
+		assert.deepStrictEqual(
+			extractImagePathsFromText("open `C:/tmp/backtick.png` and @C:/tmp/at.png and ![[C:/tmp/embed.webp]]"),
+			["C:/tmp/backtick.png", "C:/tmp/at.png", "C:/tmp/embed.webp"]
+		);
+		assert.deepStrictEqual(
+			extractImagePathsFromText("(see C:/tmp/trailing.png)"),
+			["C:/tmp/trailing.png"]
+		);
+		// Non-image references, remote URLs, and data URIs are ignored.
+		assert.deepStrictEqual(
+			extractImagePathsFromText("edit build/logo.png.json, keep C:/tmp/a.glb, see https://x.io/i.png"),
+			[]
+		);
+		assert.deepStrictEqual(extractImagePathsFromText("no images here"), []);
+	});
+
+	test("extracts inline base64 image data URIs from a prompt", () => {
+		const sample = "Here is the render:\ndata:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		assert.deepStrictEqual(extractImageDataUrisFromText(sample), [
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+		]);
+		// Wrapped base64 across lines is reassembled into one data URI.
+		const wrapped = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEA\nAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		assert.deepStrictEqual(extractImageDataUrisFromText(wrapped), [
+			"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==",
+		]);
+		assert.deepStrictEqual(extractImageDataUrisFromText("plain text without images"), []);
+		assert.deepStrictEqual(extractImageDataUrisFromText("data:image/svg+xml,<svg/>"), []);
+	});
+
+	test("rejects a decodable PNG data URI when its IEND chunk is truncated", () => {
+		const complete = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+		const bytes = Buffer.from(complete.slice(complete.indexOf(",") + 1), "base64");
+		const truncated = `data:image/png;base64,${bytes.subarray(0, -12).toString("base64")}`;
+		assert.strictEqual(isCompleteImageDataUri(complete), true);
+		assert.strictEqual(isCompleteImageDataUri(truncated), false);
+	});
+
+	test("recovers a truncated inline PNG from an exact temp-file prefix", async () => {
+		const complete = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64");
+		const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "llama-image-recovery-"));
+		const imagePath = path.join(tempDirectory, "vision.png");
+		try {
+			await fs.writeFile(imagePath, complete);
+			const recovered = await findTempImageWithPrefix("image/png", complete.subarray(0, -12), tempDirectory);
+			assert.strictEqual(recovered, imagePath);
+		} finally {
+			await fs.rm(tempDirectory, { recursive: true, force: true });
+		}
+	});
+
+	test("resolves git-bash style image paths to real filesystem variants", () => {
+		const tmp = "C:\\Users\\krist\\AppData\\Local\\Temp";
+		assert.deepStrictEqual(resolveLocalImagePath("/tmp/vision_test.png", tmp), [
+			"/tmp/vision_test.png",
+			"C:\\Users\\krist\\AppData\\Local\\Temp/vision_test.png",
+		]);
+		assert.deepStrictEqual(resolveLocalImagePath("C:/tmp/vision_test.png", tmp), [
+			"C:/tmp/vision_test.png",
+			"C:\\Users\\krist\\AppData\\Local\\Temp/vision_test.png",
+		]);
+		assert.deepStrictEqual(resolveLocalImagePath("/d/GitHub/logo.png", tmp), [
+			"/d/GitHub/logo.png",
+			"D:/GitHub/logo.png",
+		]);
+		assert.deepStrictEqual(resolveLocalImagePath("D:/real/x.png", tmp), ["D:/real/x.png"]);
+	});
+
+	test("collects prompt image paths only from the latest user message", () => {
+		const messages = [
+			vscode.LanguageModelChatMessage.User("old C:/old/one.png"),
+			vscode.LanguageModelChatMessage.Assistant("ok"),
+			vscode.LanguageModelChatMessage.User("look at C:/new/two.png and C:/new/three.png"),
+		];
+		assert.deepStrictEqual(collectPromptImagePaths(messages), ["C:/new/two.png", "C:/new/three.png"]);
+		assert.deepStrictEqual(collectPromptImagePaths(messages, 1), ["C:/new/two.png"]);
+		assert.strictEqual(collectPromptImagePaths([]).length, 0);
+		assert.ok(MAX_PROMPT_IMAGES >= 1);
 	});
 
 	test("keeps one app-server turn alive across a native tool card", async () => {

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { promises as fs } from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import * as vscode from "vscode";
 
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
@@ -19,8 +22,14 @@ import {
 	estimateCodexInputTokens,
 	createCodexConversationAnchor,
 	convertCodexToolResult,
+	collectPromptImagePaths,
+	extractImageDataUrisFromText,
 	findCodexToolContinuations,
+	latestUserPromptText,
 	matchCodexConversationTail,
+	MAX_PROMPT_IMAGE_BYTES,
+	MAX_PROMPT_IMAGES,
+	resolveLocalImagePath,
 	serializeCodexConversation,
 	type CodexCompactionResult,
 	type CodexConversationAnchor,
@@ -1185,6 +1194,19 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			maxTextChars: maxInputChars,
 			maxToolResultChars: config.get("codexMaxToolResultChars", 12_000),
 		});
+		// VS Code does not deliver file attachments into subagent prompts (the
+		// child request carries only the parent agent's text). When the prompt
+		// references screenshots by path or inline data URI, attach the actual
+		// pixels so vision models (Codex) can see them.
+		const promptImagePaths = collectPromptImagePaths(serializedMessages);
+		const promptDataUris = extractImageDataUrisFromText(latestUserPromptText(serializedMessages));
+		const resolvedPromptImages = await resolvePromptImageFiles(promptImagePaths, this.logSink);
+		const resolvedPromptDataUris = await resolvePromptDataUriImages(promptDataUris, this.logSink);
+		const promptImageInputs = [
+			...resolvedPromptImages.inputs,
+			...resolvedPromptDataUris.inputs,
+		].slice(0, MAX_PROMPT_IMAGES);
+		const promptPreview = latestUserPromptText(serializedMessages).slice(0, 240).replace(/\s+/g, " ");
 		const reusedThread = activeTurn ?? interruptedContinuation ?? conversationContinuation;
 		const threadMode: CodexThreadMode = activeTurn
 			? "tool-resume"
@@ -1215,8 +1237,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			omittedMessageCount: input.omittedMessageCount,
 			truncatedMessageCount: input.truncatedMessageCount,
 			truncatedToolResultCount: input.truncatedToolResultCount,
-			imageCount: input.images.length,
+			imageCount: input.images.length + promptImageInputs.length,
 			omittedImageCount: input.omittedImageCount,
+			promptImageCount: promptImagePaths.length,
+			promptImageLoadedCount: resolvedPromptImages.inputs.length,
+			promptImageDataUriCount: promptDataUris.length,
+			promptImageDataUriValidCount: resolvedPromptDataUris.validCount,
+			promptImageDataUriRecoveredCount: resolvedPromptDataUris.recoveredPaths.length,
+			promptImageDataUriRecoveredPaths: resolvedPromptDataUris.recoveredPaths,
+			promptImagePaths: promptImagePaths.slice(0, MAX_PROMPT_IMAGES),
+			promptImageSkips: resolvedPromptImages.skips.slice(0, MAX_PROMPT_IMAGES),
+			promptPreview,
 			outerToolCount: options.tools?.length ?? 0,
 			vsCodeToolCount: dynamicToolSet.callableNames.size,
 			deferredVsCodeToolCount: dynamicToolSet.deferredNames.size,
@@ -1435,6 +1466,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 						input: [
 							{ type: "text", text: input.text, text_elements: [] },
 							...input.images.map(url => ({ type: "image", url })),
+							...promptImageInputs,
 						],
 						effort,
 						summary: ["auto", "concise", "detailed", "none"].includes(summary) ? summary : "auto",
@@ -2801,4 +2833,233 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			? Math.max(min, Math.min(max, value))
 			: fallback;
 	}
+}
+const PROMPT_IMAGE_MIME: Record<string, string> = {
+	".png": "image/png",
+	".jpg": "image/jpeg",
+	".jpeg": "image/jpeg",
+	".webp": "image/webp",
+	".gif": "image/gif",
+};
+
+function imageMimeForPath(filePath: string): string | undefined {
+	const extension = path.extname(filePath).toLocaleLowerCase();
+	return PROMPT_IMAGE_MIME[extension];
+}
+
+type PromptImageInput =
+	| { type: "image"; url: string }
+	| { type: "localImage"; path: string };
+
+interface DecodedImageDataUri {
+	mime: string;
+	bytes: Buffer;
+}
+
+function decodeImageDataUri(uri: string): DecodedImageDataUri | undefined {
+	const match = /^data:image\/(png|jpe?g|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/i.exec(uri);
+	if (!match) {
+		return undefined;
+	}
+	const mimeSubtype = match[1].toLocaleLowerCase().replace("jpg", "jpeg");
+	const bytes = Buffer.from(match[2], "base64");
+	if (bytes.length === 0 || bytes.length > MAX_PROMPT_IMAGE_BYTES) {
+		return undefined;
+	}
+	return { mime: `image/${mimeSubtype}`, bytes };
+}
+
+function isCompleteImageBytes(mime: string, bytes: Buffer): boolean {
+	if (mime === "image/png") {
+		const signature = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+		const iend = Buffer.from([0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82]);
+		return bytes.length >= signature.length + iend.length
+			&& bytes.subarray(0, signature.length).equals(signature)
+			&& bytes.subarray(-iend.length).equals(iend);
+	}
+	if (mime === "image/jpeg") {
+		return bytes.length >= 4
+			&& bytes[0] === 0xff
+			&& bytes[1] === 0xd8
+			&& bytes[bytes.length - 2] === 0xff
+			&& bytes[bytes.length - 1] === 0xd9;
+	}
+	if (mime === "image/gif") {
+		const header = bytes.subarray(0, 6).toString("ascii");
+		return (header === "GIF87a" || header === "GIF89a")
+			&& bytes[bytes.length - 1] === 0x3b;
+	}
+	if (mime === "image/webp") {
+		return bytes.length >= 12
+			&& bytes.subarray(0, 4).toString("ascii") === "RIFF"
+			&& bytes.subarray(8, 12).toString("ascii") === "WEBP"
+			&& bytes.readUInt32LE(4) + 8 === bytes.length;
+	}
+	return false;
+}
+
+/** True only when a data URI contains a structurally complete image. */
+export function isCompleteImageDataUri(uri: string): boolean {
+	const decoded = decodeImageDataUri(uri);
+	return Boolean(decoded && isCompleteImageBytes(decoded.mime, decoded.bytes));
+}
+
+/**
+ * Loads image files referenced by the latest user prompt as native localImage
+ * inputs. This avoids base64 truncation in the VS Code prompt serialization.
+ * git-bash style paths (/tmp/x.png, C:/tmp/x.png, /d/...) are resolved to
+ * the real filesystem locations before the load attempt. Missing,
+ * unreadable, and oversized files are skipped; every skip reason is
+ * returned so the caller can log why an image did not reach the model.
+ */
+async function resolvePromptImageFiles(
+	paths: readonly string[],
+	logSink?: Pick<LlamaLogSink, "log">
+): Promise<{ inputs: PromptImageInput[]; skips: Array<{ path: string; reason: string }> }> {
+	if (paths.length === 0) {
+		return { inputs: [], skips: [] };
+	}
+	const inputs: PromptImageInput[] = [];
+	const skips: Array<{ path: string; reason: string }> = [];
+	for (const filePath of paths.slice(0, MAX_PROMPT_IMAGES)) {
+		const resolved = await findExistingImageFile(filePath);
+		if (!resolved) {
+			skips.push({ path: filePath, reason: "ENOENT" });
+			logSink?.log("codex.prompt_image.skip", { path: filePath, error: "ENOENT" });
+			continue;
+		}
+		try {
+			const stat = await fs.stat(resolved);
+			if (!stat.isFile()) {
+				skips.push({ path: filePath, reason: "not-a-file" });
+				continue;
+			}
+			if (stat.size > MAX_PROMPT_IMAGE_BYTES) {
+				skips.push({ path: filePath, reason: "too-large" });
+				continue;
+			}
+			const mime = imageMimeForPath(resolved);
+			if (!mime) {
+				skips.push({ path: filePath, reason: "unsupported-extension" });
+				continue;
+			}
+			inputs.push({ type: "localImage", path: resolved });
+			if (resolved !== filePath) {
+				logSink?.log("codex.prompt_image.resolved", { path: filePath, resolved });
+			}
+		} catch (error) {
+			const code = error && typeof error === "object" && "code" in error ? String((error as { code?: unknown }).code) : "";
+			skips.push({ path: filePath, reason: code || "unreadable" });
+			logSink?.log("codex.prompt_image.skip", { path: filePath, error: code || String(error) });
+		}
+	}
+	return { inputs, skips };
+}
+
+async function resolvePromptDataUriImages(
+	dataUris: readonly string[],
+	logSink?: Pick<LlamaLogSink, "log">
+): Promise<{ inputs: PromptImageInput[]; validCount: number; recoveredPaths: string[] }> {
+	const inputs: PromptImageInput[] = [];
+	const recoveredPaths: string[] = [];
+	let validCount = 0;
+	for (const uri of dataUris.slice(0, MAX_PROMPT_IMAGES)) {
+		const decoded = decodeImageDataUri(uri);
+		if (decoded && isCompleteImageBytes(decoded.mime, decoded.bytes)) {
+			inputs.push({ type: "image", url: uri });
+			validCount++;
+			continue;
+		}
+		const recovered = decoded && decoded.bytes.length >= 64
+			? await findTempImageWithPrefix(decoded.mime, decoded.bytes)
+			: undefined;
+		if (recovered) {
+			inputs.push({ type: "localImage", path: recovered });
+			recoveredPaths.push(recovered);
+			logSink?.log("codex.prompt_image.recovered", {
+				path: recovered,
+				reason: "truncated-data-uri",
+				prefixBytes: decoded?.bytes.length,
+			});
+			continue;
+		}
+		logSink?.log("codex.prompt_image.skip", {
+			error: decoded ? "truncated-or-invalid-image" : "invalid-data-uri",
+			decodedBytes: decoded?.bytes.length ?? 0,
+		});
+	}
+	return { inputs, validCount, recoveredPaths };
+}
+
+/**
+ * Finds a complete image in the OS temp directory whose bytes begin with an
+ * inline image's decoded bytes. VS Code can truncate a large prompt part at
+ * the end while leaving syntactically decodable base64; exact prefix matching
+ * makes recovery deterministic without selecting an unrelated screenshot.
+ */
+export async function findTempImageWithPrefix(
+	mime: string,
+	prefix: Buffer,
+	tempDirectory = os.tmpdir()
+): Promise<string | undefined> {
+	let entries;
+	try {
+		entries = await fs.readdir(tempDirectory, { withFileTypes: true });
+	} catch {
+		return undefined;
+	}
+	const candidates: Array<{ filePath: string; mtimeMs: number }> = [];
+	for (const entry of entries) {
+		if (!entry.isFile()) {
+			continue;
+		}
+		const filePath = path.join(tempDirectory, entry.name);
+		if (imageMimeForPath(filePath) !== mime) {
+			continue;
+		}
+		try {
+			const stat = await fs.stat(filePath);
+			if (stat.size >= prefix.length && stat.size <= MAX_PROMPT_IMAGE_BYTES) {
+				candidates.push({ filePath, mtimeMs: stat.mtimeMs });
+			}
+		} catch {
+			// The temp file may disappear while the directory is scanned.
+		}
+	}
+	candidates.sort((left, right) => right.mtimeMs - left.mtimeMs);
+	for (const candidate of candidates.slice(0, 1_000)) {
+		let handle;
+		try {
+			handle = await fs.open(candidate.filePath, "r");
+			const head = Buffer.alloc(prefix.length);
+			const { bytesRead } = await handle.read(head, 0, head.length, 0);
+			if (bytesRead !== prefix.length || !head.equals(prefix)) {
+				continue;
+			}
+			const complete = await fs.readFile(candidate.filePath);
+			if (isCompleteImageBytes(mime, complete)) {
+				return candidate.filePath;
+			}
+		} catch {
+			// Try the next candidate.
+		} finally {
+			await handle?.close().catch(() => undefined);
+		}
+	}
+	return undefined;
+}
+
+/** Returns the first resolvable variant of a prompt image path, if any. */
+async function findExistingImageFile(candidate: string): Promise<string | undefined> {
+	for (const variant of resolveLocalImagePath(candidate)) {
+		try {
+			const stat = await fs.stat(variant);
+			if (stat.isFile()) {
+				return variant;
+			}
+		} catch {
+			// Try the next variant.
+		}
+	}
+	return undefined;
 }

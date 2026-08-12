@@ -1,60 +1,61 @@
-# AI Agent Bridge 1.12.0 — release notes
+# AI Agent Bridge 1.13.0 — release notes
 
-This release turns the accumulated 1.11.x development patches into a stable
-baseline. The headline: **Claude turns no longer burn the 5-hour rate limit**
-and **compaction is now fully provider-owned**.
+Hotfix release. Two integration breakages are fixed and verified end-to-end:
+Claude restored sessions could burn the whole 5-hour allowance without ever
+producing a token, and Codex subagents (Luna) could silently lose screenshots.
 
-## The most important fixes
+## 1. Claude: durable restore no longer hangs or burns the rate limit
 
-### 1. Claude context safety — the 5-hour limit stops being destroyed
-Three defects could each force a full cold replay of a long Claude chat
-(hundreds of thousands of fresh input tokens — measured 563K in a single
-request, ~503K new cache writes, instantly hitting the Anthropic 5-hour
-rate limit):
+A persisted resume checkpoint could point into the middle of a tool chain,
+where the SDK transcript splits one assistant message into thinking/text/tool
+fragments. Restoring from such a boundary made the SDK initialize but then
+produce no stream activity until the 90-second timeout — twice, with the same
+broken session selected again on retry. The diagnostics showed
+`resume_failed (sdk_resume, timeout)` and a blocked 176K-token full replay.
 
-- A mid-turn notification or retry resends the same turn with a truncated or
-  rewritten transcript. The old durable-restore check required conversation
-  "progress" and rejected such requests, so the whole chat was re-sent cold.
-  **Restore now matches on the exact conversation id alone** — the model
-  resumes warm from the SDK fork.
-- A stopped Claude turn could deliver the next task as an orphan tool-result
-  JSON blob, so the model answered yesterday's task. **The latest user
-  message now always carries the user's real text.**
-- The persisted resume checkpoint stayed at the last clean turn, so a
-  stop/restart in the middle of a long tool chain restored a stale session.
-  **Checkpoints now advance through the chain.**
+Fixes:
 
-### 2. Provider-owned Compact Conversation
-The native context-usage Compact button routes to the extension for
-contributed models. Recovery compacts below the automatic threshold, keeps a
-configurable 25–90% retained target, cleans poisoned/looped context,
-persists the new snapshot immediately, and works right after
-`Developer: Reload Window`. Optionally, `deepseek-v4-flash` rewrites the
-dropped history into a structured engineering handoff (objective, decisions,
-verification, failed approaches) — off by default because it is a paid call.
+- **Checkpoints advance only after a successful logical turn.** A thinking or
+  tool-use fragment is never treated as a completed boundary anymore.
+- **Resume boundaries are validated from the transcript before any model
+  request.** Missing, non-assistant, and incomplete tool-use boundaries are
+  quarantined immediately — no second retry against the same broken session.
+- **Failed resumes stay quarantined until a successful recovery replaces
+  them.** If a full replay exceeds the configured 64K safety limit, Claude
+  starts a fresh session with only the latest user message, after a
+  conservative 2x cost estimate (including 8K SDK overhead) and a fresh
+  five-hour-usage check. If even that bounded recovery is unsafe, the request
+  fails **before contacting the model** instead of silently spending the
+  remaining allowance.
+- A completely fresh cold start is also guarded by the same token limit, so a
+  missing transcript file or an extension reload cannot bypass the protection.
 
-### 3. Centralized API Provider Manager
-Any number of OpenAI-compatible API profiles (name, base URL, request
-format, model family, context length, optional key). Every profile
-contributes its `/models` catalog to the shared VS Code model picker;
-credentials live only in SecretStorage and never return to the webview.
+Verified with a real Opus smoke run: native tool call succeeded, the follow-up
+turn resumed warm (cache write 675 → 21 tokens), and the 5-hour usage stayed
+at 0%.
 
-### 4. Long agent runs are uninterrupted
-The cross-request tool-density guard that injected "pause and summarize"
-into productive tool workflows was removed. Real repeated-call loops are
-still caught by the reliability guard, and a new streaming reasoning-loop
-guard stops multi-kilobyte thinking repetition before it burns the output
-budget.
+## 2. Codex: vision subagents (Luna) actually see screenshots
 
-### 5. UI: memory manager and Live Report
-- Shared Memory shows its context-token footprint in Quick Access; the
-  memory manager panel (global/workspace scopes) is back and refreshes live.
-- The Performance sparkline is dynamic — bars stretch to fill the track.
-- The Live Report webview now renders only the active tab, skips unchanged
-  keep-alive payloads, and coalesces update bursts to at most one render per
-  second (previously every turn event rebuilt all four tabs from scratch).
+VS Code does not deliver file attachments into subagent prompts, so the
+extension extracts image references from the prompt text. Two failure modes
+were found and fixed:
+
+- The prompt contained a PNG data URI that decoded successfully but was the
+  first 1,080 bytes of a 1,100-byte file — missing the mandatory `IEND` chunk.
+  Codex replaced it with `image content omitted because it could not be
+  processed`. **Data URIs are now checked for format-specific end markers**
+  (PNG IEND, JPEG EOI, WebP RIFF size, GIF trailer), not just base64
+  decodability.
+- Local screenshots are now sent through the native app-server `localImage`
+  input instead of being re-encoded into data URIs. When an inline image is
+  truncated, the provider recovers it from an exact byte-prefix match in
+  `%TEMP%` (`codex.prompt_image.recovered`); unrelated files cannot match.
+  Prompt image paths also resolve through git-bash aliases (`/tmp/x.png`,
+  `C:/tmp/x.png`, `/d/GitHub/x.png`), and wrapped multi-line base64 is
+  reassembled.
 
 ## Quality
-- 380 passing tests, ESLint clean, pinned to VS Code 1.131.
+
+- 389 passing tests, ESLint clean, TypeScript clean.
 - The VSIX for this tag is attached to this release; install with
-  `code --install-extension llama-vscode-chat-1.12.0.vsix`.
+  `code --install-extension llama-vscode-chat-1.13.0.vsix`.

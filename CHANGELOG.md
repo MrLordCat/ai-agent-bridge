@@ -1,5 +1,122 @@
 # Changelog
 
+## 1.13.0 (stable) - 2026-08-12
+
+Hotfix release on top of 1.12.0. Two integration breakages are fixed and
+verified end-to-end:
+
+- **Claude durable checkpoints now advance only after a successful logical
+  turn**. The Agent SDK emits thinking, text, and tool-use fragments as
+  separate assistant records; the previous implementation treated the next
+  fragment as proof that the prior one was complete. This persisted malformed
+  `stop_reason: tool_use` boundaries and made restored sessions initialize but
+  produce no stream activity until the 90-second timeout.
+- **Durable resume boundaries are validated from the SDK transcript before any
+  model request**. Missing, non-assistant, and incomplete tool-use boundaries
+  are quarantined immediately, preventing a known-bad session from consuming a
+  second retry.
+- **Failed resumes remain persistently quarantined until a successful recovery
+  replaces them**. If a full replay exceeds the configured 64K safety limit,
+  Claude starts a fresh session with only the latest user message, but only
+  after a conservative 2x cost estimate (including 8K SDK overhead) and a
+  fresh five-hour-usage check pass. If even that bounded recovery is unsafe,
+  the request fails before contacting the model instead of silently spending
+  the remaining allowance.
+- **Codex vision inputs no longer accept silently truncated images**: the
+  failing Luna request contained a base64 PNG that decoded successfully but
+  was the first 1,080 bytes of a 1,100-byte file, missing the final `IEND`
+  chunk. Codex replaced it with `image content omitted because it could not
+  be processed`. Data URIs are now checked for format-specific end markers
+  instead of mere base64 decodability.
+- **Local screenshots use the native app-server `localImage` input** instead
+  of being converted back into large data URIs. When an inline image is
+  truncated, the provider can recover it from an exact byte-prefix match in
+  `%TEMP%` and logs `codex.prompt_image.recovered`; unrelated files cannot
+  match. Prompt image paths also resolve through git-bash aliases
+  (`/tmp/x.png`, `C:/tmp/x.png`, `/d/GitHub/x.png`).
+- No-activity timeouts are classified correctly as resume timeouts in live
+  diagnostics. Regression coverage: 389 tests, including fragmented
+  checkpoints, malformed boundaries, quarantine selection, conservative cost
+  estimates, and the observed `no activity for 90 seconds` failure.
+
+## 1.12.5 (dev) - 2026-08-12
+
+- **Claude durable checkpoints now advance only after a successful logical
+  turn**. The Agent SDK emits thinking, text, and tool-use fragments as
+  separate assistant records; the previous implementation treated the next
+  fragment as proof that the prior one was complete. This persisted malformed
+  `stop_reason: tool_use` boundaries and made restored sessions initialize but
+  produce no stream activity until the 90-second timeout.
+- **Durable resume boundaries are validated from the SDK transcript before any
+  model request**. Missing, non-assistant, and incomplete tool-use boundaries
+  are quarantined immediately, preventing a known-bad session from consuming a
+  second retry.
+- **Failed resumes remain persistently quarantined until a successful recovery
+  replaces them**. If a full replay exceeds the configured 64K safety limit,
+  Claude starts a fresh session with only the latest user message, but only
+  after a conservative 2x cost estimate (including 8K SDK overhead) and a
+  fresh five-hour-usage check pass. If even that bounded recovery is unsafe,
+  the request fails before contacting the model instead of silently spending
+  the remaining allowance.
+- **No-activity timeouts are classified correctly** as resume timeouts in live
+  diagnostics. Regression tests cover fragmented checkpoints, malformed
+  boundaries, quarantine selection, conservative cost estimates, and the
+  observed `no activity for 90 seconds` failure.
+
+## 1.12.4 (dev) - 2026-08-11
+
+- **Codex vision inputs no longer accept silently truncated images**: the
+  failing Luna request contained a base64 PNG that decoded successfully but
+  was the first 1,080 bytes of a 1,100-byte file, missing the final `IEND`
+  chunk. Codex therefore replaced it with `image content omitted because it
+  could not be processed`. Data URIs are now checked for format-specific end
+  markers instead of mere base64 decodability.
+- **Local screenshots use the native app-server `localImage` input** instead
+  of being converted back into large data URIs. When an inline image is
+  truncated, the provider can recover it from an exact byte-prefix match in
+  `%TEMP%` and logs `codex.prompt_image.recovered`; unrelated files cannot
+  match. PNG/JPEG/GIF/WebP completeness and filesystem recovery have
+  regression coverage.
+
+## 1.12.3 (dev) - 2026-08-11
+
+- **Prompt image paths resolve through git-bash aliases**: agents commonly
+  write paths the way git-bash renders them (`/tmp/x.png`, `C:/tmp/x.png`,
+  `/d/GitHub/x.png`) while the file lives in the OS temp directory or a
+  drive root. The provider now tries the literal path first, then the
+  msys-drive and temp-directory variants, and logs `codex.prompt_image.
+  resolved` when an alias was used. Wrapped (multi-line) base64 data URIs
+  are reassembled, and every data URI is validated (decodable, ≤20MB)
+  before attachment.
+- **Prompt diagnostics**: `codex.chat.start` now logs `promptPreview` (first
+  240 chars of the latest user message) and `promptImageDataUriValidCount`
+  so a vision subagent that still reports no images can be traced to the
+  exact prompt text and image sources.
+
+## 1.12.2 (dev) - 2026-08-11
+
+- **Prompt image attachment is more robust and self-diagnosing**: recognized
+  path formats now include backticked paths, `@path` mentions, Obsidian
+  `![[path]]` embeds, trailing punctuation, and inline `data:image/...;
+  base64` URIs (attached directly instead of being left as opaque text).
+  `codex.chat.start` logs the exact `promptImagePaths`, every skip reason
+  (`promptImageSkips`: missing/unreadable/too-large/unsupported), and
+  `codex.prompt_image.skip` events for read failures — so a vision subagent
+  that still reports no images can be traced to the exact path that did not
+  resolve.
+
+## 1.12.1 (dev) - 2026-08-11
+
+- **Codex subagents can now see images referenced in their prompt**: VS Code
+  does not deliver file attachments into subagent requests (the child gets
+  only the parent agent's text), so a vision model could not look at
+  rendered screenshots. The provider now scans the latest user message for
+  image paths — markdown destinations, `file://` URLs, quoted and bare
+  Windows/Unix paths — loads up to 8 existing files (≤20MB each, png/jpg/
+  webp/gif) and attaches them as data-URL image blocks to the Codex turn.
+  Missing or oversized files are skipped silently; `codex.chat.start` logs
+  `promptImageCount`/`promptImageLoadedCount`.
+
 ## 1.12.0 (stable) - 2026-08-11
 
 Stability release: Claude context safety that stops cold replays and

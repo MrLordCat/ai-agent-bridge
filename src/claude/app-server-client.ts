@@ -92,7 +92,7 @@ export type ClaudeAgentSessionMode = "new" | "warm" | "restored" | "rollover" | 
 
 export interface ClaudeAgentTurnContext {
 	sessionMode: ClaudeAgentSessionMode;
-	inputMode: "full" | "user-turn";
+	inputMode: "full" | "user-turn" | "latest-user";
 	/** Distinguishes invisible maintenance turns from user-visible chat turns. */
 	turnKind?: "user" | "keep-alive";
 	conversationKey?: string;
@@ -257,6 +257,76 @@ export async function hasPersistedClaudeSession(sessionId: string, cwd: string):
 	}
 }
 
+export interface ClaudePersistedSessionValidation {
+	exists: boolean;
+	resumeBoundaryValid: boolean;
+	reason: "ok" | "session_missing" | "boundary_missing" | "boundary_not_found"
+		| "boundary_not_assistant" | "boundary_incomplete";
+}
+
+export function classifyClaudeResumeBoundary(
+	boundary: unknown
+): ClaudePersistedSessionValidation["reason"] {
+	const sdkMessage = asRecord(boundary);
+	const message = asRecord(sdkMessage.message);
+	if (sdkMessage.type !== "assistant" || message.role !== "assistant") {
+		return "boundary_not_assistant";
+	}
+	const stopReason = typeof message.stop_reason === "string" ? message.stop_reason : "";
+	return !stopReason || stopReason === "tool_use" ? "boundary_incomplete" : "ok";
+}
+
+/**
+ * Validates a durable resume boundary without starting a model request.
+ * Assistant messages emitted by the SDK can be split into thinking/text/tool
+ * fragments that share one API message. A fragment whose stop reason is
+ * `tool_use` is not a safe place to append a new user turn, even when its
+ * base transcript file exists.
+ */
+export async function validatePersistedClaudeSession(
+	sessionId: string,
+	cwd: string,
+	resumeSessionAt?: string
+): Promise<ClaudePersistedSessionValidation> {
+	try {
+		const sdk = await import("@anthropic-ai/claude-agent-sdk");
+		const messages = await sdk.getSessionMessages(sessionId, { dir: cwd, limit: 10_000 });
+		if (messages.length === 0) {
+			return { exists: false, resumeBoundaryValid: false, reason: "session_missing" };
+		}
+		if (!resumeSessionAt) {
+			return { exists: true, resumeBoundaryValid: false, reason: "boundary_missing" };
+		}
+		const boundary = messages.find(message => asRecord(message).uuid === resumeSessionAt);
+		if (!boundary) {
+			return { exists: true, resumeBoundaryValid: false, reason: "boundary_not_found" };
+		}
+		const reason = classifyClaudeResumeBoundary(boundary);
+		return { exists: true, resumeBoundaryValid: reason === "ok", reason };
+	} catch {
+		return { exists: false, resumeBoundaryValid: false, reason: "session_missing" };
+	}
+}
+
+/** Tracks only logical-turn-complete assistant checkpoints. */
+export class ClaudeAssistantCheckpointTracker {
+	private currentFragmentId: string | undefined;
+	private completedFragmentId: string | undefined;
+
+	recordFragment(fragmentId: string): void {
+		this.currentFragmentId = fragmentId;
+	}
+
+	completeLogicalTurn(): string | undefined {
+		this.completedFragmentId = this.currentFragmentId;
+		return this.completedFragmentId;
+	}
+
+	get stableFragmentId(): string | undefined {
+		return this.completedFragmentId;
+	}
+}
+
 interface ActiveTurn {
 	progress: vscode.Progress<vscode.LanguageModelResponsePart>;
 	resolve: () => void;
@@ -377,9 +447,7 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	private activeTurn: ActiveTurn | undefined;
 	private logicalTurn: ClaudeLogicalTurn | undefined;
 	private sessionId: string | undefined;
-	private lastAssistantMessageId: string | undefined;
-	/** Last assistant message whose tool calls were fully resolved. */
-	private lastCompletedAssistantId: string | undefined;
+	private readonly checkpoint = new ClaudeAssistantCheckpointTracker();
 	private lastTurnProducedOutput = false;
 	private keepAliveMode = false;
 	/**
@@ -412,9 +480,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		return new Set(this.pendingTools.keys());
 	}
 
-	/** Last assistant message durably observed from the SDK transcript. */
+	/** Last assistant fragment from a successfully completed logical turn. */
 	get stableAssistantMessageId(): string | undefined {
-		return this.lastCompletedAssistantId ?? this.lastAssistantMessageId;
+		return this.checkpoint.stableFragmentId;
 	}
 
 	get canRetryLastTurn(): boolean {
@@ -745,13 +813,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				this.failActiveTurn(new Error(`Claude API error: ${message.error}`), "failed");
 				return;
 			}
-			// A new assistant message arrived — the previous one (if any) was
-			// fully resolved (its tool calls were completed).  Save it as the
-			// last checkpoint safe for resumeSessionAt after an interruption.
-			if (this.lastAssistantMessageId) {
-				this.lastCompletedAssistantId = this.lastAssistantMessageId;
-			}
-			this.lastAssistantMessageId = message.uuid;
+			// The SDK emits thinking/text/tool_use as separate assistant records.
+			// Merely seeing the next fragment does not complete the logical turn.
+			this.checkpoint.recordFragment(message.uuid);
 			this.handleAssistantMessage(message.message, message.uuid);
 			return;
 		}
@@ -881,6 +945,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			}
 			active.progress.report(new vscode.LanguageModelTextPart(message.result));
 		}
+		// Only a successful SDK result proves that every assistant fragment and
+		// tool round in this logical turn is complete and safe to resume from.
+		this.checkpoint.completeLogicalTurn();
 		this.finishLogicalTurn("completed");
 		this.completeActiveTurn();
 	}
