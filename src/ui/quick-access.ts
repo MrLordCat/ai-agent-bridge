@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import type { ProviderState } from "../providers/provider-directory";
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
 import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
@@ -355,7 +356,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
 		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
 		private readonly getMemoryContextTokens: () => number = () => 0,
-		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 })
+		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 }),
+		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined
 	) {}
 
 	refresh(): void {
@@ -444,14 +446,14 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const usageExperiments = this.getUsageExperiments();
 		const apiProviderSummary = this.getApiProviderSummary();
 
-		const apiProviders = new QuickAccessItem("apiProviders", "API Providers", {
+		const apiProviders = new QuickAccessItem("apiProviders", "Providers", {
 			description: apiProviderSummary.total > 0
 				? `${apiProviderSummary.enabled}/${apiProviderSummary.total} active`
 				: "Add sources",
 			icon: new vscode.ThemeIcon("server-environment"),
 			tooltip: "Manage multiple OpenAI-compatible API endpoints and credentials. API keys are stored in VS Code SecretStorage.",
 			children: [
-				new QuickAccessItem("apiProviders.manage", "Manage API Providers", {
+				new QuickAccessItem("apiProviders.manage", "Providers Manager", {
 					description: apiProviderSummary.total > 0 ? `${apiProviderSummary.total} configured` : "Add, edit or remove",
 					icon: new vscode.ThemeIcon("server-process"),
 					command: command("llamacpp.openApiProviders", "Manage API Providers"),
@@ -988,6 +990,19 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			],
 		});
 
-		return [apiProviders, local, deepSeek, codex, claude, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
+		// Providers that are enabled but unreachable are hidden from Quick
+		// Access and reappear as soon as the availability probe reports them
+		// online again. The Providers group stays visible so the reason can
+		// be inspected in the Providers Manager.
+		const providerRoots = [
+			{ key: "local", item: local },
+			{ key: "deepseek", item: deepSeek },
+			{ key: "codex", item: codex },
+			{ key: "claude", item: claude },
+		];
+		const visibleProviders = providerRoots
+			.filter(({ key }) => this.getProviderState(key) !== "offline")
+			.map(({ item }) => item);
+		return [apiProviders, ...visibleProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
 	}
 }

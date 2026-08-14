@@ -1,9 +1,14 @@
 # API Providers
 
+> **Renamed in 1.14.2**: the manager is now the unified **Providers Manager** —
+> Local LLM, DeepSeek, Codex, Claude, and custom API profiles share one window.
+> Offline providers are hidden from Quick Access and reappear when they come
+> back online; the reason for being offline is shown in the manager.
+
 AI Agent Bridge can load models from multiple OpenAI-compatible HTTP APIs at
 the same time. Profiles are managed from:
 
-`Quick Access → API Providers → Manage API Providers`
+`Quick Access → Providers → Providers Manager`
 
 Each enabled profile contributes its discovered models to the native VS Code
 model picker without replacing the built-in Local LLM or DeepSeek source.

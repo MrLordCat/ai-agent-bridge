@@ -48,7 +48,7 @@ package is deliberately distributed outside the gallery.
    [Releases](https://github.com/MrLordCat/ai-agent-bridge/releases/latest).
 2. Install it:
    ```sh
-   code --install-extension llama-vscode-chat-v1.14.1.vsix
+   code --install-extension llama-vscode-chat-v1.14.3.vsix
    ```
 3. Run `Developer: Reload Window`.
 
@@ -62,7 +62,7 @@ package is deliberately distributed outside the gallery.
 **Local:** start an OpenAI-compatible server such as `llama-server`, then set
 its URL with `AI Agent Bridge: Set Local Server URL`.
 
-**Custom APIs:** open Quick Access → `API Providers` → `Manage API Providers`,
+**Custom APIs:** open Quick Access → `Providers` → `Providers Manager`,
 add a profile, choose its API format and model family, then refresh models. A
 base URL may already end in `/v1` (for example `https://openrouter.ai/api/v1`).
 
@@ -222,7 +222,7 @@ current-context value without indicating a context overflow.
 | Command | Purpose |
 |---|---|
 | `AI Agent Bridge: Open Sidebar` | Quick Access with connections, provider context sliders, behavior, memory, diagnostics |
-| `AI Agent Bridge: Manage API Providers` | Add, edit, enable, disable, or delete OpenAI-compatible API profiles |
+| `AI Agent Bridge: Providers Manager` | One place for every source: Local LLM, DeepSeek, Codex, Claude, and custom API profiles, with live availability and offline reasons |
 | `AI Agent Bridge: Refresh Models` | Refresh every enabled source |
 | `AI Agent Bridge: Configure DeepSeek` | Store DeepSeek API key |
 | `AI Agent Bridge: Sign In to Codex Subscription` | Authenticate Codex app-server |
@@ -298,7 +298,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.14.1. Current local development build: 1.14.1.** The
+**Stable release: 1.14.3. Current local development build: 1.14.3.** The
 stable line consolidates the 1.13.x development patches: Claude follow-up
 messages are forwarded to the resumed session, the active-turn timeout is
 300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
@@ -309,7 +309,7 @@ screenshots, and measured cache-hit numbers.
 npm install
 npm run compile
 npm run lint
-npm test              # 396 extension-host tests in the current 1.14.1 dev patch
+npm test              # 408 extension-host tests in the current 1.14.3 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

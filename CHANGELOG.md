@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.14.3 (stable) - 2026-08-14
+
+Centralized provider management: one Providers Manager for every source
+(Local, DeepSeek, Codex, Claude, custom APIs), dynamic Quick Access that
+hides offline providers, and per-provider availability reasons.
+
+- **Providers Manager (Phase 2) — full control surface.** The webview now
+  manages every source, not just custom API profiles. Built-in provider cards
+  (Local LLM, DeepSeek, Codex, Claude) show live status from the provider
+  directory plus controls for each source: enable/disable, endpoint, API key,
+  context sliders, sign-in, and account status. DeepSeek cards include balance
+  and peak-hours billing; Codex and Claude cards show subscription usage and
+  limits.
+- **Actions run through existing VS Code commands.** Every button posts a
+  command id back to the panel, which executes the registered
+  `llamacpp.*` command (non-`llamacpp.*` ids are rejected). Toggle/sign-in
+  commands reuse the same handlers as Quick Access, so behavior stays
+  identical.
+- **Provider manager stays live.** It re-renders on directory and
+  subscription-status changes and on the 60-second usage-limit timer, so
+  balance, usage percent, and limits stay current while the panel is open.
+
+## 1.14.2 (dev) - 2026-08-14
+
+- **Providers Manager (Phase 1).** A new `ProviderDirectory` service holds one
+  status model for every source: Local LLM, DeepSeek, Codex, Claude, and custom
+  API profiles. HTTP sources are probed with a lightweight GET /models every
+  5 minutes; subscription states come from the providers' own periodic refresh.
+- **Quick Access is dynamic.** A provider that is enabled but unreachable
+  disappears from Quick Access and reappears as soon as the probe reports it
+  online again. Disabled and unconfigured sources stay visible as before.
+- **Manage API Providers renamed to Providers Manager.** The webview now shows
+  availability and the offline reason for every provider next to the custom
+  API profiles, with a manual "Recheck availability" button.
+- API profile changes now also update the Quick Access "Providers" group
+  (configured/active counts were not wired into the tree before).
+
 ## 1.14.1 (stable) - 2026-08-14
 
 Hotfix for the 1.14.0 storefront release: "Manage API Providers" was

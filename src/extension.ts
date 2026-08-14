@@ -29,6 +29,7 @@ import { SessionQualityPanel } from "./ui/session-quality-panel";
 import { MemoryManagerPanel, estimateMemoryTokens } from "./ui/memory-manager";
 import { ApiProviderManagerPanel } from "./ui/api-provider-manager";
 import { ApiProviderService } from "./api-providers/api-provider-service";
+import { ProviderDirectory } from "./providers/provider-directory";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
@@ -560,6 +561,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const apiProviderService = new ApiProviderService(context.globalState, context.secrets);
 	context.subscriptions.push(apiProviderService);
 
+	// Unified provider directory: one status model for every source.
+	let lastCodexStatus: { state: string; summary: string } | undefined;
+	let lastClaudeStatus: { state: string; summary: string } | undefined;
+	const providerDirectory = new ProviderDirectory({
+		getSecret: key => Promise.resolve(context.secrets.get(key)),
+		getConfigValue: (key, fallback) => vscode.workspace.getConfiguration(CONFIG_SECTION).get(key, fallback),
+		getApiProfiles: async () => apiProviderService.listSummaries(),
+		getCodexStatus: () => lastCodexStatus,
+		getClaudeStatus: () => lastClaudeStatus,
+	});
+	context.subscriptions.push(providerDirectory);
+
 	// Llama.cpp Provider
 	const llamaProvider = new LlamaCppChatModelProvider(
 		context.secrets,
@@ -608,15 +621,38 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => codexProvider.codexUsageLimitResetLabel,
 		() => claudeProvider.claudeUsageLimitPercent,
 		() => claudeProvider.claudeUsageLimitResetLabel,
-		() => estimateMemoryTokens(memoryService.list())
+		() => estimateMemoryTokens(memoryService.list()),
+		() => ({
+			total: apiProviderService.count,
+			enabled: apiProviderService.enabledCount,
+		}),
+		key => providerDirectory.stateOf(key)
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(usageExperiments.onDidChange(() => quickActionsProvider.refresh()));
-	context.subscriptions.push(codexProvider.onDidChangeStatus(() => quickActionsProvider.refresh()));
-	context.subscriptions.push(claudeProvider.onDidChangeStatus(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(codexProvider.onDidChangeStatus(status => {
+		lastCodexStatus = { state: status.state, summary: status.summary };
+		void providerDirectory.refresh();
+		quickActionsProvider.refresh();
+		ApiProviderManagerPanel.refreshIfOpen();
+	}));
+	context.subscriptions.push(claudeProvider.onDidChangeStatus(status => {
+		lastClaudeStatus = { state: status.state, summary: status.summary };
+		void providerDirectory.refresh();
+		quickActionsProvider.refresh();
+		ApiProviderManagerPanel.refreshIfOpen();
+	}));
+	context.subscriptions.push(apiProviderService.onDidChange(() => {
+		void providerDirectory.refresh();
+		quickActionsProvider.refresh();
+	}));
+	context.subscriptions.push(providerDirectory.onDidChange(() => {
+		quickActionsProvider.refresh();
+		ApiProviderManagerPanel.refreshIfOpen();
+	}));
 	context.subscriptions.push(claudeProvider.onDidChangeCacheKeepAliveStatus(() => {
 		quickActionsProvider.refresh();
 		SessionQualityPanel.refreshIfOpen();
@@ -657,8 +693,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	llamaProvider.refreshLanguageModelChatInformation();
 	codexProvider.refreshLanguageModelChatInformation();
 	claudeProvider.refreshLanguageModelChatInformation();
-	void codexProvider.refreshStatus().catch(error => logService.logError("codex.initial_status.failed", error));
-	void claudeProvider.refreshStatus().catch(error => logService.logError("claude.initial_status.failed", error));
+	void codexProvider.refreshStatus().then(status => {
+		lastCodexStatus = { state: status.state, summary: status.summary };
+	}).catch(error => logService.logError("codex.initial_status.failed", error));
+	void claudeProvider.refreshStatus().then(status => {
+		lastClaudeStatus = { state: status.state, summary: status.summary };
+	}).catch(error => logService.logError("claude.initial_status.failed", error));
+	void providerDirectory.recheck().catch(error => logService.logError("providers.initial_recheck.failed", error));
 	void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.balance.initial_failed", error));
 
 	// Auto-refresh provider usage limits and balances so Quick Access shows when
@@ -666,6 +707,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// provider refresh is internally TTL-guarded, so this stays lightweight.
 	const usageLimitRefreshTimer = setInterval(() => {
 		quickActionsProvider.refresh();
+		ApiProviderManagerPanel.refreshIfOpen();
 		void codexProvider.refreshStatus().catch(error => logService.logError("codex.periodic_status.failed", error));
 		void claudeProvider.refreshSubscriptionUsage().catch(error => logService.logError("claude.periodic_usage.failed", error));
 		void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.periodic_balance.failed", error));
@@ -1001,7 +1043,23 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("llamacpp.openApiProviders", () => {
 			ApiProviderManagerPanel.createOrShow(
 				apiProviderService,
-				() => llamaProvider.refreshLanguageModelChatInformation()
+				providerDirectory,
+				() => llamaProvider.refreshLanguageModelChatInformation(),
+				() => ({
+					deepSeek: { balance: llamaProvider.deepSeekBalanceSummary },
+					codex: {
+						summary: lastCodexStatus?.summary ?? codexProvider.accountSummary,
+						usagePercent: codexProvider.codexUsageLimitPercent,
+						usageReset: codexProvider.codexUsageLimitResetLabel,
+					},
+					claude: {
+						summary: lastClaudeStatus?.summary ?? claudeProvider.accountSummary,
+						limits: claudeProvider.subscriptionUsageLimits.map(limit => ({
+							label: limit.label,
+							description: limit.description,
+						})),
+					},
+				})
 			);
 		})
 	);
@@ -1594,6 +1652,16 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				) {
 					quickActionsProvider.refresh();
 					claudeProvider.refreshCacheKeepAliveStatus();
+				}
+				if (
+					event.affectsConfiguration("llamacpp.enableLocalServer") ||
+					event.affectsConfiguration("llamacpp.localServerUrl") ||
+					event.affectsConfiguration("llamacpp.enableDeepSeek") ||
+					event.affectsConfiguration("llamacpp.serverUrl") ||
+					event.affectsConfiguration("llamacpp.enableCodexSubscription") ||
+					event.affectsConfiguration("llamacpp.enableClaudeSubscription")
+				) {
+					void providerDirectory.recheck();
 				}
 				if (
 					event.affectsConfiguration("llamacpp.codexCacheKeepAliveEnabled") ||

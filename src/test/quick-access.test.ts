@@ -40,7 +40,7 @@ suite("quick access", () => {
 
 		assert.deepStrictEqual(
 			root.map(labelOf),
-			["API Providers", "Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
+			["Providers", "Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
 		);
 		assert.ok(root.every(item => item.collapsibleState === vscode.TreeItemCollapsibleState.Collapsed));
 		assert.ok(root.every(item => item.id?.startsWith("llamacpp.quickAccess.")));
@@ -93,9 +93,9 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => 0,
 			() => ({ total: 3, enabled: 2 })
 		);
-		const apiProviders = (await getItems(provider)).find(item => labelOf(item) === "API Providers");
+		const apiProviders = (await getItems(provider)).find(item => labelOf(item) === "Providers");
 		assert.strictEqual(apiProviders?.description, "2/3 active");
-		const manage = (await getItems(provider, apiProviders)).find(item => labelOf(item) === "Manage API Providers");
+		const manage = (await getItems(provider, apiProviders)).find(item => labelOf(item) === "Providers Manager");
 		assert.strictEqual(manage?.command?.command, "llamacpp.openApiProviders");
 	});
 
@@ -509,5 +509,49 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.ok(String(models[0].tooltip).includes("Focused complex tasks"));
 		assert.ok(String(models[0].tooltip).includes("5-hour limit 100%"));
 		assert.ok(String(models[0].tooltip).includes("Available after:"));
+	});
+
+	test("hides enabled-but-offline providers and restores them when online", async () => {
+		const stateMap: Record<string, string | undefined> = { local: "offline", deepseek: "offline" };
+		const provider = new LlamaQuickActionsProvider(
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => emptyTokenUsageHistorySummary(),
+			() => emptyUsageExperimentSummary(),
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => ({ total: 0, enabled: 0 }),
+			key => (stateMap[key] as "offline" | "online" | undefined)
+		);
+
+		const labels = (await getItems(provider)).map(labelOf);
+		assert.ok(!labels.includes("Local LLM"), "offline Local LLM must be hidden");
+		assert.ok(!labels.includes("DeepSeek"), "offline DeepSeek must be hidden");
+		assert.ok(labels.includes("Codex"), "healthy Codex must stay visible");
+		assert.ok(labels.includes("Claude"), "healthy Claude must stay visible");
+		assert.ok(labels.includes("Providers"), "Providers group must stay visible for offline reasons");
+
+		stateMap.local = "online";
+		const recovered = (await getItems(provider)).map(labelOf);
+		assert.ok(recovered.includes("Local LLM"), "Local LLM must reappear when online");
 	});
 });

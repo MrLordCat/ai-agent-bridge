@@ -7,6 +7,15 @@ import {
 	type ApiProviderService,
 	type ApiProviderSummary,
 } from "../api-providers/api-provider-service";
+import { CONFIG_SECTION, DEFAULT_SERVER_URL } from "../constants";
+import {
+	formatDeepSeekPeakEffectiveLocal,
+	resolveDeepSeekPricingSnapshot,
+} from "../deepseek-peak-hours";
+import {
+	type ProviderDirectory,
+	type ProviderStatusEntry,
+} from "../providers/provider-directory";
 
 function esc(value: unknown): string {
 	return String(value ?? "")
@@ -23,20 +32,184 @@ function selectOption(value: string, current: string, label: string): string {
 	return `<option value="${escAttr(value)}"${value === current ? " selected" : ""}>${esc(label)}</option>`;
 }
 
+export interface ProviderManagerLiveData {
+	deepSeek?: { balance?: string };
+	codex?: { summary?: string; usagePercent?: number; usageReset?: string };
+	claude?: { summary?: string; limits?: Array<{ label: string; description: string }> };
+}
+
+export interface ProviderManagerExtras {
+	local?: { enabled: boolean; endpoint: string };
+	deepSeek?: {
+		enabled: boolean;
+		compactionSummary: boolean;
+		balance?: string;
+		peakHours: string;
+	};
+	codex?: {
+		enabled: boolean;
+		summary?: string;
+		usagePercent?: number;
+		usageReset?: string;
+	};
+	claude?: {
+		enabled: boolean;
+		summary?: string;
+		limits: Array<{ label: string; description: string }>;
+	};
+}
+
 export interface ApiProviderManagerRenderState {
 	profiles: readonly ApiProviderSummary[];
+	providers: readonly ProviderStatusEntry[];
+	extras?: ProviderManagerExtras;
 	editingId?: string;
 	status?: string;
 	error?: string;
 }
 
+function stateLabelOf(state: string | undefined): string {
+	const labels: Record<string, string> = {
+		checking: "Checking",
+		off: "Off",
+		unconfigured: "Not configured",
+		online: "Online",
+		offline: "Offline",
+		paused: "Paused",
+	};
+	return labels[state ?? "checking"] ?? "—";
+}
+
+function renderBuiltinProviders(state: ApiProviderManagerRenderState): string {
+	const extras = state.extras ?? {};
+	const statusOf = (key: string): ProviderStatusEntry | undefined =>
+		state.providers.find(provider => provider.key === key);
+
+	const card = (
+		key: string,
+		name: string,
+		description: string,
+		enabled: boolean,
+		badges: Array<{ label: string; css?: string }>,
+		buttons: Array<{ command: string; label: string; primary?: boolean }>
+	): string => {
+		const status = statusOf(key);
+		return `
+		<article class="provider-card${enabled ? "" : " disabled"}">
+			<div class="provider-head">
+				<div>
+					<div class="provider-name">${esc(name)}</div>
+					<div class="endpoint">${esc(description)}</div>
+				</div>
+				<span class="status ${esc(status?.state ?? "checking")}">${stateLabelOf(status?.state)}</span>
+			</div>
+			<div class="badges">
+				${badges.map(badge => `<span class="${esc(badge.css ?? "")}">${esc(badge.label)}</span>`).join("")}
+			</div>
+			<div class="actions">
+				${buttons.map(button => `<button class="ctrl-btn${button.primary ? " primary" : ""}" data-command="${escAttr(button.command)}" type="button">${esc(button.label)}</button>`).join("")}
+			</div>
+		</article>`;
+	};
+
+	const local = extras.local;
+	const deepSeek = extras.deepSeek;
+	const codex = extras.codex;
+	const claude = extras.claude;
+
+	const cards: string[] = [];
+	if (local) {
+		cards.push(card("local", "Local LLM", `OpenAI-compatible server · ${local.endpoint}`, local.enabled,
+			[{ label: `endpoint ${local.endpoint}` }],
+			[
+				{ command: "llamacpp.toggleLocalServer", label: local.enabled ? "Disable source" : "Enable source" },
+				{ command: "llamacpp.setLocalServerUrl", label: "Set endpoint" },
+				{ command: "llamacpp.refreshModels", label: "Refresh models" },
+			]));
+	}
+	if (deepSeek) {
+		const badges = [
+			{ label: deepSeek.balance ? `balance ${deepSeek.balance}` : "balance n/a" },
+			{ label: deepSeek.peakHours, css: resolveDeepSeekPricingSnapshot().isPeak ? "peak" : "" },
+			{ label: `AI summaries ${deepSeek.compactionSummary ? "on (paid)" : "off"}` },
+		];
+		cards.push(card("deepseek", "DeepSeek", deepSeek.balance ? `API account · ${deepSeek.balance}` : "API account · balance n/a", deepSeek.enabled,
+			badges,
+			[
+				{ command: "llamacpp.toggleDeepSeek", label: deepSeek.enabled ? "Disable source" : "Enable source" },
+				{ command: "llamacpp.configureDeepSeek", label: "API key", primary: true },
+				{ command: "llamacpp.openContextControl", label: "Context sliders" },
+				{ command: "llamacpp.toggleDeepSeekCompactionSummary", label: "Toggle AI summaries" },
+			]));
+	}
+	if (codex) {
+		const badges = [
+			{ label: codex.summary ?? "Checking..." },
+		];
+		if (codex.usagePercent !== undefined) {
+			badges.push({ label: `${codex.usagePercent}% used${codex.usageReset ? ` · resets ${codex.usageReset}` : ""}` });
+		}
+		cards.push(card("codex", "Codex", codex.summary ?? "ChatGPT subscription account", codex.enabled,
+			badges,
+			[
+				{ command: "llamacpp.toggleCodexSubscription", label: codex.enabled ? "Disable source" : "Enable source" },
+				{ command: "llamacpp.codexSignIn", label: "Sign in", primary: true },
+				{ command: "llamacpp.codexShowStatus", label: "Account status" },
+			]));
+	}
+	if (claude) {
+		const badges = [
+			{ label: claude.summary ?? "Checking..." },
+			...claude.limits.map(limit => ({ label: limit.description.split(" / ")[0] ?? limit.label })),
+		];
+		cards.push(card("claude", "Claude", claude.summary ?? "Claude Agent SDK subscription", claude.enabled,
+			badges,
+			[
+				{ command: "llamacpp.toggleClaudeSubscription", label: claude.enabled ? "Disable source" : "Enable source" },
+				{ command: "llamacpp.claudeSignIn", label: "Sign in", primary: true },
+				{ command: "llamacpp.claudeShowStatus", label: "Account status" },
+			]));
+	}
+
+	return `
+		<div class="status-section">
+			<div class="section-title">Built-in providers</div>
+			${cards.length === 0
+				? '<div class="empty">Provider controls appear after the first activation.</div>'
+				: cards.join("")}
+		</div>
+	`;
+}
+
 export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderState): string {
 	const nonce = randomBytes(16).toString("base64");
+	const builtinCards = renderBuiltinProviders(state);
 	const editing = state.editingId
 		? state.profiles.find(profile => profile.id === state.editingId)
 		: undefined;
 	const editingIsNew = state.editingId === "new";
 	const formVisible = editingIsNew || editing !== undefined;
+	const statusRows = `
+		<div class="status-section">
+			<div class="section-title">Provider availability</div>
+			${state.providers.length === 0
+				? '<div class="empty">No provider status yet — recheck after the first activation.</div>'
+				: state.providers.map(provider => {
+					const stateLabel = { checking: "Checking", off: "Off", unconfigured: "Not configured", online: "Online", offline: "Offline", paused: "Paused" }[provider.state] ?? provider.state;
+					return `
+				<article class="provider-card status-row">
+					<div class="provider-head">
+						<div>
+							<div class="provider-name">${esc(provider.label)}</div>
+							<div class="endpoint">${esc(provider.detail)}</div>
+						</div>
+						<span class="status ${esc(provider.state)}">${stateLabel}</span>
+					</div>
+				</article>`;
+				}).join("")}
+		</div>
+	`;
+
 	const form = formVisible
 		? `
 		<section class="form-card">
@@ -124,7 +297,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 	<meta charset="UTF-8" />
 	<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';" />
 	<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-	<title>API Providers</title>
+	<title>Providers Manager</title>
 	<style>
 		:root { color-scheme: light dark; }
 		body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); background: var(--vscode-editor-background); padding: 20px; max-width: 1000px; margin: 0 auto; }
@@ -145,8 +318,12 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		.provider-name { font-weight: 600; font-size: 15px; }
 		.endpoint { color: var(--vscode-descriptionForeground); margin-top: 4px; overflow-wrap: anywhere; }
 		.status, .badges span { border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 8px; font-size: 12px; white-space: nowrap; }
-		.status.on, .key-set { color: var(--vscode-testing-iconPassed); }
-		.status.off { color: var(--vscode-descriptionForeground); }
+		.status.on, .key-set, .status.online { color: var(--vscode-testing-iconPassed); }
+		.status.off, .status.unconfigured, .status.checking { color: var(--vscode-descriptionForeground); }
+		.status.offline { color: var(--vscode-errorForeground); }
+		.status.paused { color: var(--vscode-charts-yellow, #e2c08d); }
+		.status-section { margin-bottom: 20px; }
+		.status-section .provider-card { margin-bottom: 8px; }
 		.badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
 		.section-title { font-weight: 600; font-size: 16px; margin-bottom: 14px; }
 		.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 13px; }
@@ -164,29 +341,37 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 	</style>
 </head>
 <body>
-	<h1>API Providers</h1>
-	<p class="subtitle">Connect multiple OpenAI-compatible API sources. Active profiles contribute their model catalogs to the shared VS Code picker.</p>
-	<div class="notice"><strong>Built-in sources stay compatible.</strong> Local LLM and the dedicated DeepSeek profile remain available in Quick Access. This manager adds any number of independent API endpoints and accounts.</div>
+	<h1>Providers Manager</h1>
+	<p class="subtitle">One place for every model source: Local LLM, DeepSeek, Codex, Claude, and custom API endpoints.</p>
+	<div class="notice"><strong>Availability is checked automatically.</strong> HTTP sources are probed every 5 minutes; subscription states refresh on their own. Offline providers are hidden from Quick Access and their reason is shown here.</div>
 	<div class="toolbar">
 		<div><strong>${state.profiles.filter(profile => profile.enabled).length}</strong> active · ${state.profiles.length} configured</div>
 		<div class="actions">
 			<button id="refresh-models-btn" type="button">Refresh models</button>
+			<button id="recheck-btn" type="button">Recheck availability</button>
 			<button id="add-btn" class="primary" type="button">Add provider</button>
 		</div>
 	</div>
 	<div class="message ${state.error ? "error" : "success"}">${esc(state.error ?? state.status ?? "")}</div>
 	${form}
+	${builtinCards}
+	${statusRows}
 	<div id="providers">${cards}</div>
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
 		document.getElementById('add-btn').addEventListener('click', () => vscode.postMessage({ type: 'new' }));
 		document.getElementById('refresh-models-btn').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
+		document.getElementById('recheck-btn').addEventListener('click', () => vscode.postMessage({ type: 'recheck' }));
 		document.querySelectorAll('.edit-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'edit', id: button.dataset.id })));
 		document.querySelectorAll('.delete-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'delete', id: button.dataset.id })));
 		document.querySelectorAll('.toggle-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({
 			type: 'toggle',
 			id: button.dataset.id,
 			enabled: button.dataset.enabled !== 'true',
+		})));
+		document.querySelectorAll('.ctrl-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({
+			type: 'runCommand',
+			command: button.dataset.command,
 		})));
 		const cancel = document.getElementById('cancel-btn');
 		if (cancel) cancel.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
@@ -214,6 +399,7 @@ interface ApiProviderManagerMessage {
 	type?: string;
 	id?: string;
 	enabled?: boolean;
+	command?: string;
 	provider?: ApiProviderDraft;
 	apiKey?: string;
 	clearApiKey?: boolean;
@@ -232,10 +418,13 @@ export class ApiProviderManagerPanel {
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly service: ApiProviderService,
-		private readonly refreshModels: () => void
+		private readonly directory: ProviderDirectory,
+		private readonly refreshModels: () => void,
+		private readonly getExtras?: () => ProviderManagerLiveData
 	) {
 		this.disposables.push(
 			this.service.onDidChange(() => void this.render()),
+			this.directory.onDidChange(() => void this.render()),
 			this.panel.webview.onDidReceiveMessage(message => void this.handleMessage(message)),
 			this.panel.onDidDispose(() => {
 				ApiProviderManagerPanel.current = undefined;
@@ -247,7 +436,12 @@ export class ApiProviderManagerPanel {
 		void this.render();
 	}
 
-	static createOrShow(service: ApiProviderService, refreshModels: () => void): void {
+	static createOrShow(
+		service: ApiProviderService,
+		directory: ProviderDirectory,
+		refreshModels: () => void,
+		getExtras?: () => ProviderManagerLiveData
+	): void {
 		if (ApiProviderManagerPanel.current) {
 			ApiProviderManagerPanel.current.panel.reveal(vscode.ViewColumn.Beside);
 			void ApiProviderManagerPanel.current.render();
@@ -255,7 +449,7 @@ export class ApiProviderManagerPanel {
 		}
 		const panel = vscode.window.createWebviewPanel(
 			ApiProviderManagerPanel.viewType,
-			"AI Agent Bridge · API Providers",
+			"AI Agent Bridge · Providers Manager",
 			vscode.ViewColumn.Beside,
 			{
 				enableScripts: true,
@@ -263,7 +457,7 @@ export class ApiProviderManagerPanel {
 				retainContextWhenHidden: true,
 			}
 		);
-		ApiProviderManagerPanel.current = new ApiProviderManagerPanel(panel, service, refreshModels);
+		ApiProviderManagerPanel.current = new ApiProviderManagerPanel(panel, service, directory, refreshModels, getExtras);
 	}
 
 	static refreshIfOpen(): void {
@@ -331,6 +525,19 @@ export class ApiProviderManagerPanel {
 					this.refreshModels();
 					this.status = "Model catalogs are refreshing.";
 					break;
+				case "recheck":
+					await this.directory.recheck();
+					this.status = "Provider availability rechecked.";
+					break;
+				case "runCommand": {
+					const command = String(data.command ?? "").trim();
+					if (!command || !command.startsWith("llamacpp.")) {
+						throw new Error("Unknown provider action.");
+					}
+					await vscode.commands.executeCommand(command);
+					this.status = "Action executed.";
+					break;
+				}
 				default:
 					return;
 			}
@@ -338,6 +545,43 @@ export class ApiProviderManagerPanel {
 			this.error = error instanceof Error ? error.message : String(error);
 		}
 		await this.render();
+	}
+
+	private buildExtras(): ProviderManagerExtras {
+		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+		const localEnabled = config.get<boolean>("enableLocalServer", true) !== false;
+		const localEndpoint = String(config.get("localServerUrl", DEFAULT_SERVER_URL) ?? DEFAULT_SERVER_URL);
+		const deepSeekEnabled = config.get<boolean>("enableDeepSeek", true) !== false;
+		const deepSeekCompactionSummary = config.get<boolean>("deepSeekCompactionSummary", false) === true;
+		const codexEnabled = config.get<boolean>("enableCodexSubscription", true) !== false;
+		const claudeEnabled = config.get<boolean>("enableClaudeSubscription", true) !== false;
+		const live = this.getExtras?.() ?? {};
+		const pricing = resolveDeepSeekPricingSnapshot();
+		const peakHours = pricing.state === "flat"
+			? `Peak billing starts ${formatDeepSeekPeakEffectiveLocal()} (local)`
+			: pricing.isPeak
+				? `Peak · 2× price · until ${pricing.nextTransitionLocal} (local)`
+				: `Off-peak · ½ price · next peak ${pricing.nextTransitionLocal} (local)`;
+		return {
+			local: { enabled: localEnabled, endpoint: localEndpoint },
+			deepSeek: {
+				enabled: deepSeekEnabled,
+				compactionSummary: deepSeekCompactionSummary,
+				balance: live.deepSeek?.balance,
+				peakHours,
+			},
+			codex: {
+				enabled: codexEnabled,
+				summary: live.codex?.summary,
+				usagePercent: live.codex?.usagePercent,
+				usageReset: live.codex?.usageReset,
+			},
+			claude: {
+				enabled: claudeEnabled,
+				summary: live.claude?.summary,
+				limits: live.claude?.limits ?? [],
+			},
+		};
 	}
 
 	private async render(): Promise<void> {
@@ -348,6 +592,8 @@ export class ApiProviderManagerPanel {
 		}
 		this.panel.webview.html = renderApiProviderManagerHtml({
 			profiles,
+			providers: this.directory.list(),
+			extras: this.buildExtras(),
 			editingId: this.editingId,
 			status: this.status,
 			error: this.error,

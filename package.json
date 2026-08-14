@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.14.1",
+	"version": "1.14.3",
 	"engines": {
 		"vscode": "^1.104.0"
 	},
@@ -991,7 +991,7 @@
 			},
 			{
 				"command": "llamacpp.openApiProviders",
-				"title": "AI Agent Bridge: Manage API Providers",
+				"title": "AI Agent Bridge: Providers Manager",
 				"icon": "$(server-process)"
 			},
 			{
