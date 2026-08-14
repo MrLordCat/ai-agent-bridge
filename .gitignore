@@ -13,3 +13,6 @@ pics
 scripts/tmp-*
 snapshot-*.html
 live.html
+
+# Дизайн-бриф иконки (личный, не в репо)
+docs/BRAND.md

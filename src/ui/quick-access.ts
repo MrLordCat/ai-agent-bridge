@@ -17,6 +17,10 @@ import {
 	type ProviderRuntimeMetrics,
 } from "../provider-metrics";
 import { normalizeThinkingMode, resolveReasoningBudget } from "../reasoning";
+import {
+	formatDeepSeekPeakEffectiveLocal,
+	resolveDeepSeekPricingSnapshot,
+} from "../deepseek-peak-hours";
 import type { SubagentModelProfile } from "../subagent-guidance";
 import {
 	emptyTokenUsageHistorySummary,
@@ -381,6 +385,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		);
 		const deepSeekContextLength = Number(config.get("deepSeekContextLength", 258_400)) || 258_400;
 		const deepSeekMaxOutputTokens = Number(config.get("deepSeekDefaultMaxOutputTokens", 70_000)) || 70_000;
+		const deepSeekPricing = resolveDeepSeekPricingSnapshot();
 		const codexEnabled = config.get<boolean>("enableCodexSubscription", true) !== false;
 		const codexDeferredToolsEnabled = config.get<boolean>("codexDeferNonCoreTools", true) !== false;
 		const codexCacheKeepAliveEnabled = config.get<boolean>("codexCacheKeepAliveEnabled", false) === true;
@@ -484,8 +489,13 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		});
 
 		const deepSeek = new QuickAccessItem("deepseek", "DeepSeek", {
-			description: deepSeekEnabled ? "V4 Pro" : "Off",
-			icon: new vscode.ThemeIcon("cloud"),
+			description: deepSeekEnabled
+				? deepSeekPricing.isPeak ? "V4 Pro · PEAK 2×" : "V4 Pro"
+				: "Off",
+			icon: new vscode.ThemeIcon(
+				"cloud",
+				deepSeekEnabled && deepSeekPricing.isPeak ? new vscode.ThemeColor("charts.orange") : undefined
+			),
 			children: [
 				new QuickAccessItem("deepseek.source", "Source", {
 					description: deepSeekEnabled ? "On" : "Off",
@@ -497,6 +507,23 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					description: this.getDeepSeekBalance() ?? "n/a",
 					tooltip: "DeepSeek account balance from the official /user/balance endpoint. Refreshes automatically every minute.",
 					icon: new vscode.ThemeIcon("credit-card"),
+					command: command("llamacpp.openSettings", "Open Settings"),
+				}),
+				new QuickAccessItem("deepseek.peakHours", "Peak Hours", {
+					description: deepSeekPricing.state === "flat"
+						? `Starts ${formatDeepSeekPeakEffectiveLocal()} (local)`
+						: deepSeekPricing.isPeak
+							? `Peak · 2× price · until ${deepSeekPricing.nextTransitionLocal} (local)`
+							: `Off-peak · ½ price · next peak ${deepSeekPricing.nextTransitionLocal} (local)`,
+					tooltip: [
+						"DeepSeek peak/off-peak billing from 16:00 UTC, Aug 16 2026. Peak: 01:00–04:00 and 06:00–10:00 UTC; off-peak costs half the peak rate.",
+						`Local peak windows: ${deepSeekPricing.peakWindowsLocal}.`,
+						"v4-pro per 1M tokens (cache miss / output): off-peak $0.66 / $1.98, peak $1.32 / $3.96.",
+					].join("\n"),
+					icon: new vscode.ThemeIcon(
+						deepSeekPricing.state === "flat" ? "calendar" : deepSeekPricing.isPeak ? "flame" : "moon",
+						deepSeekPricing.isPeak ? new vscode.ThemeColor("charts.orange") : undefined
+					),
 					command: command("llamacpp.openSettings", "Open Settings"),
 				}),
 				new QuickAccessItem("deepseek.contextLimit", "Maximum Context", {

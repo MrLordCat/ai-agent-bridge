@@ -525,6 +525,7 @@ export function findLatestPersistedClaudeConversation(
 interface ClaudeToolContinuation {
 	session: ClaudeConversationSession;
 	results: vscode.LanguageModelToolResultPart[];
+	followUpText?: string;
 }
 
 export interface ClaudeUsageLimit {
@@ -1242,13 +1243,17 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (continuation) {
 			continuation.session.lastUsedAt = Date.now();
 			this.warmReuseCount++;
+			const followUpText = continuation.followUpText;
 			this.logSink?.log("claude.chat.tool_resumed", {
 				sessionKey: continuation.session.key,
 				sdkSessionId: continuation.session.sdkSessionId,
 				resultCount: continuation.results.length,
 				pendingCount: continuation.session.client.pendingCallIds.size,
+				messageCount: messages.length,
+				followUpTextPresent: followUpText !== undefined,
+				followUpTextPreview: followUpText ? followUpText.slice(0, 120) : undefined,
 			});
-			await continuation.session.client.resumeToolResults(continuation.results, progress, token);
+			await continuation.session.client.resumeToolResults(continuation.results, progress, token, followUpText);
 			continuation.session.lastUsedAt = Date.now();
 			await this.rememberDurableSession(continuation.session);
 			return;
@@ -1921,7 +1926,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				}
 			}
 			if (results.length > 0) {
-				return { session, results };
+				return { session, results, followUpText: extractFollowUpUserText(messages) };
 			}
 		}
 		return undefined;
@@ -2459,6 +2464,28 @@ function createInitialUserMessage(
 	const content: Record<string, unknown>[] = [{ type: "text", text }];
 	appendImages(messages, content);
 	return createSdkUserMessage(content);
+}
+
+export function extractFollowUpUserText(
+	messages: readonly vscode.LanguageModelChatRequestMessage[]
+): string | undefined {
+	// A continuation request can carry the user's brand-new message next to the
+	// executed tool results. It must reach the SDK as its own user message;
+	// otherwise the model only sees its own tool loop (observed: user asked to
+	// stop / switch tasks, model kept the old chain for minutes).
+	// VS Code appends the fresh user message AFTER the tool-result tail, so only
+	// the last user message can be a follow-up; anything earlier is history that
+	// already lives inside the SDK session transcript.
+	const last = messages.at(-1);
+	if (!last || last.role !== vscode.LanguageModelChatMessageRole.User) {
+		return undefined;
+	}
+	const text = last.content
+		.filter(part => part instanceof vscode.LanguageModelTextPart)
+		.map(part => (part).value)
+		.join(" ")
+		.trim();
+	return text.length > 0 ? text : undefined;
 }
 
 export function createLatestUserMessage(

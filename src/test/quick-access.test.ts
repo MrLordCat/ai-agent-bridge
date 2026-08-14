@@ -46,7 +46,25 @@ suite("quick access", () => {
 		assert.ok(root.every(item => item.id?.startsWith("llamacpp.quickAccess.")));
 	});
 
-	test("opens centralized API provider management from Quick Access", async () => {
+	test("shows DeepSeek peak hours in local time with a peak marker", async () => {
+	const provider = new LlamaQuickActionsProvider(
+		() => undefined,
+		() => undefined,
+		() => 0
+	);
+	const deepSeek = (await getItems(provider)).find(item => labelOf(item) === "DeepSeek");
+	assert.ok(deepSeek);
+	assert.ok(typeof deepSeek.description === "string" && deepSeek.description.startsWith("V4 Pro"));
+	const children = await getItems(provider, deepSeek);
+	const peak = children.find(item => labelOf(item) === "Peak Hours");
+	assert.ok(peak, "Peak Hours item must be present in the DeepSeek group");
+	const peakDescription = typeof peak.description === "string" ? peak.description : "";
+	assert.ok(peakDescription, "peak item must describe the current billing window");
+	assert.ok(/(local)|(2×)|(½)/.test(peakDescription), `unexpected peak description: ${peakDescription}`);
+	assert.ok(typeof peak.tooltip === "string" && peak.tooltip.includes("16:00 UTC"));
+});
+
+test("opens centralized API provider management from Quick Access", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined,
 			() => undefined,

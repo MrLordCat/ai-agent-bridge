@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.14.0 (stable) - 2026-08-14
+
+Consolidates dev patches 1.13.1–1.13.3 and the repository storefront.
+
+- **Claude follow-up messages reach the resumed session.** A new user message
+  sent while a tool chain runs ("stop", "switch task") is now forwarded to the
+  SDK right after the tool results; previously only tool results were sent and
+  the model kept executing the old chain. `claude.chat.tool_resumed` logs
+  `followUpTextPresent`/`followUpTextPreview` for observability.
+- **Active-turn timeout raised to 300 s with a pending-tool guard.** The timer
+  now extends while any delegated tool is in flight instead of failing during
+  long tool executions; dead SDK streams still fail after 300 s.
+- **DeepSeek peak hours in Quick Access (local time).** DeepSeek switches to
+  peak/off-peak billing on Aug 16 2026, 16:00 UTC (peak = 01:00–04:00 and
+  06:00–10:00 UTC, price ×2; off-peak = half). The DeepSeek group shows the
+  current window and next transition in local time and turns orange during
+  peak hours.
+- **Storefront**: README showcase (logo, screenshots, architecture diagram,
+  install, comparison, measured 99.3% DeepSeek cache hit), GitHub description
+  and topics, social preview, restored activity-bar icon.
+
+## 1.13.3 (dev) - 2026-08-13
+
+- **DeepSeek peak hours in Quick Access (local time)**: from 16:00 UTC on
+  Aug 16 2026 DeepSeek switches to peak/off-peak billing with off-peak at half
+  the peak rate (official pricing page: peak = 01:00–04:00 and 06:00–10:00
+  UTC). The DeepSeek group now shows a `Peak Hours` row with the current
+  billing state and the next transition in local time; while peak is active
+  the group icon and row turn orange (`charts.orange`) and the headline shows
+  `PEAK 2×`, fading back automatically once the window ends (the Quick Access
+  tree already refreshes every minute). Includes the effective date before
+  Aug 16, both peak windows as local clock labels, and v4-pro peak rates in
+  the tooltip. Pure logic lives in `src/deepseek-peak-hours.ts` with
+  regression tests for window boundaries, the switchover instant, and the
+  next-transition wrap-around.
+
+## 1.13.2 (dev) - 2026-08-12
+
+- **Claude now receives the user's brand-new messages during a running tool
+  chain**. VS Code folds a follow-up message ("stop", "switch to the tower 3D
+  task") into the same continuation request that carries tool results; the
+  provider only forwarded the tool results, so the model kept executing the
+  old chain for minutes without ever seeing the new instruction. The
+  continuation now extracts the trailing user text and pushes it to the SDK
+  as a fresh user message right after the tool results, and
+  `claude.chat.tool_resumed` logs `followUpTextPresent`/`followUpTextPreview`
+  so delivery is observable.
+
+## 1.13.1 (dev) - 2026-08-12
+
+- **Claude watchdog no longer mistakes a slow Opus xhigh turn for a hang**: the
+  live report for chat `1f864b98` showed a warm restored session that executed
+  four tools (4.2 minutes of tool time) and still died with "Claude produced no
+  activity for 90 seconds". The model can legitimately stay silent for minutes
+  while it reasons (`xhigh`, ~110s to first token was measured) and while VS
+  Code runs delegated tools. The activity watchdog is raised from 90 to 300
+  seconds and is now paused while any delegated tool is in flight
+  (`pendingTools` guard), so long `run_in_terminal`/`view_image` steps cannot
+  trip it. Hang detection still works: a truly dead SDK stream fails the turn
+  after the same 300s window.
+
 ## 1.13.0 (stable) - 2026-08-12
 
 Hotfix release on top of 1.12.0. Two integration breakages are fixed and

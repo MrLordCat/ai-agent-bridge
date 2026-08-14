@@ -18,6 +18,7 @@ import {
 	estimateClaudeRecoveryTokens,
 	findLatestPersistedClaudeConversation,
 	findPersistedClaudeConversation,
+	extractFollowUpUserText,
 	resolveClaudeResumeFallbackDecision,
 	resolveClaudeSafetySettings,
 	resolveClaudeInitialInputChars,
@@ -27,6 +28,7 @@ import {
 } from "../claude/claude-provider";
 import { buildClaudeModelAvailability } from "../claude/availability";
 import {
+	CLAUDE_ACTIVE_TURN_TIMEOUT_MS,
 	ClaudeAgentSession,
 	ClaudeAssistantCheckpointTracker,
 	classifyClaudeResumeBoundary,
@@ -183,7 +185,37 @@ suite("Claude subscription provider", () => {
 		);
 	});
 
-	test("advances Claude resume checkpoints only after a logical turn completes", () => {
+	test("extracts a brand-new user message from a tool continuation", () => {
+	const toolResult = new vscode.LanguageModelToolResultPart(
+		"call-1",
+		[{ content: [new vscode.LanguageModelTextPart("tool output")] }]
+	);
+	const toolMessage = {
+		role: vscode.LanguageModelChatMessageRole.User,
+		name: "tool-result",
+		content: [toolResult],
+	};
+	const freshMessage = {
+		role: vscode.LanguageModelChatMessageRole.User,
+		name: "user",
+		content: [new vscode.LanguageModelTextPart("Stop and switch to the tower 3D task")],
+	};
+	assert.strictEqual(
+		extractFollowUpUserText([toolMessage, freshMessage]),
+		"Stop and switch to the tower 3D task"
+	);
+	// Pure tool continuation: no follow-up text.
+	assert.strictEqual(extractFollowUpUserText([toolMessage]), undefined);
+	// Older user text must not be mistaken for a follow-up.
+	const oldUser = {
+		role: vscode.LanguageModelChatMessageRole.User,
+		name: "user",
+		content: [new vscode.LanguageModelTextPart("old task")],
+	};
+	assert.strictEqual(extractFollowUpUserText([oldUser, toolMessage]), undefined);
+});
+
+test("advances Claude resume checkpoints only after a logical turn completes", () => {
 		const tracker = new ClaudeAssistantCheckpointTracker();
 		tracker.recordFragment("thinking-fragment");
 		tracker.recordFragment("tool-use-fragment");
@@ -225,7 +257,18 @@ suite("Claude subscription provider", () => {
 		assert.strictEqual(isClaudeVsCodeToolName("mcp__other__write_file"), false);
 	});
 
-	test("marks the session stream as closed after an interrupt", async () => {
+	test("keeps the Claude activity watchdog tolerant of slow xhigh turns and long tools", () => {
+	// The observed live failure: an Opus xhigh chain resumed warm, called four
+	// tools (4.2 min of tool execution), and still died with "no activity for
+	// 90 seconds" between model segments. The watchdog must outlast both a
+	// slow first token (measured up to ~110s) and in-flight VS Code tools.
+	assert.ok(
+		CLAUDE_ACTIVE_TURN_TIMEOUT_MS >= 300_000,
+		"watchdog must tolerate multi-minute xhigh reasoning and tool execution"
+	);
+});
+
+test("marks the session stream as closed after an interrupt", async () => {
 		const session = new ClaudeAgentSession({
 			model: "claude-opus-5[1m]",
 			cwd: ".",

@@ -18,7 +18,7 @@ import type { LlamaLogSink } from "../logger";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
 import { asRecord, isCacheControlPart } from "../utils";
 
-const ACTIVE_TURN_TIMEOUT_MS = 90_000;
+export const CLAUDE_ACTIVE_TURN_TIMEOUT_MS = 300_000;
 const TOOL_CARD_SETTLE_MS = 30;
 const MAX_TOOL_RESULT_CHARS = 16_000;
 
@@ -540,7 +540,8 @@ export class ClaudeAgentSession implements vscode.Disposable {
 	async resumeToolResults(
 		results: readonly vscode.LanguageModelToolResultPart[],
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
-		token: vscode.CancellationToken
+		token: vscode.CancellationToken,
+		followUpText?: string
 	): Promise<void> {
 		if (this.streamClosed) {
 			throw new Error("Claude session stream is closed; the session must be restarted");
@@ -564,6 +565,24 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		if (resolved === 0) {
 			this.failActiveTurn(new Error("Claude tool continuation no longer exists"), "failed");
 		} else {
+			// VS Code may fold a brand-new user message into the same continuation
+			// request that carries tool results. Without an explicit SDK push the
+			// model only ever sees the tool results and keeps executing the old
+			// chain (observed: "stop" and "switch to the tower 3D task" were
+			// ignored for minutes). Deliver the follow-up text as a fresh user
+			// message after the results so the model reacts to the user, not just
+			// to its own tool loop.
+			if (followUpText && followUpText.trim()) {
+				this.input.push({
+					type: "user",
+					parent_tool_use_id: null,
+					message: {
+						role: "user",
+						content: [{ type: "text", text: followUpText }],
+					},
+				} as unknown as SDKUserMessage);
+				this.emitTurnUpdate("running");
+			}
 			this.emitTurnUpdate("running");
 		}
 		return completion;
@@ -759,9 +778,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				void this.interrupt();
 			});
 			const timeout = setTimeout(() => {
-				this.failActiveTurn(new Error("Claude produced no completed response for 90 seconds"), "timed_out");
+				this.failActiveTurn(new Error("Claude produced no completed response for 300 seconds"), "timed_out");
 				void this.interrupt();
-			}, ACTIVE_TURN_TIMEOUT_MS);
+			}, CLAUDE_ACTIVE_TURN_TIMEOUT_MS);
 			this.activeTurn = {
 				progress,
 				resolve,
@@ -1126,6 +1145,9 @@ export class ClaudeAgentSession implements vscode.Disposable {
 			toolCategory: "vscode",
 		});
 		this.emitTurnUpdate("running");
+		// Delegated tools run in VS Code while the SDK stream is silent; keep the
+		// activity watchdog from firing during the tool execution.
+		this.touchActiveTurn();
 	}
 
 	private finishToolStep(
@@ -1222,9 +1244,17 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		clearTimeout(active.timeout);
 		active.timeout = setTimeout(() => {
-			this.failActiveTurn(new Error("Claude produced no activity for 90 seconds"), "timed_out");
+			// While VS Code runs delegated tools the SDK stays silent by design;
+			// the model can also think (xhigh) for minutes before its first token.
+			// Neither is a hang: only fail when the model itself is idle AND no
+			// tool is in flight.
+			if (this.pendingTools.size > 0) {
+				this.touchActiveTurn();
+				return;
+			}
+			this.failActiveTurn(new Error("Claude produced no activity for 300 seconds"), "timed_out");
 			void this.interrupt();
-		}, ACTIVE_TURN_TIMEOUT_MS);
+		}, CLAUDE_ACTIVE_TURN_TIMEOUT_MS);
 	}
 
 	private completeActiveTurn(): void {

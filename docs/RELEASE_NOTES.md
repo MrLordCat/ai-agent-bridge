@@ -1,61 +1,67 @@
-# AI Agent Bridge 1.13.0 — release notes
+# AI Agent Bridge 1.14.0 — release notes
 
-Hotfix release. Two integration breakages are fixed and verified end-to-end:
-Claude restored sessions could burn the whole 5-hour allowance without ever
-producing a token, and Codex subagents (Luna) could silently lose screenshots.
+Storefront and stability release. Consolidates the 1.13.1–1.13.3 development
+patches — most importantly, Claude finally receives your new messages while a
+tool chain is running — plus the repository makeover: README showcase, real
+logo and screenshots, GitHub metadata, and measured cache-hit numbers.
 
-## 1. Claude: durable restore no longer hangs or burns the rate limit
+## 1. Claude: follow-up messages reach the resumed session
 
-A persisted resume checkpoint could point into the middle of a tool chain,
-where the SDK transcript splits one assistant message into thinking/text/tool
-fragments. Restoring from such a boundary made the SDK initialize but then
-produce no stream activity until the 90-second timeout — twice, with the same
-broken session selected again on retry. The diagnostics showed
-`resume_failed (sdk_resume, timeout)` and a blocked 176K-token full replay.
+Previously a new user message sent while a tool chain was running ("stop",
+"switch to the 3D task") was dropped: the continuation request only forwarded
+the tool results to the Agent SDK, so the model kept executing the old chain
+for minutes without ever seeing the new instruction.
 
-Fixes:
+- The trailing user text of a continuation is now extracted
+  (`extractFollowUpUserText`) and pushed to the SDK as a fresh user message
+  right after the tool results.
+- `claude.chat.tool_resumed` now logs `followUpTextPresent` and
+  `followUpTextPreview` (first 120 chars), so delivery is observable in the
+  logs.
+- Regression tests cover pure tool continuations, fresh follow-ups, and stale
+  history that must not be mistaken for a follow-up.
 
-- **Checkpoints advance only after a successful logical turn.** A thinking or
-  tool-use fragment is never treated as a completed boundary anymore.
-- **Resume boundaries are validated from the transcript before any model
-  request.** Missing, non-assistant, and incomplete tool-use boundaries are
-  quarantined immediately — no second retry against the same broken session.
-- **Failed resumes stay quarantined until a successful recovery replaces
-  them.** If a full replay exceeds the configured 64K safety limit, Claude
-  starts a fresh session with only the latest user message, after a
-  conservative 2x cost estimate (including 8K SDK overhead) and a fresh
-  five-hour-usage check. If even that bounded recovery is unsafe, the request
-  fails **before contacting the model** instead of silently spending the
-  remaining allowance.
-- A completely fresh cold start is also guarded by the same token limit, so a
-  missing transcript file or an extension reload cannot bypass the protection.
+## 2. Claude: 300 s active-turn timeout with a pending-tool guard
 
-Verified with a real Opus smoke run: native tool call succeeded, the follow-up
-turn resumed warm (cache write 675 → 21 tokens), and the 5-hour usage stayed
-at 0%.
+The active-turn watchdog failed long tool executions: the SDK is silent by
+design while a delegated tool runs, so the timer could fire mid-tool. Now the
+timer extends while any delegated tool is in flight, and real dead SDK streams
+still fail after 300 seconds instead of the old 90.
 
-## 2. Codex: vision subagents (Luna) actually see screenshots
+## 3. DeepSeek peak hours in Quick Access (local time)
 
-VS Code does not deliver file attachments into subagent prompts, so the
-extension extracts image references from the prompt text. Two failure modes
-were found and fixed:
+DeepSeek switches to peak/off-peak billing on **Aug 16 2026, 16:00 UTC**:
+peak = 01:00–04:00 and 06:00–10:00 UTC (2× price), everything else is
+off-peak at half the peak rate.
 
-- The prompt contained a PNG data URI that decoded successfully but was the
-  first 1,080 bytes of a 1,100-byte file — missing the mandatory `IEND` chunk.
-  Codex replaced it with `image content omitted because it could not be
-  processed`. **Data URIs are now checked for format-specific end markers**
-  (PNG IEND, JPEG EOI, WebP RIFF size, GIF trailer), not just base64
-  decodability.
-- Local screenshots are now sent through the native app-server `localImage`
-  input instead of being re-encoded into data URIs. When an inline image is
-  truncated, the provider recovers it from an exact byte-prefix match in
-  `%TEMP%` (`codex.prompt_image.recovered`); unrelated files cannot match.
-  Prompt image paths also resolve through git-bash aliases (`/tmp/x.png`,
-  `C:/tmp/x.png`, `/d/GitHub/x.png`), and wrapped multi-line base64 is
-  reassembled.
+- The DeepSeek group in Quick Access shows a `Peak Hours` row with the current
+  billing state, both peak windows and the next transition in your local time.
+- While peak is active the row and group icon turn orange (`charts.orange`)
+  and the headline reads `PEAK 2×`; the highlight fades automatically when the
+  window ends.
+- Verified against the official pricing page on 2026-08-13
+  (https://api-docs.deepseek.com/quick_start/pricing). Logic lives in
+  `src/deepseek-peak-hours.ts` with tests for window boundaries, the
+  switchover instant, and midnight wrap-around.
 
-## Quality
+## 4. Repository storefront
 
-- 389 passing tests, ESLint clean, TypeScript clean.
-- The VSIX for this tag is attached to this release; install with
-  `code --install-extension llama-vscode-chat-1.13.0.vsix`.
+- README rebuilt as a showcase: logo, badges, clickable screenshots, install
+  section, model sources, honest comparison with Continue and Cline/Roo, and
+  the request-flow diagram.
+- Measured cache efficiency front and center: a real long-running DeepSeek
+  v4-pro session (266 turns, 267 segments) reached **99.3% prompt cache hit**
+  — 36.8M prompt tokens, 36.5M from cache, 3 misses. Cached input is billed at
+  a fraction of uncached input, so this directly reduces API cost.
+- Custom API profiles are documented as implemented for OpenAI-compatible
+  endpoints but not yet field-tested against third-party gateways.
+- New extension logo (512 px, transparent corners), social preview for link
+  shares, restored activity-bar icon, and refreshed GitHub description/topics.
+
+## Verification
+
+- **396 extension-host tests passing** (VS Code 1.131, Windows).
+- Lint and TypeScript compilation clean.
+- Real Claude Opus smoke test: native tool call succeeded, second response
+  passed as `WARM`; cache creation 675+21, 5-hour usage 0%.
+- GitHub Actions CI and Release workflows green for this tag.
