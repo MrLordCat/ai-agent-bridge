@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.14.1 (stable) - 2026-08-14
+
+Hotfix for the 1.14.0 storefront release: "Manage API Providers" was
+advertised in the README and Quick Access, but the command was never
+registered — the button did nothing.
+
+- **Manage API Providers now works.** The `llamacpp.openApiProviders` command was
+  declared in `package.json` and referenced by Quick Access, but never
+  registered in the extension host — the button silently did nothing. The
+  command now opens the API Provider Manager panel, and the provider service
+  is wired into model discovery (`getApiModelSources`), so saved profiles
+  appear in the model picker. Toggling, saving, or deleting a profile
+  refreshes the model catalog automatically.
+
 ## 1.14.0 (stable) - 2026-08-14
 
 Consolidates dev patches 1.13.1–1.13.3 and the repository storefront.

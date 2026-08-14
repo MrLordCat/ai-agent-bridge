@@ -291,6 +291,7 @@ export class ApiProviderManagerPanel {
 				case "toggle":
 					await this.service.setEnabled(String(data.id ?? ""), data.enabled === true);
 					this.status = data.enabled ? "Provider enabled." : "Provider disabled.";
+					this.refreshModels();
 					break;
 				case "delete": {
 					const profile = this.service.get(String(data.id ?? ""));
@@ -310,6 +311,7 @@ export class ApiProviderManagerPanel {
 						this.editingId = undefined;
 					}
 					this.status = `Deleted ${profile.name}.`;
+					this.refreshModels();
 					break;
 				}
 				case "save": {
@@ -322,6 +324,7 @@ export class ApiProviderManagerPanel {
 					});
 					this.editingId = undefined;
 					this.status = `Saved ${profile.name}.`;
+					this.refreshModels();
 					break;
 				}
 				case "refreshModels":

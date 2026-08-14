@@ -222,12 +222,13 @@ def draw_architecture():
     img = vertical_gradient((w, h), BG_TOP, BG_BOTTOM).convert("RGBA")
     d = ImageDraw.Draw(img)
 
-    f_title = ImageFont.truetype(FONT_BOLD, 40)
-    f_box = ImageFont.truetype(FONT_BOLD, 30)
-    f_small = ImageFont.truetype(FONT_REG, 24)
+    d.text((48, 32), "AI Agent Bridge — request flow", font=ImageFont.truetype(FONT_BOLD, 40), fill=TEXT)
 
-    d.text((48, 32), "AI Agent Bridge — request flow", font=f_title, fill=TEXT)
+    def arrow_right(color, x, cy):
+        d.line([(x, cy), (x - 14, cy - 10)], fill=color, width=4)
+        d.line([(x, cy), (x - 14, cy + 10)], fill=color, width=4)
 
+    # --- Left: source boxes, one shared width that fits every text ---
     sources = [
         ("Local llama.cpp", "OpenAI-compatible HTTP", TEAL),
         ("Custom API profiles", "any /models gateway", BLUE),
@@ -235,28 +236,54 @@ def draw_architecture():
         ("Codex", "ChatGPT app-server", ORANGE),
         ("Claude", "Agent SDK + account", (250, 180, 220)),
     ]
-    box_w, box_h = 260, 92
+    name_font = ImageFont.truetype(FONT_BOLD, 30)
+    sub_font = ImageFont.truetype(FONT_REG, 24)
+    pad_x = 24
+    max_name_w = max(text_size(d, t, name_font)[0] for t, _, _ in sources)
+    max_sub_w = max(text_size(d, t, sub_font)[0] for t, _, _ in sources)
+    box_w = max(260, max_name_w + 2 * pad_x, max_sub_w + 2 * pad_x)
+    box_h, gap = 92, 24
     x0, y0 = 56, 116
+    box_positions = []
     for i, (name, sub, color) in enumerate(sources):
-        y = y0 + i * (box_h + 24)
+        y = y0 + i * (box_h + gap)
+        box_positions.append((y, color))
         rounded_panel(img, [x0, y, x0 + box_w, y + box_h], 18, PANEL, color, 3)
-        d.text((x0 + 22, y + 16), name, font=f_box, fill=TEXT)
-        d.text((x0 + 22, y + 54), sub, font=f_small, fill=MUTED)
-        d.line([(x0 + box_w, y + box_h / 2), (368, y + box_h / 2)], fill=color, width=4)
-        d.line([(368, y + box_h / 2), (350, y + box_h / 2 - 10)], fill=color, width=4)
-        d.line([(368, y + box_h / 2), (350, y + box_h / 2 + 10)], fill=color, width=4)
+        d.text((x0 + pad_x, y + 16), name, font=name_font, fill=TEXT)
+        d.text((x0 + pad_x, y + 56), sub, font=sub_font, fill=MUTED)
 
-    rounded_panel(img, [380, 284, 760, 436], 24, PANEL, TEAL, 4)
-    d.text((420, 310), "AI Agent Bridge", font=f_box, fill=TEXT)
-    d.text((420, 352), "routing · guardrails", font=f_small, fill=MUTED)
-    d.text((420, 384), "cache · diagnostics", font=f_small, fill=MUTED)
+    first_cy = box_positions[0][0] + box_h / 2
+    last_cy = box_positions[-1][0] + box_h / 2
+    mid_y = (first_cy + last_cy) / 2
+    bus_x = x0 + box_w + 28
 
-    d.line([(760, 360), (856, 360)], fill=TEAL, width=4)
-    d.line([(856, 360), (838, 350)], fill=TEAL, width=4)
-    d.line([(856, 360), (838, 370)], fill=TEAL, width=4)
+    # vertical bus joins every source exit; stubs point right into the bus
+    d.line([(bus_x, first_cy), (bus_x, last_cy)], fill=(138, 134, 182), width=4)
+    for y, color in box_positions:
+        cy = y + box_h / 2
+        d.line([(x0 + box_w, cy), (bus_x, cy)], fill=color, width=4)
+        arrow_right(color, bus_x, cy)
 
-    rounded_panel(img, [868, 116, 1224, 604], 24, PANEL, ORANGE, 4)
-    d.text((896, 140), "VS Code Copilot Chat", font=f_box, fill=TEXT)
+    # --- Center: bridge block, vertically centered on the sources ---
+    center_w, center_h = 340, 76
+    cx0 = bus_x + 44
+    cy0 = mid_y - center_h / 2
+    rounded_panel(img, [cx0, cy0, cx0 + center_w, cy0 + center_h], 24, PANEL, TEAL, 4)
+    f_box = ImageFont.truetype(FONT_BOLD, 30)
+    f_small = ImageFont.truetype(FONT_REG, 22)
+    d.text((cx0 + 24, cy0 + 12), "AI Agent Bridge", font=f_box, fill=TEXT)
+    center_sub = "routing · guardrails · cache"
+    center_sub_font = fit_font(d, center_sub, FONT_REG, center_w - 48, 22, 18)
+    d.text((cx0 + 24, cy0 + 46), center_sub, font=center_sub_font, fill=MUTED)
+
+    # connector bus -> center, arrowhead points right into the block
+    d.line([(bus_x, mid_y), (cx0, mid_y)], fill=TEAL, width=4)
+    arrow_right(TEAL, cx0, mid_y)
+
+    # --- Right: VS Code block; horizontal connector through the row gap ---
+    vy0, vy1 = 116, 604
+    vx1 = 1224
+    vx0 = cx0 + center_w + 44
     rows = [
         ("Model picker", "all sources in one list"),
         ("Native tool cards", "visible + approvals"),
@@ -264,15 +291,25 @@ def draw_architecture():
         ("Quick Access", "balance, limits, peak hours"),
         ("Session Quality", "cache · tokens · latency"),
     ]
-    for i, (name, sub) in enumerate(rows):
-        y = 196 + i * 76
-        d.ellipse([896, y + 8, 912, y + 24], fill=ORANGE)
-        d.text((928, y), name, font=f_small, fill=TEXT)
-        d.text((928, y + 30), sub, font=f_small, fill=MUTED)
+    row_y = vy0 + 64
+    row_h = 78
+    gap_y = vy0 + 64 + 3 * row_h - 10  # sits between the 3rd and 4th rows
+    d.line([(cx0 + center_w, mid_y), (cx0 + center_w + 24, mid_y)], fill=ORANGE, width=4)
+    d.line([(cx0 + center_w + 24, mid_y), (cx0 + center_w + 24, gap_y)], fill=ORANGE, width=4)
+    d.line([(cx0 + center_w + 24, gap_y), (vx0, gap_y)], fill=ORANGE, width=4)
+    arrow_right(ORANGE, vx0, gap_y)
+
+    rounded_panel(img, [vx0, vy0, vx1, vy1], 24, PANEL, ORANGE, 4)
+    d.text((vx0 + 24, vy0 + 20), "VS Code Copilot Chat", font=f_box, fill=TEXT)
+    row_name_font = ImageFont.truetype(FONT_BOLD, 24)
+    for name, sub in rows:
+        d.ellipse([vx0 + 24, row_y + 6, vx0 + 40, row_y + 22], fill=ORANGE)
+        d.text((vx0 + 56, row_y), name, font=row_name_font, fill=TEXT)
+        sub_fit = fit_font(d, sub, FONT_REG, vx1 - vx0 - 80, 24, 18)
+        d.text((vx0 + 56, row_y + 30), sub, font=sub_fit, fill=MUTED)
+        row_y += row_h
 
     return img
-
-
 def main():
     # NEVER overwrite assets/logo.png: it is the official logo maintained by
     # the user. The placeholder below is only a fallback for the preview

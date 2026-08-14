@@ -4,9 +4,9 @@
 
 **Bridge local models, DeepSeek, Codex, and Claude into one native VS Code agent workflow.**
 
-![GitHub release](https://img.shields.io/github/v/release/MrLordCat/ai-agent-bridge?label=release)
-![License](https://img.shields.io/github/license/MrLordCat/ai-agent-bridge)
-![CI](https://github.com/MrLordCat/ai-agent-bridge/actions/workflows/ci.yml/badge.svg)
+[![GitHub release](https://img.shields.io/github/v/release/MrLordCat/ai-agent-bridge?label=release)](https://github.com/MrLordCat/ai-agent-bridge/releases/latest)
+[![License](https://img.shields.io/github/license/MrLordCat/ai-agent-bridge)](https://github.com/MrLordCat/ai-agent-bridge/blob/main/LICENSE)
+[![CI](https://github.com/MrLordCat/ai-agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MrLordCat/ai-agent-bridge/actions/workflows/ci.yml)
 
 Every enabled source appears in the normal VS Code model picker. The selected
 model keeps the existing Chat UI, workspace context, tool cards, approval
@@ -48,7 +48,7 @@ package is deliberately distributed outside the gallery.
    [Releases](https://github.com/MrLordCat/ai-agent-bridge/releases/latest).
 2. Install it:
    ```sh
-   code --install-extension llama-vscode-chat-v1.14.0.vsix
+   code --install-extension llama-vscode-chat-v1.14.1.vsix
    ```
 3. Run `Developer: Reload Window`.
 
@@ -298,7 +298,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.14.0. Current local development build: 1.14.0.** The
+**Stable release: 1.14.1. Current local development build: 1.14.1.** The
 stable line consolidates the 1.13.x development patches: Claude follow-up
 messages are forwarded to the resumed session, the active-turn timeout is
 300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
@@ -309,7 +309,7 @@ screenshots, and measured cache-hit numbers.
 npm install
 npm run compile
 npm run lint
-npm test              # 396 extension-host tests in the current 1.14.0 dev patch
+npm test              # 396 extension-host tests in the current 1.14.1 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

@@ -27,6 +27,8 @@ import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
 import { SessionQualityPanel } from "./ui/session-quality-panel";
 import { MemoryManagerPanel, estimateMemoryTokens } from "./ui/memory-manager";
+import { ApiProviderManagerPanel } from "./ui/api-provider-manager";
+import { ApiProviderService } from "./api-providers/api-provider-service";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
@@ -554,6 +556,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		})
 	);
 
+	// API provider profiles (multi-endpoint manager) share the model-source path.
+	const apiProviderService = new ApiProviderService(context.globalState, context.secrets);
+	context.subscriptions.push(apiProviderService);
+
 	// Llama.cpp Provider
 	const llamaProvider = new LlamaCppChatModelProvider(
 		context.secrets,
@@ -561,7 +567,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		logService,
 		memoryService,
 		context.globalState,
-		context.globalStorageUri.fsPath
+		context.globalStorageUri.fsPath,
+		() => apiProviderService.getModelSources()
 	);
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
@@ -987,6 +994,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			if (!opened) {
 				vscode.window.showWarningMessage("Unable to open the Local LLM sidebar automatically. Use View: Open View...");
 			}
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.openApiProviders", () => {
+			ApiProviderManagerPanel.createOrShow(
+				apiProviderService,
+				() => llamaProvider.refreshLanguageModelChatInformation()
+			);
 		})
 	);
 
