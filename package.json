@@ -1154,19 +1154,19 @@
 		"test": "npm run compile && vscode-test"
 	},
 	"devDependencies": {
-		"@eslint/js": "^9.13.0",
-		"@stylistic/eslint-plugin": "^2.9.0",
+		"@eslint/js": "^10.0.1",
+		"@stylistic/eslint-plugin": "^5.10.0",
 		"@types/mocha": "^10.0.6",
-		"@types/node": "^22",
-		"@types/vscode": "^1.103.0",
+		"@types/node": "^26",
+		"@types/vscode": "^1.125.0",
 		"@vscode/dts": "^0.4.1",
-		"@vscode/test-cli": "^0.0.11",
-		"@vscode/test-electron": "^2.5.2",
+		"@vscode/test-cli": "^0.0.15",
+		"@vscode/test-electron": "^3.1.0",
 		"@vscode/vsce": "3.9.2",
-		"eslint": "^9.13.0",
-		"prettier": "^3.1.0",
-		"typescript": "^5.9.2",
-		"typescript-eslint": "^8.39.0"
+		"eslint": "^10.8.1",
+		"prettier": "^3.9.6",
+		"typescript": "^7.0.2",
+		"typescript-eslint": "^8.67.0"
 	},
 	"overrides": {
 		"diff": "8.0.3",
