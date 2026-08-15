@@ -178,7 +178,7 @@ export class SessionQualityPanel {
 			);
 		} catch (err: unknown) {
 			panel.dispose();
-			throw new Error(`Failed to initialize session quality panel: ${err instanceof Error ? err.message : String(err)}`);
+			throw new Error(`Failed to initialize session quality panel: ${err instanceof Error ? err.message : String(err)}`, { cause: err });
 		}
 	}
 

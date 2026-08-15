@@ -1682,7 +1682,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 						throw new Error(
 							`Claude resume fallback blocked (${selectedDecision.reason}): ${selectedDecision.detail} `
 							+ "The failed durable session was quarantined and will not be retried. "
-							+ `Original resume error: ${resumeFailure.detail}`
+							+ `Original resume error: ${resumeFailure.detail}`,
+						{ cause: error }
 						);
 					}
 					this.removeSession(session.key);

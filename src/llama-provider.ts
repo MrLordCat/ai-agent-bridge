@@ -6160,7 +6160,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 const bodyText = await response.text();
                 bodySnippet = bodyText.trim().slice(0, 300);
             } catch {
-                bodySnippet = "";
+                // Keep the empty snippet when the body cannot be read.
             }
             const details = bodySnippet ? `\n${bodySnippet}` : "";
             throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}${details}`);

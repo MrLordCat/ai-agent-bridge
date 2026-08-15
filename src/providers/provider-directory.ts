@@ -93,7 +93,7 @@ export function defaultProbeHttp(
 				try {
 					bodySnippet = (await response.text()).trim().slice(0, 160);
 				} catch {
-					bodySnippet = "";
+					// Keep the empty snippet when the body cannot be read.
 				}
 				return {
 					ok: false,

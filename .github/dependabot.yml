@@ -18,6 +18,12 @@ updates:
         dependency-type: "development"
         patterns:
           - "*"
+    ignore:
+      # TypeScript 7 is not supported by typescript-eslint 8.x yet; the
+      # 2026-08-15 dev-group bump to 7.0.2 broke npm ci (ERESOLVE).
+      # Remove this rule once typescript-eslint supports TS 7.
+      - dependency-name: "typescript"
+        versions: ">=6"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

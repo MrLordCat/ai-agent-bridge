@@ -906,7 +906,6 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
                         visible += chunk;
                     }
                     this._thinkingTagBuffer = keep > 0 ? data.slice(data.length - keep) : "";
-                    data = "";
                     break;
                 }
 
@@ -928,7 +927,6 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
                     emittedAny = true;
                 }
                 this._thinkingTagBuffer = keep > 0 ? data.slice(data.length - keep) : "";
-                data = "";
                 break;
             }
 
@@ -1008,18 +1006,11 @@ export abstract class BaseChatModelProvider implements LanguageModelChatProvider
                 // Find the delimiter that ends the name/index segment
                 const a = data.indexOf(ARG_BEGIN);
                 const e = data.indexOf(END);
-                let delimIdx = -1;
-                let delimKind: "arg" | "end" | undefined = undefined;
-                if (a !== -1 && (e === -1 || a < e)) {
-                    delimIdx = a;
-                    delimKind = "arg";
-                } else if (e !== -1) {
-                    delimIdx = e;
-                    delimKind = "end";
-                } else {
+                const delimIdx = a !== -1 && (e === -1 || a < e) ? a : e;
+                const delimKind: "arg" | "end" = a !== -1 && (e === -1 || a < e) ? "arg" : "end";
+                if (delimIdx === -1) {
                     // Incomplete header; keep for next chunk (re-add BEGIN so we don't lose it)
                     this._textToolParserBuffer = BEGIN + data;
-                    data = "";
                     break;
                 }
 

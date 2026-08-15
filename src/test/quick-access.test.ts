@@ -322,9 +322,9 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const usage = roots.find(item => labelOf(item) === "Token Usage");
 		assert.ok(usage);
 		for (const label of ["Local / Qwen", "DeepSeek", "Codex", "Claude"]) {
-			const group = (await getItems(provider, usage)).find(item => labelOf(item) === label);
+			const group: QuickAccessItem | undefined = (await getItems(provider, usage)).find(item => labelOf(item) === label);
 			assert.ok(group);
-			const lastRequest = (await getItems(provider, group)).find(item => labelOf(item) === "Last Request");
+			const lastRequest: QuickAccessItem | undefined = (await getItems(provider, group)).find(item => labelOf(item) === "Last Request");
 			assert.ok(lastRequest);
 			const children = await getItems(provider, lastRequest);
 			assert.strictEqual(children.find(item => labelOf(item) === "Tokens (last)")?.description, "2.0K in · 500 out");

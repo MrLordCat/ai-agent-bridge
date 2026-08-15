@@ -445,7 +445,7 @@ export function convertMessages(
 				try {
 					args = stableJsonStringify(part.input ?? {});
 				} catch {
-					args = "{}";
+					// Keep the fallback value when serialization fails.
 				}
 				const fallbackId = createHash("sha256")
 					.update(`${messageIndex}:${partIndex}:${part.name}:`)

@@ -360,7 +360,7 @@ export class MemoryManagerPanel {
 			MemoryManagerPanel.current = new MemoryManagerPanel(panel, memory);
 		} catch (error: unknown) {
 			panel.dispose();
-			throw new Error(`Failed to initialize shared memory panel: ${error instanceof Error ? error.message : String(error)}`);
+			throw new Error(`Failed to initialize shared memory panel: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 		}
 	}
 

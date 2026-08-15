@@ -689,7 +689,7 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 		new Script(patched, { filename: validationPath });
 		execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
 	} catch (error) {
-		throw new Error(`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`);
+		throw new Error(`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	} finally {
 		fs.rmSync(validationPath, { force: true });
 		fs.rmSync(workbenchValidationPath, { force: true });

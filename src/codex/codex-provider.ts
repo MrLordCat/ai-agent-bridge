@@ -2512,7 +2512,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				}
 				const account = await this.client.request<CodexAccountResponse>("account/read", { refreshToken: true });
 				if (!account.account || account.account.type !== "chatgpt") {
-					throw new Error("Codex session expired. Run AI Agent Bridge: Sign In to Codex Subscription.");
+					throw new Error("Codex session expired. Run AI Agent Bridge: Sign In to Codex Subscription.", { cause: error });
 				}
 				this.cacheSubscriptionAccount(account.account);
 				return account.account;
