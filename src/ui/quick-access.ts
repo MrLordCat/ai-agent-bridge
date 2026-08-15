@@ -358,6 +358,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getMemoryContextTokens: () => number = () => 0,
 		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 }),
 		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined,
+		private readonly getTotalMemoryCount: () => number | undefined = () => undefined,
 	) {}
 
 	refresh(): void {
@@ -415,8 +416,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const memoryCount = this.getMemoryCount();
 		const expiredMemoryCount = this.getExpiredMemoryCount();
 		const memoryContextTokens = this.getMemoryContextTokens();
+		const totalMemoryCount = this.getTotalMemoryCount();
 		const memoryDescription = memoryEnabled
-			? `${memoryCount} entries${expiredMemoryCount > 0 ? ` / ${expiredMemoryCount} expired` : ""} · ~${formatCompactTokenCount(memoryContextTokens)} tokens context`
+			? `${memoryCount} entries${totalMemoryCount !== undefined && totalMemoryCount > memoryCount ? ` (of ${totalMemoryCount})` : ""}${expiredMemoryCount > 0 ? ` / ${expiredMemoryCount} expired` : ""} · ~${formatCompactTokenCount(memoryContextTokens)} tokens context`
 			: "Off";
 		const lastThroughput = this.getLastThroughput();
 		const lastContextUsage = this.getLastContextUsage();
@@ -899,7 +901,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				command: command("llamacpp.openMemory", "Open Shared Memory"),
 			}),
 		];
-		if (memoryCount > 0) {
+		if ((totalMemoryCount ?? memoryCount) > 0) {
 			memoryChildren.push(
 				new QuickAccessItem("memory.clear", "Clear All Entries", {
 					icon: new vscode.ThemeIcon("trash"),

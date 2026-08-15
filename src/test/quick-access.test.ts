@@ -176,6 +176,41 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.strictEqual(memory?.description, "5 entries / 2 expired · ~5.0K tokens context");
 	});
 
+	test("shows workspace-visible memory entries with the total entry count", async () => {
+		const provider = new LlamaQuickActionsProvider(
+			() => undefined,
+			() => undefined,
+			() => 3,
+			() => undefined,
+			() => undefined,
+			() => 0,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => [],
+			() => emptyTokenUsageHistorySummary(),
+			() => emptyUsageExperimentSummary(),
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => undefined,
+			() => 2100,
+			() => ({ total: 0, enabled: 0 }),
+			() => undefined,
+			() => 51
+		);
+		const memory = (await getItems(provider)).find(item => labelOf(item) === "Memory");
+		assert.strictEqual(memory?.description, "3 entries (of 51) · ~2.1K tokens context");
+	});
+
 	test("shows separate Claude subscription limit windows", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined,

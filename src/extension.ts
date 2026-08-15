@@ -20,6 +20,7 @@ import {
 } from "./constants";
 import { LlamaLogService } from "./logger";
 import { SessionQualityTracker } from "./diagnostics/session-report";
+import { getCurrentWorkspaceScopeId, filterEntriesVisibleInWorkspace } from "./memory/scope";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
 import { registerContextControlCommand } from "./ui/context-control";
@@ -623,7 +624,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const quickActionsProvider = new LlamaQuickActionsProvider(
 		() => lastThroughput,
 		() => lastContextUsage,
-		() => memoryService.count,
+		() => filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId()).length,
 		() => lastPromptCache,
 		() => sessionQuality.count === 0 ? "No turns" : `${sessionQuality.count} turns / cache ${sessionQuality.summary.cacheHitPercent ?? "n/a"}%`,
 		() => memoryService.expiredCount,
@@ -645,12 +646,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => codexProvider.codexUsageLimitResetLabel,
 		() => claudeProvider.claudeUsageLimitPercent,
 		() => claudeProvider.claudeUsageLimitResetLabel,
-		() => estimateMemoryTokens(memoryService.list()),
+		() => estimateMemoryTokens(filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId())),
 		() => ({
 			total: apiProviderService.count,
 			enabled: apiProviderService.enabledCount,
 		}),
-		key => providerDirectory.stateOf(key)
+		key => providerDirectory.stateOf(key),
+		() => memoryService.count
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));

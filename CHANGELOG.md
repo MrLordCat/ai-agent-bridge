@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.14.16 (dev) - 2026-08-15
+
+Memory section in Quick Access is now workspace-aware:
+
+- **Before**: the Memory section showed the total entry count and context
+  tokens across all projects (e.g. 51 entries), even though only global plus
+  the current workspace's entries participate in that workspace's prompt
+  context.
+- **After**: the count and token estimate now include only the entries
+  visible in the current workspace (global + workspace entries whose scopeId
+  matches the open folders). When other projects' entries are hidden, the
+  description shows the total, e.g. "14 entries (of 51)".
+- **Implementation**: new filterEntriesVisibleInWorkspace() in
+  src/memory/scope.ts; Quick Access gained a getTotalMemoryCount callback;
+  "Clear All Entries" stays available while hidden entries exist.
+- **Tests**: workspace-filter regression tests + a Quick Access description
+  test (419 extension-host tests total).
+
+## 1.14.15 (dev) - 2026-08-15
+
+Claude recovery fix (production failure on 2026-08-15):
+
+- **Bug**: after a durable session was quarantined (invalid_resume_boundary),
+  the bounded latest-message recovery was rejected with "Estimated replay
+  178720 tokens exceeds safe limit 64000" and the turn failed. In the Agents
+  Window the last user message can carry the whole transcript, so the
+  latest-only input could be larger than the replay guard.
+- **Fix**: the latest-only recovery now truncates oversized user content to
+  the configured resume-fallback token budget, keeping the fresh tail of the
+  message (the actual question) and dropping the stale head. The fallback
+  decision then uses the truncated estimate, so the turn proceeds instead of
+  failing. Logs report truncatedChars.
+- **Tests**: two new regression tests for truncateLatestUserContent (417
+  extension-host tests total).
+
 ## 1.14.14 (dev) - 2026-08-15
 
 Production-readiness hardening (no Marketplace publishing planned):

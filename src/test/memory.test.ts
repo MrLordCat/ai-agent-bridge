@@ -7,10 +7,26 @@ import {
 	injectAppendOnlySharedMemoryContext,
 	injectSharedMemoryContext,
 } from "../memory/prompt";
+import { filterEntriesVisibleInWorkspace } from "../memory/scope";
 import { SharedMemoryService } from "../memory/shared-memory-service";
 import type { OpenAIChatMessage } from "../types";
 
 suite("Shared memory", () => {
+
+	test("filterEntriesVisibleInWorkspace keeps global and only the current workspace", () => {
+		const base = { id: "g", title: "t", content: "", tags: [], pinned: false, scope: "global", kind: "preference", createdAt: "", updatedAt: "" };
+		const entries = [
+			base,
+			{ ...base, id: "a", scope: "workspace", scopeId: "file:///a" },
+			{ ...base, id: "b", scope: "workspace", scopeId: "file:///b" },
+			{ ...base, id: "m", scope: "model", scopeId: "qwen-local" },
+		] as never[];
+		const typed = entries as Parameters<typeof filterEntriesVisibleInWorkspace>[0];
+
+		assert.deepStrictEqual(filterEntriesVisibleInWorkspace(typed, "file:///a").map(entry => entry.id), ["g", "a"]);
+		assert.deepStrictEqual(filterEntriesVisibleInWorkspace(typed, "file:///b").map(entry => entry.id), ["g", "b"]);
+		assert.deepStrictEqual(filterEntriesVisibleInWorkspace(typed, undefined).map(entry => entry.id), ["g"]);
+	});
 	let tempDirectory = "";
 	let memory: SharedMemoryService;
 
