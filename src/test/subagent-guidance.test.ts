@@ -50,6 +50,16 @@ suite("subagent model guidance", () => {
 	});
 
 	test("requires an explicit model in subagent schemas without mutating the host definition", () => {
+		// Self-contained: extension activation refreshes profiles from the live
+		// model catalog asynchronously, so relying on the previous test state
+		// is a race on CI runners (the catalog there is empty).
+		setSubagentModelProfiles("deepseek", [{
+			id: "deepseek::deepseek-v4-pro",
+			label: "DeepSeek V4 Pro",
+			provider: "deepseek",
+			defaultEffort: "high",
+			useWhen: "Focused complex tasks",
+		}]);
 		const original = {
 			name: "runSubagent",
 			inputSchema: {
