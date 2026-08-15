@@ -40,6 +40,10 @@ recent conversation history.*
 
 ## Install
 
+VS Code **1.131 or newer is required** (the agent-host patches and the
+Copilot Chat patch are validated against 1.131; older versions degrade
+silently). Windows is the only supported platform.
+
 The extension ships as a VSIX from GitHub Releases. It is not on the VS Code
 Marketplace: the optional Copilot Chat patch is not a Marketplace API, so the
 package is deliberately distributed outside the gallery.
@@ -300,7 +304,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.14.3. Current local development build: 1.14.13.** The
+**Stable release: 1.14.3. Current local development build: 1.14.14.** The
 stable line consolidates the 1.13.x development patches: Claude follow-up
 messages are forwarded to the resumed session, the active-turn timeout is
 300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
@@ -311,7 +315,7 @@ screenshots, and measured cache-hit numbers.
 npm install
 npm run compile
 npm run lint
-npm test              # 415 extension-host tests in the current 1.14.13 dev patch
+npm test              # 415 extension-host tests in the current 1.14.14 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

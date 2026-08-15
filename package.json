@@ -8,9 +8,10 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.14.13",
+	"version": "1.14.14",
 	"engines": {
-		"vscode": "^1.104.0"
+		"vscode": "^1.131.0",
+		"node": ">=20"
 	},
 	"categories": [
 		"AI",

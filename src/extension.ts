@@ -517,6 +517,28 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// Keep UA minimal: only extension version and VS Code version
 	const ua = `${EXTENSION_NAME}/${extVersion} VSCode/${vscodeVersion}`;
 	const logService = new LlamaLogService(context);
+
+	// Production-grade crash logging: VS Code keeps the extension host alive on
+	// uncaught exceptions, but without these handlers the failure is silent to
+	// users. Log the error to the extension journal and show a one-time notice
+	// pointing at the log location. Never re-throw: a crash in the handler must
+	// not take the host down.
+	process.on("uncaughtException", (error) => {
+		try {
+			logService.logError("extension.uncaught_exception", error);
+			vscode.window.showWarningMessage(`AI Agent Bridge hit an unexpected error: ${error instanceof Error ? error.message : String(error)}. Details are in the extension log (AI Agent Bridge: Open Latest Log).`);
+		} catch {
+			// Nothing else we can do here.
+		}
+	});
+	process.on("unhandledRejection", (reason) => {
+		try {
+			logService.logError("extension.unhandled_rejection", reason instanceof Error ? reason : new Error(String(reason)));
+		} catch {
+			// Nothing else we can do here.
+		}
+	});
+
 	const memoryService = new SharedMemoryService(context.globalStorageUri.fsPath);
 	const sessionQuality = new SessionQualityTracker();
 	const tokenUsageHistory = new TokenUsageHistory(

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,7 +19,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: xvfb-run -a npm test
+      - run: npm test
       - run: npm run package -- --out llama-vscode-chat-${{ github.ref_name }}.vsix
       - run: gh release create "${{ github.ref_name }}" "llama-vscode-chat-${{ github.ref_name }}.vsix" --notes-file docs/RELEASE_NOTES.md --verify-tag
         env:

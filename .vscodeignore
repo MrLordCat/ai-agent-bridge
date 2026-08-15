@@ -9,6 +9,7 @@ AGENTS.md
 .github/**
 src/**
 out/test/**
+docs/**
 subprojects/**
 scripts/**
 .gitignore
@@ -32,3 +33,18 @@ node_modules/@anthropic-ai/claude-agent-sdk/browser-sdk.*
 node_modules/@anthropic-ai/claude-agent-sdk/bridge.*
 node_modules/@anthropic-ai/claude-agent-sdk/*.d.ts
 node_modules/@anthropic-ai/claude-agent-sdk/manifest*
+node_modules/**/*.d.mts
+node_modules/**/*.md
+node_modules/**/README*
+node_modules/**/CHANGELOG*
+node_modules/**/SECURITY*
+node_modules/**/.github/**
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/__tests__/**
+node_modules/**/benchmark/**
+node_modules/**/benchmarks/**
+node_modules/**/examples/**
+node_modules/**/docs/**
+node_modules/**/*.cjs.map
+node_modules/**/*.mjs.map

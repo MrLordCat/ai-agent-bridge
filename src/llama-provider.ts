@@ -357,6 +357,8 @@ interface PreparedMessagesForBudget {
 
 interface CachePrefixSnapshot {
     requestId: string;
+    /** Model id that produced the snapshot — a model switch invalidates prefix reuse. */
+    modelId: string;
     staticFieldsHash: string;
     toolsHash: string;
     toolsCount: number;
@@ -1296,6 +1298,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // --- Store current snapshot for next turn's comparison ---
         const current: CachePrefixSnapshot = {
             requestId,
+            modelId,
             staticFieldsHash,
             toolsHash,
             toolsCount,
@@ -1338,6 +1341,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             }
         }
 
+        const modelChanged = previous !== undefined && previous.modelId !== modelId;
         const staticFieldsMatch = previous?.staticFieldsHash === staticFieldsHash;
         const toolsMatch = previous?.toolsHash === toolsHash;
         const previousToolNames = previous?.toolNames;
@@ -1347,11 +1351,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const addedTools = toolsMatch || !Array.isArray(previousToolNames)
             ? []
             : toolNames.filter(name => !previousToolNames.includes(name)).sort();
-        const reusableMessagePercent = previous && staticFieldsMatch && toolsMatch && previous.messageChars > 0
+        const reusableMessagePercent = previous && !modelChanged && staticFieldsMatch && toolsMatch && previous.messageChars > 0
             ? Number(((sharedMessagePrefixChars / previous.messageChars) * 100).toFixed(1))
             : previous ? 0 : undefined;
         const prefix = {
             scope: this.shortHash(scope),
+            modelChanged,
             staticFieldsHash,
             toolsHash,
             toolsCount,
@@ -1476,6 +1481,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             : undefined;
         storeSnapshot({
             requestId,
+            modelId,
             staticFieldsHash,
             toolsHash,
             toolsCount,
@@ -1623,13 +1629,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private redactHeaders(headers: Record<string, string>): Record<string, string> {
+        const sensitive = new Set(["authorization", "proxy-authorization", "api-key", "x-api-key", "x-goog-api-key", "cookie"]);
         const next: Record<string, string> = {};
         for (const [key, value] of Object.entries(headers)) {
-            if (key.toLowerCase() === "authorization") {
-                next[key] = "[redacted]";
-            } else {
-                next[key] = value;
-            }
+            next[key] = sensitive.has(key.toLowerCase()) ? "[redacted]" : value;
         }
         return next;
     }

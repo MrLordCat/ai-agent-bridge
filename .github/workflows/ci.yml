@@ -10,7 +10,10 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    # The extension is Windows-only (native Claude/Codex runtimes ship for
+    # win32-x64) and the agent-host patch patterns are validated against the
+    # VS Code 1.131 bundle.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -19,7 +22,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: xvfb-run -a npm test
+      - run: npm test
       - run: npm run package -- --out llama-vscode-chat.vsix
       - uses: actions/upload-artifact@v4
         with:

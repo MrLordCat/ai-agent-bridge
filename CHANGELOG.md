@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.14.14 (dev) - 2026-08-15
+
+Production-readiness hardening (no Marketplace publishing planned):
+
+- **Engines**: `engines.vscode` raised to `^1.131.0` and `engines.node`
+  to `>=20` — the agent-host and Copilot Chat patches are validated only
+  against 1.131, and the extension is Windows-only. README states both facts
+  in the Install section.
+- **CI/CD**: GitHub Actions now runs on `windows-latest` (lint + full test
+  suite + VSIX build); the release workflow matches.
+- **Security**: `npm audit fix` cleared 4 transitive vulnerabilities
+  (hono/fast-uri/ip-address via the MCP SDK) — 0 known issues. Header
+  redaction extended to api-key/x-api-key/proxy-authorization/cookie.
+  `SECURITY.md` added.
+- **Crash visibility**: `uncaughtException`/`unhandledRejection` handlers
+  log to the extension journal and surface a one-time warning instead of
+  failing silently.
+- **Community**: CONTRIBUTING.md, CODE_OF_CONDUCT.md, Dependabot (npm +
+  actions, weekly), issue and PR templates.
+- **Package size**: .vscodeignore now strips dependency docs, tests, d.mts,
+  and the repo docs/ folder from the VSIX.
+- **Stricter TS**: noImplicitReturns, noFallthroughCasesInSwitch,
+  noUnusedParameters enabled (one dead parameter removed).
+- **Repo hygiene**: removed qwen_promt_reslut.md and
+  docs/TEMP_CLAUDE_CACHE_PRIORITY_PLAN.md.
+
 ## 1.14.13 (dev) - 2026-08-15
 
 - **Removed the Agents Bridge HTTP proxy.** The local OpenAI-compatible
