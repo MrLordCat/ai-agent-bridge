@@ -66,13 +66,26 @@ export interface AgentHostThinkingPatchTarget {
 
 /** Locates the agent-host bundle of the installed VS Code. */
 export function findAgentHostBundle(explicitRoot?: string): AgentHostThinkingPatchTarget {
-	const copilot = findCopilotBundle(explicitRoot);
-	const appRoot = path.resolve(path.dirname(copilot.workbenchPath), "..", "..", "..");
-	const bundlePath = agentHostBundlePathFromAppRoot(appRoot);
-	if (!fs.existsSync(bundlePath)) {
-		throw new Error(`Could not locate the VS Code agent host bundle: ${bundlePath}`);
+	// The agent-host bundle lives at a deterministic path under the app root, so
+	// an explicit root (or the running extension host) needs no Copilot-bundle
+	// lookup — bare VS Code archives on CI runners have no bundled extensions.
+	if (explicitRoot) {
+		const directPath = agentHostBundlePathFromAppRoot(explicitRoot);
+		if (fs.existsSync(directPath)) {
+			return { bundlePath: directPath };
+		}
 	}
-	return { bundlePath };
+	try {
+		const copilot = findCopilotBundle(explicitRoot);
+		const appRoot = path.resolve(path.dirname(copilot.workbenchPath), "..", "..", "..");
+		const bundlePath = agentHostBundlePathFromAppRoot(appRoot);
+		if (fs.existsSync(bundlePath)) {
+			return { bundlePath };
+		}
+	} catch {
+		// Fall through to the error below with both candidates reported.
+	}
+	throw new Error(`Could not locate the VS Code agent host bundle (tried the app root and installed VS Code installations)`);
 }
 
 /** Applies the thinking-level schema to the BYOK snapshot model mapping. */

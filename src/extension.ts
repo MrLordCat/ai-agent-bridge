@@ -764,7 +764,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleAgentHostThinkingPatch", async () => {
 			try {
-				const target = findAgentHostBundle();
+				const target = findAgentHostBundle(vscode.env.appRoot);
 				const status = getAgentHostThinkingPatchStatus(target.bundlePath);
 				if (status.applied) {
 					const result = restoreAgentHostThinkingPatch(target.bundlePath);

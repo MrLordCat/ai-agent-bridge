@@ -93,6 +93,6 @@ suite("Agents Bridge — agent-host thinking patch", () => {
 		assert.notStrictEqual(patched, bundle, "the installed 1.131 bundle must contain the BYOK snapshot pattern");
 		assert.ok(patched.includes(AGENT_HOST_THINKING_PATCH_MARKER));
 		assert.ok(status.backupPath.endsWith(".llama-vscode-chat.bak"));
-		void findAgentHostBundle();
+		void findAgentHostBundle(vscode.env.appRoot);
 	});
 });
