@@ -76,6 +76,8 @@ does not substitute for the required ChatGPT account mode.
 **Claude:** the VSIX includes the supported platform runtime. Sign in, then run
 `AI Agent Bridge: Sign In to Claude Subscription`.
 
+**Agents Window (BYOK):** register the model catalog in the VS Code Agents Window without any manual endpoint setup: the extension enables `chat.agentHost.byokModels.enabled` automatically, and the whole catalog — Local, DeepSeek, Codex, Claude, and custom API profiles — appears in the Agents model picker directly through the built-in language-model provider. For a reasoning-effort switch in the Agents model picker, run `AI Agent Bridge: Toggle Thinking Picker Patch` (Quick Access → Copilot Patches → Thinking picker (Agents)) and restart the agent host; the patch also fixes the VS Code 1.131 BYOK loopback proxy for non-streaming SDK requests.
+
 ## Model Sources
 
 | Source | Models | Best For |
@@ -298,7 +300,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.14.3. Current local development build: 1.14.3.** The
+**Stable release: 1.14.3. Current local development build: 1.14.13.** The
 stable line consolidates the 1.13.x development patches: Claude follow-up
 messages are forwarded to the resumed session, the active-turn timeout is
 300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
@@ -309,7 +311,7 @@ screenshots, and measured cache-hit numbers.
 npm install
 npm run compile
 npm run lint
-npm test              # 408 extension-host tests in the current 1.14.3 dev patch
+npm test              # 415 extension-host tests in the current 1.14.13 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

@@ -30,6 +30,7 @@ import { MemoryManagerPanel, estimateMemoryTokens } from "./ui/memory-manager";
 import { ApiProviderManagerPanel } from "./ui/api-provider-manager";
 import { ApiProviderService } from "./api-providers/api-provider-service";
 import { ProviderDirectory } from "./providers/provider-directory";
+import { applyAgentHostThinkingPatch, findAgentHostBundle, getAgentHostThinkingPatchStatus, restoreAgentHostThinkingPatch } from "./byok/agent-host-thinking-patch";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
@@ -590,6 +591,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const compositeProvider = new CompositeChatModelProvider(llamaProvider, codexProvider, claudeProvider);
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
+
 	let lastThroughput: string | undefined;
 	let lastPromptCache: string | undefined;
 	let lastContextUsage: ContextUsageDisplay | undefined;
@@ -714,7 +716,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}, 60_000);
 	context.subscriptions.push(new vscode.Disposable(() => clearInterval(usageLimitRefreshTimer)));
 
-	const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 95);
+	// VS Code hides BYOK models in the Agents Window model picker until
+	// `chat.agentHost.byokModels.enabled` is true (experimental flag, read at
+	// window startup). The extension sets it itself so the bridge works
+	// out of the box; a user-provided value is never overwritten.
+	const ensureAgentsByokFlag = (): void => {
+		const chatConfig = vscode.workspace.getConfiguration("chat");
+		const inspected = chatConfig.inspect<boolean>("agentHost.byokModels.enabled");
+		if (inspected?.globalValue === undefined && inspected?.workspaceValue === undefined) {
+			void chatConfig.update("agentHost.byokModels.enabled", true, vscode.ConfigurationTarget.Global);
+			logService.log("byok.bridge.byok_flag_enabled");
+		}
+	};
+
+	// Never touch workspace settings in the test runner: the test instance
+	// shares the VS Code host lifecycle and a chat.* write can restart the
+	// agent host mid-run (tests abort with a clean extension-host exit).
+	if (context.extensionMode !== vscode.ExtensionMode.Test) {
+		ensureAgentsByokFlag();
+	}
+
+	// Thinking-level picker for BYOK models in the Agents Window. VS Code
+	// 1.131 omits the configSchema from BYOK snapshot models, so the UI has no
+	// reasoning-effort switch; this patch adds it to the agent-host bundle.
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleAgentHostThinkingPatch", async () => {
+			try {
+				const target = findAgentHostBundle();
+				const status = getAgentHostThinkingPatchStatus(target.bundlePath);
+				if (status.applied) {
+					const result = restoreAgentHostThinkingPatch(target.bundlePath);
+					logService.log("byok.bridge.thinking_patch_restored", { sha256: result.status.sha256 });
+					vscode.window.showInformationMessage(result.message);
+					return;
+				}
+				const result = applyAgentHostThinkingPatch(target.bundlePath);
+				logService.log("byok.bridge.thinking_patch_applied", { sha256: result.status.sha256 });
+				vscode.window.showInformationMessage(result.message);
+			} catch (error) {
+				logService.logError("byok.bridge.thinking_patch_failed", error);
+				vscode.window.showErrorMessage(`Agent-host thinking patch failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}),
+	);
+
+const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 95);
 	performanceStatusBar.name = "Local LLM Throughput";
 	performanceStatusBar.command = "llamacpp.openLatestLog";
 	performanceStatusBar.text = "$(dashboard) local LLM TPS: n/a";
@@ -1059,6 +1105,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 							description: limit.description,
 						})),
 					},
+					
 				})
 			);
 		})

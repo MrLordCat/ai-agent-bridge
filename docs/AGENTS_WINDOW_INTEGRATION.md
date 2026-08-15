@@ -1,8 +1,92 @@
 # Интеграция в Agents Window VS Code — ресёрч (2026-08-05)
 
-Статус: **исследование, код не пишем** — ~~цель~~ → **отложено по решению
-пользователя (2026-08-05)**, вопрос закрыт на неопределённый срок.
-Документ оставлен как справочник для возобновления ресёрча.
+**ОБНОВЛЕНИЕ (2026-08-15): финальная архитектура — см. раздел 0 ниже.**
+Путь найден и проверен пользователем: модели напрямую регистрируются в Agents
+через встроенный language-model провайдер расширения (флаг
+`chat.agentHost.byokModels.enabled` + рестарт агент-хоста). Локальный HTTP-мост
+(«Agents Bridge», 1.14.4–1.14.10) оказался ненужным и удалён в 1.14.13 вместе с
+командами, настройками и watcher'ом. Для переключателя мышления в модель-пикере
+Agents и для non-streaming запросов SDK применяется патч бандла агент-хоста
+(`src/byok/agent-host-thinking-patch.ts`).
+
+
+---
+
+## 0. Итог (2026-08-15): llamacpp-провайдер + патч агент-хоста — рабочий путь
+
+**Финальная архитектура (проверено пользователем 2026-08-15):**
+
+- Модели расширения регистрируются как встроенный language-model провайдер
+  (`llamacpp` vendor, `isBYOK: true`) и попадают в модель-пикер Agents
+  напрямую — без HTTP-моста и API-ключа. Нужно только, чтобы флаг
+  `chat.agentHost.byokModels.enabled` был true ДО спавна агент-хоста
+  (расширение включает его само; reload окна агент-хост НЕ переспавнивает).
+- Переключатель уровня мышления в модель-пикере Agents: патч бандла
+  `agentHostMain.js` (`src/byok/agent-host-thinking-patch.ts`, маркеры
+  `agent-host-thinking-levels:v1` / `agent-host-non-streaming:v1` /
+  `agent-host-reasoning-effort:v1`):
+  1) `configSchema.thinkingLevel` в снапшоте BYOK-моделей — без него UI не
+     показывает опцию мышления;
+  2) non-streaming JSON-ответ в `ByokLmProxyService._handleChatCompletions` —
+     иначе нативный SDK падает с «non-streaming response body was not valid
+     JSON» после включения мышления (прокси всегда отвечал SSE);
+  3) проброс `reasoning_effort` из тела SDK-запроса в `modelOptions`
+     провайдера — без него уровень мышления не доходил до модели.
+- Бывший HTTP-мост «Agents Bridge» (сервер 127.0.0.1:17811, key в
+  SecretStorage, watcher `chatLanguageModels.json`, команды
+  `llamacpp.toggleAgentsBridge`/`copyAgentsBridgeKey`/
+  `regenerateAgentsBridgeKey`/`checkAgentsPicker`) удалён в 1.14.13 —
+  поток customendpoint не нужен.
+
+**Исторический ресёрч ниже (CustomEndpoint-путь, 2026-08-14):**
+
+
+Пользователь обнаружил в Agents Window UI добавление кастомного
+эндпоинта + API-ключа — это и есть BYOK-механизм, который в ресёрче был
+открытым вопросом №3. Разобрано по бандлам установленного VS Code 1.131:
+
+- В `extensions/copilot/dist/extension.js` есть 9 BYOK-провайдеров
+  (Anthropic, Gemini, xAI, OpenAI/OpenRouter, Azure, **CustomOAI**,
+  **CustomEndpoint**), регистрируются через
+  `registerLanguageModelChatProvider` (сервис `byok-contribution`,
+  метод `_buildProviders`).
+- `CustomEndpoint`/`CustomOAI` (классы `aP`/`GI`) ходят в наш URL так:
+  - `GET {base}/models` с `Authorization: Bearer <key>` — ждёт
+    `{data:[{id,...}]}` или `{models:[...]}` (`getModelsDiscoveryUrl` =
+    `{url}/models`, `callSite: byok-models-discovery`);
+  - `POST {base}/chat/completions` (или `/responses` при
+    `apiType=responses`) — OpenAI-совместимый, SSE-стриминг, tools,
+    thinking (`h3i`/`b3i` добавляют `/v1/chat/completions` к base URL);
+  - ключ хранится у Copilot в SecretStorage (`copilot-byok-...-api-key`),
+    модели — в globalState (`copilot-byok-...-models-config`).
+- Агент-хост достаёт BYOK-модели через мост `agentHostByokLmHandler`
+  (канал renderer→agent-host `agentHostClientByokLm`: `models` →
+  `listModels`, `chat` → `chat`).
+
+**Решение, реализованное в расширении (1.14.4):**
+- `src/byok/agents-bridge-server.ts` — node:http сервер на 127.0.0.1
+  (порт по умолчанию 17811, fallback +20 при занятости), локальный
+  API-ключ (64 hex, SecretStorage `llamacpp.agentsBridgeApiKey`),
+  timing-safe проверка Bearer.
+- `src/byok/openai-message-converter.ts` — конвертеры OpenAI ↔
+  vscode.LanguageModelChat (сообщения, tools, SSE-дельта, non-stream
+  ответ). Requests идут через `vscode.lm` в наш composite provider,
+  поэтому Local/DeepSeek/Codex/Claude/custom API работают с той же
+  механикой (подписки, лимиты, tool calling, reasoning, компакция).
+- Команды: `llamacpp.toggleAgentsBridge`, `llamacpp.copyAgentsBridgeKey`,
+  `llamacpp.regenerateAgentsBridgeKey`; группа «Agents Bridge» в Quick
+  Access показывает URL и ключ при включении; карточка в Providers
+  Manager; авто-восстановление после перезагрузки окна; настройки
+  `llamacpp.agentsBridgeEnabled` / `llamacpp.agentsBridgePort`.
+- Тесты: `src/test/agents-bridge.test.ts` (414 passing всего).
+
+Проверка вручную: включить мост → в Agents Window добавить custom
+endpoint: URL `http://127.0.0.1:<port>/v1`, ключ из Quick Access →
+выбрать модель (id вида `deepseek::deepseek-chat`, `codex::...`,
+`claude::...`, `local::...`, `api-<id>::...`).
+
+---
+
 
 Источники: установленный VS Code **1.131** (`e4c7e7b1d6/resources/app`),
 расширение **OpenAI ChatGPT 26.707.91948** (`~/.vscode/extensions`),

@@ -1,5 +1,143 @@
 # Changelog
 
+## 1.14.13 (dev) - 2026-08-15
+
+- **Removed the Agents Bridge HTTP proxy.** The local OpenAI-compatible
+  endpoint (127.0.0.1 server, API key in SecretStorage, custom-endpoint
+  flow) proved unnecessary: models registered by the extension's own
+  language-model provider reach the Agents Window directly via
+  `chat.agentHost.byokModels.enabled`. Deleted
+  `src/byok/agents-bridge-server.ts`,
+  `src/byok/agents-bridge-file-fill.ts`,
+  `src/byok/openai-message-converter.ts`,
+  `src/byok/agents-bridge-agent-host.ts` and their tests; removed the
+  commands `llamacpp.toggleAgentsBridge`/`copyAgentsBridgeKey`/
+  `regenerateAgentsBridgeKey`/`checkAgentsPicker`, the
+  `llamacpp.agentsBridgeEnabled`/`agentsBridgePort` settings, the Quick
+  Access group, and the Providers Manager card.
+- The BYOK flag is now enabled unconditionally at activation (it never
+  overwrites a user-provided value) — except in the test runner, where the
+  chat.* write would restart the test instance's agent host mid-run — and the
+  agent-host thinking patch is toggled from Quick Access → Copilot Patches →
+  "Thinking picker (Agents)".
+
+## 1.14.12 (dev) - 2026-08-15
+
+- **Fix: Agents chat crashed after picking a thinking level** ("non-streaming
+  response body was not valid JSON"). VS Code 1.131's BYOK loopback proxy
+  (\`ByokLmProxyService\`, 127.0.0.1 loopback in the agent host) always answers
+  with \`text/event-stream\`, even when the native Copilot SDK sends a
+  non-streaming request — the SDK then fails JSON parsing and retries 5 times
+  (visible in extension logs as repeated turns with identical prompts). The
+  agent-host patch now answers non-streaming requests with a JSON
+  \`chat.completion\` (content + tool_calls + usage) and keeps SSE for
+  streaming requests.
+- The BYOK proxy also drops \`reasoning_effort\` from the SDK body; the patch
+  forwards it as \`modelOptions.reasoningEffort\` so the thinking-level picker
+  actually reaches the model (previously the model always used the
+  \`llamacpp.thinkingMode\` default).
+- Agent-host patch now applies three patterns idempotently (thinking-level
+  schema, non-streaming JSON, reasoning-effort forwarding) with one backup and
+  one restore path.
+
+## 1.14.11 (dev) - 2026-08-15
+
+- **Thinking-level picker for BYOK models in the Agents Window.** VS Code
+  1.131 omits the `configSchema` from BYOK snapshot models, so the model
+  picker has no reasoning-effort switch. New agent-host patch
+  (`llamacpp.toggleAgentHostThinkingPatch` / Quick Access → Agents Bridge →
+  "Thinking picker (patch)") adds a `thinkingLevel` schema
+  (low/medium/high/extra-high) to the agent-host bundle with backup, syntax
+  validation, status and restore — same lifecycle as the Copilot patch.
+- The provider now reads `modelOptions.thinkingLevel` in addition to
+  `reasoningEffort`, so the picker value reaches the model.
+- DeepSeek reasoning mapping extended per official docs
+  (api-docs.deepseek.com/guides/thinking_mode, 2026-08-15): "light" now maps
+  to `reasoning_effort: "low"` (previously "high"); API levels are
+  low/high/max with medium/xhigh as aliases of high.
+
+## 1.14.10 (dev) - 2026-08-14
+
+- **Request status in bridge logs.** Every request handled by the Agents
+  Bridge is now logged with its HTTP status (`byok.bridge.request`), so
+  "Invalid API key" (401) and model-not-found (404) failures from the Agents
+  Window are diagnosable without guessing.
+
+## 1.14.9 (dev) - 2026-08-14
+
+- **Agent-host contract tests + picker diagnostic.** Tests now reproduce the
+  "only Auto in the picker" bug at its real layer: VS Code 1.131 maps
+  `chat.agentHost.byokModels.enabled` into the agent-host env
+  `VSCODE_AGENT_HOST_BYOK_MODELS_ENABLED` only at spawn time, and window
+  reloads never respawn the process. A flag enabled after the first spawn
+  keeps the picker on Auto until the agent host is restarted.
+- New Quick Access item `Agents Bridge → Check model picker`
+  (`llamacpp.checkAgentsPicker`) diagnoses the flag/env contract and tells
+  whether a restart of the agent-host process is required.
+
+## 1.14.8 (dev) - 2026-08-14
+
+- **"Add custom endpoint → paste key → done" now works.** VS Code 1.131's
+  Add UI writes a blank template into `chatLanguageModels.json` and opens it
+  for manual editing (it never asks for a URL, so discovery never runs). The
+  extension now watches that file and fills the empty Custom Endpoint group
+  with the bridge catalog automatically — just close the editor tab.
+- Added file-fill tests (empty template, user-filled groups untouched, other
+  vendors untouched, empty catalog, and a real file-watcher test).
+
+## 1.14.7 (dev) - 2026-08-14
+
+- **Agents Window chat fixed.** The model picker sends the qualified model
+  identifier (`customendpoint/<group>/<modelId>`) in chat requests; the
+  bridge rejected it with 404. The model lookup now accepts any path-shaped
+  alias whose last segment matches a catalog model id.
+- Added Agents Window integration tests: discovery via `GET /models` (the
+  add-source step) and chat via both the picker identifier and the plain model
+  id, covering the SSE contract (`data: [DONE]`).
+
+## 1.14.6 (dev) - 2026-08-14
+
+- **No more empty model count at startup.** The Agents Bridge now retries the
+  model catalog fill until providers have registered their models (up to 6
+  attempts, 1.5 s apart — the startup race where the bridge came up before
+  `llamacpp` providers is gone). Quick Access and Providers Manager refresh
+  automatically once the catalog is ready.
+- Catalog changes in VS Code chat models trigger an immediate refetch
+  (`refreshCatalogNow`), and the bridge logs `catalog_ready` /
+  `catalog_empty` events for diagnostics.
+
+## 1.14.5 (dev) - 2026-08-14
+
+- **Agents Bridge out of the box.** The extension now enables the VS Code
+  experimental flag `chat.agentHost.byokModels.enabled` automatically when
+  the bridge is turned on (a user-provided value is never overwritten), so
+  BYOK models appear in the Agents Window model picker without manual setup.
+- **Live model count.** The bridge fills its model catalog right at startup
+  instead of waiting for the first discovery request, so Quick Access and
+  Providers Manager show the real model count as soon as the bridge starts.
+  The catalog refreshes when VS Code chat models change.
+
+## 1.14.4 (dev) - 2026-08-14
+
+- **Agents Bridge — all models in the VS Code Agents Window.** The extension
+  can now run a local OpenAI-compatible endpoint on 127.0.0.1 (default port
+  17811) protected by a locally generated API key. Add it as a custom
+  endpoint in the Agents Window (Copilot BYOK) and the whole catalog —
+  Local, DeepSeek, Codex, Claude, and custom API profiles — becomes
+  available there.
+- **One converter for every source.** Requests from the Agents Window are
+  translated into vscode.lm calls against our composite provider, so
+  subscriptions (Codex/Claude), limits, reasoning, and tool calling behave
+  exactly as they do in the regular chat.
+- **Toggle-driven, key in Quick Access.** Enable via Quick Access
+  ("Agents Bridge" group) or Providers Manager; while running, the group
+  shows the endpoint URL and the API key (click to copy). Regenerate the
+  key anytime. The bridge restores automatically after a window reload if
+  it was left on.
+- GET /models lists every advertised model with token limits and tool/vision
+  capabilities; POST /chat/completions supports SSE streaming, tool calls,
+  reasoning_content, and non-streaming responses.
+
 ## 1.14.3 (stable) - 2026-08-14
 
 Centralized provider management: one Providers Manager for every source

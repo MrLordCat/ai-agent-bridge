@@ -357,7 +357,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
 		private readonly getMemoryContextTokens: () => number = () => 0,
 		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 }),
-		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined
+		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined,
 	) {}
 
 	refresh(): void {
@@ -977,8 +977,14 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const patches = new QuickAccessItem("patches", "Copilot Patches", {
 			description: `${patchStatus.applied ? "controls \u2713" : "controls \u2717"} \u00b7 ${patchStatus.workbenchApplied ? "bounds \u2713" : "bounds \u2717"}`,
 			icon: new vscode.ThemeIcon("pinned"),
-			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. Click to open the detailed status log.`,
+			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. The agent-host thinking patch is toggled below. Click to open the detailed status log.`,
 			children: [
+				new QuickAccessItem("patches.thinking", "Thinking picker (Agents)", {
+					description: "toggle the thinking-level picker for BYOK models",
+					tooltip: "Patches the VS Code agent-host bundle so the Agents model picker gets a Thinking level switch (low/medium/high/extra-high) and answers non-streaming SDK requests with JSON.",
+					icon: new vscode.ThemeIcon("symbol-boolean"),
+					command: command("llamacpp.toggleAgentHostThinkingPatch", "Toggle Thinking Picker Patch"),
+				}),
 				new QuickAccessItem("patches.status", "Show Patch Status", {
 					icon: new vscode.ThemeIcon("info"),
 					command: command("llamacpp.copilotPatchStatus", "Show Copilot Patch Status"),

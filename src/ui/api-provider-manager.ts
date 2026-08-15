@@ -157,6 +157,7 @@ function renderBuiltinProviders(state: ApiProviderManagerRenderState): string {
 				{ command: "llamacpp.codexShowStatus", label: "Account status" },
 			]));
 	}
+
 	if (claude) {
 		const badges = [
 			{ label: claude.summary ?? "Checking..." },

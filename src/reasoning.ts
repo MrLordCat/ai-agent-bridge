@@ -32,6 +32,8 @@ export function resolveRequestThinkingMode(
 	const requestedMode =
 		modelOptions?.reasoningEffort ??
 		modelOptions?.reasoning_effort ??
+		modelOptions?.thinkingLevel ??
+		modelOptions?.thinking_level ??
 		modelOptions?.thinkingMode ??
 		modelOptions?.thinking_mode;
 
@@ -59,13 +61,17 @@ export function resolveReasoningBudget(mode: ThinkingMode, configuredBudget: num
 	}
 }
 
-export function toDeepSeekReasoningEffort(mode: ThinkingMode): "high" | "max" | undefined {
+// DeepSeek API (api-docs.deepseek.com/guides/thinking_mode, verified 2026-08-15):
+// `reasoning_effort` accepts low|high|max; the API also maps user-set
+// "medium" and "xhigh" to the model's "high" level. "none" disables thinking.
+export function toDeepSeekReasoningEffort(mode: ThinkingMode): "low" | "high" | "max" | undefined {
 	switch (mode) {
 		case "off":
 			return undefined;
 		case "deep":
 			return "max";
 		case "light":
+			return "low";
 		case "balanced":
 		case "auto":
 		default:
