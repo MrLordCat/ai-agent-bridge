@@ -24,7 +24,7 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm run package -- --out llama-vscode-chat.vsix
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: llama-vscode-chat-vsix
           path: llama-vscode-chat.vsix
