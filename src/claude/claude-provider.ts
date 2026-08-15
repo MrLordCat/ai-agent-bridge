@@ -1283,6 +1283,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			reason: string;
 			input: SDKUserMessage;
 			estimatedTokens: number;
+			truncatedChars: number;
 		} | undefined;
 		if (!session && conversationId && this.durableSessionsEnabled()) {
 			const exact = this.durableSessions.get(this.durableSessionKey(modelId, conversationId));
@@ -1290,6 +1291,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 					messages,
 					toolSchemaTokens,
+					safety.resumeFallbackMaxInputTokens,
 					`quarantined:${exact.quarantineReason ?? "unknown"}`
 				);
 			}
@@ -1347,6 +1349,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 						messages,
 						toolSchemaTokens,
+						safety.resumeFallbackMaxInputTokens,
 						persisted.quarantineReason
 					);
 					this.logSink?.log("claude.chat.persisted_session_quarantined", {
@@ -1362,6 +1365,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 						messages,
 						toolSchemaTokens,
+						safety.resumeFallbackMaxInputTokens,
 						persisted.quarantineReason
 					);
 					this.logSink?.log("claude.chat.persisted_session_quarantined", {
@@ -1437,12 +1441,14 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 					messages,
 					toolSchemaTokens,
+					safety.resumeFallbackMaxInputTokens,
 					`cold_replay_guard:${estimatedColdTokens}`
 				);
 				this.logSink?.log("claude.chat.cold_replay_reduced", {
 					model: modelId,
 					estimatedColdTokens,
 					estimatedLatestUserTokens: latestOnlyRecovery.estimatedTokens,
+					truncatedChars: latestOnlyRecovery.truncatedChars,
 					maxReplayTokens: safety.resumeFallbackMaxInputTokens,
 				}, "warn");
 			}
@@ -1476,6 +1482,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				model: modelId,
 				reason: latestOnlyRecovery.reason,
 				estimatedTokens: latestOnlyRecovery.estimatedTokens,
+				truncatedChars: latestOnlyRecovery.truncatedChars,
 				usagePercent: this.claudeUsageLimitPercent,
 			}, "warn");
 		}
@@ -1567,6 +1574,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			messageCount: messages.length,
 			inputMode: latestOnlyRecovery ? "latest-user" : reused ? "user-turn" : "full",
 			recoveryEstimatedTokens: latestOnlyRecovery?.estimatedTokens,
+			latestUserHead: latestOnlyRecovery ? summarizeLatestUserText(latestOnlyRecovery.input, true) : undefined,
+			latestUserTail: latestOnlyRecovery ? summarizeLatestUserText(latestOnlyRecovery.input, false) : undefined,
 			maxInputChars,
 			conversationIdPresent: conversationId !== undefined,
 			copilotTurnIndex,
@@ -1638,6 +1647,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 						const latest = this.prepareClaudeLatestOnlyRecovery(
 							messages,
 							toolSchemaTokens,
+							safety.resumeFallbackMaxInputTokens,
 							`resume_failed:${resumeFailure.reason}`
 						);
 						const latestDecision = resolveClaudeResumeFallbackDecision({
@@ -2176,17 +2186,24 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	private prepareClaudeLatestOnlyRecovery(
 		messages: readonly vscode.LanguageModelChatRequestMessage[],
 		toolSchemaTokens: number,
+		maxTokens: number,
 		reason: string
-	): { reason: string; input: SDKUserMessage; estimatedTokens: number } {
-		const input = createLatestUserMessage(messages);
-		const content = JSON.stringify(input.message.content);
+	): { reason: string; input: SDKUserMessage; estimatedTokens: number; truncatedChars: number } {
+		const rawInput = createLatestUserMessage(messages);
+		const rawContent = rawInput.message.content as unknown as Record<string, unknown>[];
+		const truncated = truncateLatestUserContent(
+			rawContent,
+			Math.max(1_024, maxTokens - toolSchemaTokens)
+		);
+		const input = truncated.truncatedChars > 0 ? createSdkUserMessage(truncated.content) : rawInput;
 		return {
 			reason,
 			input,
 			estimatedTokens: estimateClaudeRecoveryTokens(
-				estimateClaudeTokens(content),
+				estimateClaudeTokens(JSON.stringify(truncated.content)),
 				toolSchemaTokens
 			),
+			truncatedChars: truncated.truncatedChars,
 		};
 	}
 
@@ -2489,6 +2506,23 @@ export function extractFollowUpUserText(
 	return text.length > 0 ? text : undefined;
 }
 
+/** User messages longer than this are treated as whole-transcript blobs, not real follow-ups. */
+export const CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS = 6_000;
+
+function summarizeLatestUserText(input: SDKUserMessage, head: boolean): string | undefined {
+	const content = input.message.content;
+	const parts = Array.isArray(content) ? content : [];
+	const text = parts
+		.filter(part => typeof part === "object" && part !== null && (part as { type?: unknown }).type === "text")
+		.map(part => String((part as { text?: unknown }).text ?? ""))
+		.join("\n");
+	if (!text) {
+		return undefined;
+	}
+	const window = text.slice(0, 400).replace(/\s+/g, " ");
+	return head ? window : text.slice(Math.max(0, text.length - 400)).replace(/\s+/g, " ");
+}
+
 export function createLatestUserMessage(
 	messages: readonly vscode.LanguageModelChatRequestMessage[]
 ): SDKUserMessage {
@@ -2499,15 +2533,29 @@ export function createLatestUserMessage(
 	// message" would send a JSON blob of the result instead of the user's
 	// task (observed: Claude continued the previous task). Skip trailing
 	// user messages that carry only tool results.
-	const latest = [...messages]
+	const candidates = [...messages]
 		.reverse()
-		.find(message =>
+		.filter(message =>
 			message.role === vscode.LanguageModelChatMessageRole.User
 			&& message.content.some(part =>
 				(part instanceof vscode.LanguageModelTextPart && part.value.trim().length > 0)
 				|| (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/"))
 			)
 		);
+	// The trailing user message in an Agents Window transcript can be a giant
+	// blob (the whole conversation) with no question in it. When a short,
+	// focused user follow-up exists before it, that is the user's real task.
+	const textChars = (message: vscode.LanguageModelChatRequestMessage): number => {
+		let chars = 0;
+		for (const part of message.content) {
+			if (part instanceof vscode.LanguageModelTextPart) {
+				chars += part.value.length;
+			}
+		}
+		return chars;
+	};
+	const latest = candidates.find(message => textChars(message) <= CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS)
+		?? candidates[0];
 	if (!latest) {
 		return createSdkUserMessage([{ type: "text", text: "Continue." }]);
 	}
@@ -2531,6 +2579,43 @@ export function createLatestUserMessage(
 		content.push({ type: "text", text: JSON.stringify(serializeMessage(latest)) });
 	}
 	return createSdkUserMessage(content);
+}
+
+export function truncateLatestUserContent(
+	content: Record<string, unknown>[],
+	maxTokens: number
+): { content: Record<string, unknown>[]; truncatedChars: number } {
+	const estimate = (candidate: Record<string, unknown>[]): number => estimateClaudeTokens(JSON.stringify(candidate));
+	if (estimate(content) <= maxTokens) {
+		return { content, truncatedChars: 0 };
+	}
+	// An Agents Window transcript can arrive as a single giant user message
+	// (the whole conversation). Keep the fresh tail — it contains the actual
+	// question — and drop the stale head until the estimate fits the budget.
+	const textParts = content.filter(part => part.type === "text" && typeof (part as { text?: unknown }).text === "string");
+	const nonTextParts = content.filter(part => part.type !== "text");
+	const fullText = textParts.map(part => (part as { text: string }).text).join("\n");
+	const build = (tailLength: number): Record<string, unknown>[] => [
+		{ type: "text", text: fullText.slice(fullText.length - tailLength) },
+		...nonTextParts,
+	];
+	let low = 0;
+	let high = fullText.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (estimate(build(mid)) <= maxTokens) {
+			low = mid;
+		} else {
+			high = mid - 1;
+		}
+	}
+	const tailLength = low;
+	const truncatedChars = fullText.length - tailLength;
+	if (truncatedChars === 0) {
+		// Nothing can make it fit: keep the original and let the caller decide.
+		return { content, truncatedChars: 0 };
+	}
+	return { content: build(tailLength), truncatedChars };
 }
 
 function createSdkUserMessage(content: Record<string, unknown>[]): SDKUserMessage {

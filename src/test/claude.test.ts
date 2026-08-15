@@ -17,6 +17,7 @@ import {
 	createLatestUserMessage,
 	estimateClaudeRecoveryTokens,
 	findLatestPersistedClaudeConversation,
+	truncateLatestUserContent,
 	findPersistedClaudeConversation,
 	extractFollowUpUserText,
 	resolveClaudeResumeFallbackDecision,
@@ -717,6 +718,24 @@ test("marks the session stream as closed after an interrupt", async () => {
 		assert.ok(!content[0].text?.includes("file content"));
 	});
 
+	test("prefers the latest focused user message over a trailing transcript-sized one", () => {
+		// Regression for the 2026-08-15 Agents Window failure: the trailing user
+		// message can be a whole-transcript blob (~45K tokens) with no question in
+		// it. The recovery must pick the user's actual short follow-up instead.
+		const messages = [
+			vscode.LanguageModelChatMessage.User("old task"),
+			vscode.LanguageModelChatMessage.Assistant("done"),
+			vscode.LanguageModelChatMessage.User("fix the failing test please"),
+			vscode.LanguageModelChatMessage.Assistant("ok"),
+			vscode.LanguageModelChatMessage.User("TRANSCRIPT-FILLER".repeat(1_000)),
+		];
+		const built = createLatestUserMessage(messages);
+		const content = built.message.content as Array<{ type: string; text?: string }>;
+
+		assert.strictEqual(content.length, 1);
+		assert.strictEqual(content[0].text, "fix the failing test please");
+	});
+
 	test("falls back to Continue when the tail has no real user content", () => {
 		const built = createLatestUserMessage([
 			vscode.LanguageModelChatMessage.User([
@@ -730,6 +749,33 @@ test("marks the session stream as closed after an interrupt", async () => {
 		assert.strictEqual(content.length, 1);
 		assert.strictEqual(content[0].type, "text");
 		assert.strictEqual(content[0].text, "Continue.");
+	});
+
+	test("truncates an oversized latest user message to fit the token budget, keeping the tail", () => {
+		// Regression for the 2026-08-15 production failure: the last user message
+		// in an Agents Window transcript can carry the whole conversation
+		// (~178K tokens), so the latest-only recovery was blocked instead of
+		// sending a bounded tail.
+		const tailMarker = "ANSWER-THIS-FRESH-QUESTION";
+		const oversized = [
+			{ type: "text", text: "history-filler".repeat(60_000) + tailMarker },
+		];
+		const before = estimateClaudeTokens(JSON.stringify(oversized));
+		assert.ok(before > 64_000, `expected an oversized message, got ${before} tokens`);
+		const result = truncateLatestUserContent(oversized, 64_000);
+		const after = estimateClaudeTokens(JSON.stringify(result.content));
+		assert.ok(after <= 64_000, `truncated content must fit the budget: ${after}`);
+		assert.ok(result.truncatedChars > 0);
+		const text = (result.content.find(part => part.type === "text") as { text: string }).text;
+		assert.ok(text.endsWith(tailMarker), "the fresh tail of the message must be preserved");
+		assert.ok(text.length < (oversized[0] as { text: string }).text.length, "the message must actually be shortened");
+	});
+
+	test("keeps an undersized latest user message unchanged", () => {
+		const content = [{ type: "text", text: "small question" }];
+		const result = truncateLatestUserContent(content, 64_000);
+		assert.deepStrictEqual(result.content, content);
+		assert.strictEqual(result.truncatedChars, 0);
 	});
 
 	test("builds separate 5h, weekly, and model-scoped usage limits", () => {
