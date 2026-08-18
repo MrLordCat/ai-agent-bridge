@@ -329,6 +329,63 @@ export function validateToolArguments(argumentsValue: Record<string, unknown>, s
 	return issues.slice(0, 8);
 }
 
+const TERMINAL_ASYNC_COMMAND_PATTERNS: RegExp[] = [
+	/\b(server|servers|daemon|nodemon)\b/i,
+	/\bserve\b/i,
+	/\bwatch\b/i,
+	/\buvicorn\b|\bgunicorn\b|\brunserver\b/i,
+	/\bflask\s+run\b/i,
+	/\bnext\s+dev\b|\bvite\b|\bwebpack\s+dev/i,
+	/\b(npm|yarn|pnpm)\s+(run\s+)?(dev|serve|start)\b/i,
+	/\bdocker\s+(compose\s+)?up\b/i,
+	/\b--watch\b/i,
+	/tail\s+(-[a-zA-Z]+\s+)*-?f\b|\bdocker\s+logs\b.*\s-f\b|\bjournalctl\b.*\s-f\b/i,
+	/^(htop|btop|top)\b/i,
+	/&\s*$/,
+];
+
+/**
+ * Whether a terminal command looks like a genuinely long-running process
+ * (server, watcher, daemon, tail -f) that legitimately needs its own
+ * persistent terminal. Everything else is ephemeral and belongs in the
+ * session terminal (sync mode).
+ */
+export function shouldKeepTerminalAsync(command: string): boolean {
+	const normalized = command.trim();
+	if (!normalized) {
+		return false;
+	}
+	return TERMINAL_ASYNC_COMMAND_PATTERNS.some(pattern => pattern.test(normalized));
+}
+
+/**
+ * Models frequently call run_in_terminal with mode=async (or the legacy
+ * isBackground=true) even for one-shot commands, and the VS Code host creates
+ * a NEW persistent terminal for every async invocation. Ephemeral commands
+ * are rewritten to sync so the host reuses the session terminal instead of
+ * spawning terminal windows. Genuinely long-running processes keep async.
+ */
+function repairEphemeralAsyncTerminal(
+	name: string,
+	argumentsValue: Record<string, unknown>,
+	repairEnabled: boolean
+): boolean {
+	if (!repairEnabled || name !== "run_in_terminal") {
+		return false;
+	}
+	const command = argumentsValue.command;
+	if (typeof command !== "string" || !command.trim()) {
+		return false;
+	}
+	const isAsync = argumentsValue.mode === "async" || argumentsValue.isBackground === true;
+	if (!isAsync || shouldKeepTerminalAsync(command)) {
+		return false;
+	}
+	argumentsValue.mode = "sync";
+	delete argumentsValue.isBackground;
+	return true;
+}
+
 function repairTerminalTimeout(
 	name: string,
 	argumentsValue: Record<string, unknown>,
@@ -450,6 +507,12 @@ export class ToolCallReliabilityGuard {
 				this.metrics.unknownTool += 1;
 				return { ok: false, pending: false, kind: "unknown_tool", reason: `unknown tool: ${rawName || "<missing>"}` };
 			}
+		}
+		if (repairEphemeralAsyncTerminal(name, parsed.value, this.options.repairEnabled)) {
+			repaired = true;
+		}
+		if (repairEphemeralAsyncTerminal(name, parsed.value, this.options.repairEnabled)) {
+			repaired = true;
 		}
 		if (repairTerminalTimeout(name, parsed.value, this.options.repairEnabled)) {
 			repaired = true;

@@ -6,6 +6,8 @@ import { Script } from "node:vm";
 
 export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v22";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
+export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID = "llama-vscode-chat:copilot-git-repositories-guard:v1";
+export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER = `/* ${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-history-bounds:v2";
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER = "/* llama-vscode-chat:vscode-chat-history-bounds:v1 */";
@@ -267,6 +269,30 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 		"extension terminal output serializer"
 	);
 	return patched;
+}
+
+/**
+ * Guards the Copilot git branch service against a non-array `repositories`
+ * value. On some starts the Git extension API hands out an unexpected value,
+ * and Copilot's `fp`-derived list dies with "e is not iterable" in
+ * D8e.setItems (Kk.init), retried on a timer every ~30s. Wrapping the value
+ * in Array.isArray keeps the reactive chain array-shaped at no behavior cost.
+ */
+export function patchCopilotGitRepositoriesGuard(source: string): string {
+	if (source.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)) {
+		return source;
+	}
+	const pattern = "()=>t.repositories??[]";
+	const occurrences = source.split(pattern).length - 1;
+	if (occurrences !== 1) {
+		throw new Error(
+			`Copilot git repositories pattern not unique (found ${occurrences}); VS Code shape changed.`
+		);
+	}
+	return source.replace(
+		pattern,
+		`${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER}()=>Array.isArray(t.repositories)?t.repositories:[]`
+	);
 }
 
 export function patchCopilotBundle(source: string): string {
@@ -649,13 +675,13 @@ export function formatCopilotPatchStatus(status: CopilotPatchStatus): string {
 
 export function applyCopilotPatch(target: CopilotPatchTarget, force = false): CopilotPatchResult {
 	const initialStatus = getCopilotPatchStatus(target);
-	if (initialStatus.applied && initialStatus.workbenchApplied) {
+	const installed = fs.readFileSync(target.bundlePath, "utf8");
+	if (initialStatus.applied && initialStatus.workbenchApplied && installed.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)) {
 		return { changed: false, status: initialStatus, message: "Copilot Chat patch is already applied." };
 	}
 	if (initialStatus.legacyPatch && !initialStatus.backupExists) {
 		throw new Error("Cannot upgrade the legacy Copilot patch because its original bundle backup is missing.");
 	}
-	const installed = fs.readFileSync(target.bundlePath, "utf8");
 	const original = initialStatus.applied
 		? installed
 		: initialStatus.legacyPatch
@@ -679,7 +705,7 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 		);
 	}
 
-	const patched = patchCopilotBundle(original);
+	const patched = patchCopilotGitRepositoriesGuard(patchCopilotBundle(original));
 	const patchedWorkbench = patchVsCodeWorkbenchBundle(installedWorkbenchBefore);
 	const validationPath = target.bundlePath + ".llama-vscode-chat.tmp.js";
 	const workbenchValidationPath = target.workbenchPath + ".llama-vscode-chat.tmp.mjs";

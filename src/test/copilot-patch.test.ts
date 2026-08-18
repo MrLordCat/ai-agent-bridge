@@ -7,14 +7,29 @@ import { Script } from "node:vm";
 import * as vscode from "vscode";
 
 import {
+	COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER,
 	COPILOT_PATCH_ID,
 	COPILOT_PATCH_MARKER,
 	findCopilotBundle,
+	patchCopilotGitRepositoriesGuard,
 	patchCopilotBundle,
 	patchExtensionTokenizerCache,
 	patchVsCodeWorkbenchBundle,
 	VSCODE_CHAT_HISTORY_PATCH_MARKER,
 } from "../copilot-patch";
+
+	test("guards the git repositories reactive chain with Array.isArray", () => {
+		const source = 'class X{async init(){let t=await P(this.a);let r=no(this,o=>t.onDidOpenRepository(o),()=>t.repositories??[]);await Q(r,o=>o.length>0,void 0),!this.s&&fp(this,r,(o,a)=>{a.add(L())},o=>o.rootUri.toString()).recomputeInitiallyAndOnChange(this.s)}}';
+		const patched = patchCopilotGitRepositoriesGuard(source);
+		assert.ok(patched.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER), "guard marker must be present");
+		assert.ok(patched.includes("()=>Array.isArray(t.repositories)?t.repositories:[]"), "Array.isArray guard must be present");
+		assert.ok(!patched.includes("()=>t.repositories??[]"), "original unguarded expression must be gone");
+		new Function(patched);
+		// Idempotent.
+		assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
+		// Non-unique / missing pattern must throw.
+		assert.throws(() => patchCopilotGitRepositoriesGuard("class X{}"), /not unique/);
+	});
 
 suite("Copilot patch", () => {
 	test("keeps v16 prompt rendering and stored tool output bounded", function () {

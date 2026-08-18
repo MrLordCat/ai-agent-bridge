@@ -9,7 +9,7 @@ import { MANUAL_COMPACTION_TRIGGER } from "../context/manual-compaction";
 import { ReasoningRepetitionDetector, ReasoningRepetitionError } from "../context/reasoning-repetition";
 import { ToolCallValidationError, type ToolCallReliabilityMetrics } from "../tools/tool-call-reliability";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
-import { convertMessages, convertTools, validateRequest } from "../utils";
+import { convertMessages, convertTools, stripTerminalControlNoise, validateRequest } from "../utils";
 
 // Mock SecretStorage
 class MockSecretStorage implements vscode.SecretStorage {
@@ -762,6 +762,21 @@ suite("Llama.cpp Chat Provider Extension", () => {
 		assert.strictEqual(providerAny.lastToolExecutionErrorDetails[0]?.name, "run_in_terminal");
 		assert.strictEqual(providerAny.lastToolExecutionErrorDetails[0]?.command, "npm run compile");
 	});
+
+        test("strips cursor position report noise from terminal tool text", () => {
+            assert.strictEqual(stripTerminalControlNoise("[22;3R"), "");
+            assert.strictEqual(stripTerminalControlNoise("3R[21;5R[21;11R"), "");
+            assert.strictEqual(stripTerminalControlNoise("\x1b[21;5R"), "");
+            assert.strictEqual(stripTerminalControlNoise("$ [22;3R"), "");
+            assert.strictEqual(
+                stripTerminalControlNoise("output line\n[22;3R\nmore output"),
+                "output line\nmore output"
+            );
+            // Legitimate text must survive.
+            assert.strictEqual(stripTerminalControlNoise('echo "[22;3R"'), 'echo "[22;3R"');
+            assert.strictEqual(stripTerminalControlNoise("[21;5R] bracket text"), "[21;5R] bracket text");
+            assert.strictEqual(stripTerminalControlNoise("npm test\n42 passing"), "npm test\n42 passing");
+        });
 
         test("strips every cache_control marker shape so tool text stays stable", () => {
             // Shape VS Code emits today; the previous regex did not match it and the

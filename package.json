@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.14.16",
+	"version": "1.14.21",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -300,9 +300,14 @@
 					"maximum": 200,
 					"description": "Maximum Claude Agent SDK model segments in one outer VS Code turn. Set to 0 to disable this segment cap; the cumulative-input circuit breaker remains active."
 				},
+				"llamacpp.workbenchTerminalPatchEnabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Reuse an idle background tool terminal for sync commands instead of spawning a new terminal per call (patches the VS Code workbench bundle; requires a window restart to take effect)."
+				},
 				"llamacpp.claudeMaxCumulativeInputTokens": {
 					"type": "number",
-					"default": 2000000,
+					"default": 10000000,
 					"minimum": 100000,
 					"maximum": 50000000,
 					"description": "Maximum cumulative Claude input tokens processed across all model segments in one outer VS Code turn."

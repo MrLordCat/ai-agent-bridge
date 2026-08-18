@@ -72,7 +72,7 @@ import {
     type ProviderHealthReport,
     type ProviderHealthSourceReport,
 } from "./diagnostics/provider-health";
-import { BoundedMap, convertMessages, convertTools, stableJsonStringify, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
+import { BoundedMap, convertMessages, convertTools, stableJsonStringify, stripTerminalControlNoise, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
 import { LlamaLogSink } from "./logger";
 import { buildMemoryQuery, injectAppendOnlySharedMemoryContext } from "./memory/prompt";
 import { getCurrentWorkspaceScopeId } from "./memory/scope";
@@ -2369,7 +2369,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             let nextContent = content;
             if (this.getSanitizeToolResultArtifacts()) {
                 // Remove transient transport metadata sometimes appended to tool output text.
-                const cleaned = stripCacheControlArtifacts(nextContent)
+                const cleaned = stripTerminalControlNoise(stripCacheControlArtifacts(nextContent))
                     .replace(/\n{3,}/g, "\n\n")
                     .trimEnd();
                 if (cleaned !== nextContent) {

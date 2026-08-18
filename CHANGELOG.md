@@ -1,5 +1,87 @@
 # Changelog
 
+## 1.14.21 (dev) - 2026-08-16
+
+"e is not iterable" startup error fixed (foreign Copilot crash):
+
+- **Symptom**: at VS Code startup a dialog "AI Agent Bridge hit an
+  unexpected error: e is not iterable" appeared, and the error re-fired
+  every ~30s in some windows.
+- **Root cause**: the crash is in Copilot's own git branch service
+  (Kk.init -> D8e.setItems, "for..of" over the Git extension repositories
+  value, which is occasionally not an array). Our global uncaughtException
+  handler runs in the same extension-host process and was reporting the
+  foreign crash as our own error.
+- **Fixes**: (1) a new Copilot bundle patch guards the reactive chain with
+  Array.isArray (marker llama-vscode-chat:copilot-git-repositories-guard:v1,
+  applied on top of the v22 patch; original backup stays valid); (2) the
+  uncaughtException handler now logs foreign crashes as
+  extension.uncaught_exception_foreign without showing a dialog — only our
+  own stack traces produce a notice.
+- **Tests**: guard patch regression tests (428 extension-host tests total).
+
+## 1.14.20 (dev) - 2026-08-16
+
+Cursor position report noise filter for terminal tool output:
+
+- **Problem**: git-bash terminals periodically print stray CPR sequences
+  ("[22;3R", "3R[21;5R[21;11R") when bash/readline re-queries the cursor
+  position and the reply leaks into the terminal buffer. Verified that no
+  VS Code bundle sends ESC[6n — the query comes from the shell itself, so
+  the VS Code side cannot be patched; the noise confused agents parsing
+  command output.
+- **Fix**: stripTerminalControlNoise() in src/utils.ts removes CPR lines
+  (with and without ESC, including chains and prompt-glued variants) from
+  tool results in both the llama/DeepSeek sanitizer and the Claude tool
+  result converter. Legitimate text is untouched.
+- **Tests**: 8 regression cases (427 extension-host tests total).
+
+## 1.14.19 (dev) - 2026-08-16
+
+Idle background terminal reuse (workbench bundle patch):
+
+- **Problem**: VS Code 1.131's RunInTerminalTool caches one foreground
+  terminal per chat session, but once that terminal moves to the background
+  (sync timeout or interruption) every following sync call spawns a NEW
+  terminal — panels kept accumulating even with only sync calls.
+- **Fix**: patch the installed workbench bundle
+  (out/vs/workbench/workbench.desktop.main.js) so _initTerminal flips an
+  idle background terminal (shell alive, no executing command per the rich
+  CommandDetection capability) back to foreground and reuses it instead of
+  creating a new one. Original behavior preserved for busy/dead terminals.
+- **Controls**: llamacpp.workbenchTerminalPatchEnabled (default true,
+  auto-applied on activation, test mode excluded) and the
+  llamacpp.toggleWorkbenchTerminalPatch command; a backup is kept at
+  workbench.desktop.main.js.llama-vscode-chat.bak.
+- **Implementation**: src/byok/workbench-terminal-patch.ts + regression
+  tests (426 extension-host tests total).
+
+## 1.14.18 (dev) - 2026-08-16
+
+Terminal reuse for DeepSeek and local models:
+
+- **Problem**: models kept calling run_in_terminal with mode=async (or legacy
+  isBackground=true) even for one-shot commands, and the VS Code host creates
+  a NEW persistent terminal for every async invocation — terminal panels
+  multiplied despite the tool guidance.
+- **Fix**: the tool-call reliability guard now rewrites ephemeral async
+  terminal calls to sync, so the host reuses the session terminal (one
+  terminal per chat). Genuinely long-running processes (servers, watchers,
+  daemons, tail -f, npm run dev/serve/start, docker up, etc.) keep their own
+  persistent terminal.
+- **Implementation**: shouldKeepTerminalAsync() + repairEphemeralAsyncTerminal()
+  in src/tools/tool-call-reliability.ts; regression tests (421 extension-host
+  tests total).
+
+## 1.14.17 (dev) - 2026-08-15
+
+- **Default raised**: llamacpp.claudeMaxCumulativeInputTokens 2,000,000 →
+  10,000,000. The 2M default tripped on long normal agent flows (118 model
+  segments in one outer turn): the circuit breaker killed the turn mid-work,
+  VS Code restored the session, and the model burned quota re-discovering
+  context. 10M matches long multi-tool sessions while still capping runaway
+  turns (validation max is 50M).
+
 ## 1.14.16 (dev) - 2026-08-15
 
 Memory section in Quick Access is now workspace-aware:

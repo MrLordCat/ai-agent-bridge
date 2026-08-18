@@ -141,6 +141,35 @@ suite("tool call reliability", () => {
 		assert.ok(async.ok && async.arguments.timeout === 300 && !async.repaired);
 	});
 
+	test("forces sync for ephemeral async terminal calls but keeps long-running async", () => {
+		const guard = new ToolCallReliabilityGuard();
+		guard.configure([terminalTool], { repairEnabled: true, validateSchema: true });
+
+		// One-off command wrongly sent as async: becomes sync, reusing the session terminal.
+		const ephemeral = guard.evaluate("run_in_terminal", '{"command":"npm test","mode":"async","timeout":300000}', true);
+		assert.ok(ephemeral.ok);
+		assert.deepStrictEqual(ephemeral.ok && ephemeral.arguments, {
+			command: "npm test",
+			mode: "sync",
+			timeout: 300_000,
+		});
+		assert.strictEqual(ephemeral.ok && ephemeral.repaired, true);
+
+		// Legacy isBackground=true for a one-off command is normalized to sync.
+		const legacy = guard.evaluate("run_in_terminal", '{"command":"ls -la","mode":"sync","isBackground":true}', true);
+		assert.ok(legacy.ok);
+		assert.deepStrictEqual(legacy.ok && legacy.arguments, { command: "ls -la", mode: "sync" });
+		assert.strictEqual(legacy.ok && legacy.repaired, true);
+
+		// Genuinely long-running processes keep their own persistent terminal.
+		const devServer = guard.evaluate("run_in_terminal", '{"command":"npm run dev","mode":"async"}', true);
+		assert.ok(devServer.ok && !devServer.repaired && devServer.arguments.mode === "async");
+		const uvicorn = guard.evaluate("run_in_terminal", '{"command":"python -m uvicorn app:app --reload","mode":"async"}', true);
+		assert.ok(uvicorn.ok && !uvicorn.repaired && uvicorn.arguments.mode === "async");
+		const tail = guard.evaluate("run_in_terminal", '{"command":"tail -f app.log","mode":"async"}', true);
+		assert.ok(tail.ok && !tail.repaired && tail.arguments.mode === "async");
+	});
+
 	test("rejects unknown tools and invalid schemas", () => {
 		const guard = new ToolCallReliabilityGuard();
 		guard.configure([tool], { repairEnabled: true, validateSchema: true });

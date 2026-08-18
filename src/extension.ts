@@ -32,6 +32,7 @@ import { ApiProviderManagerPanel } from "./ui/api-provider-manager";
 import { ApiProviderService } from "./api-providers/api-provider-service";
 import { ProviderDirectory } from "./providers/provider-directory";
 import { applyAgentHostThinkingPatch, findAgentHostBundle, getAgentHostThinkingPatchStatus, restoreAgentHostThinkingPatch } from "./byok/agent-host-thinking-patch";
+import { applyWorkbenchTerminalPatch, findWorkbenchBundle, getWorkbenchTerminalPatchStatus, restoreWorkbenchTerminalPatch } from "./byok/workbench-terminal-patch";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
@@ -526,8 +527,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// not take the host down.
 	process.on("uncaughtException", (error) => {
 		try {
-			logService.logError("extension.uncaught_exception", error);
-			vscode.window.showWarningMessage(`AI Agent Bridge hit an unexpected error: ${error instanceof Error ? error.message : String(error)}. Details are in the extension log (AI Agent Bridge: Open Latest Log).`);
+			const stack = error instanceof Error ? (error.stack ?? "") : "";
+			const ours = stack.includes("mrlordcat.llama-vscode-chat") || stack.includes("AI Agent Bridge");
+			logService.logError(ours ? "extension.uncaught_exception" : "extension.uncaught_exception_foreign", error);
+			// Extensions share one extension-host process: uncaught exceptions from
+			// other extensions (e.g. Copilot's git service) must not surface as a
+			// scary "AI Agent Bridge" dialog. Only our own crashes get a notice.
+			if (ours) {
+				vscode.window.showWarningMessage(`AI Agent Bridge hit an unexpected error: ${error instanceof Error ? error.message : String(error)}. Details are in the extension log (AI Agent Bridge: Open Latest Log).`);
+			}
 		} catch {
 			// Nothing else we can do here.
 		}
@@ -758,7 +766,51 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// agent host mid-run (tests abort with a clean extension-host exit).
 	if (context.extensionMode !== vscode.ExtensionMode.Test) {
 		ensureAgentsByokFlag();
+
+		// Reuse idle background tool terminals for sync commands. VS Code
+		// 1.131 spawns a new terminal per sync call once the session terminal
+		// was moved to the background (timeout/interruption); the workbench
+		// patch flips an idle background terminal back to foreground instead.
+		const workbenchTerminalPatchEnabled = vscode.workspace
+			.getConfiguration(CONFIG_SECTION)
+			.get<boolean>("workbenchTerminalPatchEnabled", true);
+		if (workbenchTerminalPatchEnabled) {
+			try {
+				const target = findWorkbenchBundle(vscode.env.appRoot);
+				if (!getWorkbenchTerminalPatchStatus(target.bundlePath).applied) {
+					const result = applyWorkbenchTerminalPatch(target.bundlePath);
+					logService.log("byok.bridge.workbench_terminal_patch_applied", {
+						sha256: result.status.sha256,
+						message: result.message,
+					});
+				}
+			} catch (error) {
+				// Missing/unpatchable bundle must never break activation.
+				logService.logError("byok.bridge.workbench_terminal_patch_failed", error);
+			}
+		}
 	}
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.toggleWorkbenchTerminalPatch", async () => {
+			try {
+				const target = findWorkbenchBundle(vscode.env.appRoot);
+				const status = getWorkbenchTerminalPatchStatus(target.bundlePath);
+				if (status.applied) {
+					const result = restoreWorkbenchTerminalPatch(target.bundlePath);
+					logService.log("byok.bridge.workbench_terminal_patch_restored", { sha256: result.status.sha256 });
+					vscode.window.showInformationMessage(result.message);
+					return;
+				}
+				const result = applyWorkbenchTerminalPatch(target.bundlePath);
+				logService.log("byok.bridge.workbench_terminal_patch_applied", { sha256: result.status.sha256 });
+				vscode.window.showInformationMessage(result.message);
+			} catch (error) {
+				logService.logError("byok.bridge.workbench_terminal_patch_failed", error);
+				vscode.window.showErrorMessage(`Workbench terminal patch failed: ${error instanceof Error ? error.message : String(error)}`);
+			}
+		}),
+	);
 
 	// Thinking-level picker for BYOK models in the Agents Window. VS Code
 	// 1.131 omits the configSchema from BYOK snapshot models, so the UI has no

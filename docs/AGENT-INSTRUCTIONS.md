@@ -59,6 +59,7 @@ Memory is the main asset. You must **initiate** saving yourself — do not wait 
 - Batch independent commands in one call; for long processes use background mode and read the output afterwards.
 - Read output fully: exit code, errors, warnings are part of the result.
 - On Windows/git-bash remember path differences (`/d/...` vs `D:\...`, `cygpath` when passing paths to node).
+- **Code search — always `rg` (ripgrep), never `grep`**: faster on Windows/git-bash, respects `.gitignore`, same flags (`-n`, `-i`, `-o`, `-l`).
 - **Git line endings**: the repo pins `.gitattributes` with `eol=lf` — do not change it and do not rely on `core.autocrlf`; after checkout files must be LF.
 
 ## 5. Git and versions

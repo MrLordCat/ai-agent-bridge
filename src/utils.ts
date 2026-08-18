@@ -1102,6 +1102,42 @@ export function truncate(value: string, maxChars: number): string {
 	return value.length <= maxChars ? value : `${value.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+/**
+ * Strips cursor position report (CPR) noise from terminal tool output.
+ *
+ * Bash/readline queries the cursor position with ESC[6n when re-drawing long
+ * prompts. On Windows git-bash the reply (ESC[row;colR) occasionally leaks
+ * into the terminal buffer instead of being consumed, so tool results contain
+ * stray "[22;3R" / "3R[21;5R[21;11R" lines that confuse models. The VS Code
+ * bundles never send ESC[6n (verified 2026-08-16), so the query comes from
+ * the shell itself and cannot be fixed on the VS Code side; filtering the
+ * leaked replies out of tool output is the reliable fix.
+ */
+export function stripTerminalControlNoise(text: string): string {
+        if (!text.includes("[") || !text.includes("R")) {
+                return text;
+        }
+        // Full CPR sequences including the escape character.
+        let cleaned = text.replace(/\x1b\[\d+;\d+R/g, "");
+        const out: string[] = [];
+        for (const line of cleaned.split("\n")) {
+                // Bare CPR chains glued to a prompt, e.g. "$ [22;3R" -> "$ ".
+                const stripped = line.replace(/(\s)(?:\[\d+;\d+R)+/g, "$1");
+                const trimmed = stripped.trim();
+                // A line that is nothing but CPR noise (possibly a chain whose
+                // first token lost its opening bracket, e.g. "3R[21;5R[21;11R").
+                if (/^(?:\[\d+;\d+R|\d*R(?:\[\d+;\d+R)+)$/.test(trimmed)) {
+                        continue;
+                }
+                // Prompt-only residue left after CPR removal.
+                if (/^[$>]\s*$/.test(trimmed)) {
+                        continue;
+                }
+                out.push(stripped);
+        }
+        return out.join("\n");
+}
+
 /** Node-compatible binary-to-base64 (Buffer path; faster than btoa loops). */
 export function bytesToBase64(bytes: Uint8Array): string {
 	return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString("base64");

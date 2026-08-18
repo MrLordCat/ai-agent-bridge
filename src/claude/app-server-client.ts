@@ -16,7 +16,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import type { LlamaLogSink } from "../logger";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
-import { asRecord, isCacheControlPart } from "../utils";
+import { asRecord, isCacheControlPart, stripTerminalControlNoise } from "../utils";
 
 export const CLAUDE_ACTIVE_TURN_TIMEOUT_MS = 300_000;
 const TOOL_CARD_SETTLE_MS = 30;
@@ -1420,7 +1420,7 @@ function convertToolResult(result: vscode.LanguageModelToolResultPart): CallTool
 			}
 		}
 	}
-	let text = textParts.join("\n") || "Tool completed.";
+	let text = stripTerminalControlNoise(textParts.join("\n")) || "Tool completed.";
 	if (text.length > MAX_TOOL_RESULT_CHARS) {
 		const half = Math.floor(MAX_TOOL_RESULT_CHARS / 2);
 		text = `${text.slice(0, half)}\n...[tool result truncated]...\n${text.slice(-half)}`;

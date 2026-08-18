@@ -112,7 +112,7 @@ suite("Claude subscription provider", () => {
 	test("uses conservative Claude safety defaults and clamps invalid values", () => {
 		assert.deepStrictEqual(resolveClaudeSafetySettings({}), {
 			maxAgentTurns: 0,
-			maxCumulativeInputTokens: 2_000_000,
+			maxCumulativeInputTokens: 10_000_000,
 			resumeFallbackPolicy: "safe",
 			resumeFallbackMaxInputTokens: 64_000,
 			resumeFallbackMaxUsagePercent: 80,
