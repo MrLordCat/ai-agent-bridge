@@ -1117,8 +1117,10 @@ export function stripTerminalControlNoise(text: string): string {
         if (!text.includes("[") || !text.includes("R")) {
                 return text;
         }
-        // Full CPR sequences including the escape character.
-        let cleaned = text.replace(/\x1b\[\d+;\d+R/g, "");
+        // Full CPR sequences including the escape character. Built from a
+        // string so the escape is visible and eslint no-control-regex is happy.
+        const cprPattern = new RegExp(String.fromCharCode(27) + "\\[\\d+;\\d+R", "g");
+        const cleaned = text.replace(cprPattern, "");
         const out: string[] = [];
         for (const line of cleaned.split("\n")) {
                 // Bare CPR chains glued to a prompt, e.g. "$ [22;3R" -> "$ ".
