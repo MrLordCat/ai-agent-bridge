@@ -68,7 +68,7 @@ and installs it from there:
 .\install-ai-agent-bridge.cmd
 ```
 
-The script prefers `llama-vscode-chat-1.14.35.vsix` next to itself (update the
+The script prefers `llama-vscode-chat-1.14.38.vsix` next to itself (update the
 `PRIMARY_VSIX` line when the version bumps) and falls back to any other
 `llama-vscode-chat-1.*.vsix` in the same folder.
 
@@ -82,9 +82,16 @@ The script prefers `llama-vscode-chat-1.14.35.vsix` next to itself (update the
 **Local:** start an OpenAI-compatible server such as `llama-server`, then set
 its URL with `AI Agent Bridge: Set Local Server URL`.
 
-**Custom APIs:** open Quick Access → `Providers` → `Providers Manager`,
-add a profile, choose its API format and model family, then refresh models. A
-base URL may already end in `/v1` (for example `https://openrouter.ai/api/v1`).
+**Custom APIs:** open Quick Access → `Providers` → `Providers Manager` and
+add a profile. Built-in presets fill the base URL, API format, model family,
+and context window for OpenRouter, Cloudflare Workers AI, DeepSeek, and
+OpenAI — Cloudflare additionally has a dedicated Account ID field. Refresh
+the model catalog, then pick the model from the normal picker. Enabled
+profiles appear in Quick Access as their own roots with Source, Balance, and
+Maximum Context: OpenRouter shows its remaining credits, Cloudflare shows
+`n/a` (Workers AI has no public balance API). API keys live in VS Code
+SecretStorage; a base URL may already end in `/v1` (for example
+`https://openrouter.ai/api/v1`).
 
 **DeepSeek:** run `AI Agent Bridge: Configure DeepSeek`, store the API key in VS Code
 SecretStorage, then refresh models.
@@ -103,7 +110,7 @@ does not substitute for the required ChatGPT account mode.
 | Source | Models | Best For |
 |---|---|---|
 | Local OpenAI-compatible server | Whatever the configured server advertises | Private or high-volume work, local vision-capable models, and bounded mechanical tasks. The server must be running. |
-| Custom API profiles | Models returned by each enabled OpenAI-compatible `/models` endpoint | Multiple gateways, vendors, or accounts with independent URLs, credentials, request formats, model families, and context limits. Implemented for OpenAI-compatible endpoints; not yet field-tested against third-party gateways. |
+| Custom API profiles (OpenRouter, Cloudflare Workers AI, …) | Models returned by each enabled OpenAI-compatible endpoint (Cloudflare uses `/ai/models/search`) | Multiple gateways and vendors with independent URLs, credentials, formats, model families, context limits, presets, and Quick Access balance rows. Field-tested against OpenRouter and Cloudflare Workers AI; see "Prompt cache behavior" below for the Cloudflare cache caveat. |
 | DeepSeek API | Models returned by the configured DeepSeek endpoint | API-backed reasoning and implementation with explicit key storage and usage tracking. |
 | Codex (ChatGPT account) | Models discovered from the installed Codex app-server | Subscription-backed coding with configurable reasoning effort and native VS Code tools. The catalog can change with account and runtime availability. |
 | Claude (Agent SDK) | Supported Claude subscription profiles | Long-running analysis, implementation, and review through durable Agent SDK sessions. |
@@ -111,6 +118,21 @@ does not substitute for the required ChatGPT account mode.
 All sources appear together in the native picker. Custom entries use the profile
 name you assign; built-in entries retain `(Local)`, `(DeepSeek)`, `(Codex)`, and `(Claude)`.
 Internal prefixes route requests, never sent upstream.
+
+### Prompt cache behavior (Cloudflare)
+
+Cloudflare Workers AI prefix caching is **per model instance**: a cache hit
+requires the next request to land on the instance that computed the prefix.
+The extension sends the documented `x-session-affinity` header with a stable
+per-conversation id, but Cloudflare treats affinity as best-effort
+("increasing the likelihood" of a hit), so even with a byte-stable prompt and
+stable tools, hits alternate with full misses **on Cloudflare's side**.
+Observed on `@cf/deepseek-ai/deepseek-v4-pro-0813`: ~94% hit turns interleaved
+with 100% misses, plus a ~5–8K tail that stays uncached on hit turns. This is
+upstream behavior, not a client defect — the turn report labels it
+`upstream_cache_partial` with the `cloudflare` provider kind. DeepSeek-direct
+shows the same partial-miss class (CloudFront route changes) but far less
+frequently, so it remains the most cache-stable option for long agentic chats.
 
 ## How It Compares
 
