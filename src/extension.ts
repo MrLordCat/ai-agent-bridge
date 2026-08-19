@@ -600,6 +600,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getSecret: key => Promise.resolve(context.secrets.get(key)),
 		getConfigValue: (key, fallback) => vscode.workspace.getConfiguration(CONFIG_SECTION).get(key, fallback),
 		getApiProfiles: async () => apiProviderService.listSummaries(),
+		getApiProfileKey: id => apiProviderService.getApiKey(id),
 		getCodexStatus: () => lastCodexStatus,
 		getClaudeStatus: () => lastClaudeStatus,
 	});
@@ -660,7 +661,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			enabled: apiProviderService.enabledCount,
 		}),
 		key => providerDirectory.stateOf(key),
-		() => memoryService.count
+		() => memoryService.count,
+		() => apiProviderService.quickAccessApiProviders()
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
@@ -680,7 +682,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		ApiProviderManagerPanel.refreshIfOpen();
 	}));
 	context.subscriptions.push(apiProviderService.onDidChange(() => {
-		void providerDirectory.refresh();
+		// Probe newly saved/edited profiles right away; a plain refresh()
+		// would leave them stuck on "Checking" until the 5-minute timer.
+		void providerDirectory.recheck().catch(error =>
+			logService.logError("providers.profile_change_recheck.failed", error)
+		);
 		quickActionsProvider.refresh();
 	}));
 	context.subscriptions.push(providerDirectory.onDidChange(() => {

@@ -129,6 +129,58 @@ suite("provider directory", () => {
 		assert.strictEqual(directory.stateOf("api-b"), "off");
 	});
 
+	test("custom profile probes carry the saved API key (secret-key format)", async () => {
+		let probedKey: string | undefined;
+		const profiles: ApiProviderSource[] = [
+			{ id: "gateway-1", name: "Gateway", baseUrl: "https://gateway.example/v1", enabled: true, hasApiKey: true },
+		];
+		const directory = new ProviderDirectory(fakeOptions({
+			profiles,
+			getApiProfileKey: async id => {
+				assert.strictEqual(id, "gateway-1");
+				return "sk-profile-key";
+			},
+			probeHttp: async (endpoint, apiKey) => {
+				assert.strictEqual(endpoint, "https://gateway.example/v1/models");
+				probedKey = apiKey;
+				return { ok: true };
+			},
+		}));
+		await directory.recheck();
+		assert.strictEqual(probedKey, "sk-profile-key");
+		assert.strictEqual(directory.stateOf("api-gateway-1"), "online");
+
+		// Without getApiProfileKey the directory falls back to the service
+		// secret key format (llamacpp.apiProvider.{id}.apiKey).
+		let fallbackKey: string | undefined;
+		const directory2 = new ProviderDirectory(fakeOptions({
+			profiles,
+			secrets: { "llamacpp.apiProvider.gateway-1.apiKey": "sk-fallback" },
+			probeHttp: async (_endpoint, apiKey) => {
+				fallbackKey = apiKey;
+				return { ok: true };
+			},
+		}));
+		await directory2.recheck();
+		assert.strictEqual(fallbackKey, "sk-fallback");
+	});
+
+	test("cloudflare 401 probe detail explains the token requirements", async () => {
+		const profiles: ApiProviderSource[] = [
+			{ id: "cf", name: "Cloudflare", baseUrl: "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1", enabled: true, hasApiKey: true },
+		];
+		const directory = new ProviderDirectory(fakeOptions({
+			profiles,
+			getApiProfileKey: async () => "sk-token",
+			probeHttp: async () => ({ ok: false, status: 401, error: "HTTP 401 Unauthorized" }),
+		}));
+		await directory.recheck();
+		const entry = directory.list().find(provider => provider.key === "api-cf");
+		assert.strictEqual(entry?.state, "offline");
+		assert.match(entry?.detail ?? "", /cfut_\.\.\./);
+		assert.match(entry?.detail ?? "", /Workers AI > Read/);
+	});
+
 	test("recheck probes only enabled sources", async () => {
 		const probed: string[] = [];
 		const profiles: ApiProviderSource[] = [

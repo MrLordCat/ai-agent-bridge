@@ -6,9 +6,17 @@ import {
 	type ApiRequestProtocol,
 	type ChatModelSource,
 } from "../model-sources/source-routing";
+import {
+	fetchApiProviderBalance,
+	type ApiProviderBalanceInfo,
+} from "./balance";
 
 const API_PROVIDER_STORAGE_KEY = "llamacpp.apiProviders.v1";
 const API_PROVIDER_SECRET_PREFIX = "llamacpp.apiProvider.";
+
+export function apiProviderSecretKey(id: string): string {
+	return `${API_PROVIDER_SECRET_PREFIX}${id}.apiKey`;
+}
 
 export const API_PROVIDER_CONTEXT_MIN = 4_096;
 export const API_PROVIDER_CONTEXT_MAX = 1_048_576;
@@ -53,6 +61,18 @@ export interface ApiProviderDraft {
 export interface ApiProviderSecretUpdate {
 	apiKey?: string;
 	clearApiKey?: boolean;
+}
+
+/** Enabled profile summary for Quick Access, enriched with balance info. */
+export interface QuickAccessApiProvider {
+	id: string;
+	name: string;
+	baseUrl: string;
+	protocol: ApiRequestProtocol;
+	contextLength: number;
+	enabled: boolean;
+	hasApiKey: boolean;
+	balance?: ApiProviderBalanceInfo;
 }
 
 const PROTOCOLS = new Set<ApiRequestProtocol>(["openai", "deepseek", "llamacpp"]);
@@ -173,6 +193,62 @@ export class ApiProviderService implements vscode.Disposable {
 		return this.list().filter(profile => profile.enabled).length;
 	}
 
+	private readonly balances = new Map<string, { info: ApiProviderBalanceInfo; fetchedAt: number }>();
+	private readonly balanceInflight = new Map<string, Promise<ApiProviderBalanceInfo | undefined>>();
+
+	/**
+	 * Balance/usage info for a profile, fetched from provider-specific
+	 * endpoints and cached for 60 seconds (like the DeepSeek balance).
+	 */
+	async getBalanceInfo(id: string): Promise<ApiProviderBalanceInfo | undefined> {
+		const profile = this.get(id);
+		if (!profile || !profile.enabled) {
+			return undefined;
+		}
+		const cached = this.balances.get(id);
+		if (cached && Date.now() - cached.fetchedAt < 60_000) {
+			return cached.info;
+		}
+		const inFlight = this.balanceInflight.get(id);
+		if (inFlight) {
+			return inFlight;
+		}
+		const promise = (async () => {
+			const apiKey = await this.getApiKey(id);
+			if (!apiKey) {
+				return undefined;
+			}
+			const info = await fetchApiProviderBalance(profile.baseUrl, apiKey);
+			if (info) {
+				this.balances.set(id, { info, fetchedAt: Date.now() });
+			}
+			return info;
+		})();
+		this.balanceInflight.set(id, promise);
+		try {
+			return await promise;
+		} finally {
+			this.balanceInflight.delete(id);
+		}
+	}
+
+	/** Enabled profiles enriched with their (cached) balance info, for Quick Access. */
+	async quickAccessApiProviders(): Promise<QuickAccessApiProvider[]> {
+		const summaries = await this.listSummaries();
+		return Promise.all(summaries
+			.filter(profile => profile.enabled)
+			.map(async profile => ({
+				id: profile.id,
+				name: profile.name,
+				baseUrl: profile.baseUrl,
+				protocol: profile.protocol,
+				contextLength: profile.contextLength,
+				enabled: profile.enabled,
+				hasApiKey: profile.hasApiKey,
+				balance: await this.getBalanceInfo(profile.id),
+			})));
+	}
+
 	list(): ApiProviderProfile[] {
 		const stored = this.state.get<unknown[]>(API_PROVIDER_STORAGE_KEY, []);
 		if (!Array.isArray(stored)) {
@@ -256,6 +332,7 @@ export class ApiProviderService implements vscode.Disposable {
 		} else if (secretUpdate.clearApiKey) {
 			await this.secrets.delete(this.secretKey(profile.id));
 		}
+		this.balances.delete(profile.id);
 
 		this._onDidChange.fire();
 		return profile;
@@ -277,6 +354,7 @@ export class ApiProviderService implements vscode.Disposable {
 		}
 		await this.state.update(API_PROVIDER_STORAGE_KEY, next);
 		await this.secrets.delete(this.secretKey(id));
+		this.balances.delete(id);
 		this._onDidChange.fire();
 		return true;
 	}
@@ -286,6 +364,11 @@ export class ApiProviderService implements vscode.Disposable {
 	}
 
 	private secretKey(id: string): string {
-		return `${API_PROVIDER_SECRET_PREFIX}${id}.apiKey`;
+		return apiProviderSecretKey(id);
+	}
+
+	/** The saved API key for a profile, or undefined when none is stored. */
+	async getApiKey(id: string): Promise<string | undefined> {
+		return this.secrets.get(this.secretKey(id));
 	}
 }

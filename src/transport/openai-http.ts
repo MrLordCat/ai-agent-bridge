@@ -20,12 +20,71 @@ export function getChatCompletionsEndpoint(serverUrl: string): string {
 }
 
 export function getModelsEndpoint(serverUrl: string): string {
-	return `${getOpenAiApiRoot(serverUrl)}/models`;
+	const root = getOpenAiApiRoot(serverUrl);
+	// Cloudflare Workers AI REST API has no OpenAI-style GET /models route
+	// (it answers HTTP 405 even with a valid token). The model catalog lives
+	// at /ai/models/search; use it for both probing and model listing.
+	if (isCloudflareWorkersAiBase(root)) {
+		return `${root.replace(/\/ai\/v\d+$/, "/ai/models/search")}?per_page=100`;
+	}
+	return `${root}/models`;
 }
 
-function getOpenAiApiRoot(serverUrl: string): string {
+/** True for https://api.cloudflare.com/client/v4/accounts/{id}/ai/v1 bases. */
+export function isCloudflareWorkersAiBase(baseUrl: string): boolean {
+	try {
+		const url = new URL(baseUrl);
+		return url.hostname === "api.cloudflare.com" && /\/ai\/v\d+/.test(url.pathname);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Picks the catalog id for a model item. Cloudflare Workers AI
+ * models/search items carry a uuid in `id` and the canonical model name in
+ * `name` — the uuid is useless for chat requests and unreadable in the picker.
+ */
+export function pickModelCatalogId(item: Record<string, unknown>, baseUrl: string): string | undefined {
+	if (isCloudflareWorkersAiBase(baseUrl)) {
+		const name = typeof item.name === "string" ? item.name.trim() : "";
+		return name.length > 0 ? name : undefined;
+	}
+	const id = typeof item.id === "string"
+		? item.id
+		: typeof item.model === "string"
+			? item.model
+			: typeof item.name === "string"
+				? item.name
+				: undefined;
+	return id && id.trim().length > 0 ? id.trim() : undefined;
+}
+
+/**
+ * Normalizes a user-supplied provider base URL. Users often paste the full
+ * OpenAI chat endpoint (https://host/v1/chat/completions); the provider
+ * machinery appends /v1/models and /chat/completions itself, so the suffix
+ * must be stripped first.
+ */
+export function normalizeProviderBaseUrl(serverUrl: string): string {
+        let normalized = serverUrl.trim().replace(/\/+$/, "");
+        if (/\/chat\/completions$/i.test(normalized)) {
+                normalized = normalized.replace(/\/chat\/completions$/i, "");
+                normalized = normalized.replace(/\/+$/, "");
+        }
+        return normalized;
+}
+
+export function getOpenAiApiRoot(serverUrl: string): string {
 	const normalized = serverUrl.trim().replace(/\/+$/, "");
-	if (isDeepSeekEndpoint(normalized) || /\/v\d+(?:\.\d+)?$/i.test(normalized)) {
+	// Cloudflare AI Gateway exposes OpenAI-compatible paths under
+	// /v1/{account_id}/{gateway_slug}/openai — the trailing /openai is the
+	// root, /v1 must NOT be appended (verified against the official docs).
+	if (
+		isDeepSeekEndpoint(normalized)
+		|| /\/v\d+(?:\.\d+)?$/i.test(normalized)
+		|| /\/openai$/i.test(normalized)
+	) {
 		return normalized;
 	}
 	return `${normalized}/v1`;

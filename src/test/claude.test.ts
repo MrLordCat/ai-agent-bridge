@@ -1,4 +1,7 @@
 import * as assert from "assert";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
 import * as vscode from "vscode";
 
 import {
@@ -35,6 +38,7 @@ import {
 	classifyClaudeResumeBoundary,
 	createClaudeNativeContextUsage,
 	createClaudeNativeUsage,
+	hasClaudeAccountEvidence,
 	isClaudeVsCodeToolName,
 	parseClaudeAssistantUsage,
 } from "../claude/app-server-client";
@@ -53,6 +57,42 @@ function usageSnapshot(rateLimits: Record<string, unknown>): UsageSnapshot {
 		rate_limits: rateLimits,
 	} as unknown as UsageSnapshot;
 }
+
+suite("Claude account evidence", () => {
+        test("detects Claude Code login evidence in a temp home", () => {
+                const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-auth-"));
+                try {
+                        // No files: no evidence.
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), false);
+
+                        // ~/.claude/.credentials.json with a token: signed in.
+                        fs.mkdirSync(path.join(dir, ".claude"), { recursive: true });
+                        fs.writeFileSync(path.join(dir, ".claude", ".credentials.json"), '{"token":"x"}');
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), true);
+
+                        // Empty credentials file: not evidence.
+                        fs.writeFileSync(path.join(dir, ".claude", ".credentials.json"), '{}');
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), false);
+
+                        // ~/.claude.json with oauthAccount.accountUuid: signed in.
+                        fs.writeFileSync(
+                                path.join(dir, ".claude.json"),
+                                JSON.stringify({ oauthAccount: { accountUuid: "uuid-1" }, machineID: "m" })
+                        );
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), true);
+
+                        // ~/.claude.json without oauthAccount: not evidence.
+                        fs.writeFileSync(path.join(dir, ".claude.json"), JSON.stringify({ machineID: "m" }));
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), false);
+
+                        // Invalid JSON: not evidence (no throw).
+                        fs.writeFileSync(path.join(dir, ".claude.json"), "{broken");
+                        assert.strictEqual(hasClaudeAccountEvidence(dir), false);
+                } finally {
+                        fs.rmSync(dir, { recursive: true, force: true });
+                }
+        });
+});
 
 suite("Claude subscription provider", () => {
 	test("fails safe and explains why Claude cache keep-alive is paused", () => {

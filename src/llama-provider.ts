@@ -20,6 +20,7 @@ import {
     DEEPSEEK_CONTEXT_LENGTH,
     DEFAULT_DEEPSEEK_CONTEXT_LIMIT,
     DEEPSEEK_MAX_OUTPUT_TOKENS,
+    DEEPSEEK_SERVER_URL,
     DEFAULT_SERVER_URL,
 } from "./constants";
 import {
@@ -105,6 +106,7 @@ import {
     getChatCompletionsEndpoint,
     getModelsEndpoint,
     isDeepSeekEndpoint,
+    pickModelCatalogId,
     isTransientHttpStatus,
     OpenAIHttpTransport,
     parseRetryAfterMs,
@@ -6065,13 +6067,20 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             return this.deepSeekBalanceInflight;
         }
         this.deepSeekBalanceInflight = (async () => {
-            const apiKey = await this.getDeepSeekApiKey();
+            const config = this.getConfig();
+            // Balance lives on the official DeepSeek API. A fresh install has no
+            // serverUrl configured (defaults to localhost), so use api.deepseek.com
+            // unless the configured server actually IS a DeepSeek endpoint.
+            const configuredUrl = String(config.get("serverUrl", "") || "").trim();
+            const serverUrl = isDeepSeekEndpoint(configuredUrl) ? configuredUrl : DEEPSEEK_SERVER_URL;
+            // Never send a local/private server key to api.deepseek.com: the
+            // primary key counts only when the primary endpoint is DeepSeek.
+            const apiKey = (await this.secrets.get("llamacpp.deepSeekApiKey"))
+                ?? (isDeepSeekEndpoint(configuredUrl) ? await this.getApiKey() : undefined);
             if (!apiKey) {
                 return undefined;
             }
             try {
-                const config = this.getConfig();
-                const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
                 const endpoint = `${serverUrl}/user/balance`;
                 const response = await this.httpTransport.request(endpoint, {
                     method: "GET",
@@ -6166,12 +6175,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}${details}`);
         }
 
-        const data = (await response.json()) as { data?: unknown[]; models?: unknown[] };
+        const data = (await response.json()) as { data?: unknown[]; models?: unknown[]; result?: unknown[] };
         const descriptors = Array.isArray(data.models)
             ? data.models.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
             : [];
         const serverModalities = await this.fetchServerModalities(serverUrl, headers);
-        const rawModels = Array.isArray(data.data) && data.data.length > 0 ? data.data : data.models ?? [];
+        // Cloudflare Workers AI returns its catalog under the REST envelope
+        // key `result` (GET /ai/models/search), OpenAI and llama.cpp use `data`.
+        const rawModels = Array.isArray(data.data) && data.data.length > 0
+                ? data.data
+                : Array.isArray(data.result) && data.result.length > 0
+                        ? data.result
+                        : data.models ?? [];
 
         return rawModels.flatMap(item => {
             if (!item || typeof item !== "object") {
@@ -6180,14 +6195,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
             const obj = item as Record<string, unknown>;
             const modelMeta = obj.meta && typeof obj.meta === "object" ? (obj.meta as Record<string, unknown>) : undefined;
-            const id =
-                typeof obj.id === "string"
-                    ? obj.id
-                    : typeof obj.model === "string"
-                      ? obj.model
-                      : typeof obj.name === "string"
-                        ? obj.name
-                        : undefined;
+            const id = pickModelCatalogId(obj, serverUrl);
 
             if (!id || id.trim().length === 0) {
                 return [];

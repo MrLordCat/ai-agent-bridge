@@ -40,6 +40,48 @@ class MockMemento implements vscode.Memento {
 }
 
 suite("Llama.cpp Chat Provider Extension", () => {
+        test("refreshes the DeepSeek balance against api.deepseek.com on a fresh install", async () => {
+            const isolated = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent");
+            const isolatedAny = isolated as unknown as {
+                secrets: vscode.SecretStorage;
+                httpTransport: { request: (url: string, init: unknown) => Promise<unknown> };
+            };
+            await isolatedAny.secrets.store("llamacpp.deepSeekApiKey", "sk-test");
+            const requested: string[] = [];
+            const original = isolatedAny.httpTransport.request.bind(isolatedAny.httpTransport);
+            isolatedAny.httpTransport.request = async (url: string) => {
+                requested.push(url);
+                return { ok: true, json: async () => ({ balance_infos: [{ total_balance: "110.00", currency: "CNY" }] }) };
+            };
+            try {
+                const summary = await isolated.refreshDeepSeekBalance(true);
+                assert.deepStrictEqual(requested, ["https://api.deepseek.com/user/balance"]);
+                assert.strictEqual(summary, "110.00 CNY");
+                assert.strictEqual(isolated.deepSeekBalanceSummary, "110.00 CNY");
+            } finally {
+                isolatedAny.httpTransport.request = original;
+            }
+        });
+
+        test("does not send a local-server primary key to the DeepSeek balance endpoint", async () => {
+            const isolated = new LlamaCppChatModelProvider(new MockSecretStorage(), "test-user-agent");
+            const isolatedAny = isolated as unknown as {
+                secrets: vscode.SecretStorage;
+                httpTransport: { request: (url: string, init: unknown) => Promise<unknown> };
+            };
+            await isolatedAny.secrets.store("llamacpp.apiKey", "local-key");
+            let called = 0;
+            const original = isolatedAny.httpTransport.request.bind(isolatedAny.httpTransport);
+            isolatedAny.httpTransport.request = async () => { called += 1; throw new Error("must not be called"); };
+            try {
+                const summary = await isolated.refreshDeepSeekBalance(true);
+                assert.strictEqual(summary, undefined);
+                assert.strictEqual(called, 0);
+            } finally {
+                isolatedAny.httpTransport.request = original;
+            }
+        });
+
     suite("provider", () => {
         const secretStorage = new MockSecretStorage();
         const provider = new LlamaCppChatModelProvider(secretStorage, "test-user-agent");

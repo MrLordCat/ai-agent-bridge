@@ -7,6 +7,7 @@ import {
 	type ApiProviderService,
 	type ApiProviderSummary,
 } from "../api-providers/api-provider-service";
+import { API_PROVIDER_PRESETS } from "../api-providers/presets";
 import { CONFIG_SECTION, DEFAULT_SERVER_URL } from "../constants";
 import {
 	formatDeepSeekPeakEffectiveLocal,
@@ -16,6 +17,7 @@ import {
 	type ProviderDirectory,
 	type ProviderStatusEntry,
 } from "../providers/provider-directory";
+import { normalizeProviderBaseUrl } from "../transport/openai-http";
 
 function esc(value: unknown): string {
 	return String(value ?? "")
@@ -217,12 +219,25 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 			<div class="section-title">${editing ? `Edit ${esc(editing.name)}` : "Add API provider"}</div>
 			<div class="grid">
 				<label>
+					<span>Preset</span>
+					<select id="provider-preset">
+						<option value="">Custom…</option>
+						${API_PROVIDER_PRESETS.map(preset => `<option value="${escAttr(preset.id)}">${esc(preset.label)}</option>`).join("")}
+					</select>
+					<small id="provider-preset-notes">Start from a preset — it fills provider-specific base URL, API format, family and context defaults.</small>
+				</label>
+				<label>
 					<span>Name</span>
 					<input id="provider-name" maxlength="80" value="${escAttr(editing?.name ?? "")}" placeholder="OpenRouter, OpenAI, company gateway…" />
 				</label>
 				<label>
 					<span>Base URL</span>
 					<input id="provider-url" value="${escAttr(editing?.baseUrl ?? "")}" placeholder="https://openrouter.ai/api/v1" />
+				</label>
+				<label id="provider-account-wrap" class="hidden">
+					<span>Cloudflare Account ID</span>
+					<input id="provider-account" placeholder="60aede95d0bccb405ae11145f2da23ed" />
+					<small>Replaces {account_id} in the base URL.</small>
 				</label>
 				<label>
 					<span>API format</span>
@@ -316,6 +331,8 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		.provider-card, .form-card { border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
 		.provider-card.disabled { opacity: .68; }
 		.provider-head { justify-content: space-between; gap: 18px; }
+		.hidden { display: none; }
+		.invalid { border-color: #e51400 !important; outline: 1px solid #e51400; }
 		.provider-name { font-weight: 600; font-size: 15px; }
 		.endpoint { color: var(--vscode-descriptionForeground); margin-top: 4px; overflow-wrap: anywhere; }
 		.status, .badges span { border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 8px; font-size: 12px; white-space: nowrap; }
@@ -376,21 +393,78 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		})));
 		const cancel = document.getElementById('cancel-btn');
 		if (cancel) cancel.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
-		const save = document.getElementById('save-btn');
-		if (save) save.addEventListener('click', () => vscode.postMessage({
-			type: 'save',
-			provider: {
-				id: ${editing ? JSON.stringify(editing.id) : "undefined"},
-				name: document.getElementById('provider-name').value,
-				baseUrl: document.getElementById('provider-url').value,
-				protocol: document.getElementById('provider-protocol').value,
-				family: document.getElementById('provider-family').value,
-				contextLength: Number(document.getElementById('provider-context').value),
-				enabled: document.getElementById('provider-enabled').checked,
-			},
-			apiKey: document.getElementById('provider-key').value,
-			clearApiKey: document.getElementById('provider-clear-key')?.checked === true,
-		}));
+		const presets = ${JSON.stringify(API_PROVIDER_PRESETS)};
+		const presetSelect = document.getElementById('provider-preset');
+		if (presetSelect) {
+			presetSelect.addEventListener('change', () => {
+				const preset = presets.find(candidate => candidate.id === presetSelect.value);
+				if (!preset) {
+					return;
+				}
+				document.getElementById('provider-url').value = preset.baseUrl;
+				document.getElementById('provider-protocol').value = preset.protocol;
+				document.getElementById('provider-family').value = preset.family;
+				document.getElementById('provider-context').value = String(preset.contextLength);
+				const notes = document.getElementById('provider-preset-notes');
+				if (notes) {
+					notes.textContent = preset.notes;
+				}
+				syncAccountField();
+			});
+		}
+		const urlInput = document.getElementById('provider-url');
+		const accountWrap = document.getElementById('provider-account-wrap');
+		const accountInput = document.getElementById('provider-account');
+		const syncAccountField = () => {
+			if (!accountWrap || !accountInput) {
+				return;
+			}
+			accountWrap.classList.toggle('hidden', !urlInput.value.includes('{account_id}'));
+		};
+		const markInvalid = (element, valid) => {
+			if (!element) {
+				return;
+			}
+			element.classList.toggle('invalid', !valid);
+		};
+		if (urlInput) {
+			urlInput.addEventListener('input', syncAccountField);
+			syncAccountField();
+			const save = document.getElementById('save-btn');
+			if (save) save.addEventListener('click', () => {
+				const nameValue = document.getElementById('provider-name').value.trim();
+				const urlValue = urlInput.value.trim();
+				let validUrl = true;
+				try {
+					new URL(urlValue);
+				} catch {
+					validUrl = false;
+				}
+				markInvalid(document.getElementById('provider-name'), nameValue.length > 0);
+				markInvalid(urlInput, validUrl);
+				let accountValue = accountInput ? accountInput.value.trim() : '';
+				if (urlValue.includes('{account_id}')) {
+					markInvalid(accountInput, accountValue.length > 0);
+				}
+				if (!nameValue || !validUrl || (urlValue.includes('{account_id}') && !accountValue)) {
+					return;
+				}
+				vscode.postMessage({
+					type: 'save',
+					provider: {
+						id: ${editing ? JSON.stringify(editing.id) : "undefined"},
+						name: nameValue,
+						baseUrl: accountValue ? urlValue.split('{account_id}').join(accountValue) : urlValue,
+						protocol: document.getElementById('provider-protocol').value,
+						family: document.getElementById('provider-family').value,
+						contextLength: Number(document.getElementById('provider-context').value),
+						enabled: document.getElementById('provider-enabled').checked,
+					},
+					apiKey: document.getElementById('provider-key').value,
+					clearApiKey: document.getElementById('provider-clear-key')?.checked === true,
+				});
+			});
+		}
 	</script>
 </body>
 </html>`;
@@ -416,6 +490,16 @@ export class ApiProviderManagerPanel {
 	private renderSequence = 0;
 	private readonly disposables: vscode.Disposable[] = [];
 
+	/** Re-renders the panel unless the user is editing a provider form. */
+	private readonly renderUnlessEditing = (): void => {
+		// A full DOM replacement would discard typed form values, so external
+		// status/model events must not rebuild the panel while the form is open.
+		// The form's own save/cancel handlers render.
+		if (!this.editingId) {
+			void this.render();
+		}
+	};
+
 	private constructor(
 		private readonly panel: vscode.WebviewPanel,
 		private readonly service: ApiProviderService,
@@ -424,8 +508,8 @@ export class ApiProviderManagerPanel {
 		private readonly getExtras?: () => ProviderManagerLiveData
 	) {
 		this.disposables.push(
-			this.service.onDidChange(() => void this.render()),
-			this.directory.onDidChange(() => void this.render()),
+			this.service.onDidChange(this.renderUnlessEditing),
+			this.directory.onDidChange(this.renderUnlessEditing),
 			this.panel.webview.onDidReceiveMessage(message => void this.handleMessage(message)),
 			this.panel.onDidDispose(() => {
 				ApiProviderManagerPanel.current = undefined;
@@ -445,7 +529,7 @@ export class ApiProviderManagerPanel {
 	): void {
 		if (ApiProviderManagerPanel.current) {
 			ApiProviderManagerPanel.current.panel.reveal(vscode.ViewColumn.Beside);
-			void ApiProviderManagerPanel.current.render();
+			ApiProviderManagerPanel.current.renderUnlessEditing();
 			return;
 		}
 		const panel = vscode.window.createWebviewPanel(
@@ -462,7 +546,7 @@ export class ApiProviderManagerPanel {
 	}
 
 	static refreshIfOpen(): void {
-		void ApiProviderManagerPanel.current?.render();
+		void ApiProviderManagerPanel.current?.renderUnlessEditing();
 	}
 
 	private async handleMessage(message: unknown): Promise<void> {
@@ -476,9 +560,12 @@ export class ApiProviderManagerPanel {
 			switch (data.type) {
 				case "new":
 					this.editingId = "new";
+					// The form must appear; the tail render below skips while editing.
+					await this.render();
 					break;
 				case "edit":
 					this.editingId = String(data.id ?? "");
+					await this.render();
 					break;
 				case "cancel":
 					this.editingId = undefined;
@@ -487,6 +574,9 @@ export class ApiProviderManagerPanel {
 					await this.service.setEnabled(String(data.id ?? ""), data.enabled === true);
 					this.status = data.enabled ? "Provider enabled." : "Provider disabled.";
 					this.refreshModels();
+					// Render even while a form is open: the tail render is skipped
+					// while editing, and the list must not show stale cards.
+					await this.render();
 					break;
 				case "delete": {
 					const profile = this.service.get(String(data.id ?? ""));
@@ -499,7 +589,8 @@ export class ApiProviderManagerPanel {
 						"Delete"
 					);
 					if (confirmation !== "Delete") {
-						return;
+						this.status = "Deletion cancelled.";
+						break;
 					}
 					await this.service.remove(profile.id);
 					if (this.editingId === profile.id) {
@@ -507,12 +598,21 @@ export class ApiProviderManagerPanel {
 					}
 					this.status = `Deleted ${profile.name}.`;
 					this.refreshModels();
+					// Render even while a form is open so a deleted card never
+					// stays visible until the next external event.
+					await this.render();
 					break;
 				}
 				case "save": {
 					if (!data.provider) {
 						throw new Error("Provider data is missing.");
 					}
+					// Users often paste the full chat endpoint. Strip it so probing
+					// appends /v1/models (and requests /chat/completions) to a clean base.
+					data.provider = {
+						...data.provider,
+						baseUrl: normalizeProviderBaseUrl(data.provider.baseUrl ?? ""),
+					};
 					const profile = await this.service.upsert(data.provider, {
 						apiKey: data.apiKey,
 						clearApiKey: data.clearApiKey,
@@ -545,7 +645,11 @@ export class ApiProviderManagerPanel {
 		} catch (error) {
 			this.error = error instanceof Error ? error.message : String(error);
 		}
-		await this.render();
+		// A full rebuild would discard typed form values. refreshModels/recheck/
+		// runCommand keep the form open, so only render when not editing.
+		if (!this.editingId) {
+			await this.render();
+		}
 	}
 
 	private buildExtras(): ProviderManagerExtras {

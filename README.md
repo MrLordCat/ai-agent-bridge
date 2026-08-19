@@ -56,6 +56,22 @@ package is deliberately distributed outside the gallery.
    ```
 3. Run `Developer: Reload Window`.
 
+### Installer script (recommended when the VSIX lives on a network share)
+
+The VS Code installer rejects VSIX files opened from a UNC path (`\\host\...`)
+with `Extract: UNC host ... access is not allowed`. When the package sits on
+as share, double-click `install-ai-agent-bridge.cmd` placed next to it on the
+target machine instead — the script copies the VSIX to the local temp folder
+and installs it from there:
+
+```sh
+.\install-ai-agent-bridge.cmd
+```
+
+The script prefers `llama-vscode-chat-1.14.35.vsix` next to itself (update the
+`PRIMARY_VSIX` line when the version bumps) and falls back to any other
+`llama-vscode-chat-1.*.vsix` in the same folder.
+
 ## Quick Start
 
 1. Install the extension and run `Developer: Reload Window`.
@@ -304,7 +320,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.14.3. Current local development build: 1.14.21.** The
+**Stable release: 1.14.3. Current local development build: 1.14.35.** The
 stable line consolidates the 1.13.x development patches: Claude follow-up
 messages are forwarded to the resumed session, the active-turn timeout is
 300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
@@ -315,7 +331,7 @@ screenshots, and measured cache-hit numbers.
 npm install
 npm run compile
 npm run lint
-npm test              # 428 extension-host tests in the current 1.14.21 dev patch
+npm test              # 456 extension-host tests in the current 1.14.35 dev patch
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

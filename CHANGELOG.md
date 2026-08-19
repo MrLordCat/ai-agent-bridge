@@ -1,5 +1,223 @@
 # Changelog
 
+## 1.14.35 (dev) - 2026-08-19
+
+API providers in Quick Access + balance:
+
+- Enabled API providers now appear as their own Quick Access roots
+  (Cloud, OpenRouter, ...) with Source, Balance, Maximum Context and a
+  shortcut to the Providers Manager. Disabled providers stay hidden.
+- **Balance**: OpenRouter reads GET /api/v1/credits (fallback
+  /api/v1/auth/key) and shows remaining credits / usage, cached 60s and
+  invalidated on key change. Cloudflare Workers AI has no public balance
+  API, so it honestly shows "n/a" with a dashboard pointer instead of a
+  fake number. Other hosts get no balance row.
+- Wiring: ApiProviderService.quickAccessApiProviders() feeds the tree;
+  balance cache lives in the service (src/api-providers/balance.ts).
+- **Tests**: balance parsing (credits/free tier/fallback/cloudflare) and
+  Quick Access root building (456 extension-host tests total).
+
+## 1.14.34 (dev) - 2026-08-19
+
+Cloudflare model names + delete feedback:
+
+- **Model ids**: Cloudflare models/search items carry a uuid in id and the
+  canonical model name in name (@cf/...). The catalog now prefers the
+  canonical name (pickModelCatalogId), so the model picker shows readable
+  ids that actually work in chat requests.
+- **Delete**: dismissing the delete confirmation now reports "Deletion
+  cancelled." instead of silently doing nothing; E2E coverage for deleting
+  one of two profiles.
+- **Tests**: catalog id selection + two-profile delete (449
+  extension-host tests total).
+
+## 1.14.33 (dev) - 2026-08-19
+
+Cloudflare 401 hint: paste the full token:
+
+- The 401 hint now mentions that the FULL token value must be pasted
+  including its prefix (e.g. cfut_...) — Cloudflare rejects the bare
+  secret part with code 10000 even though the token itself is valid and
+  active (verified against the live API).
+
+## 1.14.32 (dev) - 2026-08-19
+
+Cloudflare 401 diagnostics:
+
+- When a Cloudflare Workers AI probe is rejected with HTTP 401/403 the
+  provider status now appends an actionable hint (use a Cloudflare API
+  token with Account > Workers AI > Read for the same account; make sure
+  it is not expired), so the cause is visible right in the manager
+  instead of a bare "Authentication error".
+- **Tests**: 401 hint regression case (448 extension-host tests total).
+
+## 1.14.31 (dev) - 2026-08-19
+
+Cloudflare account id field fix + delete regression coverage:
+
+- **Bug**: selecting the Cloudflare preset filled the base URL but never
+  revealed the Account ID field — the syncAccountField() call was lost
+  from the preset change handler during earlier edits.
+- **Fix**: the preset handler now toggles the account field after filling
+  the URL; the field also appears when editing a profile whose URL
+  contains {account_id}.
+- **Delete regression coverage**: the panel test suite now drives the real
+  message handler with a fake webview (createOrShow + ApiProviderService
+  + ProviderDirectory): add a profile, render, delete it, and assert the
+  storage is empty and the card is gone (447 extension-host tests total).
+
+## 1.14.30 (dev) - 2026-08-19
+
+Providers Manager webview script fix:
+
+- **Bug**: 1.14.29 broke the generated webview script (unbalanced braces in
+  the save handler after the validation changes) — a SyntaxError disabled
+  every panel button (Add/Delete/Edit/Toggle did nothing).
+- **Fix**: the save handler is rebuilt with balanced braces and the
+  account/validation code now runs only when the form is present.
+- **Regression guard**: new test suite renders the panel HTML (list view,
+  new-provider form, edit form) and syntax-checks the embedded script
+  (445 extension-host tests total).
+
+## 1.14.29 (dev) - 2026-08-19
+
+Cloudflare auth probe fix + provider form UX:
+
+- **Probe never carried the API key**: the availability probe read
+  llamacpp.apiProvider.{id} while the profile key is stored as
+  llamacpp.apiProvider.{id}.apiKey — probes of custom profiles went out
+  without Authorization, so Cloudflare answered 400 "Missing
+  X-Auth-Key/X-Auth-Email/Authorization headers" even though the key was
+  saved (chat requests were unaffected — they already used the right key).
+  ProviderDirectory now resolves profile keys through the new
+  getApiProfileKey option (wired to ApiProviderService.getApiKey), with a
+  fallback to the correct secret key format.
+- **Cloudflare Account ID field**: the Cloudflare preset URL keeps an
+  {account_id} placeholder; the form shows a dedicated Account ID input
+  whenever the URL contains it and substitutes the value on save.
+- **Required-field validation**: Save now highlights empty/invalid fields
+  (name, base URL, account id) in red and blocks the request instead of
+  failing silently.
+- **Stale list fix**: Delete/Toggle render the panel even while a form is
+  open, so a deleted provider card never stays visible.
+- **Tests**: profile probe key regression (441 extension-host tests).
+
+## 1.14.28 (dev) - 2026-08-19
+
+Cloudflare Workers AI works; provider presets added:
+
+- **Cloudflare 405 fix**: the Workers AI REST API has no OpenAI-style
+  GET /models route (it answers HTTP 405 "GET not supported for requested
+  URI" even with a valid token — verified against the live API). The model
+  catalog endpoint /ai/models/search is used instead for both the
+  availability probe and the model list; the catalog response envelope
+  (result key) is now parsed by fetchModels. Saved profiles are probed
+  immediately (previously they waited for the 5-minute timer, showing
+  "Checking").
+- **Presets**: Providers Manager form starts from ready-made presets —
+  OpenRouter, Cloudflare Workers AI, DeepSeek, OpenAI — filling base URL,
+  API format, family, context length and showing key/notes hints per
+  provider (src/api-providers/presets.ts).
+- **Tests**: preset suites (440 extension-host tests total).
+
+## 1.14.27 (dev) - 2026-08-19
+
+Providers Manager form stability (all re-render paths closed):
+
+- 1.14.26 guarded only the panel's internal subscriptions; the static
+  refreshIfOpen() call sites in extension.ts (Claude/Codex status
+  changes, directory probes) still rebuilt the whole webview and wiped
+  typed form values.
+- Now every external render path goes through renderUnlessEditing():
+  static refreshIfOpen(), createOrShow() reveal, the handleMessage tail
+  render (refreshModels/recheck/runCommand keep the form open), and the
+  internal service/directory subscriptions. Opening a form (new/edit)
+  renders explicitly; save/cancel render after clearing the form state.
+
+## 1.14.26 (dev) - 2026-08-19
+
+Cloudflare AI Gateway provider + Providers Manager form stability:
+
+- Cloudflare AI Gateway exposes OpenAI-compatible chat under
+  /v1/{account_id}/{gateway_slug}/openai/chat/completions. getOpenAiApiRoot
+  now treats a trailing /openai as a complete root, so entering
+  https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/openai (or the
+  full .../openai/chat/completions URL, which the save handler strips)
+  produces the correct /chat/completions and /models endpoints. The
+  Workers AI REST base https://api.cloudflare.com/client/v4/accounts/{id}/ai/v1
+  already worked (verified against the official docs).
+- Providers Manager no longer rebuilds the whole webview while a provider
+  form is open: external status/model events (probe cycles, Claude/Codex
+  status changes) were discarding typed form values. The panel now skips
+  re-rendering while editing; save/cancel still render.
+- Tests: Cloudflare endpoint resolution cases (436 extension-host tests).
+
+## 1.14.25 (dev) - 2026-08-19
+
+OpenRouter (and other gateways) provider setup fix:
+
+- **Bug**: adding a gateway provider with the full chat endpoint
+  (https://openrouter.ai/api/v1/chat/completions) produced
+  ".../chat/completions/v1/models: HTTP 404" — the probe appends
+  /v1/models to the stored base URL, and the stored URL already ended
+  with /chat/completions.
+- **Fix**: normalizeProviderBaseUrl() strips a trailing /chat/completions
+  (and trailing slashes) when a provider is saved in the Providers
+  Manager, so both probing and chat requests start from a clean base URL.
+  The Base URL form now also explains that only the base is expected.
+- **Tests**: normalizeProviderBaseUrl cases (435 extension-host tests).
+
+## 1.14.24 (dev) - 2026-08-18
+
+VS Code 1.133 / Copilot Chat 0.61.0 compatibility:
+
+- **Bug**: on VS Code 1.133 the Copilot patch failed with "extension
+  endpoint background compaction was not found" and the workbench terminal
+  reuse patch found no initTerminal pattern, so no patch was applied and
+  partial prompt-cache misses appeared.
+- **Fix**: the minified variable names changed in Copilot 0.61.0
+  (_/w/E -> x/k/P, truncateAt:v -> truncateAt:E) and the
+  RunInTerminalTool._initTerminal tool-session parameter was renamed
+  (o -> i). All affected patterns now capture the minified names instead
+  of hardcoding them, so both 0.60.x and 0.61.0 bundles patch cleanly.
+  Verified against the exact build a5b5009513 (VS Code 1.133.0, Copilot
+  Chat 0.61.0): full copilot patch, git-repositories guard, workbench
+  history bounds and terminal reuse all apply and pass syntax checks.
+- **Refactor**: patchAgentHistoryCap extracted from patchCopilotBundle for
+  focused shape tests.
+- **Tests**: 0.61.0 and 1.133 shape regression cases (434 extension-host
+  tests total).
+
+## 1.14.23 (dev) - 2026-08-18
+
+DeepSeek balance fix on fresh installs:
+
+- **Bug**: after entering a DeepSeek API key on a machine without a
+  configured serverUrl, the balance never appeared. The balance probe used
+  the raw serverUrl setting (default http://localhost:8000) instead of the
+  official DeepSeek API, so /user/balance was queried against localhost.
+- **Fix**: the probe now uses api.deepseek.com unless the configured
+  serverUrl is itself a DeepSeek endpoint. A primary API key is only sent
+  to the balance endpoint when the primary endpoint is DeepSeek (a local
+  server key is never leaked to api.deepseek.com).
+- **Tests**: fresh-install URL selection and key-guard regression cases
+  (431 extension-host tests total).
+
+## 1.14.22 (dev) - 2026-08-18
+
+Claude sign-in detection on fresh machines:
+
+- **Bug**: the Claude provider reported "Connected" whenever a claude
+  executable was found. Our extension bundles the Claude Agent SDK
+  executable, so the check always succeeded — even on a machine where the
+  user never signed into a Claude account.
+- **Fix**: hasClaudeAccountEvidence() verifies real login evidence on disk
+  (~/.claude/.credentials.json or an oauthAccount.accountUuid in
+  ~/.claude.json) before the provider reports "connected". Without it the
+  status is now signedOut with the "Not signed in" summary, so the UI asks
+  the user to sign in instead of showing a false "Connected".
+- **Tests**: temp-home regression cases (429 extension-host tests total).
+
 ## 1.14.21 (dev) - 2026-08-16
 
 "e is not iterable" startup error fixed (foreign Copilot crash):

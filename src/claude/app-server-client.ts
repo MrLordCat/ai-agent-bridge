@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { createRequire } from "node:module";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { z, type ZodType } from "zod";
@@ -407,6 +408,45 @@ class AsyncMessageQueue implements AsyncIterable<SDKUserMessage> {
 			},
 		};
 	}
+}
+
+/**
+ * Whether the current user has Claude account login evidence on disk.
+ *
+ * The bundled claude.exe always exists (it ships with our extension), so
+ * binary presence alone must NOT mean "connected": on a machine where the
+ * user never signed in, the SDK would fail at request time. Evidence:
+ *  - ~/.claude/.credentials.json (Claude Code CLI credentials), or
+ *  - ~/.claude.json with an oauthAccount.accountUuid entry.
+ */
+export function hasClaudeAccountEvidence(homeDir = os.homedir()): boolean {
+        try {
+                const credentialsPath = path.join(homeDir, ".claude", ".credentials.json");
+                const stat = statSync(credentialsPath);
+                if (stat.isFile() && stat.size > 2) {
+                        return true;
+                }
+        } catch {
+                // No credentials file.
+        }
+        try {
+                const claudeJsonPath = path.join(homeDir, ".claude.json");
+                const parsed = JSON.parse(readFileSync(claudeJsonPath, "utf8")) as {
+                        oauthAccount?: unknown;
+                };
+                const oauthAccount = parsed?.oauthAccount;
+                if (
+                        oauthAccount
+                        && typeof oauthAccount === "object"
+                        && typeof (oauthAccount as Record<string, unknown>).accountUuid === "string"
+                        && (oauthAccount as Record<string, unknown>).accountUuid !== ""
+                ) {
+                        return true;
+                }
+        } catch {
+                // No Claude Code state file or it cannot be parsed.
+        }
+        return false;
 }
 
 export function resolveClaudeCodeBinary(): string | undefined {

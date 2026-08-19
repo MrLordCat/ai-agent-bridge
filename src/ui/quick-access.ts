@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 
+import type { QuickAccessApiProvider } from "../api-providers/api-provider-service";
 import type { ProviderState } from "../providers/provider-directory";
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
 import {
@@ -325,6 +326,48 @@ export function formatProviderUsageLine(
 		: `${status}: ${percent}%`;
 }
 
+/**
+ * Quick Access root for one enabled API profile: source state, provider
+ * balance (OpenRouter / Cloudflare) and the configured context window.
+ */
+export function buildApiProfileItem(
+	profile: QuickAccessApiProvider,
+	state: ProviderState | undefined
+): QuickAccessItem {
+	return new QuickAccessItem(`api.${profile.id}`, profile.name, {
+		description: state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
+		icon: new vscode.ThemeIcon("cloud"),
+		tooltip: profile.baseUrl,
+		children: [
+			new QuickAccessItem(`api.${profile.id}.source`, "Source", {
+				description: "On",
+				tooltip: "Enabled API provider; disable it in the Providers Manager.",
+				icon: toggleIcon(true),
+				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+			}),
+			...(profile.balance
+				? [new QuickAccessItem(`api.${profile.id}.balance`, "Balance", {
+					description: profile.balance.summary,
+					tooltip: profile.balance.tooltip,
+					icon: new vscode.ThemeIcon("credit-card"),
+					command: command("llamacpp.openApiProviders", "Manage API Providers"),
+				})]
+				: []),
+			new QuickAccessItem(`api.${profile.id}.context`, "Maximum Context", {
+				description: formatCompactTokenCount(profile.contextLength),
+				tooltip: "Context window advertised for this provider. Edit it in the Providers Manager.",
+				icon: new vscode.ThemeIcon("symbol-numeric"),
+				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+			}),
+			new QuickAccessItem(`api.${profile.id}.manage`, "Providers Manager", {
+				description: "Edit, disable or delete",
+				icon: new vscode.ThemeIcon("server-process"),
+				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+			}),
+		],
+	});
+}
+
 export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickAccessItem> {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -359,6 +402,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 }),
 		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined,
 		private readonly getTotalMemoryCount: () => number | undefined = () => undefined,
+	private readonly getApiProviders: () => Promise<readonly QuickAccessApiProvider[]> = async () => [],
 	) {}
 
 	refresh(): void {
@@ -376,7 +420,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		return this.buildRootItems();
 	}
 
-	private buildRootItems(): QuickAccessItem[] {
+	private async buildRootItems(): Promise<QuickAccessItem[]> {
 		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 		const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
 		const localServerUrl = String(config.get("localServerUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
@@ -1011,6 +1055,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const visibleProviders = providerRoots
 			.filter(({ key }) => this.getProviderState(key) !== "offline")
 			.map(({ item }) => item);
-		return [apiProviders, ...visibleProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
+
+		const apiProfileItems = (await this.getApiProviders()).map(profile =>
+			buildApiProfileItem(profile, this.getProviderState(`api-${profile.id}`))
+		);
+		return [apiProviders, ...apiProfileItems, ...visibleProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
 	}
 }

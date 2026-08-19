@@ -12,6 +12,7 @@ import {
 	COPILOT_PATCH_MARKER,
 	findCopilotBundle,
 	patchCopilotGitRepositoriesGuard,
+	patchAgentHistoryCap,
 	patchCopilotBundle,
 	patchExtensionTokenizerCache,
 	patchVsCodeWorkbenchBundle,
@@ -29,6 +30,29 @@ import {
 		assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
 		// Non-unique / missing pattern must throw.
 		assert.throws(() => patchCopilotGitRepositoriesGuard("class X{}"), /not unique/);
+	});
+
+	suite("agent history cap shapes", () => {
+		const SHAPE_060 = `class X{render(t,r,o,a){_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+		const SHAPE_061 = `class X{render(t,r,o,a){x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:E,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+
+		test("patches the 0.60.x variable names (_/w/E, truncateAt:v)", () => {
+			const patched = patchAgentHistoryCap(SHAPE_060);
+			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+			assert.ok(patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "wiring must keep the original truncateAt variable");
+			assert.ok(patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:v"), "wiring must switch to the capped arrays");
+			assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
+			new Function(patched);
+		});
+
+		test("patches the 0.61.0 variable names (x/k/P, truncateAt:E)", () => {
+			const patched = patchAgentHistoryCap(SHAPE_061);
+			assert.ok(patched.includes("x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass"), "original names must be preserved");
+			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+			assert.ok(patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:E"), "wiring must keep truncateAt:E");
+			assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
+			new Function(patched);
+		});
 	});
 
 suite("Copilot patch", () => {

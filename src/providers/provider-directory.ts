@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 
 import { DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
-import { isDeepSeekEndpoint, getModelsEndpoint } from "../transport/openai-http";
+import { apiProviderSecretKey } from "../api-providers/api-provider-service";
+import { getModelsEndpoint, isCloudflareWorkersAiBase, isDeepSeekEndpoint } from "../transport/openai-http";
 
 /**
  * Unified provider directory: one place that knows every model source
@@ -62,6 +63,8 @@ export interface ProviderDirectoryOptions {
 	getSecret: (key: string) => Promise<string | undefined>;
 	getConfigValue: (key: string, fallback?: unknown) => unknown;
 	getApiProfiles: () => Promise<readonly ApiProviderSource[]>;
+	/** Resolves the saved API key for a custom profile (undefined when none). */
+	getApiProfileKey?: (id: string) => Promise<string | undefined>;
 	getCodexStatus?: () => SubscriptionProviderStatus | undefined;
 	getClaudeStatus?: () => SubscriptionProviderStatus | undefined;
 	probeHttp?: HttpProbeFn;
@@ -227,8 +230,12 @@ export class ProviderDirectory implements vscode.Disposable {
 			} else if (probed.result.ok) {
 				this.setMapped(key, profile.name, "api", true, "online", `Reachable at ${endpoint}.`);
 			} else {
+				const status = probed.result.status;
+				const cloudflareHint = (status === 401 || status === 403) && isCloudflareWorkersAiBase(profile.baseUrl)
+					? " (token rejected: paste the FULL token including its prefix, e.g. cfut_..., with Account > Workers AI > Read for this account)"
+					: "";
 				this.setMapped(key, profile.name, "api", true, "offline",
-					`${endpoint}: ${probed.result.error ?? "Unreachable."}`);
+					`${endpoint}: ${probed.result.error ?? "Unreachable."}${cloudflareHint}`);
 			}
 		}
 
@@ -262,9 +269,10 @@ export class ProviderDirectory implements vscode.Disposable {
 		}
 
 		for (const profile of profiles.filter(profile => profile.enabled)) {
-			jobs.push(this.probeSource(`api-${profile.id}`, getModelsEndpoint(profile.baseUrl),
-				profile.hasApiKey ? await secrets(`llamacpp.apiProvider.${profile.id}`).catch(() => undefined) : undefined,
-				now));
+			const profileKey = profile.hasApiKey
+				? await (this.options.getApiProfileKey?.(profile.id) ?? secrets(apiProviderSecretKey(profile.id))).catch(() => undefined)
+				: undefined;
+			jobs.push(this.probeSource(`api-${profile.id}`, getModelsEndpoint(profile.baseUrl), profileKey, now));
 		}
 
 		await Promise.allSettled(jobs);

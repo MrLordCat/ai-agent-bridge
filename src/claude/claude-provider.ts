@@ -14,6 +14,7 @@ import {
 } from "./availability";
 import {
 	ClaudeAgentSession,
+	hasClaudeAccountEvidence,
 	resolveClaudeCodeBinary,
 	validatePersistedClaudeSession,
 	type ClaudeAgentTurnContext,
@@ -691,7 +692,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			return "Off";
 		}
 		if (this.status === "signedOut") {
-			return "Claude Code not found";
+			return resolveClaudeCodeBinary() ? "Not signed in" : "Claude Code not found";
 		}
 		if (this.status === "unavailable") {
 			return "Claude unavailable";
@@ -981,6 +982,9 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (!resolveClaudeCodeBinary()) {
 			return this.toStatus("signedOut");
 		}
+		if (!hasClaudeAccountEvidence()) {
+			return this.toStatus("signedOut");
+		}
 		const status = this.toStatus("connected");
 		void this.refreshSubscriptionUsage().catch(error => {
 			this.logSink?.logError("claude.usage_probe.failed", error);
@@ -1161,6 +1165,10 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			return [];
 		}
 		if (!resolveClaudeCodeBinary()) {
+			this.toStatus("signedOut");
+			return [];
+		}
+		if (!hasClaudeAccountEvidence()) {
 			this.toStatus("signedOut");
 			return [];
 		}

@@ -23,6 +23,28 @@ const INIT_TERMINAL_SOURCE =
         `this._terminalChatService.registerTerminalInstanceWithToolSession(o,u.instance),` +
         `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}}`;
 
+	suite("1.133 parameter rename", () => {
+		const INIT_TERMINAL_133 =
+			`class X{` +
+			`async _initTerminal(e,t,i,n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
+			`if(u&&!u.isBackground&&!u.instance.isDisposed)if(u.instance.exitCode!==void 0)` +
+			`this._logService.info(\`RunInTerminalTool: Cached terminal shell has exited (code=\${u.instance.exitCode}), creating a new terminal\`),` +
+			`this._sessionTerminalAssociations.delete(e);` +
+			`else return this._logService.debug(\`RunInTerminalTool: Using cached terminal with session resource \\\`\${e}\\\`\`),` +
+			`this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
+			`this._terminalChatService.registerTerminalInstanceWithToolSession(i,u.instance),` +
+			`this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}}`;
+
+		test("patches the 1.133 signature (tool-session parameter i)", () => {
+			const patched = patchWorkbenchTerminalBundle(INIT_TERMINAL_133);
+			assert.ok(patched.includes(WORKBENCH_TERMINAL_PATCH_MARKER), "marker must be present");
+			assert.ok(patched.includes("_initTerminal(e,t,i,n,r){"), "original signature must be preserved");
+			assert.ok(patched.includes("registerTerminalInstanceWithToolSession(i,u.instance)"), "patched code must use the captured parameter name");
+			assert.ok(patched.includes("u.isBackground=!1"), "reuse branch must be present");
+			new Function(patched);
+		});
+	});
+
 suite("Agents Bridge — workbench terminal reuse patch", () => {
         test("patches the idle background terminal reuse branch into initTerminal", () => {
                 const patched = patchWorkbenchTerminalBundle(INIT_TERMINAL_SOURCE);
@@ -54,7 +76,7 @@ suite("Agents Bridge — workbench terminal reuse patch", () => {
         });
 
         test("rejects a bundle without a unique initTerminal pattern", () => {
-                assert.throws(() => patchWorkbenchTerminalBundle("class X{}"), /expected 1 initTerminal pattern/);
+                assert.throws(() => patchWorkbenchTerminalBundle("class X{}"), /initTerminal pattern/);
         });
 
         test("applies and restores against a temporary bundle copy", () => {

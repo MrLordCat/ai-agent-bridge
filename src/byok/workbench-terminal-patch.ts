@@ -21,19 +21,16 @@ import * as path from "path";
 export const WORKBENCH_TERMINAL_PATCH_ID = "llama-vscode-chat:idle-bg-terminal-reuse:v1";
 export const WORKBENCH_TERMINAL_PATCH_MARKER = `/* ${WORKBENCH_TERMINAL_PATCH_ID} */`;
 
+// VS Code 1.131 named the tool-session parameter "o"; 1.133 minifies it to
+// "i". Capture the name so both bundles match and the patched method keeps
+// the original signature.
 const INIT_TERMINAL_PATTERN =
-        `_initTerminal(e,t,o,n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
-        `if(u&&!u.isBackground&&!u.instance.isDisposed)if(u.instance.exitCode!==void 0)` +
-        `this._logService.info(\`RunInTerminalTool: Cached terminal shell has exited (code=\${u.instance.exitCode}), creating a new terminal\`),` +
-        `this._sessionTerminalAssociations.delete(e);` +
-        `else return this._logService.debug(\`RunInTerminalTool: Using cached terminal with session resource \\\`\${e}\\\`\`),` +
-        `this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
-        `this._terminalChatService.registerTerminalInstanceWithToolSession(o,u.instance),` +
-        `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}`;
+        /_initTerminal\(e,t,([A-Za-z_$][\w$]*),n,r\)\{if\(!n\)\{let u=this\._sessionTerminalAssociations\.get\(e\);if\(u&&!u\.isBackground&&!u\.instance\.isDisposed\)if\(u\.instance\.exitCode!==void 0\)this\._logService\.info\(`RunInTerminalTool: Cached terminal shell has exited \(code=\${u\.instance\.exitCode}\), creating a new terminal`\),this\._sessionTerminalAssociations\.delete\(e\);else return this\._logService\.debug\(`RunInTerminalTool: Using cached terminal with session resource \\`\${e}\\``\),this\._terminalToolCreator\.refreshShellIntegrationQuality\(u\),this\._terminalChatService\.registerTerminalInstanceWithToolSession\(([A-Za-z_$][\w$]*),u\.instance\),this\._backgroundNotifications\.deleteAndDispose\(u\.instance\.instanceId\),u\}/;
 
-const INIT_TERMINAL_PATCHED =
-        `_initTerminal(e,t,o,n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
-        WORKBENCH_TERMINAL_PATCH_MARKER +
+function buildPatchedInitTerminal(sessionParam: string): string {
+        return (
+                `_initTerminal(e,t,${sessionParam},n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
+                WORKBENCH_TERMINAL_PATCH_MARKER +
         `if(u&&!u.instance.isDisposed){` +
         `if(u.isBackground){` +
         `if(u.instance.exitCode===void 0&&u.shellIntegrationQuality==="rich"&&` +
@@ -41,15 +38,17 @@ const INIT_TERMINAL_PATCHED =
         `u.isBackground=!1;` +
         `this._logService.info(\`RunInTerminalTool: Reusing idle background terminal for session resource \\\`\${e}\\\`\`);` +
         `return this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
-        `this._terminalChatService.registerTerminalInstanceWithToolSession(o,u.instance),` +
+        `this._terminalChatService.registerTerminalInstanceWithToolSession(${sessionParam},u.instance),` +
         `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}` +
         `else if(u.instance.exitCode!==void 0)` +
         `this._logService.info(\`RunInTerminalTool: Cached terminal shell has exited (code=\${u.instance.exitCode}), creating a new terminal\`),` +
         `this._sessionTerminalAssociations.delete(e);` +
         `else return this._logService.debug(\`RunInTerminalTool: Using cached terminal with session resource \\\`\${e}\\\`\`),` +
         `this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
-        `this._terminalChatService.registerTerminalInstanceWithToolSession(o,u.instance),` +
-        `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}`;
+        `this._terminalChatService.registerTerminalInstanceWithToolSession(${sessionParam},u.instance),` +
+        `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}`
+        );
+}
 
 function sha256(filePath: string): string {
         return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
@@ -81,13 +80,25 @@ export function patchWorkbenchTerminalBundle(source: string): string {
         if (source.includes(WORKBENCH_TERMINAL_PATCH_MARKER)) {
                 return source;
         }
-        const occurrences = source.split(INIT_TERMINAL_PATTERN).length - 1;
-        if (occurrences !== 1) {
+        const flags = INIT_TERMINAL_PATTERN.flags.replaceAll("g", "");
+        const matcher = new RegExp(INIT_TERMINAL_PATTERN.source, flags);
+        const first = matcher.exec(source);
+        if (!first || first.index === undefined) {
                 throw new Error(
-                        `workbench terminal patch: expected 1 initTerminal pattern occurrence, found ${occurrences}`
+                        "workbench terminal patch: initTerminal pattern not found (VS Code bundle shape changed)."
                 );
         }
-        return source.replace(INIT_TERMINAL_PATTERN, INIT_TERMINAL_PATCHED);
+        if (matcher.exec(source.slice(first.index + first[0].length))) {
+                throw new Error("workbench terminal patch: initTerminal pattern is not unique.");
+        }
+        if (first[1] !== first[2]) {
+                throw new Error("workbench terminal patch: initTerminal parameter names differ unexpectedly.");
+        }
+        return (
+                source.slice(0, first.index)
+                + buildPatchedInitTerminal(first[1])
+                + source.slice(first.index + first[0].length)
+        );
 }
 
 export interface WorkbenchTerminalPatchStatus {

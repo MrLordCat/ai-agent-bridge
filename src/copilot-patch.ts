@@ -295,6 +295,58 @@ export function patchCopilotGitRepositoriesGuard(source: string): string {
 	);
 }
 
+/**
+ * Caps the rendered agent history (tool-call rounds) for llama.cpp providers.
+ * Extracted so both supported Copilot bundle shapes (0.60.x variable names and
+ * the 0.61.0 rename: _/w/E -> x/k/P, truncateAt:v -> truncateAt:E) can be
+ * covered by focused synthetic tests. The regexes capture the minified names
+ * and keep the original ones in the replacement.
+ */
+export function patchAgentHistoryCap(source: string): string {
+        let patched = replacePatternOnce(
+                source,
+                /([A-Za-z_$][\w$]*)=o\.userQueryTagName,([A-Za-z_$][\w$]*)=o\.ReminderInstructionsClass,([A-Za-z_$][\w$]*)=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
+                '$1=o.userQueryTagName,$2=o.ReminderInstructionsClass,$3=o.ToolReferencesHintClass;' +
+                        'let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;' +
+                        'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+                        'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
+                        'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
+                        'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
+                        'let __llamaHead=Math.floor(__llamaCap*.2);' +
+                        '__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}' +
+                        'if(Array.isArray(__llamaResults)&&__llamaResults.length>__llamaCap)' +
+                        '__llamaResults=__llamaResults.slice(__llamaResults.length-__llamaCap)}' +
+                        'return this.props.enableSummarization?',
+                "extension model agent history cap"
+        );
+        patched = replacePatternOnceWith(
+                patched,
+                /(toolCallRounds:this\.props\.promptContext\.toolCallRounds,toolCallResults:this\.props\.promptContext\.toolCallResults,truncateAt:)([A-Za-z_$][\w$]*)(,enableCacheBreakpoints:!1)/,
+                match => `toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:${match[2]},enableCacheBreakpoints:!1`,
+                "extension model agent history cap wiring"
+        );
+        patched = replaceOnce(
+                patched,
+                'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;',
+                'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
+                        'let __llamaRounds=this.props.toolCallRounds;' +
+                        'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+                        'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
+                        'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
+                        'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
+                        'let __llamaHead=Math.floor(__llamaCap*.2);' +
+                        '__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}}',
+                "agent history element cap"
+        );
+        patched = replaceOnce(
+                patched,
+                'l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));',
+                'l=__llamaRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,__llamaRounds.length,s,c,a));',
+                "agent history element cap wiring"
+        );
+        return patched;
+}
+
 export function patchCopilotBundle(source: string): string {
 	if (source.includes(COPILOT_PATCH_MARKER)) {
 		return source;
@@ -425,8 +477,8 @@ export function patchCopilotBundle(source: string): string {
 	);
 	patched = replacePatternOnce(
 		patched,
-		/([A-Za-z_$][\w$]*)=_\?this\._getOrCreateBackgroundSummarizer\(t\.conversation\?\.sessionId\):void 0/,
-		'$1=_&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
+		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?this\._getOrCreateBackgroundSummarizer\(t\.conversation\?\.sessionId\):void 0/,
+		'$1=$2&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
 		"extension endpoint background compaction"
 	);
 	// Deterministic tool ordering — sort by name so the prefix cache survives Extension Host restarts.
@@ -438,58 +490,7 @@ export function patchCopilotBundle(source: string): string {
 		'$1.tools=$2.tools?.slice().sort((a,b)=>{let x=a.name,y=b.name;return x<y?-1:x>y?1:0}).map($3=>({type:"function",function:{name:$3.name,description:$3.description,parameters:$3.inputSchema&&Object.keys($3.inputSchema).length?$3.inputSchema:void 0}}))',
 		"deterministic tool ordering"
 	);
-	// Copilot's prompt renderer (prompt-tsx) walks and rebalances the whole element
-	// tree on every step, so a 1500-message conversation costs minutes of host CPU
-	// per agent round even when token counts are cached. Cap the rendered history
-	// for llama.cpp: keep the oldest 20% of tool-call rounds (stable prefix for the
-	// upstream prompt cache) plus the newest rounds. llamacpp.agentHistoryRounds=0
-	// disables the cap.
-	patched = replacePatternOnce(
-		patched,
-		/_=o\.userQueryTagName,w=o\.ReminderInstructionsClass,E=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
-		'_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;' +
-			'let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;' +
-			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-			'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
-			'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
-			'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
-			'let __llamaHead=Math.floor(__llamaCap*.2);' +
-			'__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}' +
-			'if(Array.isArray(__llamaResults)&&__llamaResults.length>__llamaCap)' +
-			'__llamaResults=__llamaResults.slice(__llamaResults.length-__llamaCap)}' +
-			'return this.props.enableSummarization?',
-		"extension model agent history cap"
-	);
-	patched = replaceOnce(
-		patched,
-		'toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1',
-		'toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:v,enableCacheBreakpoints:!1',
-		"extension model agent history cap wiring"
-	);
-	// The history element (dl) is shared by every agent prompt — the main Agent
-	// prompt plus the specialised editing/exploring agents. Cap the rounds there
-	// too so chats that render through another agent class get the same bound.
-	// toolCallResults is left untouched: it is a lookup map, never rendered, and
-	// the round renderer needs it to resolve results for the retained head.
-	patched = replaceOnce(
-		patched,
-		'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;',
-		'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
-			'let __llamaRounds=this.props.toolCallRounds;' +
-			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-			'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
-			'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
-			'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
-			'let __llamaHead=Math.floor(__llamaCap*.2);' +
-			'__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}}',
-		"agent history element cap"
-	);
-	patched = replaceOnce(
-		patched,
-		'l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));',
-		'l=__llamaRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,__llamaRounds.length,s,c,a));',
-		"agent history element cap wiring"
-	);
+	patched = patchAgentHistoryCap(patched);
 	// Rounds only bound the current request. Everything before it arrives as prior
 	// conversation turns, and a CPU profile of a 1573-message chat put 35% of the
 	// host time in prompt-tsx token accounting and 29% in its node-removal walk,
