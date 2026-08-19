@@ -24,6 +24,7 @@ suite("context budget", () => {
 		assert.strictEqual(budget.replyReserveTokens, 8192);
 		assert.strictEqual(budget.softInputTarget, 101171);
 		assert.strictEqual(budget.hardInputTarget, 84131);
+		assert.strictEqual(budget.forceInputTarget, 117964);
 	});
 
 	test("caps reply reserve at percent of context", () => {
@@ -90,6 +91,7 @@ suite("context budget", () => {
 				messageTokens: calibratedMessageTokens,
 				autoCompact: true,
 				softInputTarget: 218_739,
+				forceInputTarget: 1_000_000,
 				overflowRetry: false,
 			}).kind,
 			"auto",
@@ -102,14 +104,36 @@ suite("context budget", () => {
 			messageTokens: 110000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
-		}), { kind: "auto", target: 82500 });
+		}), { kind: "auto", target: 82500, reason: "auto" });
 
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 101000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
+		}), { kind: "none" });
+	});
+
+	test("force-compacts at the 90% context limit even when autoCompact is off", () => {
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 260_000,
+			autoCompact: false,
+			softInputTarget: 235_000,
+			forceInputTarget: 252_000,
+			overflowRetry: false,
+			targetRatio: 0.5,
+		}), { kind: "auto", target: 130_000, reason: "force" });
+
+		assert.deepStrictEqual(selectContextCompaction({
+			messageTokens: 240_000,
+			autoCompact: false,
+			softInputTarget: 235_000,
+			forceInputTarget: 252_000,
+			overflowRetry: false,
+			targetRatio: 0.5,
 		}), { kind: "none" });
 	});
 
@@ -118,25 +142,28 @@ suite("context budget", () => {
 			messageTokens: 110000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
 			targetRatio: 0.25,
-		}), { kind: "auto", target: 27500 });
+		}), { kind: "auto", target: 27500, reason: "auto" });
 
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 110000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
 			targetRatio: 0.5,
-		}), { kind: "auto", target: 55000 });
+		}), { kind: "auto", target: 55000, reason: "auto" });
 
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 101000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: true,
 			targetRatio: 0.5,
-		}), { kind: "auto", target: 50500 });
+		}), { kind: "auto", target: 50500, reason: "overflow" });
 	});
 
 	test("clamps unsafe compaction target ratios", () => {
@@ -144,16 +171,18 @@ suite("context budget", () => {
 			messageTokens: 1000,
 			autoCompact: true,
 			softInputTarget: 900,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
 			targetRatio: 0.1,
-		}), { kind: "auto", target: 250 });
+		}), { kind: "auto", target: 250, reason: "auto" });
 		assert.deepStrictEqual(selectContextCompaction({
 			messageTokens: 1000,
 			autoCompact: true,
 			softInputTarget: 900,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
 			targetRatio: 1,
-		}), { kind: "auto", target: 900 });
+		}), { kind: "auto", target: 900, reason: "auto" });
 	});
 
 	test("auto-compaction lands below the trigger to avoid micro-compactions", () => {
@@ -164,6 +193,7 @@ suite("context budget", () => {
 			messageTokens: 450000,
 			autoCompact: true,
 			softInputTarget: 402100,
+			forceInputTarget: 1_000_000,
 			overflowRetry: false,
 		});
 		assert.strictEqual(decision.kind, "auto");
@@ -178,7 +208,8 @@ suite("context budget", () => {
 			messageTokens: 101000,
 			autoCompact: true,
 			softInputTarget: 101171,
+			forceInputTarget: 1_000_000,
 			overflowRetry: true,
-		}), { kind: "auto", target: 75750 });
+		}), { kind: "auto", target: 75750, reason: "overflow" });
 	});
 });

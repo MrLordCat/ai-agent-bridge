@@ -1,5 +1,43 @@
 # Changelog
 
+## 1.15.0 (stable) - 2026-08-19
+
+Stable release consolidating the 1.14.x development patches:
+
+- **Context ceiling enforcement** (1.14.39): selectContextCompaction now
+  force-compacts when the message context exceeds 90% of the configured
+  context window, independent of llamacpp.autoCompact. Previously, with
+  autoCompact=false (the default and the Configure DeepSeek preset) and a
+  ~1M-context model that never rejects oversized prompts, the context
+  grew past llamacpp.deepSeekContextLength. The decision now carries a
+  reason ("auto" / "force" / "overflow" / "manual"), logged as
+  "force-compact" ("Conversation summary (context limit reached)").
+- **Cloudflare cache diagnostics** (1.14.36-38): x-session-affinity
+  restores prompt-cache hits; partial-miss wording corrected (Cloudflare
+  responses carry no CloudFront route telemetry); provider-kind labels
+  for sessions; README caveat about per-instance prefix caching.
+- **Provider management + Quick Access** (README): provider add/edit/
+  remove, balance and turn counts, model catalog, Agents Window BYOK.
+- **Tests**: 459 extension-host tests, VS Code 1.131 pinned.
+
+## 1.14.39 (dev) - 2026-08-19
+
+Enforced context ceiling at 90% of the configured limit:
+
+- **Problem**: with llamacpp.autoCompact=false (the default and the
+  Configure DeepSeek preset), the context grew past the configured
+  llamacpp.deepSeekContextLength because proactive compaction was off and
+  the server (a ~1M-context model) never rejected the oversized prompt,
+  so the overflow-retry path also never fired.
+- **Fix**: selectContextCompaction now force-compacts whenever the
+  message context exceeds 90% of the model context window
+  (FORCE_COMPACTION_CONTEXT_RATIO), independent of autoCompact. The
+  decision carries a reason ("auto" / "force" / "overflow" / "manual")
+  and the force case is logged/compacted as "force-compact" with the
+  label "Conversation summary (context limit reached)".
+- **Tests**: force-trigger and 90%-threshold budget coverage
+  (459 extension-host tests total).
+
 ## 1.14.38 (dev) - 2026-08-19
 
 Diagnostic wording fix for Cloudflare:

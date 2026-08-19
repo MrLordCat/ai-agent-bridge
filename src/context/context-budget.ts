@@ -15,6 +15,7 @@ export interface ContextBudget {
 	replyReservePercent: number;
 	softInputTarget: number;
 	hardInputTarget: number;
+	forceInputTarget: number;
 }
 
 interface ContextUsageEstimate {
@@ -25,12 +26,13 @@ interface ContextUsageEstimate {
 
 export type ContextCompactionDecision =
 	| { kind: "none" }
-	| { kind: "auto"; target: number };
+	| { kind: "auto"; target: number; reason: "auto" | "force" | "overflow" | "manual" };
 
 interface ContextCompactionDecisionInput {
 	messageTokens: number;
 	autoCompact: boolean;
 	softInputTarget: number;
+	forceInputTarget: number;
 	overflowRetry: boolean;
 	targetRatio?: number;
 }
@@ -44,11 +46,15 @@ interface ContextCompactionDecisionInput {
 export function selectContextCompaction(
 	input: ContextCompactionDecisionInput
 ): ContextCompactionDecision {
-	if (input.overflowRetry || (input.autoCompact && input.messageTokens > input.softInputTarget)) {
-		return {
-			kind: "auto",
-			target: Math.max(1, Math.floor(input.messageTokens * normalizeCompactionTargetRatio(input.targetRatio))),
-		};
+	const target = Math.max(1, Math.floor(input.messageTokens * normalizeCompactionTargetRatio(input.targetRatio)));
+	if (input.overflowRetry) {
+		return { kind: "auto", target, reason: "overflow" };
+	}
+	if (input.messageTokens > input.forceInputTarget) {
+		return { kind: "auto", target, reason: "force" };
+	}
+	if (input.autoCompact && input.messageTokens > input.softInputTarget) {
+		return { kind: "auto", target, reason: "auto" };
 	}
 	return { kind: "none" };
 }
@@ -62,6 +68,7 @@ export function selectContextCompaction(
 export const DEFAULT_COMPACTION_TARGET_RATIO = 0.75;
 export const MIN_COMPACTION_TARGET_RATIO = 0.25;
 export const MAX_COMPACTION_TARGET_RATIO = 0.9;
+export const FORCE_COMPACTION_CONTEXT_RATIO = 0.9;
 
 export function normalizeCompactionTargetRatio(value: unknown): number {
 	const parsed = typeof value === "number" ? value : Number(value);
@@ -97,6 +104,7 @@ export function calculateContextBudget(input: ContextBudgetInput): ContextBudget
 		1,
 		Math.floor(modelInputLimit * input.hardContextUtilization) - replyReserveTokens - input.toolTokens
 	);
+	const forceInputTarget = Math.max(1, Math.floor(modelInputLimit * FORCE_COMPACTION_CONTEXT_RATIO));
 
 	return {
 		modelInputLimit,
@@ -105,6 +113,7 @@ export function calculateContextBudget(input: ContextBudgetInput): ContextBudget
 		replyReservePercent: input.replyReservePercent,
 		softInputTarget,
 		hardInputTarget,
+		forceInputTarget,
 	};
 }
 

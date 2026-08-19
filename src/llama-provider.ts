@@ -3210,7 +3210,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         label: string,
         maxToolResultChars: number | undefined,
         requestId: string,
-        cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop",
+        cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop" | "force-compact",
         token: CancellationToken,
         forceKeepLastTurnOnly = false
     ): Promise<OpenAIChatMessage[]> {
@@ -4453,6 +4453,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             replyReserveTokens: replyReserve,
             softInputTarget,
             hardInputTarget,
+            forceInputTarget,
         } = contextBudget;
 
         this.log("chat.turn.budget", {
@@ -4629,7 +4630,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             sourceMessages: OpenAIChatMessage[],
             targetTokens: number,
             label: string,
-            cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop",
+            cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop" | "force-compact",
             forceKeepLastTurnOnly = false
         ): Promise<{
             messages: OpenAIChatMessage[];
@@ -4880,11 +4881,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 ? {
                     kind: "auto" as const,
                     target: Math.max(1, Math.floor(messageTokenCount * compactionTargetRatio)),
+                    reason: "manual" as const,
                 }
                 : selectContextCompaction({
                     messageTokens: messageTokenCount,
                     autoCompact: autoCompact && !snapshotStale && !(isFirstRequestForScope && !snapshotMessages?.length),
                     softInputTarget,
+                    forceInputTarget,
                     overflowRetry: false,
                     targetRatio: compactionTargetRatio,
                 });
@@ -4894,10 +4897,17 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 const beforeCompactionCount = preparedMessages.length;
                 const beforeCompactionTokens = messageTokenCount;
                 const beforeCompactionChars = this.messageChars(preparedMessages);
-                const compactionCause = manualCompactionRequested ? "manual" as const : "auto-compact" as const;
+                const compactionReason = compactionDecision.reason;
+                const compactionCause = manualCompactionRequested
+                    ? ("manual" as const)
+                    : compactionReason === "force"
+                        ? ("force-compact" as const)
+                        : ("auto-compact" as const);
                 const compactionLabel = manualCompactionRequested
                     ? "Conversation summary (manual compact)"
-                    : "Conversation summary (auto-compact)";
+                    : compactionReason === "force"
+                        ? "Conversation summary (context limit reached)"
+                        : "Conversation summary (auto-compact)";
                 const compacted = await compactWithCurrentMemory(
                     preparedMessages,
                     compactionDecision.target,
@@ -4911,6 +4921,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 autoCompacted = true;
                 this.log(manualCompactionRequested ? "chat.messages.manual_compact" : "chat.messages.auto_compact", {
                     requestId,
+                    reason: compactionReason,
                     tokenEstimate: messageTokenCount,
                     tokenCountSource: counted.source,
                     promptTokens: counted.promptTokens,
@@ -5190,8 +5201,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         messageTokens: prepared.finalTokenEstimate,
                         autoCompact,
                         softInputTarget,
+                        forceInputTarget,
                         overflowRetry: true,
-                            targetRatio: compactionTargetRatio,
+                        targetRatio: compactionTargetRatio,
                     });
                     // Single compaction scheme: an overflow retry uses the same
                         // configured target as proactive compaction — no separate
