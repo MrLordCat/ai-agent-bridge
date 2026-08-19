@@ -174,7 +174,7 @@ export interface LlamaChatTurnStepMetrics {
 export interface LlamaChatTurnMetrics {
     requestId: string;
     modelId: string;
-    providerKind?: "local" | "deepseek" | "codex" | "claude";
+    providerKind?: "local" | "deepseek" | "codex" | "claude" | "cloudflare" | "openrouter";
     lifecyclePhase?: "running" | "completed" | "timed_out" | "interrupted" | "abandoned" | "failed";
     terminalDetail?: string;
     threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
@@ -1046,6 +1046,19 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             tailRoles: roles.slice(-8),
             largestChars,
         };
+    }
+
+    private providerKindLabel(serverUrl: string): "local" | "deepseek" | "cloudflare" | "openrouter" {
+        if (isDeepSeekEndpoint(serverUrl)) {
+            return "deepseek";
+        }
+        if (isCloudflareWorkersAiBase(serverUrl)) {
+            return "cloudflare";
+        }
+        if (new URL(serverUrl).hostname === "openrouter.ai" || new URL(serverUrl).hostname.endsWith(".openrouter.ai")) {
+            return "openrouter";
+        }
+        return "local";
     }
 
     private cachePrefixScope(
@@ -5903,7 +5916,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             const metrics: LlamaChatTurnMetrics = {
                 requestId,
                 modelId: model.id,
-                providerKind: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                providerKind: this.providerKindLabel(serverUrl),
                 lifecyclePhase: "completed",
                 conversationKey: typeof options.modelOptions?._copilotConversationId === "string"
                     ? this.shortHash(options.modelOptions._copilotConversationId)
@@ -5989,7 +6002,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 const failedMetrics: LlamaChatTurnMetrics = {
                     requestId,
                     modelId: model.id,
-                    providerKind: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                    providerKind: this.providerKindLabel(serverUrl),
                     lifecyclePhase: "failed",
                     terminalDetail: err instanceof Error ? err.message : String(err),
                     conversationKey: typeof options.modelOptions?._copilotConversationId === "string"

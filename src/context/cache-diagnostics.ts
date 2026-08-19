@@ -352,12 +352,14 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 				detail: `${missDetail}; the previous turn compacted the history, so its new cache prefix is still only partially readable upstream`,
 			};
 		}
-		const routeDetail = backendRouteChanged(input.backend)
-			? `the observed CloudFront route also changed (${formatRouteChange(input.backend)}); `
-				+ "that coincided with the loss but does not identify the internal DeepSeek cache shard"
-			: "the visible CloudFront route stayed unchanged, so the fluctuation occurred behind that edge or inside the upstream cache tier";
+		const routeDetail = input.provider === "cloudflare"
+			? "the Cloudflare endpoint exposes no CloudFront route telemetry, so the miss occurred inside Cloudflare's model-serving tier"
+			: backendRouteChanged(input.backend)
+				? `the observed CloudFront route also changed (${formatRouteChange(input.backend)}); `
+					+ "that coincided with the loss but does not identify the internal DeepSeek cache shard"
+				: "the visible CloudFront route stayed unchanged, so the fluctuation occurred behind that edge or inside the upstream cache tier";
 		const cloudflareNote = input.provider === "cloudflare"
-			? " Cloudflare Workers AI: prefix caching requires the model to support it (see its model page) and requests to reach the same model instance — x-session-affinity is now sent automatically per conversation."
+			? " Cloudflare Workers AI: prefix caching is per model instance and the x-session-affinity pin is best-effort (docs: 'increasing the likelihood'); with a byte-stable prefix and stable affinity, alternating hit/miss across requests means requests land on different instances. Model support for prefix caching is listed on its model page."
 			: "";
 		return {
 			reason: "upstream_cache_partial",

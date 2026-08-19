@@ -6,7 +6,7 @@ rem ("Extract: UNC host ... access is not allowed"), so this script copies
 rem the vsix next to itself to the local temp folder and installs from there.
 rem Update PRIMARY_VSIX on every version bump (the file next to this script).
 
-set "PRIMARY_VSIX=%~dp0llama-vscode-chat-1.14.36.vsix"
+set "PRIMARY_VSIX=%~dp0llama-vscode-chat-1.14.38.vsix"
 set "VSIX="
 if exist "%PRIMARY_VSIX%" set "VSIX=%PRIMARY_VSIX%"
 if not defined VSIX (

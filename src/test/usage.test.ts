@@ -133,7 +133,8 @@ suite("prompt cache diagnostics", () => {
 		});
 		assert.strictEqual(report.reason, "upstream_cache_partial");
 		assert.ok(report.detail.includes("x-session-affinity"), "must mention instance pinning");
-		assert.ok(report.detail.includes("model to support it"), "must mention model support");
+		assert.ok(report.detail.includes("different instances"), "must mention instance alternation");
+		assert.ok(report.detail.includes("Model support"), "must mention model support");
 	});
 
 	test("does not blame a route change when uncached tokens are explained by the new tail", () => {

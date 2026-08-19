@@ -58,7 +58,7 @@ suite("AI Agent Bridge branding", () => {
 	test("keeps the main README release and development facts current", () => {
 		const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 		assert.match(readme, /^# AI Agent Bridge for VS Code/m);
-			assert.ok(readme.includes("**Stable release: 1.14.3. Current local development build: 1.14.36.**"));
+			assert.ok(readme.includes("**Stable release: 1.14.3. Current local development build: 1.14.38.**"));
 		assert.match(readme, /458 extension-host tests/);
 		assert.match(readme, /Patch v22/);
 		assert.doesNotMatch(readme, /Local LLM Chat Provider|Local LLM:|Stable release: 1.9.0|283 extension-host tests|Patch v16/);

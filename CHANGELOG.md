@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.14.38 (dev) - 2026-08-19
+
+Diagnostic wording fix for Cloudflare:
+
+- The Cloudflare partial-miss detail no longer claims a CloudFront route
+  was involved: Cloudflare responses carry no via/x-amz-cf-pop telemetry
+  (the old text was a DeepSeek-specific fallback that fired when both
+  route values were absent). The text now states the miss occurred
+  inside Cloudflare's model-serving tier.
+
+## 1.14.37 (dev) - 2026-08-19
+
+Cloudflare cache alternation: diagnostics + providerKind labels:
+
+- Log analysis of the reported misses shows the x-session-affinity header
+  is present and byte-stable on every request (hit and miss turns alike),
+  with stable tools/system/messages — the alternation (hit → 100% miss →
+  hit) is Cloudflare-side: prefix caching is per model instance and the
+  affinity pin is best-effort, so requests land on different instances.
+  The partial-miss note now explains this instead of implying a client
+  bug.
+- providerKind in turn reports is now "cloudflare" / "openrouter"
+  (previously every non-DeepSeek HTTP source was labeled "local").
+- **Tests**: updated cloudflare diagnostic assertions (458
+  extension-host tests total).
+
 ## 1.14.36 (dev) - 2026-08-19
 
 Cloudflare prompt cache: x-session-affinity + diagnostics:
