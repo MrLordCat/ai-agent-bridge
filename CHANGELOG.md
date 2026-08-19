@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.14.36 (dev) - 2026-08-19
+
+Cloudflare prompt cache: x-session-affinity + diagnostics:
+
+- **Problem**: chats through a Cloudflare Workers AI profile (e.g.
+  @cf/deepseek-ai/deepseek-v4-pro-0813) showed ~100% upstream cache
+  misses every turn even with a byte-stable prefix and seconds-long
+  gaps.
+- **Cause** (verified against the official docs): Workers AI prefix
+  caching only works when the request routes to the same model instance
+  that computed the prefix, and it is enabled per model. Requests
+  without pinning can land on different instances, losing the cached
+  tensors.
+- **Fix**: chat requests to api.cloudflare.com now send
+  x-session-affinity: llama-vscode-chat-{conversationId} (per
+  conversation, stable across turns). Diagnostics classify Cloudflare
+  sources as provider "cloudflare" and the partial-miss detail explains
+  the instance-pinning and per-model support requirements.
+- **Tests**: affinity value, cloudflare diagnostic note (458
+  extension-host tests total).
+
 ## 1.14.35 (dev) - 2026-08-19
 
 API providers in Quick Access + balance:

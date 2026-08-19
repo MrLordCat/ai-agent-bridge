@@ -115,6 +115,27 @@ suite("prompt cache diagnostics", () => {
 		assert.ok(report.detail.includes("coincided"));
 	});
 
+	test("cloudflare partial miss explains instance pinning and model support", () => {
+		const report = buildCacheDiagnostics({
+			provider: "cloudflare",
+			modelId: "@cf/deepseek-ai/deepseek-v4-pro-0813",
+			requestId: "req-2",
+			usage: usage(126_436, 0),
+			prefix: {
+				previousRequestId: "req-1",
+				staticFieldsMatch: true,
+				toolsMatch: true,
+				identicalMessagePrefix: 210,
+				messageCount: 212,
+				previousMessageCount: 210,
+			},
+			backend: { previousPromptTokens: 124_913 },
+		});
+		assert.strictEqual(report.reason, "upstream_cache_partial");
+		assert.ok(report.detail.includes("x-session-affinity"), "must mention instance pinning");
+		assert.ok(report.detail.includes("model to support it"), "must mention model support");
+	});
+
 	test("does not blame a route change when uncached tokens are explained by the new tail", () => {
 		const report = buildCacheDiagnostics({
 			...base,

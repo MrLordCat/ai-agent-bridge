@@ -31,6 +31,18 @@ export function getModelsEndpoint(serverUrl: string): string {
 }
 
 /** True for https://api.cloudflare.com/client/v4/accounts/{id}/ai/v1 bases. */
+/**
+ * Value for the Cloudflare Workers AI x-session-affinity header: pins a
+ * conversation to the same model instance so prefix caching can hit
+ * (docs: developers.cloudflare.com/workers-ai/features/prompt-caching/).
+ */
+export function cloudflareSessionAffinity(conversationId: string | undefined): string | undefined {
+	if (!conversationId) {
+		return undefined;
+	}
+	return `llama-vscode-chat-${conversationId}`;
+}
+
 export function isCloudflareWorkersAiBase(baseUrl: string): boolean {
 	try {
 		const url = new URL(baseUrl);

@@ -356,9 +356,12 @@ function classify(input: CacheDiagnosticsInput): { reason: CacheMissReason; deta
 			? `the observed CloudFront route also changed (${formatRouteChange(input.backend)}); `
 				+ "that coincided with the loss but does not identify the internal DeepSeek cache shard"
 			: "the visible CloudFront route stayed unchanged, so the fluctuation occurred behind that edge or inside the upstream cache tier";
+		const cloudflareNote = input.provider === "cloudflare"
+			? " Cloudflare Workers AI: prefix caching requires the model to support it (see its model page) and requests to reach the same model instance — x-session-affinity is now sent automatically per conversation."
+			: "";
 		return {
 			reason: "upstream_cache_partial",
-			detail: `${missDetail}; ${routeDetail}`,
+			detail: `${missDetail}; ${routeDetail}${cloudflareNote}`,
 		};
 	}
 	if (usage.hitPercent >= HEALTHY_HIT_PERCENT) {

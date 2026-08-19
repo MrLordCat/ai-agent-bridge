@@ -1,6 +1,7 @@
 import * as assert from "node:assert";
 import {
 	getChatCompletionsEndpoint,
+	cloudflareSessionAffinity,
 	getModelsEndpoint,
 	isCloudflareWorkersAiBase,
 	pickModelCatalogId,
@@ -9,6 +10,15 @@ import {
 	OpenAIHttpTransport,
 	parseRetryAfterMs,
 } from "../transport/openai-http";
+
+	test("cloudflareSessionAffinity pins a conversation to a model instance", () => {
+		assert.strictEqual(
+				cloudflareSessionAffinity("f6683c889b03a52b"),
+				"llama-vscode-chat-f6683c889b03a52b"
+		);
+		assert.strictEqual(cloudflareSessionAffinity(undefined), undefined);
+		assert.strictEqual(cloudflareSessionAffinity(""), undefined);
+	});
 
 	test("pickModelCatalogId prefers the canonical name for Cloudflare items", () => {
 		const cloudflare = "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1";

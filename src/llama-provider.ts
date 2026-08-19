@@ -105,6 +105,8 @@ import {
 import {
     getChatCompletionsEndpoint,
     getModelsEndpoint,
+    cloudflareSessionAffinity,
+    isCloudflareWorkersAiBase,
     isDeepSeekEndpoint,
     pickModelCatalogId,
     isTransientHttpStatus,
@@ -4488,6 +4490,19 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         if (apiKey) {
             headers["Authorization"] = `Bearer ${apiKey}`;
         }
+        // Cloudflare Workers AI prefix caching only hits when the request
+        // reaches the same model instance that computed the prefix; the
+        // x-session-affinity header pins a conversation to one instance.
+        if (isCloudflareWorkersAiBase(serverUrl)) {
+            const affinity = cloudflareSessionAffinity(
+                typeof (options.modelOptions as Record<string, unknown> | undefined)?._copilotConversationId === "string"
+                    ? String((options.modelOptions as Record<string, unknown>)._copilotConversationId)
+                    : undefined
+            );
+            if (affinity) {
+                headers["x-session-affinity"] = affinity;
+            }
+        }
 
         const waitForRetry = (delayMs: number): Promise<void> => new Promise((resolve, reject) => {
             if (token.isCancellationRequested) {
@@ -5847,7 +5862,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 : undefined;
             const cacheDiagnostics = usageSource === "server"
                 ? buildCacheDiagnostics({
-                    provider: isDeepSeekEndpoint(serverUrl) ? "deepseek" : "local",
+                    provider: isDeepSeekEndpoint(serverUrl)
+                        ? "deepseek"
+                        : isCloudflareWorkersAiBase(serverUrl)
+                            ? "cloudflare"
+                            : "local",
                     modelId: requestModelId,
                     requestId,
                     usage: promptCacheUsage,
