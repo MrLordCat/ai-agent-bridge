@@ -3796,9 +3796,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // The API itself decides whether to accept image content blocks;
         // if the model (e.g. DeepSeek) supports vision it may use tools
         // like view_image to inspect attached images.
-        // NOTE: DeepSeek API currently does NOT accept image_url content
-        // blocks (returns 400 Bad Request), so vision is disabled for
-        // DeepSeek models even if the model family supports it.
+        // DeepSeek vision models (deepseek-v4-flash-vision-exp) accept
+        // OpenAI-style image_url blocks — verified 2026-08-25 against
+        // https://api-docs.deepseek.com/guides/vision (JPEG/PNG/GIF/WebP,
+        // base64 data URLs or public URLs). Non-vision DeepSeek models still
+        // reject image blocks with 400, so the flag stays generic.
         const archMeta = model.meta as Record<string, unknown> | undefined;
         const inputModalities = (archMeta?.architecture as Record<string, unknown> | undefined)
             ?.input_modalities as string[] | undefined;
@@ -3813,7 +3815,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             metaModalities?.vision === true ||
             (Array.isArray(inputModalities) && inputModalities.includes("image")) ||
             capabilities.includes("vision") ||
-            capabilities.includes("multimodal");
+            capabilities.includes("multimodal") ||
+            (family === "deepseek" && /vision/i.test(model.id));
 
         const info: LanguageModelChatInformation & Record<string, unknown> = {
             id: encodeProviderModelId(source.key, model.id),

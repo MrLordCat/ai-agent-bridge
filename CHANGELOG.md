@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.6 (dev) - 2026-08-25
+
+- **DeepSeek vision-exp images enabled**: `deepseek-v4-flash-vision-exp` is
+  now advertised as image-capable (OpenAI `image_url` blocks, base64 or URL)
+  — verified against the official Vision guide 2026-08-25
+  (https://api-docs.deepseek.com/guides/vision). Other DeepSeek models remain
+  text-only.
+- **Quick Access dedup**: the Codex «Subscription Window» item is removed —
+  the two explicit limit items («Session Limit (5h)» / «Weekly Limit») already
+  show the same data; «Usage Limit» stays as endpoint-unavailable fallback.
+
 ## 1.15.5 (dev) - 2026-08-25
 
 - **Codex shows both subscription windows**: Quick Access renders the primary

@@ -499,7 +499,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const deepSeekMetrics = this.getDeepSeekMetrics();
 		const codexMetrics = this.getCodexMetrics();
 		const claudeMetrics = this.getClaudeMetrics();
-		const codexSubscriptionUsage = this.getCodexSubscriptionUsage();
 		const subagentProfiles = this.getSubagentProfiles();
 		const tokenUsageHistory = this.getTokenUsageHistory();
 		const usageExperiments = this.getUsageExperiments();
@@ -640,11 +639,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					description: codexStatus ?? "Checking...",
 					tooltip: "ChatGPT subscription account used by Codex",
 					icon: new vscode.ThemeIcon("account"),
-					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
-				}),
-				new QuickAccessItem("codex.subscription", "Subscription Window", {
-					description: codexSubscriptionUsage ?? "Usage unavailable",
-					icon: new vscode.ThemeIcon("dashboard"),
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
 				}),
 				new QuickAccessItem("codex.contextTarget", "Working Context", {

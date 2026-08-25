@@ -287,6 +287,61 @@ suite("Llama.cpp Chat Provider Extension", () => {
             }
         });
 
+        test("advertises DeepSeek vision-exp as image-capable", async () => {
+            const providerAny = provider as unknown as {
+                getModelSources: () => Promise<Array<{
+                    key: string;
+                    label: string;
+                    serverUrl: string;
+                    apiKey?: string;
+                    familyOverride?: string;
+                    contextLengthOverride?: number;
+                }>>;
+                getRuntimeContextLengthWithCache: () => Promise<number | undefined>;
+                fetchModelsWithInflightCache: (
+                    source: { serverUrl: string },
+                    apiKey: string | undefined,
+                    apiKeyPresent: boolean
+                ) => Promise<Array<{ id: string }>>;
+            };
+            const originalGetModelSources = providerAny.getModelSources;
+            const originalGetRuntimeContextLengthWithCache = providerAny.getRuntimeContextLengthWithCache;
+            const originalFetchModelsWithInflightCache = providerAny.fetchModelsWithInflightCache;
+
+            try {
+                provider.refreshLanguageModelChatInformation();
+                providerAny.getModelSources = async () => [{
+                    key: "deepseek",
+                    label: "DeepSeek",
+                    serverUrl: "https://api.deepseek.com",
+                    apiKey: "sk-test",
+                    familyOverride: "deepseek",
+                    contextLengthOverride: 1048576,
+                }];
+                providerAny.getRuntimeContextLengthWithCache = async () => undefined;
+                providerAny.fetchModelsWithInflightCache = async () => [
+                    { id: "deepseek-v4-flash-vision-exp" },
+                    { id: "deepseek-v4-pro" },
+                ];
+
+                const infos = await provider.provideLanguageModelChatInformation(
+                    { silent: true },
+                    new vscode.CancellationTokenSource().token
+                );
+
+                const vision = infos.find(info => info.id === "deepseek::deepseek-v4-flash-vision-exp");
+                assert.ok(vision, "vision-exp must be advertised");
+                assert.strictEqual(vision!.capabilities.imageInput, true);
+                const pro = infos.find(info => info.id === "deepseek::deepseek-v4-pro");
+                assert.strictEqual(pro!.capabilities.imageInput, false);
+            } finally {
+                providerAny.getModelSources = originalGetModelSources;
+                providerAny.getRuntimeContextLengthWithCache = originalGetRuntimeContextLengthWithCache;
+                providerAny.fetchModelsWithInflightCache = originalFetchModelsWithInflightCache;
+                provider.refreshLanguageModelChatInformation();
+            }
+        });
+
         test("uses local runtime context before local fallback context", async () => {
             const providerAny = provider as unknown as {
                 getModelSources: () => Promise<Array<{
