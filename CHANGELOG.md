@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.15.5 (dev) - 2026-08-25
+
+- **Codex shows both subscription windows**: Quick Access renders the primary
+  (5-hour) and secondary (weekly) limits as separate items — «Session Limit
+  (5h)» and «Weekly Limit» — with percent used and reset time each, from the
+  official codex rate-limits endpoint (`summarizeCodexRateLimits`). The
+  fallback «Usage Limit» item remains when the endpoint has no data.
+
 ## 1.15.4 (dev) - 2026-08-25
 
 - **Codex 5-hour limit is shown again**: Quick Access now labels the Codex

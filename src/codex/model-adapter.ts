@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 
-import type { CodexModel, CodexRateLimitSnapshot } from "./protocol";
+import type { CodexModel, CodexRateLimitSnapshot, CodexRateLimitWindow } from "./protocol";
 
 export const CODEX_MODEL_ID_PREFIX = "codex::";
 
@@ -112,6 +112,50 @@ export function formatCodexWindowDuration(mins: number | null | undefined): stri
 		return `${mins / 60}h`;
 	}
 	return `${mins}m`;
+}
+
+export interface CodexLimitWindowSummary {
+	label: string;
+	description: string;
+}
+
+/** Summaries for the primary (5-hour) and secondary (weekly) subscription windows. */
+export function summarizeCodexRateLimits(
+	snapshot: CodexRateLimitSnapshot | undefined
+): readonly CodexLimitWindowSummary[] {
+	if (!snapshot) {
+		return [];
+	}
+	const slots: Array<{ window: CodexRateLimitWindow | null; label: (mins: number | null) => string }> = [
+		{
+			window: snapshot.primary,
+			label: mins => mins === 300
+				? "Session Limit (5h)"
+				: mins === 10080
+					? "Weekly Limit"
+					: `Session Limit (${formatCodexWindowDuration(mins) ?? "?"})`,
+		},
+		{
+			window: snapshot.secondary,
+			label: mins => mins === 10080
+				? "Weekly Limit"
+				: mins === 300
+					? "Session Limit (5h)"
+					: `Window (${formatCodexWindowDuration(mins) ?? "?"})`,
+		},
+	];
+	const summaries: CodexLimitWindowSummary[] = [];
+	for (const { window, label } of slots) {
+		if (!window) {
+			continue;
+		}
+		const used = Math.max(0, Math.min(100, Math.round(window.usedPercent)));
+		const reset = window.resetsAt
+			? `resets ${new Date(window.resetsAt * 1000).toLocaleString()}`
+			: "resets unknown";
+		summaries.push({ label: label(window.windowDurationMins), description: `${used}% used · ${reset}` });
+	}
+	return summaries;
 }
 
 export function formatCodexRateLimit(snapshot: CodexRateLimitSnapshot | undefined): string {

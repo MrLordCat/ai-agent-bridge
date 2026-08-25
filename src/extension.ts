@@ -663,7 +663,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}),
 		key => providerDirectory.stateOf(key),
 		() => memoryService.count,
-		() => apiProviderService.quickAccessApiProviders()
+		() => apiProviderService.quickAccessApiProviders(),
+		() => codexProvider.codexUsageLimitSummaries
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));

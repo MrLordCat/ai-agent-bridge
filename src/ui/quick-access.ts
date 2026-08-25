@@ -404,6 +404,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined,
 		private readonly getTotalMemoryCount: () => number | undefined = () => undefined,
 	private readonly getApiProviders: () => Promise<readonly QuickAccessApiProvider[]> = async () => [],
+		private readonly getCodexUsageLimits: () => readonly { label: string; description: string }[] = () => [],
 	) {}
 
 	refresh(): void {
@@ -652,14 +653,16 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("settings"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
-				new QuickAccessItem("codex.usageLimit", "Session Limit", {
-					description: this.getCodexUsageLimitPercent() !== undefined
-						? [
-							this.getCodexUsageLimitWindow(),
-							`${this.getCodexUsageLimitPercent()}% used`,
-							this.getCodexUsageLimitReset() ? `resets ${this.getCodexUsageLimitReset()}` : undefined,
-						].filter(Boolean).join(" · ")
-						: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
+				...this.getCodexUsageLimits().map((limit, index) =>
+					new QuickAccessItem(`codex.usageLimit.${index}`, limit.label, {
+						description: limit.description,
+						tooltip: "ChatGPT subscription usage windows from the official Codex rate-limits endpoint (5-hour and weekly windows on Plus/Pro plans). Refreshes automatically every minute so you can see when each limit resets.",
+						icon: new vscode.ThemeIcon("dashboard"),
+						command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+					})
+				),
+				new QuickAccessItem("codex.usageLimit", "Usage Limit", {
+					description: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
 					tooltip: "ChatGPT subscription usage window from the official Codex rate-limits endpoint (5-hour window on Plus/Pro, weekly for some plans). Refreshes automatically every minute so you can see when the limit resets.",
 					icon: new vscode.ThemeIcon("dashboard"),
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),

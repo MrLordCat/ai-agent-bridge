@@ -50,6 +50,7 @@ import {
 	formatCodexRateLimit,
 	mapCodexModelInformation,
 	resolveCodexReasoningEffort,
+	summarizeCodexRateLimits,
 } from "../codex/model-adapter";
 import type { CodexModel } from "../codex/protocol";
 import { parseCodexRolloutMetrics } from "../codex/rollout-metrics";
@@ -1801,6 +1802,24 @@ suite("Codex subscription provider", () => {
 			rateLimitReachedType: null,
 		});
 		assert.match(fiveHour, /^5h · 42% used · resets /);
+	});
+
+	test("summarizes the 5-hour and weekly Codex limit windows", () => {
+		const summaries = summarizeCodexRateLimits({
+			limitId: "codex",
+			limitName: null,
+			primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1787650000 },
+			secondary: { usedPercent: 61, windowDurationMins: 10080, resetsAt: 1789910000 },
+			planType: "plus",
+			rateLimitReachedType: null,
+		});
+		assert.deepStrictEqual(
+			summaries.map(summary => [summary.label, summary.description.split(" · ")[0]]),
+			[
+				["Session Limit (5h)", "42% used"],
+				["Weekly Limit", "61% used"],
+			]
+		);
 	});
 
 	test("uses current request usage instead of cumulative thread billing for context", () => {

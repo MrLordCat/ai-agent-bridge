@@ -289,7 +289,16 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => "2.08 14:00",
 			() => undefined,
 			() => 20,
-			() => "7.08 21:45"
+			() => "7.08 21:45",
+			() => 0,
+			() => ({ total: 0, enabled: 0 }),
+			() => undefined,
+			() => undefined,
+			async () => [],
+			() => [
+				{ label: "Session Limit (5h)", description: "87% used · resets 2.08 14:00" },
+				{ label: "Weekly Limit", description: "20% used · resets 7.08 21:45" },
+			]
 		);
 		const roots = await getItems(provider);
 		const deepSeek = roots.find(item => labelOf(item) === "DeepSeek");
@@ -304,8 +313,10 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const balance = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Balance");
 		assert.strictEqual(balance?.description, "110.00 CNY");
 
-		const usageLimit = (await getItems(provider, codex)).find(item => labelOf(item) === "Session Limit");
-		assert.strictEqual(usageLimit?.description, "87% used · resets 2.08 14:00");
+		const fiveHour = (await getItems(provider, codex)).find(item => labelOf(item) === "Session Limit (5h)");
+		assert.strictEqual(fiveHour?.description, "87% used · resets 2.08 14:00");
+		const weekly = (await getItems(provider, codex)).find(item => labelOf(item) === "Weekly Limit");
+		assert.strictEqual(weekly?.description, "20% used · resets 7.08 21:45");
 
 		// Claude cache keep-alive toggle is visible and defaults to on.
 		const keepAlive = (await getItems(provider, claude)).find(item => labelOf(item) === "Cache Keep-Alive");

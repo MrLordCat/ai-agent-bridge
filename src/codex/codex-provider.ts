@@ -37,6 +37,7 @@ import {
 import {
 	formatCodexRateLimit,
 	formatCodexWindowDuration,
+	summarizeCodexRateLimits,
 	decodeCodexModelId,
 	mapCodexModelInformation,
 	resolveCodexReasoningEffort,
@@ -630,6 +631,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	/** Window duration of the primary subscription limit, e.g. "5h" or "7d". */
 	get codexUsageLimitWindowLabel(): string | undefined {
 		return formatCodexWindowDuration(this.lastRateLimitSnapshot?.primary?.windowDurationMins);
+	}
+
+	/** Primary (5-hour) and secondary (weekly) subscription window summaries. */
+	get codexUsageLimitSummaries(): ReadonlyArray<{ label: string; description: string }> {
+		return summarizeCodexRateLimits(this.lastRateLimitSnapshot);
 	}
 
 	/** True when the ChatGPT subscription window is fully consumed. */
