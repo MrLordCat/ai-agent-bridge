@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.15.4 (dev) - 2026-08-25
+
+- **Codex 5-hour limit is shown again**: Quick Access now labels the Codex
+  subscription item «Session Limit» and renders the real rate-limit window
+  from the official endpoint (`5h · 42% used · resets …`, `7d`, …) via
+  `codexUsageLimitWindowLabel` — the window duration is no longer dropped from
+  the description.
+- **DeepSeek peak hours verified 2026-08-25** (official pricing page): peak
+  windows are `01:00–04:00` and `06:00–10:00 UTC, Monday–Friday`; weekends
+  are off-peak. Quick Access/Providers Manager now show weekday-aware peak
+  labels and roll the next peak over the weekend to Monday (`Mon 04:00`),
+  including Friday evenings.
+
+## 1.15.3 (dev) - 2026-08-25
+
+Memory quality guardrails — agents write cleaner entries, less noise reaches the model:
+
+- **Store guardrails**: new memory entries are rejected above 4096 chars
+  (one thought per entry; existing longer entries remain). The store tool now
+  answers with the saved size (~token estimate) and warns when the entry is
+  close to an existing one — update that id instead of duplicating.
+- **Search output budget**: `llamacpp_search_memory` clips long entries to
+  head+tail with an omitted-chars marker (pass `full: true` for exact text)
+  and reports `N entries, N chars (~N tokens)`; a single hit can no longer
+  pull ~24K chars into agent context.
+- **Pinned always visible**: pinned entries are injected into the prompt even
+  when the current query shares no terms (capped at half the memory budget so
+  relevant entries still win the rest).
+- **Memory Health**: `llamacpp.memoryHealth` command + Quick Access entry —
+  reports entry count, pinned/expired, total tokens, average/entry, the five
+  longest entries and duplicate candidates (similarity ≥ 80%), then opens the
+  memory panel.
+- **Agent instructions** (AGENT-INSTRUCTIONS.md + copilot-instructions.md +
+  customSystemPrompt): entry format (1–3 lines, <750 chars typical), write
+  budget (max 2–3 entries per task), respect tool feedback, run Memory Health
+  before long sessions.
+
+## 1.15.2 (dev) - 2026-08-23
+
+Claude cross-provider context recovery:
+
+- **Full replay after a stale durable Claude session**: an invalid
+  `resumeSessionAt` previously forced `latest-user` recovery immediately, so
+  switching from Codex/ChatGPT could leave Claude with only the current
+  request. Recovery now attempts the current VS Code transcript first when the
+  conservative estimate and fresh usage guard allow it; latest-only remains
+  the bounded fallback for oversized or unsafe replays.
+- **Replay budget**: the safe estimated-input default is raised from 64K to
+  256K tokens, which covers the reported ~117K context while retaining the
+  existing 2x safety estimate and usage checks.
+- **Bounded reasoning tail in compaction**: DeepSeek requires
+  `reasoning_content` of every intermediate assistant message to be passed
+  back while tools are enabled, so stale chain-of-thought accumulated across
+  agent turns (measured: ~135K chars ≈ 34K tokens surviving a single
+  compaction). Compaction now folds extra reasoning-heavy turns into the
+  summary beyond `llamacpp.compactMaxReasoningChars` (default 24K chars,
+  0 disables); retained turns keep their reasoning verbatim, so the API
+  requirement still holds. `chat.messages.auto_compact` logs
+  `reasoningCharsAfter` / `reasoningMsgCountAfter`.
+- **Quick Access fix**: `llamacpp.toggleDeepSeekCompactionSummary` was shown in
+  the DeepSeek group and in the API provider page but never registered; the
+  toggle now updates `llamacpp.deepSeekCompactionSummary` from both places.
+
 ## 1.15.0 (stable) - 2026-08-19
 
 Stable release consolidating the 1.14.x development patches:

@@ -467,4 +467,71 @@ suite("message compaction", () => {
 		);
 	});
 
+	test("bounds historical reasoning_content in the compaction tail", () => {
+		// DeepSeek requires reasoning_content to be passed back for every
+		// intermediate assistant message while tools are in the request, so
+		// stale chain-of-thought accumulates in the surviving tail. The cap
+		// folds extra turns into the summary instead of carrying them over.
+		const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
+		for (let index = 0; index < 30; index += 1) {
+			messages.push(
+				{ role: "user", content: `request-${index}` },
+				{
+					role: "assistant",
+					content: `answer-${index}`,
+					reasoning_content: `thinking-${index}-` + "y".repeat(2_000),
+					tool_calls: [{
+						id: `call-${index}`,
+						type: "function",
+						function: { name: "run_in_terminal", arguments: "{}" },
+					}],
+				},
+				{ role: "tool", name: "run_in_terminal", tool_call_id: `call-${index}`, content: "ok" },
+			);
+		}
+		messages.push({ role: "user", content: "current task" }, { role: "assistant", content: "current answer" });
+
+		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
+			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+			0
+		);
+		// Modest token budget (content chars ≈ 700) forces compaction; the
+		// reasoning cap is what actually trims the tail in this test.
+		const compacted = compactMessages(messages, {
+			tokenBudget: 500,
+			keepLastCount: 12,
+			label: "Conversation summary (auto-compact)",
+			estimateTokens,
+			maxReasoningChars: 6_000,
+		});
+
+		const retainedReasoning = compacted
+			.filter(message => typeof message.reasoning_content === "string")
+			.reduce((sum, message) => sum + (message.reasoning_content as string).length, 0);
+		assert.ok(
+			retainedReasoning <= 6_000,
+			`expected reasoning tail within 6000 chars, got ${retainedReasoning}`
+		);
+		// The newest assistant response (last compaction unit) must survive;
+		// its text may still be trimmed by the final budget pass.
+		assert.strictEqual(compacted.at(-1)?.role, "assistant");
+		assert.deepStrictEqual(
+			compacted.slice(-2).map(message => message.role),
+			["user", "assistant"],
+			"expected the newest user request plus assistant answer at the tail"
+		);
+		// A reasoning message kept in the tail must be intact, never truncated.
+		assert.ok(
+			compacted.every(message =>
+				typeof message.reasoning_content !== "string"
+				|| (message.reasoning_content.startsWith("thinking-") && message.reasoning_content.endsWith("y"))
+			),
+			"expected retained reasoning to stay intact"
+		);
+		assert.ok(
+			compacted.some(message => typeof message.content === "string" && message.content.includes("Conversation summary")),
+			"expected a summary message for the folded turns"
+		);
+	});
+
 });

@@ -653,6 +653,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => llamaProvider.deepSeekBalanceSummary,
 		() => codexProvider.codexUsageLimitPercent,
 		() => codexProvider.codexUsageLimitResetLabel,
+		() => codexProvider.codexUsageLimitWindowLabel,
 		() => claudeProvider.claudeUsageLimitPercent,
 		() => claudeProvider.claudeUsageLimitResetLabel,
 		() => estimateMemoryTokens(filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId())),
@@ -1187,7 +1188,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 							description: limit.description,
 						})),
 					},
-					
+
 				})
 			);
 		})
@@ -1590,6 +1591,38 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.openMemory", () => {
 			MemoryManagerPanel.createOrShow(context.extensionUri, memoryService);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.memoryHealth", async () => {
+			const report = memoryService.healthReport();
+			const summary = (
+				`Memory health: ${report.total} entries (${report.pinned} pinned, ${report.expired} expired), ` +
+				`~${report.totalTokens} tokens, avg ${report.averageChars} chars/entry.`
+			);
+			const details: string[] = [];
+			if (report.longest.length > 0) {
+				details.push(
+					"Longest: " + report.longest
+						.map(entry => `${entry.id} "${entry.title}" (${entry.chars} chars)`)
+						.join("; ")
+				);
+			}
+			if (report.duplicates.length > 0) {
+				details.push(
+					`Duplicate candidates (${report.duplicates.length}): ` + report.duplicates
+						.map(pair => `${pair.a} ↔ ${pair.b} (${(pair.similarity * 100).toFixed(0)}%)`)
+						.join("; ")
+				);
+			}
+			const action = await vscode.window.showWarningMessage(
+				[summary, ...details].join("\n"),
+				"Open Memory"
+			);
+			if (action === "Open Memory") {
+				MemoryManagerPanel.createOrShow(context.extensionUri, memoryService);
+			}
 		})
 	);
 

@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.15.0",
+	"version": "1.15.4",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -281,10 +281,10 @@
 				},
 				"llamacpp.claudeResumeFallbackMaxInputTokens": {
 					"type": "number",
-					"default": 64000,
+					"default": 256000,
 					"minimum": 0,
 					"maximum": 1000000,
-					"description": "Maximum estimated input tokens, including tool schemas, that safe mode may automatically cold-replay after Claude resume failure."
+					"description": "Maximum estimated input tokens, including tool schemas, that safe mode may automatically replay when Claude resume recovery needs the current conversation context."
 				},
 				"llamacpp.claudeResumeFallbackMaxUsagePercent": {
 					"type": "number",
@@ -390,6 +390,13 @@
 					"minimum": 1000,
 					"maximum": 24000,
 					"description": "Maximum characters kept for each tool result when compaction retains history. Long tool outputs are truncated to this size so more recent turns fit inside the compaction budget instead of being dropped entirely."
+				},
+				"llamacpp.compactMaxReasoningChars": {
+					"type": "number",
+					"default": 24000,
+					"minimum": 0,
+					"maximum": 200000,
+					"description": "Maximum characters of historical reasoning_content kept in the compaction tail for DeepSeek. DeepSeek requires chain-of-thought of every intermediate assistant message to be passed back while tools are enabled, so stale reasoning accumulates across agent turns (~135K chars measured after one compaction). Older turns beyond this cap are folded into the summary; their assistant messages disappear entirely, which satisfies the API requirement while keeping the tail fresh. 0 disables the cap."
 				},
 				"llamacpp.toolCallOnlyAutoretry": {
 					"type": "boolean",
@@ -921,6 +928,10 @@
 			{
 				"command": "llamacpp.toggleDeepSeekCompactionSummary",
 				"title": "AI Agent Bridge: Toggle DeepSeek Compaction Summaries"
+			},
+			{
+				"command": "llamacpp.memoryHealth",
+				"title": "AI Agent Bridge: Check Memory Health"
 			},
 			{
 				"command": "llamacpp.configureDeepSeek",

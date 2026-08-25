@@ -1,13 +1,13 @@
 /**
  * DeepSeek peak / off-peak billing windows.
  *
- * Verified against the official pricing page on 2026-08-13:
+ * Verified against the official pricing page on 2026-08-25:
  * https://api-docs.deepseek.com/quick_start/pricing
  *
  * From 16:00 UTC on August 16, 2026, DeepSeek API billing switches to
  * peak/off-peak rates with off-peak rates at half the peak rates:
- *   Peak hours: 01:00–04:00 UTC and 06:00–10:00 UTC.
- *   All other hours are off-peak.
+ *   Peak hours: 01:00–04:00 UTC and 06:00–10:00 UTC, Monday through Friday.
+ *   All other hours (including weekends) are off-peak.
  *
  * Example v4-pro rates per 1M tokens (cache miss / output):
  *   off-peak $0.66 / $1.98, peak $1.32 / $3.96.
@@ -59,7 +59,11 @@ function utcMinutesAt(date: Date): number {
 	return date.getUTCHours() * 60 + date.getUTCMinutes();
 }
 
-export function isDeepSeekPeakUtc(utcMinutes: number): boolean {
+export function isDeepSeekPeakUtc(utcMinutes: number, utcWeekday = 1): boolean {
+	// Peak billing applies Monday through Friday only (1=Mon..5=Fri, 0=Sun, 6=Sat).
+	if (utcWeekday < 1 || utcWeekday > 5) {
+		return false;
+	}
 	const normalized = ((utcMinutes % 1440) + 1440) % 1440;
 	return DEEPSEEK_PEAK_WINDOWS_UTC.some(window =>
 		normalized >= window.startUtcMinutes && normalized < window.endUtcMinutes
@@ -88,24 +92,55 @@ export function formatDeepSeekPeakEffectiveLocal(nowMs = Date.now()): string {
 	});
 }
 
+/** Local label of an upcoming transition that lands on a later weekday. */
+function formatWeekdayTransition(daysAhead: number, utcMinutes: number, nowMs: number): string {
+	const now = new Date(nowMs);
+	const target = new Date(Date.UTC(
+		now.getUTCFullYear(),
+		now.getUTCMonth(),
+		now.getUTCDate() + daysAhead,
+		0,
+		0
+	) + utcMinutes * 60_000);
+	const dayLabel = target.toLocaleDateString(undefined, { weekday: "short" });
+	return `${dayLabel} ${formatLocalClock(utcMinutes, nowMs)}`;
+}
+
 export function resolveDeepSeekPricingSnapshot(nowMs = Date.now()): DeepSeekPricingSnapshot {
 	const effective = nowMs >= DEEPSEEK_PEAK_PRICING_EFFECTIVE_AT_MS;
-	const minute = utcMinutesAt(new Date(nowMs));
-	const isPeak = isDeepSeekPeakUtc(minute);
+	const now = new Date(nowMs);
+	const minute = utcMinutesAt(now);
+	const weekday = now.getUTCDay(); // 0=Sun..6=Sat
+	const isPeak = effective && weekday >= 1 && weekday <= 5 && isDeepSeekPeakUtc(minute, weekday);
 	const peakWindowsLocal = DEEPSEEK_PEAK_WINDOWS_UTC
 		.map(window => `${formatLocalClock(window.startUtcMinutes, nowMs)}–${formatLocalClock(window.endUtcMinutes, nowMs)}`)
 		.join(", ");
-	let next = PEAK_BOUNDARIES.find(boundary => boundary.at > minute);
-	if (!next) {
-		const first = PEAK_BOUNDARIES[0];
-		next = { at: first.at + 1440, nextPeak: first.nextPeak };
+	let nextState: "peak" | "off-peak";
+	let nextTransitionLocal: string;
+	if (weekday >= 1 && weekday <= 5) {
+		const boundary = PEAK_BOUNDARIES.find(candidate => candidate.at > minute);
+		if (boundary) {
+			nextState = boundary.nextPeak ? "peak" : "off-peak";
+			nextTransitionLocal = formatLocalClock(boundary.at, nowMs);
+		} else {
+			// After the last window (10:00 UTC): Friday rolls to Monday 01:00,
+			// other weekdays roll to tomorrow 01:00.
+			nextState = "peak";
+			const daysAhead = weekday === 5 ? 3 : 1;
+			nextTransitionLocal = formatWeekdayTransition(daysAhead, 60, nowMs);
+		}
+	} else {
+		// Weekends are off-peak; the next peak is Monday 01:00 UTC.
+		nextState = "peak";
+		const daysAhead = weekday === 6 ? 2 : 1;
+		nextTransitionLocal = formatWeekdayTransition(daysAhead, 60, nowMs);
 	}
 	return {
 		state: !effective ? "flat" : isPeak ? "peak" : "off-peak",
 		effective,
-		isPeak: effective && isPeak,
+		isPeak,
 		peakWindowsLocal,
-		nextTransitionLocal: formatLocalClock(next.at % 1440, nowMs),
-		nextState: next.nextPeak ? "peak" : "off-peak",
+		nextTransitionLocal,
+		nextState,
 	};
 }

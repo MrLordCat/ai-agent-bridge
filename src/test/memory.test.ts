@@ -7,6 +7,7 @@ import {
 	injectAppendOnlySharedMemoryContext,
 	injectSharedMemoryContext,
 } from "../memory/prompt";
+import { clipMemoryContent } from "../memory/tools";
 import { filterEntriesVisibleInWorkspace } from "../memory/scope";
 import { SharedMemoryService } from "../memory/shared-memory-service";
 import type { OpenAIChatMessage } from "../types";
@@ -205,10 +206,75 @@ suite("Shared memory", () => {
 		assert.strictEqual(entry.sourceUrl, "https://example.com/docs");
 	});
 
+	test("rejects new entries above the 4096-char content limit", async () => {
+		await assert.rejects(
+			memory.upsert({ title: "Too long", content: "x".repeat(4097) }),
+			/too long.*4096/
+		);
+		// Oversized updates of existing entries are blocked the same way.
+		const compact = await memory.upsert({ title: "Compact", content: "Short rule." });
+		await assert.rejects(
+			memory.upsert({ id: compact.id, title: "Compact", content: "y".repeat(5000) }),
+			/too long/
+		);
+		// Existing longer entries stay readable and are reported by health.
+		const legacy = await memory.healthReport();
+		assert.strictEqual(legacy.total, 1);
+	});
+
+	test("warns about similar entries and always injects pinned rules", async () => {
+		const first = await memory.upsert({
+			title: "Build command",
+			content: "Package the extension as a VSIX after compiling with npm run compile.",
+		});
+		await memory.upsert({
+			title: "Build command",
+			content: "Package extension as VSIX after npm run compile.",
+		});
+		const similar = memory.similarEntries({
+			title: "Build command",
+			content: "Package the extension as a VSIX after compiling.",
+		});
+		assert.ok(
+			similar.some(candidate => candidate.id === first.id),
+			"expected the duplicated entry to be flagged"
+		);
+
+		await memory.upsert({ title: "Coffee", content: "Coffee preference", pinned: true });
+		const context = await memory.buildPromptContext("typescrpt compilation", 1024);
+		assert.ok(
+			context?.text.includes("Coffee preference"),
+			"pinned rules must be injected even when the query does not match them"
+		);
+	});
+
+	test("clipMemoryContent keeps the head and tail of long entries", () => {
+		const content = "a".repeat(2000);
+		const clipped = clipMemoryContent(content);
+		assert.ok(clipped.length < 1000);
+		assert.match(clipped, /chars omitted/);
+		assert.ok(clipped.startsWith("a".repeat(600)));
+		assert.ok(clipped.endsWith("a".repeat(300)));
+		assert.strictEqual(clipMemoryContent("short"), "short");
+	});
+
+	test("health report lists duplicates and the longest entries", async () => {
+		await memory.upsert({ title: "API limit", content: "API rate limit is 60 requests per minute." });
+		await memory.upsert({ title: "API limit", content: "API rate limit is 60 requests per minute (verified)." });
+		await memory.upsert({ title: "Long", content: "z".repeat(3000) });
+
+		const report = memory.healthReport();
+		assert.strictEqual(report.total, 3);
+		assert.strictEqual(report.longest[0]?.title, "Long");
+		assert.ok(report.longest[0]!.chars >= 3000);
+		assert.ok(report.duplicates.length >= 1, "expected the near-identical limit entries to be flagged");
+		assert.strictEqual(report.totalTokens, Math.ceil(report.totalChars / 4));
+	});
+
 	test("keeps injected memory inside its configured budget", async () => {
 		await memory.upsert({
 			title: "Large entry",
-			content: "context ".repeat(4000),
+			content: "context ".repeat(500),
 			pinned: true,
 		});
 		const context = await memory.buildPromptContext("context", 128);

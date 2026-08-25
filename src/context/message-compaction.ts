@@ -35,8 +35,18 @@ export interface CompactMessagesOptions {
 	 * the current size). Truncating long results lets many more recent
 	 * turns survive inside the same budget.
 	 */
-	maxToolResultChars?: number;
-}
+	maxToolResultChars?: number;	/**
+	 * Maximum total characters of historical reasoning_content allowed in the
+	 * retained compaction tail. DeepSeek requires reasoning_content to be
+	 * passed back verbatim for every intermediate assistant message while
+	 * `tools` is in the request, so stale chain-of-thought accumulates across
+	 * agent turns and can dominate the tail after compaction (measured: ~135K
+	 * chars ≈ 34K tokens after a single compaction). Folding those turns into
+	 * the summary removes their assistant messages entirely — the API
+	 * requirement then no longer applies — while every retained turn keeps its
+	 * reasoning intact. 0 or undefined disables the cap.
+	 */
+	maxReasoningChars?: number;}
 
 export interface CompactMessagesResult {
 	messages: OpenAIChatMessage[];
@@ -185,6 +195,17 @@ function cloneMessage(message: OpenAIChatMessage): OpenAIChatMessage {
 			? { tool_calls: message.tool_calls.map(call => ({ ...call, function: { ...call.function } })) }
 			: {}),
 	};
+}
+
+/** Total characters of historical reasoning_content across assistant messages. */
+function reasoningChars(messages: OpenAIChatMessage[]): number {
+	let total = 0;
+	for (const message of messages) {
+		if (message.role === "assistant" && typeof message.reasoning_content === "string") {
+			total += message.reasoning_content.length;
+		}
+	}
+	return total;
 }
 
 function groupConversationTurns(messages: OpenAIChatMessage[]): OpenAIChatMessage[][] {
@@ -551,8 +572,16 @@ export function compactMessagesDetailed(
 	let tailTurns = chosen.tailTurns;
 	let droppedTurnCount = chosen.keepTurnIndex;
 	const tailStart = systems.length + chosen.summaryCount;
+	const maxReasoningChars = options.maxReasoningChars !== undefined && options.maxReasoningChars > 0
+		? options.maxReasoningChars
+		: undefined;
 
-	while (options.estimateTokens(compacted) > options.tokenBudget && tailTurns.length > 1) {
+	while (tailTurns.length > 1
+		&& (
+			options.estimateTokens(compacted) > options.tokenBudget
+			|| (maxReasoningChars !== undefined && reasoningChars(tailTurns.flat()) > maxReasoningChars)
+		)
+	) {
 		tailTurns = tailTurns.slice(1);
 		droppedTurnCount += 1;
 		compacted.splice(tailStart, compacted.length - tailStart, ...tailTurns.flat());

@@ -261,5 +261,14 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			refresh();
 			vscode.window.showInformationMessage(`AI Agent Bridge knowledge verification: ${next}`);
 		}),
+		vscode.commands.registerCommand("llamacpp.toggleDeepSeekCompactionSummary", async () => {
+			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+			const next = config.get<boolean>("deepSeekCompactionSummary", false) === true ? false : true;
+			await config.update("deepSeekCompactionSummary", next, vscode.ConfigurationTarget.Global);
+			refresh();
+			vscode.window.showInformationMessage(
+				`AI Agent Bridge AI compaction summaries: ${next ? "On (paid DeepSeek request per compaction)" : "Off"}`
+			);
+		}),
 	];
 }

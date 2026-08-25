@@ -36,6 +36,7 @@ import {
 } from "./message-adapter";
 import {
 	formatCodexRateLimit,
+	formatCodexWindowDuration,
 	decodeCodexModelId,
 	mapCodexModelInformation,
 	resolveCodexReasoningEffort,
@@ -624,6 +625,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	get codexUsageLimitResetLabel(): string | undefined {
 		const resetsAt = this.lastRateLimitSnapshot?.primary?.resetsAt;
 		return resetsAt ? formatShortResetTime(new Date(resetsAt * 1000)) : undefined;
+	}
+
+	/** Window duration of the primary subscription limit, e.g. "5h" or "7d". */
+	get codexUsageLimitWindowLabel(): string | undefined {
+		return formatCodexWindowDuration(this.lastRateLimitSnapshot?.primary?.windowDurationMins);
 	}
 
 	/** True when the ChatGPT subscription window is fully consumed. */

@@ -56,3 +56,34 @@ export interface SharedMemoryContextProvider {
 		context?: SharedMemoryRetrievalContext
 	): Promise<SharedMemoryPromptContext | undefined>;
 }
+
+export interface SharedMemorySimilarEntry {
+	id: string;
+	title: string;
+	similarity: number;
+}
+
+export interface SharedMemoryHealthIssue {
+	id: string;
+	title: string;
+	chars: number;
+}
+
+export interface SharedMemoryDuplicatePair {
+	a: string;
+	aTitle: string;
+	b: string;
+	bTitle: string;
+	similarity: number;
+}
+
+export interface SharedMemoryHealthReport {
+	total: number;
+	pinned: number;
+	expired: number;
+	totalChars: number;
+	totalTokens: number;
+	averageChars: number;
+	longest: SharedMemoryHealthIssue[];
+	duplicates: SharedMemoryDuplicatePair[];
+}

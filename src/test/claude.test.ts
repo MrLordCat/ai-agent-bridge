@@ -154,7 +154,7 @@ suite("Claude subscription provider", () => {
 			maxAgentTurns: 0,
 			maxCumulativeInputTokens: 10_000_000,
 			resumeFallbackPolicy: "safe",
-			resumeFallbackMaxInputTokens: 64_000,
+			resumeFallbackMaxInputTokens: 256_000,
 			resumeFallbackMaxUsagePercent: 80,
 		});
 		assert.deepStrictEqual(resolveClaudeSafetySettings({
@@ -200,6 +200,10 @@ suite("Claude subscription provider", () => {
 		assert.deepStrictEqual(resolveClaudeResumeFallbackDecision({
 			policy: "always", estimatedInputTokens: 500_000, maxInputTokens: 64_000,
 			maxUsagePercent: 80,
+		}).allowed, true);
+		assert.deepStrictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 250_000, maxInputTokens: 256_000,
+			usagePercent: 0, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80,
 		}).allowed, true);
 	});
 

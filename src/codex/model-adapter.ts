@@ -100,6 +100,20 @@ export function resolveCodexReasoningEffort(
 	return highDefault || model.supportedReasoningEfforts[0]?.reasoningEffort || "medium";
 }
 
+/** "5h" for 300 minutes, "7d" for 10080 minutes, "45m" otherwise. */
+export function formatCodexWindowDuration(mins: number | null | undefined): string | undefined {
+	if (typeof mins !== "number" || mins <= 0) {
+		return undefined;
+	}
+	if (mins % 1440 === 0) {
+		return `${mins / 1440}d`;
+	}
+	if (mins % 60 === 0) {
+		return `${mins / 60}h`;
+	}
+	return `${mins}m`;
+}
+
 export function formatCodexRateLimit(snapshot: CodexRateLimitSnapshot | undefined): string {
 	const window = snapshot?.primary;
 	if (!window) {
@@ -108,5 +122,7 @@ export function formatCodexRateLimit(snapshot: CodexRateLimitSnapshot | undefine
 	const reset = window.resetsAt
 		? new Date(window.resetsAt * 1000).toLocaleString()
 		: "unknown reset";
-	return `${Math.max(0, Math.min(100, Math.round(window.usedPercent)))}% used / resets ${reset}`;
+	const windowLabel = formatCodexWindowDuration(window.windowDurationMins);
+	const usage = `${Math.max(0, Math.min(100, Math.round(window.usedPercent)))}% used · resets ${reset}`;
+	return windowLabel ? `${windowLabel} · ${usage}` : usage;
 }

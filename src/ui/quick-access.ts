@@ -396,6 +396,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getDeepSeekBalance: () => string | undefined = () => undefined,
 		private readonly getCodexUsageLimitPercent: () => number | undefined = () => undefined,
 		private readonly getCodexUsageLimitReset: () => string | undefined = () => undefined,
+		private readonly getCodexUsageLimitWindow: () => string | undefined = () => undefined,
 		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
 		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
 		private readonly getMemoryContextTokens: () => number = () => 0,
@@ -425,6 +426,17 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
 		const localServerUrl = String(config.get("localServerUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
 		const localServerEnabled = config.get<boolean>("enableLocalServer", true) !== false;
+		const configuredLocalOutput = Number(config.get("localDefaultMaxOutputTokens", 32768));
+		const configuredOutputCap = Number(config.get("maxOutputTokensCap", 131072));
+		const localOutputCap = Math.min(
+			Number.isFinite(configuredLocalOutput)
+				? Math.min(131072, Math.max(1024, Math.floor(configuredLocalOutput)))
+				: 32768,
+			Number.isFinite(configuredOutputCap)
+				? Math.min(393216, Math.max(128, Math.floor(configuredOutputCap)))
+				: 131072,
+			32768,
+		);
 		const deepSeekEnabled = config.get<boolean>("enableDeepSeek", true) !== false;
 		const deepSeekCompactionSummary = config.get<boolean>("deepSeekCompactionSummary", false) === true;
 		const compactionTargetRatio = normalizeCompactionTargetRatio(
@@ -521,6 +533,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: toggleIcon(localServerEnabled),
 					command: command("llamacpp.toggleLocalServer", "Toggle Local Server Source"),
 				}),
+				new QuickAccessItem("local.maxOutput", "Max Output", {
+					description: formatCompactTokenCount(localOutputCap),
+					tooltip: "Effective default max_tokens for local models: the lower of localDefaultMaxOutputTokens, maxOutputTokensCap, and the provider's 32K local output limit. A specific model or server may impose a lower limit.",
+					icon: new vscode.ThemeIcon("output"),
+					command: command("llamacpp.openSettings", "Open Output Settings"),
+				}),
 				new QuickAccessItem("local.settings", "Connection", {
 					description: formatEndpointLabel(localServerUrl),
 					icon: new vscode.ThemeIcon("settings-gear"),
@@ -564,7 +582,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 							? `Peak · 2× price · until ${deepSeekPricing.nextTransitionLocal} (local)`
 							: `Off-peak · ½ price · next peak ${deepSeekPricing.nextTransitionLocal} (local)`,
 					tooltip: [
-						"DeepSeek peak/off-peak billing from 16:00 UTC, Aug 16 2026. Peak: 01:00–04:00 and 06:00–10:00 UTC; off-peak costs half the peak rate.",
+						"DeepSeek peak/off-peak billing from 16:00 UTC, Aug 16 2026. Peak: 01:00–04:00 and 06:00–10:00 UTC, Monday–Friday; weekends and all other hours are off-peak (half the peak rate).",
 						`Local peak windows: ${deepSeekPricing.peakWindowsLocal}.`,
 						"v4-pro per 1M tokens (cache miss / output): off-peak $0.66 / $1.98, peak $1.32 / $3.96.",
 					].join("\n"),
@@ -634,11 +652,15 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("settings"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
-				new QuickAccessItem("codex.usageLimit", "Usage Limit", {
+				new QuickAccessItem("codex.usageLimit", "Session Limit", {
 					description: this.getCodexUsageLimitPercent() !== undefined
-						? `${this.getCodexUsageLimitPercent()}% used${this.getCodexUsageLimitReset() ? ` · resets ${this.getCodexUsageLimitReset()}` : ""}`
+						? [
+							this.getCodexUsageLimitWindow(),
+							`${this.getCodexUsageLimitPercent()}% used`,
+							this.getCodexUsageLimitReset() ? `resets ${this.getCodexUsageLimitReset()}` : undefined,
+						].filter(Boolean).join(" · ")
 						: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
-					tooltip: "ChatGPT subscription usage window. Refreshes automatically every minute so you can see when the limit resets.",
+					tooltip: "ChatGPT subscription usage window from the official Codex rate-limits endpoint (5-hour window on Plus/Pro, weekly for some plans). Refreshes automatically every minute so you can see when the limit resets.",
 					icon: new vscode.ThemeIcon("dashboard"),
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
 				}),
@@ -909,7 +931,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				}),
 				new QuickAccessItem("modelBehavior.reasoningBudget", "Local Reasoning Cap", {
 					description: `${effectiveReasoningBudget} tokens`,
-					tooltip: "Maximum hidden reasoning tokens for local models. Light uses up to 512, Balanced up to 2048, Deep/Auto use this cap. DeepSeek uses High/Max effort instead.",
+					tooltip: "Maximum hidden reasoning tokens for local models; this is separate from Max Output. Light uses up to 512, Balanced up to 2048, Deep/Auto use this cap. DeepSeek uses High/Max effort instead.",
 					icon: new vscode.ThemeIcon("symbol-numeric"),
 					command: command("llamacpp.setReasoningBudget", "Set Reasoning Budget"),
 				}),
@@ -943,6 +965,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				description: memoryDescription,
 				icon: new vscode.ThemeIcon("database"),
 				command: command("llamacpp.openMemory", "Open Shared Memory"),
+			}),
+			new QuickAccessItem("memory.health", "Memory Health", {
+				description: "Stats · longest · duplicates",
+				tooltip: "Shows entry count, size distribution, the five longest entries and duplicate candidates (similarity ≥ 80%).",
+				icon: new vscode.ThemeIcon("sparkle"),
+				command: command("llamacpp.memoryHealth", "Check Memory Health"),
 			}),
 		];
 		if ((totalMemoryCount ?? memoryCount) > 0) {

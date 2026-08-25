@@ -3209,6 +3209,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         keepLastCount: number,
         label: string,
         maxToolResultChars: number | undefined,
+        maxReasoningChars: number | undefined,
         requestId: string,
         cause: "auto-compact" | "overflow-retry" | "manual" | "reasoning-loop" | "force-compact",
         token: CancellationToken,
@@ -3223,6 +3224,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             keepLastCount,
             label,
             maxToolResultChars,
+            maxReasoningChars,
             forceKeepLastTurnOnly,
             // Use the same calibrated estimate as the compaction trigger and the
             // context-usage metrics. Without calibration the raw heuristic often
@@ -4093,6 +4095,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const contextUtil = this.clampNumber(cfg.get("contextUtilization", 0.94), 0.5, 0.95, 0.94);
         const hardContextUtil = this.clampNumber(cfg.get("hardContextUtilization", 0.72), 0.4, 0.9, 0.72);
         const keepLastTurns = this.clampInt(cfg.get("compactKeepLastTurns", 12), 2, 64, 12);
+        const compactMaxReasoningChars = this.clampInt(
+            cfg.get("compactMaxReasoningChars", 24_000),
+            0,
+            200_000,
+            24_000
+        );
         const maxOutputCap = this.getConfiguredMaxOutputTokens();
         const minReplyReserve = this.clampInt(cfg.get("minReplyReserveTokens", 1536), 256, 32768, 1536);
         const replyReservePercent = this.clampNumber(cfg.get("replyReservePercent", 0.07), 0.03, 0.25, 0.07);
@@ -4656,6 +4664,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 keepLastTurns,
                 label,
                 compactMaxToolResultChars,
+                compactMaxReasoningChars,
                 requestId,
                 cause,
                 token,
@@ -4674,6 +4683,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     keepLastCount: keepLastTurns,
                     label,
                     maxToolResultChars: compactMaxToolResultChars,
+                    maxReasoningChars: compactMaxReasoningChars,
                     summaryContent: typeof existingSummary?.content === "string" ? existingSummary.content : undefined,
                     forceKeepLastTurnOnly,
                     estimateTokens: candidate => Math.max(
@@ -4919,9 +4929,26 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 counted = compacted.counted;
                 messageTokenCount = counted.tokens;
                 autoCompacted = true;
+                // Reasoning weight after compaction: stale chain-of-thought is a
+                // large part of what compaction removes (bounded by
+                // compactMaxReasoningChars), so record what actually survived.
+                let reasoningAfterMsgCount = 0;
+                let reasoningAfterChars = 0;
+                for (const budgetMessage of preparedMessages) {
+                    if (
+                        typeof budgetMessage.reasoning_content === "string"
+                        && budgetMessage.reasoning_content.length > 0
+                    ) {
+                        reasoningAfterMsgCount += 1;
+                        reasoningAfterChars += budgetMessage.reasoning_content.length;
+                    }
+                }
                 this.log(manualCompactionRequested ? "chat.messages.manual_compact" : "chat.messages.auto_compact", {
                     requestId,
                     reason: compactionReason,
+                    reasoningMsgCountAfter: reasoningAfterMsgCount,
+                    reasoningCharsAfter: reasoningAfterChars,
+                    maxReasoningChars: compactMaxReasoningChars,
                     tokenEstimate: messageTokenCount,
                     tokenCountSource: counted.source,
                     promptTokens: counted.promptTokens,

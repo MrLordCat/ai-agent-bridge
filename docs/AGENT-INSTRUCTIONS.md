@@ -25,6 +25,8 @@ Memory is the main asset. You must **initiate** saving yourself — do not wait 
   - `kind` — `preference` | `decision` | `environment` | `workflow` | `externalFact` | `other`.
   - `scope` is required: `global` only for durable info useful to agents in all projects; `workspace` for paths, commands, architecture and decisions of the current project only. The extension computes the project id itself.
 - **Deleting memory**: pass the same explicit `scope`; an entry of another project cannot be deleted by id alone.
+- **Entry format**: one thought per entry — `content` is 1–3 lines of essence (commands, paths, values, reasons), usually under ~750 chars. The store tool rejects new entries above 4096 chars; existing longer entries stay, but `llamacpp.memoryHealth` reports them for cleanup.
+- **Write budget**: at most 2–3 new entries per significant piece of work. The store tool answers with the saved size and warns when your entry is close to an existing one — update that id instead of duplicating.
 - **Built-in Copilot memory** (the `memory` tool, `/memories/` files) — for native chats: user memory (preferences, patterns), repo memory (project facts), session (current task plan). If available, use it just as actively.
 
 ### Memory hygiene
@@ -33,6 +35,7 @@ Memory is the main asset. You must **initiate** saving yourself — do not wait 
 - **Update, do not duplicate**: if a related entry exists, update it by `id` instead of creating a copy.
 - **Do not save**: session retellings, the obvious, transient details (random request ids, junk commands), what the code already shows (unless it explains "why").
 - Keep entries short — one thought per entry.
+- **Respect tool feedback**: the store tool returns size and similarity warnings — shrink or update rather than ignoring them. Run `llamacpp.memoryHealth` to find duplicates and overlarge entries before a long session.
 
 ## 2. Accuracy and honesty
 

@@ -4,11 +4,14 @@ import * as path from "node:path";
 
 import type {
 	SharedMemoryContextProvider,
+	SharedMemoryDuplicatePair,
 	SharedMemoryEntry,
+	SharedMemoryHealthReport,
 	SharedMemoryKind,
 	SharedMemoryPromptContext,
 	SharedMemoryRetrievalContext,
 	SharedMemoryScope,
+	SharedMemorySimilarEntry,
 	SharedMemoryUpsertInput,
 } from "./types";
 
@@ -17,10 +20,19 @@ const MEMORY_FILE_NAME = "shared-memory.json";
 const MAX_ENTRIES = 500;
 const MAX_TITLE_CHARS = 160;
 const MAX_CONTENT_CHARS = 24000;
+/**
+ * Hard cap for NEW memory content. Long session retellings and oversized
+ * entries degrade agent reasoning (they flood the injected context and the
+ * search tool output), so writes above this limit are rejected with guidance
+ * instead of being silently truncated. Existing older entries are untouched.
+ */
+const MAX_NEW_CONTENT_CHARS = 4096;
 const MAX_RANKING_CONTENT_CHARS = 12000;
 const MAX_TAGS = 16;
 const MAX_TAG_CHARS = 48;
 const FUZZY_MATCH_THRESHOLD = 0.72;
+/** Two entries are flagged as duplicates above this title/content similarity. */
+const DUPLICATE_SIMILARITY_THRESHOLD = 0.8;
 
 interface SharedMemoryDocument {
 	version: number;
@@ -274,12 +286,86 @@ export class SharedMemoryService implements SharedMemoryContextProvider {
 			.map(item => cloneEntry(item.entry));
 	}
 
+	/**
+	 * Returns existing entries whose title or content closely overlaps the
+	 * candidate. Agents use this to update an existing id instead of creating
+	 * a duplicate; the exact threshold lives in the memory service so the
+	 * store tool and the health report stay consistent.
+	 */
+	similarEntries(
+		candidate: { title: string; content: string; id?: string },
+		maxResults = 3
+	): Array<SharedMemorySimilarEntry> {
+		this.ensureInitialized();
+		const results: Array<SharedMemorySimilarEntry> = [];
+		for (const [id, entry] of this.entries) {
+			if (candidate.id && id === candidate.id) {
+				continue;
+			}
+			const similarity = this.compareEntries(
+				{ title: candidate.title, content: candidate.content },
+				entry
+			);
+			if (similarity >= FUZZY_MATCH_THRESHOLD) {
+				results.push({ id, title: entry.title, similarity });
+			}
+		}
+		results.sort((a, b) => b.similarity - a.similarity || a.title.localeCompare(b.title));
+		return results.slice(0, maxResults);
+	}
+
+	/** Aggregate statistics used by the Memory Health command. */
+	healthReport(): SharedMemoryHealthReport {
+		this.ensureInitialized();
+		const entries = Array.from(this.entries.values());
+		const now = Date.now();
+		const totalChars = entries.reduce((sum, entry) => sum + entry.content.length, 0);
+		const sortedByLength = [...entries].sort((a, b) => b.content.length - a.content.length);
+		const duplicates: Array<SharedMemoryDuplicatePair> = [];
+		for (let left = 0; left < entries.length; left += 1) {
+			for (let right = left + 1; right < entries.length; right += 1) {
+				const similarity = this.compareEntries(entries[left], entries[right]);
+				if (similarity >= DUPLICATE_SIMILARITY_THRESHOLD) {
+					duplicates.push({
+						a: entries[left].id,
+						aTitle: entries[left].title,
+						b: entries[right].id,
+						bTitle: entries[right].title,
+						similarity,
+					});
+				}
+			}
+		}
+		duplicates.sort((a, b) => b.similarity - a.similarity);
+		return {
+			total: entries.length,
+			pinned: entries.filter(entry => entry.pinned).length,
+			expired: entries.filter(entry => isExpired(entry, now)).length,
+			totalChars,
+			totalTokens: Math.ceil(totalChars / 4),
+			averageChars: entries.length > 0 ? Math.round(totalChars / entries.length) : 0,
+			longest: sortedByLength.slice(0, 5).map(entry => ({
+				id: entry.id,
+				title: entry.title,
+				chars: entry.content.length,
+			})),
+			duplicates: duplicates.slice(0, 10),
+		};
+	}
+
 	async upsert(input: SharedMemoryUpsertInput): Promise<SharedMemoryEntry> {
 		this.ensureInitialized();
 		const title = normalizeText(input.title, MAX_TITLE_CHARS);
 		const content = normalizeText(input.content, MAX_CONTENT_CHARS);
 		if (!title || !content) {
 			throw new Error("Memory title and content must not be empty.");
+		}
+		if (content.length > MAX_NEW_CONTENT_CHARS) {
+			throw new Error(
+				`Memory content is too long (${content.length} chars, limit ${MAX_NEW_CONTENT_CHARS}). ` +
+				"Keep one thought per entry: commands, paths, values, reasons — not a session retelling. " +
+				"Split related facts or update the existing entry by id instead."
+			);
 		}
 
 		const requestedId = normalizeText(input.id, 80);
@@ -369,14 +455,41 @@ export class SharedMemoryService implements SharedMemoryContextProvider {
 		const charBudget = safeTokenBudget * 4;
 		const candidates = this.rank(query, context).slice(0, 50);
 		const selected: SharedMemoryEntry[] = [];
+		const selectedIds = new Set<string>();
 		let renderedLength = 0;
 
+		// Pinned rules must stay visible even when the current query shares no
+		// terms with them; cap their pool at half the budget so relevant
+		// entries can still win the remaining space.
+		const pinnedBudget = Math.floor(charBudget * 0.5);
+		const pinnedPool = Array.from(this.entries.values())
+			.filter(entry =>
+				entry.pinned
+				&& matchesScope(entry, context)
+				&& !isExpired(entry)
+				&& !selectedIds.has(entry.id)
+			)
+			.sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+		for (const candidate of pinnedPool) {
+			const rendered = this.renderEntry(candidate);
+			if (selected.length > 0 && renderedLength + rendered.length > pinnedBudget) {
+				continue;
+			}
+			selected.push(candidate);
+			selectedIds.add(candidate.id);
+			renderedLength += rendered.length;
+		}
+
 		for (const candidate of candidates) {
+			if (selectedIds.has(candidate.entry.id)) {
+				continue;
+			}
 			const rendered = this.renderEntry(candidate.entry);
 			if (selected.length > 0 && renderedLength + rendered.length > charBudget) {
 				continue;
 			}
 			selected.push(candidate.entry);
+			selectedIds.add(candidate.entry.id);
 			renderedLength += rendered.length;
 			if (renderedLength >= charBudget) {
 				break;
@@ -505,6 +618,26 @@ export class SharedMemoryService implements SharedMemoryContextProvider {
 		if (!this.initialized) {
 			throw new Error("Shared memory service has not been initialized.");
 		}
+	}
+
+	/**
+	 * Similarity of two entries: title overlap dominates (already the strongest
+	 * retrieval signal), content overlap uses head snippets so long payloads
+	 * do not dilute the comparison.
+	 */
+	private compareEntries(
+		left: { title: string; content: string },
+		right: { title: string; content: string }
+	): number {
+		const leftTitle = left.title.toLocaleLowerCase();
+		const rightTitle = right.title.toLocaleLowerCase();
+		const titleScore = leftTitle && rightTitle ? trigramSimilarity(leftTitle, rightTitle) : 0;
+		const leftContent = left.content.slice(0, 600).toLocaleLowerCase();
+		const rightContent = right.content.slice(0, 600).toLocaleLowerCase();
+		const contentScore = leftContent && rightContent
+			? trigramSimilarity(leftContent, rightContent)
+			: 0;
+		return Math.max(titleScore * 0.7, contentScore);
 	}
 
 	private renderEntry(entry: SharedMemoryEntry): string {

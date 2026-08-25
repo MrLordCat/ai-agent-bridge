@@ -64,7 +64,7 @@ const CLAUDE_KEEPALIVE_USAGE_MAX_AGE_MS = 2 * CLAUDE_USAGE_REFRESH_TTL_MS;
 const CLAUDE_KEEPALIVE_RETRY_DELAY_MS = 5 * 60_000;
 export const DEFAULT_CLAUDE_MAX_AGENT_TURNS = 0;
 export const DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS = 10_000_000;
-export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS = 64_000;
+export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS = 256_000;
 export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_USAGE_PERCENT = 80;
 const CLAUDE_RESUME_FALLBACK_USAGE_MAX_AGE_MS = 2 * CLAUDE_USAGE_REFRESH_TTL_MS;
 
@@ -1293,15 +1293,11 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			estimatedTokens: number;
 			truncatedChars: number;
 		} | undefined;
+		let recoveryReason: string | undefined;
 		if (!session && conversationId && this.durableSessionsEnabled()) {
 			const exact = this.durableSessions.get(this.durableSessionKey(modelId, conversationId));
 			if (exact?.quarantinedAt !== undefined) {
-				latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
-					messages,
-					toolSchemaTokens,
-					safety.resumeFallbackMaxInputTokens,
-					`quarantined:${exact.quarantineReason ?? "unknown"}`
-				);
+				recoveryReason = `quarantined:${exact.quarantineReason ?? "unknown"}`;
 			}
 			const persisted = findPersistedClaudeConversation([...this.durableSessions.values()], {
 				conversationId,
@@ -1354,12 +1350,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					persisted.quarantinedAt = Date.now();
 					persisted.quarantineReason = `invalid_resume_boundary:${validation.reason}`;
 					await this.persistDurableSessions();
-					latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
-						messages,
-						toolSchemaTokens,
-						safety.resumeFallbackMaxInputTokens,
-						persisted.quarantineReason
-					);
+					recoveryReason = persisted.quarantineReason;
 					this.logSink?.log("claude.chat.persisted_session_quarantined", {
 						model: modelId,
 						sdkSessionId: persisted.sdkSessionId,
@@ -1370,12 +1361,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					persisted.quarantinedAt = Date.now();
 					persisted.quarantineReason = "session_missing";
 					await this.persistDurableSessions();
-					latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
-						messages,
-						toolSchemaTokens,
-						safety.resumeFallbackMaxInputTokens,
-						persisted.quarantineReason
-					);
+					recoveryReason = persisted.quarantineReason;
 					this.logSink?.log("claude.chat.persisted_session_quarantined", {
 						model: modelId,
 						sdkSessionId: persisted.sdkSessionId,
@@ -1391,7 +1377,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				+ "Create a new chat and retry with the Claude model."
 			);
 		}
-		if (!session && !latestOnlyRecovery && conversationId && pendingRollover) {
+		if (!session && !latestOnlyRecovery && recoveryReason === undefined && conversationId && pendingRollover) {
 			const rolloverValidation = await validatePersistedClaudeSession(
 				pendingRollover.sdkSessionId,
 				cwd,
@@ -1438,19 +1424,33 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			!session
 			&& !latestOnlyRecovery
 			&& !rolledOver
-			&& safety.resumeFallbackPolicy !== "always"
+			&& (recoveryReason !== undefined || safety.resumeFallbackPolicy !== "always")
 		) {
 			const coldReplay = buildClaudeInitialConversationText(messages, maxInputChars);
 			const estimatedColdTokens = estimateClaudeRecoveryTokens(
 				estimateClaudeTokens(coldReplay.text),
 				toolSchemaTokens
 			);
-			if (estimatedColdTokens > safety.resumeFallbackMaxInputTokens) {
+			const recoveryDecision = recoveryReason
+				? resolveClaudeResumeFallbackDecision({
+					policy: safety.resumeFallbackPolicy,
+					estimatedInputTokens: estimatedColdTokens,
+					maxInputTokens: safety.resumeFallbackMaxInputTokens,
+					usagePercent: this.claudeUsageLimitPercent,
+					usageSnapshotAgeMs: this.lastSubscriptionUsageAt > 0
+						? Date.now() - this.lastSubscriptionUsageAt
+						: undefined,
+					maxUsagePercent: safety.resumeFallbackMaxUsagePercent,
+				})
+				: undefined;
+			const fullReplayAllowed = estimatedColdTokens <= safety.resumeFallbackMaxInputTokens
+				&& (recoveryDecision === undefined || recoveryDecision.allowed);
+			if (!fullReplayAllowed) {
 				latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 					messages,
 					toolSchemaTokens,
 					safety.resumeFallbackMaxInputTokens,
-					`cold_replay_guard:${estimatedColdTokens}`
+					recoveryReason ?? `cold_replay_guard:${estimatedColdTokens}`
 				);
 				this.logSink?.log("claude.chat.cold_replay_reduced", {
 					model: modelId,
@@ -1458,6 +1458,17 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					estimatedLatestUserTokens: latestOnlyRecovery.estimatedTokens,
 					truncatedChars: latestOnlyRecovery.truncatedChars,
 					maxReplayTokens: safety.resumeFallbackMaxInputTokens,
+					recoveryReason,
+					recoveryDecision: recoveryDecision?.reason,
+				}, "warn");
+			} else if (recoveryReason) {
+				this.logSink?.log("claude.chat.quarantine_recovery", {
+					model: modelId,
+					reason: recoveryReason,
+					inputMode: "full",
+					estimatedTokens: estimatedColdTokens,
+					usagePercent: this.claudeUsageLimitPercent,
+					decision: recoveryDecision?.reason,
 				}, "warn");
 			}
 		}
@@ -1489,6 +1500,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			this.logSink?.log("claude.chat.quarantine_recovery", {
 				model: modelId,
 				reason: latestOnlyRecovery.reason,
+				inputMode: "latest-user",
 				estimatedTokens: latestOnlyRecovery.estimatedTokens,
 				truncatedChars: latestOnlyRecovery.truncatedChars,
 				usagePercent: this.claudeUsageLimitPercent,
@@ -1517,7 +1529,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			session.lastUsedAt = Date.now();
 		}
 
-		const sessionMode: ClaudeAgentTurnContext["sessionMode"] = latestOnlyRecovery
+		const sessionMode: ClaudeAgentTurnContext["sessionMode"] = latestOnlyRecovery || recoveryReason
 			? "resume-fallback"
 			: rolledOver
 			? "rollover"
@@ -1582,6 +1594,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			messageCount: messages.length,
 			inputMode: latestOnlyRecovery ? "latest-user" : reused ? "user-turn" : "full",
 			recoveryEstimatedTokens: latestOnlyRecovery?.estimatedTokens,
+			recoveryReason,
 			latestUserHead: latestOnlyRecovery ? summarizeLatestUserText(latestOnlyRecovery.input, true) : undefined,
 			latestUserTail: latestOnlyRecovery ? summarizeLatestUserText(latestOnlyRecovery.input, false) : undefined,
 			maxInputChars,

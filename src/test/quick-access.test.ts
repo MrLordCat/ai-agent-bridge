@@ -90,6 +90,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => undefined,
 			() => undefined,
 			() => undefined,
+			() => undefined,
 			() => 0,
 			() => ({ total: 3, enabled: 2 })
 		);
@@ -170,6 +171,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => undefined,
 			() => undefined,
 			() => undefined,
+			() => undefined,
 			() => 5000
 		);
 		const memory = (await getItems(provider)).find(item => labelOf(item) === "Memory");
@@ -197,6 +199,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => [],
 			() => emptyTokenUsageHistorySummary(),
 			() => emptyUsageExperimentSummary(),
+			() => undefined,
 			() => undefined,
 			() => undefined,
 			() => undefined,
@@ -254,6 +257,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const deepSeekLimit = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Maximum Context");
 		const deepSeekOutput = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Max Output");
 		const claudeLimit = (await getItems(provider, claude)).find(item => labelOf(item) === "Maximum Context");
+		const localOutput = (await getItems(provider, local)).find(item => labelOf(item) === "Max Output");
 		assert.strictEqual(deepSeekLimit?.description, "258.4K");
 		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.openContextControl");
 		assert.strictEqual(deepSeekOutput?.description, "70.0K");
@@ -266,6 +270,8 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const codexTarget = (await getItems(provider, codex)).find(item => labelOf(item) === "Working Context");
 		assert.strictEqual(codexTarget?.description, "258.4K target");
 		assert.strictEqual(codexTarget?.command?.command, "llamacpp.openContextControl");
+		assert.strictEqual(localOutput?.description, "32.8K");
+		assert.strictEqual(localOutput?.command?.command, "llamacpp.openSettings");
 		assert.ok(!(await getItems(provider, local)).some(item => labelOf(item) === "Maximum Context"));
 	});
 
@@ -281,6 +287,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => "110.00 CNY",
 			() => 87,
 			() => "2.08 14:00",
+			() => undefined,
 			() => 20,
 			() => "7.08 21:45"
 		);
@@ -297,7 +304,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const balance = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Balance");
 		assert.strictEqual(balance?.description, "110.00 CNY");
 
-		const usageLimit = (await getItems(provider, codex)).find(item => labelOf(item) === "Usage Limit");
+		const usageLimit = (await getItems(provider, codex)).find(item => labelOf(item) === "Session Limit");
 		assert.strictEqual(usageLimit?.description, "87% used · resets 2.08 14:00");
 
 		// Claude cache keep-alive toggle is visible and defaults to on.
@@ -568,6 +575,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => [],
 			() => emptyTokenUsageHistorySummary(),
 			() => emptyUsageExperimentSummary(),
+			() => undefined,
 			() => undefined,
 			() => undefined,
 			() => undefined,

@@ -23,6 +23,43 @@ suite("deepseek peak hours", () => {
 		assert.strictEqual(isDeepSeekPeakUtc(1440 + 120), true); // 02:00 UTC next day
 	});
 
+	test("applies peak windows on weekdays only (Monday-Friday)", () => {
+		assert.strictEqual(isDeepSeekPeakUtc(120, 1), true);   // Mon 02:00 UTC
+		assert.strictEqual(isDeepSeekPeakUtc(120, 2), true);   // Tue
+		assert.strictEqual(isDeepSeekPeakUtc(120, 3), true);   // Wed
+		assert.strictEqual(isDeepSeekPeakUtc(120, 4), true);   // Thu
+		assert.strictEqual(isDeepSeekPeakUtc(120, 5), true);   // Fri
+		assert.strictEqual(isDeepSeekPeakUtc(120, 6), false);  // Sat
+		assert.strictEqual(isDeepSeekPeakUtc(120, 0), false);  // Sun
+		assert.strictEqual(isDeepSeekPeakUtc(360, 6), false);  // Sat 06:00 UTC
+		assert.strictEqual(isDeepSeekPeakUtc(360, 0), false);  // Sun 06:00 UTC
+	});
+
+	test("reports weekends as off-peak and rolls the next peak to Monday", () => {
+		// Saturday 2026-08-22 02:30 UTC: within a weekday peak window, but weekend.
+		const saturday = resolveDeepSeekPricingSnapshot(Date.parse("2026-08-22T02:30:00Z"));
+		assert.strictEqual(saturday.state, "off-peak");
+		assert.strictEqual(saturday.isPeak, false);
+		assert.strictEqual(saturday.nextState, "peak");
+		assert.match(saturday.nextTransitionLocal, /^\S+ \d{2}:\d{2}$/); // "Mon 01:00" (localized)
+
+		// Sunday 2026-08-23 08:00 UTC is off-peak too.
+		const sunday = resolveDeepSeekPricingSnapshot(Date.parse("2026-08-23T08:00:00Z"));
+		assert.strictEqual(sunday.state, "off-peak");
+		assert.strictEqual(sunday.nextState, "peak");
+
+		// Friday after 10:00 UTC rolls past the weekend to Monday 01:00.
+		const fridayLate = resolveDeepSeekPricingSnapshot(Date.parse("2026-08-21T22:00:00Z"));
+		assert.strictEqual(fridayLate.state, "off-peak");
+		assert.strictEqual(fridayLate.nextState, "peak");
+		assert.match(fridayLate.nextTransitionLocal, /^\S+ \d{2}:\d{2}$/);
+
+		// Monday 02:30 UTC is still peak.
+		const monday = resolveDeepSeekPricingSnapshot(Date.parse("2026-08-24T02:30:00Z"));
+		assert.strictEqual(monday.state, "peak");
+		assert.strictEqual(monday.isPeak, true);
+	});
+
 	test("switches to peak billing on Aug 16 2026 at 16:00 UTC", () => {
 		assert.ok(DEEPSEEK_PEAK_PRICING_EFFECTIVE_AT_MS === Date.parse("2026-08-16T16:00:00Z"));
 
@@ -54,7 +91,7 @@ suite("deepseek peak hours", () => {
 		const late = resolveDeepSeekPricingSnapshot(Date.parse("2026-08-17T22:00:00Z"));
 		assert.strictEqual(late.state, "off-peak");
 		assert.strictEqual(late.nextState, "peak");
-		assert.match(late.nextTransitionLocal, /^\d{2}:\d{2}$/);
+		assert.match(late.nextTransitionLocal, /^\S+ \d{2}:\d{2}$/);
 	});
 
 	test("formats both peak windows as local clock labels", () => {

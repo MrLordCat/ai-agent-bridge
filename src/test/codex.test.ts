@@ -1790,7 +1790,17 @@ suite("Codex subscription provider", () => {
 			planType: "plus",
 			rateLimitReachedType: null,
 		});
-		assert.strictEqual(formatted, "12% used / resets unknown reset");
+		assert.strictEqual(formatted, "7d · 12% used · resets unknown reset");
+
+		const fiveHour = formatCodexRateLimit({
+			limitId: "codex",
+			limitName: null,
+			primary: { usedPercent: 42, windowDurationMins: 300, resetsAt: 1787650000 },
+			secondary: null,
+			planType: "plus",
+			rateLimitReachedType: null,
+		});
+		assert.match(fiveHour, /^5h · 42% used · resets /);
 	});
 
 	test("uses current request usage instead of cumulative thread billing for context", () => {

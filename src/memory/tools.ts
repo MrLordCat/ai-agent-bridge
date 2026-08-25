@@ -23,6 +23,8 @@ interface SearchMemoryInput {
 	limit?: number;
 	includeExpired?: boolean;
 	scope?: AgentMemoryScope;
+	/** Return every character of matching entries (default clips long content). */
+	full?: boolean;
 }
 
 interface DeleteMemoryInput {
@@ -78,8 +80,20 @@ class StoreMemoryTool implements vscode.LanguageModelTool<StoreMemoryInput> {
 		}
 		const entry = await this.memory.upsert({ ...options.input, ...destination });
 		const label = entry.scope === "global" ? "global" : "project";
+		const estimatedTokens = Math.ceil(entry.content.length / 4);
+		const similar = this.memory.similarEntries(entry, 2);
+		const lines = [
+			`Saved ${label}/${entry.kind} memory ${entry.id}: ${entry.title}`,
+			`Size: ${entry.content.length} chars (~${estimatedTokens} tokens).`,
+		];
+		for (const candidate of similar) {
+			lines.push(
+				`Warning: close to existing ${candidate.id} "${candidate.title}" (similarity ${candidate.similarity.toFixed(2)}). ` +
+				`Update that id if this is the same fact; keep each entry one thought.`
+			);
+		}
 		return new vscode.LanguageModelToolResult([
-			new vscode.LanguageModelTextPart(`Saved ${label}/${entry.kind} memory ${entry.id}: ${entry.title}`),
+			new vscode.LanguageModelTextPart(lines.join("\n")),
 		]);
 	}
 }
@@ -110,11 +124,32 @@ class SearchMemoryTool implements vscode.LanguageModelTool<SearchMemoryInput> {
 					entry.sourceUrl ? `source=${entry.sourceUrl}` : undefined,
 					entry.verifiedAt ? `verified=${entry.verifiedAt}` : undefined,
 					entry.expiresAt ? `expires=${entry.expiresAt}` : undefined,
+					`chars=${entry.content.length}`,
 				].filter(Boolean).join("; ");
-				return `- [${entry.id}] ${entry.title} (${metadata})\n${entry.content}`;
-			}).join("\n\n");
+				const body = options.input.full === true
+					? entry.content
+					: clipMemoryContent(entry.content);
+				return `- [${entry.id}] ${entry.title} (${metadata})\n${body}`;
+			}).join("\n\n") + formatSearchMetrics(entries);
 		return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(result)]);
 	}
+}
+
+/** Long entries dominate the model context; show head+tail and the omitted size. */
+export function clipMemoryContent(content: string, headChars = 600, tailChars = 300): string {
+	if (content.length <= headChars + tailChars) {
+		return content;
+	}
+	const omitted = content.length - headChars - tailChars;
+	return `${content.slice(0, headChars)}\n…[${omitted} chars omitted — pass full: true if the exact text is required]…\n${content.slice(-tailChars)}`;
+}
+
+function formatSearchMetrics(entries: readonly { content: string }[]): string {
+	if (entries.length === 0) {
+		return "";
+	}
+	const totalChars = entries.reduce((sum, entry) => sum + entry.content.length, 0);
+	return `\n\n-- ${entries.length} entries, ${totalChars} chars (~${Math.ceil(totalChars / 4)} tokens)`;
 }
 
 class DeleteMemoryTool implements vscode.LanguageModelTool<DeleteMemoryInput> {
