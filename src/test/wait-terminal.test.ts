@@ -4,39 +4,29 @@ import {
 	WAIT_TERMINAL_DEFAULT_TIMEOUT_MS,
 	WAIT_TERMINAL_MIN_TIMEOUT_MS,
 	WAIT_TERMINAL_MAX_TIMEOUT_MS,
-	commandLineMatches,
 	formatWaitTerminalClosed,
 	formatWaitTerminalResult,
 	formatWaitTerminalTimeout,
-	resolveWaitTerminalTailChars,
 	resolveWaitTerminalTimeoutMs,
-	waitForTerminalCompletion,
+	waitForTerminalNotification,
 	type TerminalWaitEvents,
 } from "../tools/wait-terminal";
 
-type StartListener = Parameters<TerminalWaitEvents["onDidStartTerminalShellExecution"]>[0];
 type EndListener = Parameters<TerminalWaitEvents["onDidEndTerminalShellExecution"]>[0];
 type CloseListener = Parameters<TerminalWaitEvents["onDidCloseTerminal"]>[0];
 
 interface FakeWindow {
-	startListeners: StartListener[];
 	endListeners: EndListener[];
 	closeListeners: CloseListener[];
 	events: TerminalWaitEvents;
-	fireStart(commandLine: string, cwd?: string): void;
-	fireEnd(commandLine: string, exitCode: number | undefined, cwd?: string): void;
+	fireEnd(commandLine: string, exitCode: number | undefined): void;
 	fireClose(): void;
 }
 
 function createFakeWindow(): FakeWindow {
-	const startListeners: StartListener[] = [];
 	const endListeners: EndListener[] = [];
 	const closeListeners: CloseListener[] = [];
 	const events: TerminalWaitEvents = {
-		onDidStartTerminalShellExecution: listener => {
-			startListeners.push(listener);
-			return { dispose() {} };
-		},
 		onDidEndTerminalShellExecution: listener => {
 			endListeners.push(listener);
 			return { dispose() {} };
@@ -46,24 +36,16 @@ function createFakeWindow(): FakeWindow {
 			return { dispose() {} };
 		},
 	};
-	const executeObject = (commandLine: string, cwd?: string) => ({
-		commandLine: { value: commandLine, isTrusted: true, confidence: 2 },
-		cwd: cwd ? { fsPath: cwd } : undefined,
-		read: async function* () {},
-	});
-	const fireStart = (commandLine: string, cwd?: string): void => {
-		for (const listener of [...startListeners]) {
-			const execution = executeObject(commandLine, cwd);
-			listener({ terminal: {} as never, shellIntegration: {} as never, execution } as never);
-		}
-	};
-	const fireEnd = (commandLine: string, exitCode: number | undefined, cwd?: string): void => {
+	const fireEnd = (commandLine: string, exitCode: number | undefined): void => {
 		for (const listener of [...endListeners]) {
-			const execution = executeObject(commandLine, cwd);
 			listener({
 				terminal: {} as never,
 				shellIntegration: {} as never,
-				execution,
+				execution: {
+					commandLine: { value: commandLine, isTrusted: true, confidence: 2 },
+					cwd: undefined,
+					read: async function* () {},
+				} as never,
 				exitCode,
 			} as never);
 		}
@@ -73,108 +55,60 @@ function createFakeWindow(): FakeWindow {
 			listener({} as never);
 		}
 	};
-	return {
-		startListeners,
-		endListeners,
-		closeListeners,
-		events,
-		fireStart,
-		fireEnd,
-		fireClose,
-	};
+	return { endListeners, closeListeners, events, fireEnd, fireClose };
 }
 
 suite("Wait for terminal tool", () => {
-	test("matches commands case-insensitively and by substring", () => {
-		assert.strictEqual(commandLineMatches(undefined, "npm test"), true);
-		assert.strictEqual(commandLineMatches("", "npm test"), true);
-		assert.strictEqual(commandLineMatches("npm", "NPM test -- --grep provider"), true);
-		assert.strictEqual(commandLineMatches("npm run build", "npm run build"), true);
-		assert.strictEqual(commandLineMatches("build", "npm run build"), true);
-		assert.strictEqual(commandLineMatches("run build", "npm run build"), true);
-		assert.strictEqual(commandLineMatches("missing", "npm test"), false);
-	});
-
-	test("clamps timeoutMs and tail chars to safe ranges", () => {
+	test("clamps timeoutMs to safe range", () => {
 		assert.strictEqual(resolveWaitTerminalTimeoutMs(undefined), WAIT_TERMINAL_DEFAULT_TIMEOUT_MS);
 		assert.strictEqual(resolveWaitTerminalTimeoutMs(1), WAIT_TERMINAL_MIN_TIMEOUT_MS);
 		assert.strictEqual(resolveWaitTerminalTimeoutMs(10 * 60_000), 10 * 60_000);
 		assert.strictEqual(resolveWaitTerminalTimeoutMs(99 * 60 * 60_000), WAIT_TERMINAL_MAX_TIMEOUT_MS);
-		assert.strictEqual(resolveWaitTerminalTailChars(undefined), 2_000);
-		assert.strictEqual(resolveWaitTerminalTailChars(-1), 0);
-		assert.strictEqual(resolveWaitTerminalTailChars(100_000), 16_384);
 	});
 
-	test("resolves when the matching command finishes", async () => {
+	test("resolves on the first terminal notification with exit code and duration", async () => {
 		const win = createFakeWindow();
 		const startedAt = Date.parse("2026-08-26T10:00:00Z");
-		const promise = waitForTerminalCompletion(
-			win.events,
-			{ command: "npm test", timeoutMs: 30_000, outputTailChars: 200 },
-			() => startedAt
-		);
-		win.fireStart("npm test -- --grep provider");
-		win.fireEnd("npm test -- --grep provider", 0);
+		const promise = waitForTerminalNotification(win.events, {}, () => startedAt);
+		win.fireEnd("npm test", 0);
 		const text = await promise;
-		assert.ok(text.includes("Terminal command finished:"), text);
-		assert.ok(text.includes("exit code: 0"), text);
-		assert.ok(text.includes("npm test -- --grep provider"), text);
-		assert.ok(text.includes("output: not captured"), text);
+		assert.ok(text.includes("Terminal command finished (npm test)"), text);
+		assert.ok(text.includes("Exit code: 0"), text);
+		assert.ok(text.includes("You can continue working."), text);
 	});
 
-	test("resolves with exit code unknown when the shell does not report it", async () => {
+	test("reports unknown exit code when the shell does not report one", async () => {
 		const win = createFakeWindow();
-		const promise = waitForTerminalCompletion(win.events, { command: "build.sh" });
+		const promise = waitForTerminalNotification(win.events, {});
 		win.fireEnd("build.sh", undefined);
 		const text = await promise;
-		assert.ok(text.includes("exit code: unknown"), text);
+		assert.ok(text.includes("Exit code: unknown"), text);
 	});
 
-	test("does not complete on unrelated commands and finishes on timeout", async () => {
+	test("times out with an actionable message when no notification arrives", async () => {
 		const win = createFakeWindow();
-		const promise = waitForTerminalCompletion(win.events, {
-			command: "npm run package",
-			timeoutMs: 1_000,
-		});
-		win.fireEnd("npm test", 0);
+		const promise = waitForTerminalNotification(win.events, { timeoutMs: 1_000 });
 		await new Promise(resolve => setTimeout(resolve, 1_500));
 		const text = await promise;
-		assert.ok(text.startsWith("Timed out"), text);
-		assert.ok(text.includes("npm run package"), text);
+		assert.ok(text.startsWith("No terminal notification within"), text);
+		assert.ok(text.includes("Check the terminal panel"), text);
 	});
 
-	test("resolves when the terminal closes", async () => {
+	test("resolves with terminal-closed message", async () => {
 		const win = createFakeWindow();
-		const promise = waitForTerminalCompletion(win.events, { command: "sleep 100" });
+		const promise = waitForTerminalNotification(win.events, {});
 		win.fireClose();
 		const text = await promise;
-		assert.strictEqual(text, formatWaitTerminalClosed("sleep 100"));
+		assert.strictEqual(text, formatWaitTerminalClosed());
 	});
 
-	test("formats result with duration and clipped output tail", () => {
-		const output = "line\n".repeat(200);
-		const text = formatWaitTerminalResult({
-			commandLine: "npm test",
-			exitCode: 1,
-			startedAt: 0,
-			endedAt: 65_430,
-			output,
-			outputTailChars: 20,
-		});
-		assert.ok(text.includes("exit code: 1"), text);
-		assert.ok(text.includes("duration: 1m 5s"), text);
-		assert.ok(text.includes("chars captured, shown last 20"), text);
-		assert.ok(text.includes("(chars omitted)") || text.includes("chars omitted"), text);
-	});
+	test("formats result and timeout texts", () => {
+		const result = formatWaitTerminalResult("npm run package", 1, 65_430);
+		assert.ok(result.includes("Exit code: 1"), result);
+		assert.ok(result.includes("Duration: 1m 5s"), result);
 
-	test("formats actionable timeout text", () => {
-		const text = formatWaitTerminalTimeout({
-			timeoutMs: 60_000,
-			command: "npm test",
-			elapsedMs: 60_000,
-		});
-		assert.ok(text.includes('"npm test"'), text);
-		assert.ok(text.includes("already finished"), text);
-		assert.ok(text.includes("shellIntegration.enabled"), text);
+		const timeout = formatWaitTerminalTimeout(60_000, 60_000);
+		assert.ok(timeout.includes("No terminal notification within 60000ms"), timeout);
 	});
 });
+

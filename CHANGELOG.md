@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.15.12 (dev) - 2026-08-26
+
+- **`llamacpp_wait_for_terminal` simplified**: the agent calls the tool,
+  waits for the FIRST terminal command notification (`onDidEndTerminalShellExecution`)
+  and continues immediately. Removed command matching, output buffering and
+  tail parameters; the only input is an optional safety-net `timeoutMs`
+  (default 10 min). The tool returns the command line, exit code and duration.
+
 ## 1.15.11 (dev) - 2026-08-26
 
 - **New agent tool `llamacpp_wait_for_terminal`**: an agent can wait until a
