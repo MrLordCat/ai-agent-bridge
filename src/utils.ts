@@ -776,6 +776,7 @@ export function convertTools(
 			// duplicate edit attempts while nothing actually executed.
 			const directPriority: Record<string, number> = {
 				run_in_terminal: 200,
+				llamacpp_wait_for_terminal: 199,
 				run_task: 198,
 				read_file: 195,
 				grep_search: 190,

@@ -133,6 +133,40 @@ export async function waitForTerminalNotification(
 	});
 }
 
+export function createWaitForTerminalToolDefinition(): vscode.LanguageModelChatTool {
+	return {
+		name: WAIT_TERMINAL_TOOL_NAME,
+		description: "Wait until the next terminal command finishes. Call it right after starting a command instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished.",
+		inputSchema: {
+			type: "object",
+			properties: {
+				timeoutMs: {
+					type: "number",
+					minimum: 5000,
+					maximum: 7200000,
+					description: "Safety net in milliseconds (default 600000 = 10 min).",
+				},
+			},
+			additionalProperties: false,
+		},
+	};
+}
+
+/**
+ * Appends the extension's built-in agent tools (wait-for-terminal) to the
+ * advertised tool list. Some VS Code hosts do not include newly registered
+ * tools in request options until a full restart; the model must still see
+ * them, so the provider injects missing built-ins itself (deduped by name).
+ */
+export function ensureBuiltInTools(
+	tools: readonly vscode.LanguageModelChatTool[] | undefined
+): vscode.LanguageModelChatTool[] {
+	const existing = tools ?? [];
+	const names = new Set(existing.map(tool => tool.name));
+	const missing = [createWaitForTerminalToolDefinition()].filter(tool => !names.has(tool.name));
+	return missing.length > 0 ? [...existing, ...missing] : [...existing];
+}
+
 export class WaitForTerminalTool implements vscode.LanguageModelTool<WaitForTerminalInput> {
 	constructor(private readonly events: TerminalWaitEvents = createDefaultTerminalWaitEvents()) {}
 

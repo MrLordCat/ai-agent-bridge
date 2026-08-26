@@ -74,6 +74,7 @@ import {
     type ProviderHealthSourceReport,
 } from "./diagnostics/provider-health";
 import { BoundedMap, convertMessages, convertTools, stableJsonStringify, stripTerminalControlNoise, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
+import { ensureBuiltInTools } from "./tools/wait-terminal";
 import { LlamaLogSink } from "./logger";
 import { buildMemoryQuery, injectAppendOnlySharedMemoryContext } from "./memory/prompt";
 import { getCurrentWorkspaceScopeId } from "./memory/scope";
@@ -1141,13 +1142,27 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // MCP servers (chrome-devtools) register a different tool *set* between
         // restarts while keeping the same count, and any catalog rewrite burns
         // the whole upstream prefix. As long as the count matches, reuse the
-        // exact previous list so the prompt stays byte-identical. When the
-        // count differs, rebuild.
+        // exact previous list so the prompt stays byte-identical. The one
+        // exception: the extension's OWN built-in tools (llamacpp_*) — a newly
+        // registered built-in (e.g. llamacpp_wait_for_terminal) or a removed
+        // one must be visible to the model even when the count did not change,
+        // so a same-count built-in swap forces a rebuild.
         const countUnchanged = previous
             && Array.isArray(config.tools)
             && previous.tools.length === config.tools.length;
-
-        if (countUnchanged && !recentActivation && !configChanged) {
+        const builtInChanged = previous
+            && Array.isArray(config.tools)
+            && [...previous.tools]
+                .map(tool => tool.function.name)
+                .filter(name => name.startsWith("llamacpp_"))
+                .sort()
+                .join("\0")
+            !== config.tools
+                .map(tool => tool.function?.name ?? "")
+                .filter(name => name.startsWith("llamacpp_"))
+                .sort()
+                .join("\0");
+        if (countUnchanged && !builtInChanged && !recentActivation && !configChanged) {
             this.stableToolCatalogs.delete(scope);
             this.stableToolCatalogs.set(scope, previous);
             this.dirtyToolCatalogScopes.add(scope);
@@ -4269,7 +4284,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 sharedMemoryMaxTokens,
             },
         });
-        const convertedToolConfig = convertTools(options, {
+        // Hosts may not propagate newly registered tools into request
+        // options (e.g. right after an update until a full restart). The
+        // extension's built-in agent tools are injected here so the model
+        // always sees them; host-supplied duplicates are deduped by name.
+        const toolOptions: vscode.ProvideLanguageModelChatResponseOptions = {
+            ...options,
+            tools: ensureBuiltInTools(options.tools ?? []),
+        };
+        const convertedToolConfig = convertTools(toolOptions, {
             mode: toolCallingModeConfig as ToolCallingMode,
             apiDirectMaxTools,
             apiDirectIncludeAllTools,
@@ -4282,11 +4305,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 advertised: Array.isArray(options.tools) ? options.tools.length : 0,
                 converted: convertedToolConfig.tools.length,
                 tokenEstimate: this.estimateToolTokens(convertedToolConfig.tools),
+                builtInInjected: (toolOptions.tools?.length ?? 0) - (options.tools?.length ?? 0),
+                builtInTools: (toolOptions.tools ?? []).filter(tool => tool.name.startsWith("llamacpp_")).map(tool => tool.name).sort(),
             });
         }
         const toolConfig = this.stabilizeToolCatalog(
             requestModelId,
-            options,
+            toolOptions,
             convertedToolConfig,
             inspectionMessages,
             requestId

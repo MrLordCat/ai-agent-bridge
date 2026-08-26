@@ -4,6 +4,8 @@ import {
 	WAIT_TERMINAL_DEFAULT_TIMEOUT_MS,
 	WAIT_TERMINAL_MIN_TIMEOUT_MS,
 	WAIT_TERMINAL_MAX_TIMEOUT_MS,
+	WAIT_TERMINAL_TOOL_NAME,
+	ensureBuiltInTools,
 	formatWaitTerminalClosed,
 	formatWaitTerminalResult,
 	formatWaitTerminalTimeout,
@@ -109,6 +111,23 @@ suite("Wait for terminal tool", () => {
 
 		const timeout = formatWaitTerminalTimeout(60_000, 60_000);
 		assert.ok(timeout.includes("No terminal notification within 60000ms"), timeout);
+	});
+
+	test("injects the built-in tool when the host does not advertise it", () => {
+		// Host does not know about the new tool yet (e.g. right after update).
+		const tools = ensureBuiltInTools([{ name: "read_file", description: "", inputSchema: {} }]);
+		assert.strictEqual(tools.length, 2);
+		assert.ok(tools.some(tool => tool.name === WAIT_TERMINAL_TOOL_NAME));
+		assert.strictEqual(tools[1].name, WAIT_TERMINAL_TOOL_NAME);
+		assert.ok(tools[1].description.includes("Wait until the next terminal command finishes"));
+
+		// Deduped when the host already advertises it.
+		const withHost = ensureBuiltInTools([
+			{ name: "read_file", description: "", inputSchema: {} },
+			{ name: WAIT_TERMINAL_TOOL_NAME, description: "host version", inputSchema: {} },
+		]);
+		assert.strictEqual(withHost.length, 2);
+		assert.strictEqual(withHost[1].description, "host version");
 	});
 });
 

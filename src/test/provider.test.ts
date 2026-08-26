@@ -1713,6 +1713,52 @@ suite("Llama.cpp Chat Provider Extension", () => {
             assert.deepStrictEqual(second.tools, first.tools);
         });
 
+        test("rebuilds the catalog when a built-in tool enters at the same count", () => {
+            const providerAny = provider as unknown as {
+                stabilizeToolCatalog: (
+                    modelId: string,
+                    options: vscode.ProvideLanguageModelChatResponseOptions,
+                    config: ReturnType<typeof convertTools>,
+                    messages: readonly OpenAIChatMessage[],
+                    requestId: string
+                ) => ReturnType<typeof convertTools>;
+            };
+            const tool = (name: string): vscode.LanguageModelChatTool => ({
+                name,
+                description: name,
+                inputSchema: { type: "object", properties: {} },
+            });
+            const initialOptions = {
+                modelOptions: { _copilotConversationId: "conversation-cache-3" },
+                tools: [tool("a_tool"), tool("y_tool"), tool("z_tool")],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            // Same count (3), but a built-in extension tool appears instead of
+            // y_tool — the model must see it, no silent count-match reuse.
+            const changedOptions = {
+                modelOptions: { _copilotConversationId: "conversation-cache-3" },
+                tools: [tool("a_tool"), tool("z_tool"), tool("llamacpp_wait_for_terminal")],
+                toolMode: vscode.LanguageModelChatToolMode.Auto,
+            } as vscode.ProvideLanguageModelChatResponseOptions;
+            providerAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                initialOptions,
+                convertTools(initialOptions, { mode: "apiDirect", apiDirectMaxTools: 3 }),
+                [{ role: "user", content: "first" }],
+                "request-1"
+            );
+            const second = providerAny.stabilizeToolCatalog(
+                "deepseek-v4-pro",
+                changedOptions,
+                convertTools(changedOptions, { mode: "apiDirect", apiDirectMaxTools: 3 }),
+                [{ role: "user", content: "next" }],
+                "request-2"
+            );
+            const names = (second.tools ?? []).map(toolDef => toolDef.function.name).sort();
+            assert.ok(names.includes("llamacpp_wait_for_terminal"), `built-in must be advertised: ${names.join(",")}`);
+            assert.ok(!names.includes("y_tool"), `removed tool must disappear: ${names.join(",")}`);
+        });
+
         test("restores host-rewritten history without dropping the new turn", () => {
             const providerAny = provider as unknown as {
                 stabilizeMessagePrefix: (

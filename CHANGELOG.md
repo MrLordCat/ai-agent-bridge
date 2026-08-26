@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.15.13 (dev) - 2026-08-26
+
+- **Built-in agent tools are injected into the tool catalog, and catalog
+  stabilization no longer hides tool-set changes.** Some VS Code hosts do not
+  propagate newly registered tools into request options until a full restart,
+  so `llamacpp_wait_for_terminal` never reached the model. The provider now
+  appends missing built-in tools itself (`ensureBuiltInTools`, deduped by
+  name) before conversion, and `stabilizeToolCatalog` compares the *set of
+  stable tool names* instead of only the count — a same-count swap (new tool
+  in, old tool out) now rebuilds the catalog and produces the expected cache
+  miss instead of silently keeping the old list. Diagnostics: `builtInInjected`
+  and `builtInTools` in `chat.tools.catalog_converted`.
+
 ## 1.15.12 (dev) - 2026-08-26
 
 - **`llamacpp_wait_for_terminal` simplified**: the agent calls the tool,
