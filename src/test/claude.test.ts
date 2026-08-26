@@ -15,6 +15,7 @@ import {
 	buildClaudeInitialConversationText,
 	canonicalizeClaudeTools,
 	classifyClaudeResumeFailure,
+	clearPersistedClaudeSessionState,
 	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
 	createLatestUserMessage,
@@ -981,4 +982,29 @@ test("marks the session stream as closed after an interrupt", async () => {
 		assert.strictEqual(availability.state, "available");
 		assert.ok(availability.reason.includes("paid extra usage is enabled"));
 	});
+});
+suite("Claude durable session state", () => {
+        test("clears durable sessions and pending rollover on sign out", async () => {
+                const store = new Map<string, unknown>();
+                const workspaceState = {
+                        get(key: string): unknown {
+                                return store.get(key);
+                        },
+                        update(key: string, value: unknown): Thenable<void> {
+                                store.set(key, value);
+                                return Promise.resolve();
+                        },
+                };
+                store.set("llamacpp.claudeDurableSessions.v1", [{ conversationId: "c1" }]);
+                store.set("llamacpp.claudePendingRollover.v1", { sourceConversationId: "c1" });
+
+                await clearPersistedClaudeSessionState(workspaceState);
+
+                assert.strictEqual(store.get("llamacpp.claudeDurableSessions.v1"), undefined);
+                assert.strictEqual(store.get("llamacpp.claudePendingRollover.v1"), undefined);
+        });
+
+        test("does not throw when workspace state is unavailable", async () => {
+                await clearPersistedClaudeSessionState(undefined);
+        });
 });

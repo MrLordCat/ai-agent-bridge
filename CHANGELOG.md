@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.7 (dev) - 2026-08-26
+
+- **Claude: sign-out/sign-in now clears durable sessions**: a cached durable
+  session (and any quarantined entry) references the previous OAuth
+  account/org; after a subscription expiry + renewal the resumed session
+  failed with `oauth_org_not_allowed` and was quarantined in memory, making
+  every further request in that chat fail with "Claude durable session is
+  quarantined". Sign-out (and sign-in) now drop durable sessions + pending
+  rollover from memory and workspace state, so the next turn starts a fresh
+  SDK session.
+
 ## 1.15.6 (dev) - 2026-08-25
 
 - **DeepSeek vision-exp images enabled**: `deepseek-v4-flash-vision-exp` is

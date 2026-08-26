@@ -347,6 +347,23 @@ export interface ClaudeResumeFailureInfo {
 	detail: string;
 }
 
+export async function clearPersistedClaudeSessionState(
+	workspaceState: { update(key: string, value: unknown): Thenable<void> } | undefined,
+	logSink?: { logError(event: string, error: unknown): void }
+): Promise<void> {
+	if (!workspaceState) {
+		return;
+	}
+	try {
+		await Promise.all([
+			Promise.resolve(workspaceState.update(CLAUDE_DURABLE_SESSION_STATE_KEY, undefined)),
+			Promise.resolve(workspaceState.update(CLAUDE_PENDING_ROLLOVER_STATE_KEY, undefined)),
+		]);
+	} catch (error) {
+		logSink?.logError("claude.session_state.clear_failed", error);
+	}
+}
+
 /** Preserve the actionable cause that would otherwise be hidden by full-input fallback. */
 export function classifyClaudeResumeFailure(error: unknown): ClaudeResumeFailureInfo {
 	const detail = (error instanceof Error ? error.message : String(error)).trim().slice(0, 1_000)
@@ -993,6 +1010,10 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	}
 
 	async signIn(): Promise<void> {
+		// A fresh subscription sign-in may resolve to a different account/org.
+		// Durable sessions (and quarantined entries) from the previous account
+		// cannot be resumed — drop them so the next turn starts a clean session.
+		await this.clearDurableSessions();
 		await this.refreshStatus();
 		vscode.window.showInformationMessage(
 			"Claude uses the account from the official Claude Code extension. Sign in there, then retry."
@@ -1005,6 +1026,12 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.lastSubscriptionUsageAt = 0;
 		this.lastContextUsage = undefined;
 		this.contextUsageByModel.clear();
+		// Durable sessions reference the previous OAuth account/org. After a
+		// subscription change (or oauth_org_not_allowed) the resumed session is
+		// quarantined in memory and every further request in that chat fails
+		// with "Claude durable session is quarantined". Drop them on sign-out
+		// so the next turn starts a fresh SDK session instead.
+		await this.clearDurableSessions();
 		this.toStatus("signedOut");
 		this.modelChanges.fire();
 	}
@@ -2171,6 +2198,12 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			this.logSink?.logError("claude.session_state.persist_failed", error);
 			throw error;
 		}
+	}
+
+	private async clearDurableSessions(): Promise<void> {
+		this.durableSessions.clear();
+		this.pendingRollover = undefined;
+		await clearPersistedClaudeSessionState(this.workspaceState, this.logSink);
 	}
 
 	private async rememberDurableSession(session: ClaudeConversationSession): Promise<void> {
