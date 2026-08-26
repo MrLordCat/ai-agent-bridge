@@ -206,6 +206,19 @@ suite("Claude subscription provider", () => {
 			policy: "safe", estimatedInputTokens: 250_000, maxInputTokens: 256_000,
 			usagePercent: 0, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80,
 		}).allowed, true);
+
+		// Bounded latest-message recovery is one user message: without a fresh
+		// usage snapshot (Claude API can return rate_limits:null) it must not
+		// be blocked — the cold-replay guard already limits its size.
+		assert.deepStrictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 36_000, maxInputTokens: 256_000,
+			maxUsagePercent: 80, bounded: true,
+		}).allowed, true);
+		// ...but a known exhausted limit still blocks it.
+		assert.strictEqual(resolveClaudeResumeFallbackDecision({
+			policy: "safe", estimatedInputTokens: 36_000, maxInputTokens: 256_000,
+			usagePercent: 99, usageSnapshotAgeMs: 1_000, maxUsagePercent: 80, bounded: true,
+		}).reason, "usage_limit");
 	});
 
 	test("classifies the original durable resume failure for live diagnostics", () => {

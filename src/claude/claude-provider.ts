@@ -466,6 +466,8 @@ export function resolveClaudeResumeFallbackDecision(value: {
 	usagePercent?: number;
 	usageSnapshotAgeMs?: number;
 	maxUsagePercent: number;
+	/** Latest-message recovery (one user message) instead of a full replay. */
+	bounded?: boolean;
 }): ClaudeResumeFallbackDecision {
 	if (value.policy === "always") {
 		return { allowed: true, reason: "policy_always", detail: "Full replay explicitly allowed by configuration." };
@@ -481,6 +483,17 @@ export function resolveClaudeResumeFallbackDecision(value: {
 		};
 	}
 	if (value.usagePercent === undefined || value.usageSnapshotAgeMs === undefined) {
+		// Claude may report rate_limits:null for a fresh/active Pro plan; the
+		// bounded path sends only the latest user message, so a missing usage
+		// snapshot must not starve the chat forever. The input_limit guard
+		// above still caps its size.
+		if (value.bounded) {
+			return {
+				allowed: true,
+				reason: "safe_limits",
+				detail: "Bounded latest-message recovery allowed without a fresh usage snapshot (one user message only).",
+			};
+		}
 		return { allowed: false, reason: "usage_unknown", detail: "Fresh Claude five-hour usage is unavailable." };
 	}
 	if (value.usageSnapshotAgeMs > CLAUDE_RESUME_FALLBACK_USAGE_MAX_AGE_MS) {
@@ -1509,6 +1522,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					? Date.now() - this.lastSubscriptionUsageAt
 					: undefined,
 				maxUsagePercent: safety.resumeFallbackMaxUsagePercent,
+				bounded: true,
 			});
 			if (!recoveryDecision.allowed) {
 				this.logSink?.log("claude.chat.quarantine_recovery_blocked", {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.8 (dev) - 2026-08-26
+
+- **Claude recovery unblocked when usage snapshot is missing**: the Claude
+  usage endpoint may report `rate_limits: null` even on an active Pro plan
+  (verified live), which made every recovery fail with
+  `usage_unknown` — "Claude durable session is quarantined". The bounded
+  latest-message recovery (one user message, already capped by
+  `resumeFallbackMaxInputTokens`) is now allowed without a fresh usage
+  snapshot; a *known* exhausted 5-hour limit still blocks it, and the full
+  cold-replay guard is unchanged.
+
 ## 1.15.7 (dev) - 2026-08-26
 
 - **Claude: sign-out/sign-in now clears durable sessions**: a cached durable
