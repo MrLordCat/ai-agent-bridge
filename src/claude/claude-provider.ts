@@ -684,6 +684,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	private usageRefresh: Promise<void> | undefined;
 	private readonly usageRefreshTimer: NodeJS.Timeout;
 	private keepAliveInflight = false;
+	private boundedRecoveryWarned = false;
 	private cacheKeepAliveStatusValue: ClaudeCacheKeepAliveStatus = {
 		state: "checking",
 		reason: "Checking Claude usage and live sessions.",
@@ -1536,6 +1537,16 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					`Claude durable session is quarantined (${latestOnlyRecovery.reason}). `
 					+ `A bounded latest-message recovery was blocked (${recoveryDecision.reason}): `
 					+ recoveryDecision.detail
+				);
+			}
+			if (!this.boundedRecoveryWarned) {
+				this.boundedRecoveryWarned = true;
+				void vscode.window.showWarningMessage(
+					`Claude is resuming with only the latest message — the full conversation context `
+					+ `was not restored (protected replay cap ${safety.resumeFallbackMaxInputTokens} tokens, `
+					+ `needed ~${latestOnlyRecovery.estimatedTokens} tokens of the tail). `
+					+ `Raise "llamacpp.claudeResumeFallbackMaxInputTokens" (e.g. 500000) to restore the full context, `
+					+ `or continue in a new chat.`
 				);
 			}
 			this.logSink?.log("claude.chat.quarantine_recovery", {

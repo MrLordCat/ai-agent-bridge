@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.15.9 (dev) - 2026-08-26
+
+- **Claude bounded recovery warns the user**: when the full replay is capped
+  by `claudeResumeFallbackMaxInputTokens` and only the latest message is sent,
+  a one-time warning explains that context was not fully restored and how to
+  raise the cap (or continue in a new chat). No behavior change otherwise.
+
 ## 1.15.8 (dev) - 2026-08-26
 
 - **Claude recovery unblocked when usage snapshot is missing**: the Claude
