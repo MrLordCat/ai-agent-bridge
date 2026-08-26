@@ -23,6 +23,7 @@ import { SessionQualityTracker } from "./diagnostics/session-report";
 import { getCurrentWorkspaceScopeId, filterEntriesVisibleInWorkspace } from "./memory/scope";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
+import { registerWaitForTerminalTool } from "./tools/wait-terminal";
 import { registerContextControlCommand } from "./ui/context-control";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
@@ -567,6 +568,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(usageExperiments);
 	await Promise.all([logService.initialize(), memoryService.initialize()]);
 	registerMemoryTools(context, memoryService);
+	registerWaitForTerminalTool(context);
 	registerCopilotPatchIntegration(context);
 
 	// Expose agent history caps to the prompt-tsx patch via globalThis.

@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.15.10",
+	"version": "1.15.11",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -900,6 +900,41 @@
 						"id",
 						"scope"
 					],
+					"additionalProperties": false
+				}
+			},
+			{
+				"name": "llamacpp_wait_for_terminal",
+				"displayName": "Wait for Terminal Command",
+				"toolReferenceName": "waitForTerminal",
+				"modelDescription": "Wait until a terminal command finishes, instead of sleeping for a guessed duration. Call it right after starting a command (e.g. run_in_terminal) and it resolves as soon as the command exits (shell integration event). Pass command as a substring of the command line (case-insensitive) to wait only for that command; omit it to wait for the next command that finishes. Returns exit code, duration, cwd and the last output chars. timeoutMs is a safety net (default 15 min) — prefer a generous timeout over polling with sleep. Never call this tool for a command that already finished: its end event has passed and only a timeout would resolve.",
+				"userDescription": "Wait for a running terminal command to finish.",
+				"canBeReferencedInPrompt": true,
+				"icon": "$(watch)",
+				"tags": [
+					"terminal",
+					"llamacpp"
+				],
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"command": {
+							"type": "string",
+							"description": "Substring of the command line to wait for (case-insensitive), e.g. \"npm run build\". Omit to wait for the next command that finishes."
+						},
+						"timeoutMs": {
+							"type": "number",
+							"minimum": 5000,
+							"maximum": 7200000,
+							"description": "Maximum wait in milliseconds (default 900000 = 15 min)."
+						},
+						"outputTailChars": {
+							"type": "number",
+							"minimum": 0,
+							"maximum": 16384,
+							"description": "Maximum output characters to return (tail, default 2000)."
+						}
+					},
 					"additionalProperties": false
 				}
 			}

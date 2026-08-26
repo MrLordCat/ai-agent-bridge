@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.15.11 (dev) - 2026-08-26
+
+- **New agent tool `llamacpp_wait_for_terminal`**: an agent can wait until a
+  terminal command actually finishes instead of sleeping for a guessed
+  duration. It listens to VS Code shell integration events
+  (`onDidStart/onDidEndTerminalShellExecution`), matches a `command` substring
+  (case-insensitive; omit to wait for the next command), and returns exit
+  code, duration, cwd and the last output chars. `timeoutMs` is only a safety
+  net (default 15 min). New files: `src/tools/wait-terminal.ts`,
+  `src/test/wait-terminal.test.ts`; registered in
+  `package.json → contributes.languageModelTools` and `extension.ts`.
+  Shell integration must be enabled (`terminal.integrated.shellIntegration.enabled`),
+  and the start event must be observed for output capture (otherwise the
+  result still carries exit code/duration).
+
 ## 1.15.10 (dev) - 2026-08-26
 
 - **Claude usage no longer erased by background probes**: Claude only
