@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.15.14 (dev) - 2026-08-26
+
+- **Compaction no longer collapses the tail to a tiny fragment when
+  `compactMaxReasoningChars` is exceeded.** Previously the reasoning cap in
+  `compactMessagesDetailed` was a *turn* budget: the tail was dropped until
+  surviving `reasoning_content` fit the cap, so with `thinkingMode: deep`
+  (2-4K reasoning chars per turn) a 24K cap kept only ~6 turns while most of
+  the 50% target stayed unused (factory log: 254 749 → 43 385 tokens at a
+  target of 127 374, `targetFillPercent: 34.1`). Now the cap trims the
+  reasoning **content** of the oldest retained blocks (`trimReasoningContent`),
+  keeping turns (with their tool results) in context; assistant tool-call
+  messages always keep the `reasoning_content` field, just shorter.
+
 ## 1.15.13 (dev) - 2026-08-26
 
 - **Built-in agent tools are injected into the tool catalog, and catalog

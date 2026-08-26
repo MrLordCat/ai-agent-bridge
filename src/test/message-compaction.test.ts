@@ -471,7 +471,8 @@ suite("message compaction", () => {
 		// DeepSeek requires reasoning_content to be passed back for every
 		// intermediate assistant message while tools are in the request, so
 		// stale chain-of-thought accumulates in the surviving tail. The cap
-		// folds extra turns into the summary instead of carrying them over.
+		// trims the reasoning CONTENT of retained turns — turns themselves
+		// (with their tool results) are never dropped just to fit the cap.
 		const messages: OpenAIChatMessage[] = [{ role: "system", content: "Stable system prompt" }];
 		for (let index = 0; index < 30; index += 1) {
 			messages.push(
@@ -492,13 +493,16 @@ suite("message compaction", () => {
 		messages.push({ role: "user", content: "current task" }, { role: "assistant", content: "current answer" });
 
 		const estimateTokens = (items: OpenAIChatMessage[]): number => items.reduce(
-			(sum, message) => sum + (typeof message.content === "string" ? message.content.length : 0),
+			(sum, message) => sum
+				+ (typeof message.content === "string" ? message.content.length : 0)
+				+ (typeof message.reasoning_content === "string" ? message.reasoning_content.length : 0),
 			0
 		);
-		// Modest token budget (content chars ≈ 700) forces compaction; the
-		// reasoning cap is what actually trims the tail in this test.
+		// Reasoning (2K chars/turn) overflows the 6K cap; with a 12K token
+		// budget the tail would fit ~4 turns, so the reasoning cap must trim
+		// content rather than collapse the tail to a single turn.
 		const compacted = compactMessages(messages, {
-			tokenBudget: 500,
+			tokenBudget: 12_000,
 			keepLastCount: 12,
 			label: "Conversation summary (auto-compact)",
 			estimateTokens,
@@ -512,6 +516,16 @@ suite("message compaction", () => {
 			retainedReasoning <= 6_000,
 			`expected reasoning tail within 6000 chars, got ${retainedReasoning}`
 		);
+		// Older turns are dropped inside 12K anyway, but at least ~3 turns
+		// (each ~2K content + 2K reasoning ≈ 4K) must survive: the cap is not
+		// what collapses the tail now.
+		const retainedToolCallIds = compacted
+			.flatMap(message => message.tool_calls ?? [])
+			.map(call => call.id);
+		assert.ok(
+			retainedToolCallIds.length >= 2,
+			`expected multiple historical turns to survive, got ${retainedToolCallIds.length}`
+		);
 		// The newest assistant response (last compaction unit) must survive;
 		// its text may still be trimmed by the final budget pass.
 		assert.strictEqual(compacted.at(-1)?.role, "assistant");
@@ -520,13 +534,15 @@ suite("message compaction", () => {
 			["user", "assistant"],
 			"expected the newest user request plus assistant answer at the tail"
 		);
-		// A reasoning message kept in the tail must be intact, never truncated.
+		// Reasoning cap trims content of the OLDEST retained blocks only; at
+		// least one full 2011-char reasoning block must survive untouched.
+		const reasoningLengths = compacted
+			.filter(message => typeof message.reasoning_content === "string")
+			.map(message => (message.reasoning_content as string).length)
+			.sort((left, right) => right - left);
 		assert.ok(
-			compacted.every(message =>
-				typeof message.reasoning_content !== "string"
-				|| (message.reasoning_content.startsWith("thinking-") && message.reasoning_content.endsWith("y"))
-			),
-			"expected retained reasoning to stay intact"
+			reasoningLengths.some(length => length >= 2_011),
+			`expected at least one intact reasoning block, got lengths ${reasoningLengths.join(",")}`
 		);
 		assert.ok(
 			compacted.some(message => typeof message.content === "string" && message.content.includes("Conversation summary")),

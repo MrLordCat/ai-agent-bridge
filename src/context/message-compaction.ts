@@ -197,15 +197,35 @@ function cloneMessage(message: OpenAIChatMessage): OpenAIChatMessage {
 	};
 }
 
-/** Total characters of historical reasoning_content across assistant messages. */
-function reasoningChars(messages: OpenAIChatMessage[]): number {
-	let total = 0;
-	for (const message of messages) {
-		if (message.role === "assistant" && typeof message.reasoning_content === "string") {
-			total += message.reasoning_content.length;
-		}
+/**
+ * Caps historical reasoning_content by trimming its CONTENT, never by
+ * dropping turns. Dropping turns to fit the reasoning cap was destroying
+ * useful recent tool/history context: with thinkingMode=deep each turn
+ * carries 2-4K reasoning chars, so a 24K cap cut the tail to ~6 turns while
+ * ~2/3 of the compaction budget stayed unused (254K -> 43K at a 127K target).
+ * Trimming from the OLDEST retained message keeps the newest reasoning
+ * intact; helper messages with tool_calls keep the field (DeepSeek requires
+ * reasoning_content on assistant tool-call messages), just shorter.
+ */
+function trimReasoningContent(messages: OpenAIChatMessage[], startIndex: number, maxChars: number): void {
+	if (!Number.isFinite(maxChars) || maxChars <= 0) {
+		return;
 	}
-	return total;
+	let remaining = maxChars;
+	for (let index = startIndex; index < messages.length; index += 1) {
+		const message = messages[index];
+		if (message.role !== "assistant" || typeof message.reasoning_content !== "string") {
+			continue;
+		}
+		if (message.reasoning_content.length <= remaining) {
+			remaining -= message.reasoning_content.length;
+			continue;
+		}
+		message.reasoning_content = remaining > 0
+			? message.reasoning_content.slice(0, remaining)
+			: "";
+		remaining = 0;
+	}
 }
 
 function groupConversationTurns(messages: OpenAIChatMessage[]): OpenAIChatMessage[][] {
@@ -577,14 +597,18 @@ export function compactMessagesDetailed(
 		: undefined;
 
 	while (tailTurns.length > 1
-		&& (
-			options.estimateTokens(compacted) > options.tokenBudget
-			|| (maxReasoningChars !== undefined && reasoningChars(tailTurns.flat()) > maxReasoningChars)
-		)
+		&& options.estimateTokens(compacted) > options.tokenBudget
 	) {
 		tailTurns = tailTurns.slice(1);
 		droppedTurnCount += 1;
 		compacted.splice(tailStart, compacted.length - tailStart, ...tailTurns.flat());
+	}
+
+	// Reasoning is content, not a turn boundary: cap the total by trimming
+	// reasoning_content inside the retained suffix instead of throwing turns
+	// away (keeps tool results and recent actions in context).
+	if (maxReasoningChars !== undefined && maxReasoningChars > 0) {
+		trimReasoningContent(compacted, tailStart, maxReasoningChars);
 	}
 
 	truncateToBudget(compacted, options, systems.length);
