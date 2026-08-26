@@ -615,6 +615,13 @@ function formatLimitWindow(
 	return `${percent}% used / resets ${reset.toLocaleString()}`;
 }
 
+export function hasClaudeRateLimits(snapshot: ClaudeSubscriptionUsageSnapshot | undefined): boolean {
+	return snapshot?.rate_limits_available === true
+		&& snapshot.rate_limits !== null
+		&& snapshot.rate_limits !== undefined
+		&& Object.keys(snapshot.rate_limits).length > 0;
+}
+
 export function buildClaudeUsageLimits(
 	snapshot: ClaudeSubscriptionUsageSnapshot | undefined
 ): ClaudeUsageLimit[] {
@@ -2091,6 +2098,31 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	}
 
 	private recordUsageSnapshot(snapshot: ClaudeSubscriptionUsageSnapshot): void {
+		const rateLimits = snapshot.rate_limits as Record<string, unknown> | null | undefined;
+		const hasRateLimits = hasClaudeRateLimits(snapshot);
+		// A fresh probe session without any real API call reports
+		// rate_limits: null (Claude populates limits only after the first
+		// model request in a session). Never let that erase limits already
+		// captured by a real turn — otherwise Quick Access flips back to
+		// "No data yet" on every background probe.
+		if (!hasRateLimits && hasClaudeRateLimits(this.lastSubscriptionUsage)) {
+			this.lastSubscriptionUsageAt = Date.now();
+			this.logSink?.log("claude.usage_snapshot", {
+				subscriptionType: snapshot.subscription_type,
+				rateLimitsAvailable: snapshot.rate_limits_available,
+				rateLimitKeys: undefined,
+				fiveHourUtilization: (this.lastSubscriptionUsage?.rate_limits?.five_hour as Record<string, unknown> | undefined)?.utilization,
+				retainedPrevious: true,
+			});
+			return;
+		}
+		this.logSink?.log("claude.usage_snapshot", {
+			subscriptionType: snapshot.subscription_type,
+			rateLimitsAvailable: snapshot.rate_limits_available,
+			rateLimitKeys: rateLimits ? Object.keys(rateLimits) : undefined,
+			fiveHourUtilization: (rateLimits?.five_hour as Record<string, unknown> | undefined)?.utilization,
+			retainedPrevious: false,
+		});
 		this.lastSubscriptionUsage = snapshot;
 		this.lastSubscriptionUsageAt = Date.now();
 		this.refreshSubagentProfiles();

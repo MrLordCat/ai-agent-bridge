@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.10 (dev) - 2026-08-26
+
+- **Claude usage no longer erased by background probes**: Claude only
+  populates `rate_limits` after the first real model request in a session,
+  so every fresh background probe (5-min cycle) returned `rate_limits: null`
+  and overwrote the real limits captured by a live turn — Quick Access
+  stayed on «No data yet». `recordUsageSnapshot` now retains previous valid
+  limits when a probe reports none (`hasClaudeRateLimits`), and logs
+  `claude.usage_snapshot` (with `retainedPrevious`) plus
+  `claude.runtime_snapshot.attempted` for diagnostics.
+
 ## 1.15.9 (dev) - 2026-08-26
 
 - **Claude bounded recovery warns the user**: when the full replay is capped

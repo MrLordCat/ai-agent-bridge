@@ -982,6 +982,10 @@ export class ClaudeAgentSession implements vscode.Disposable {
 				}
 			}
 		});
+		this.options.logSink?.log("claude.runtime_snapshot.attempted", {
+			subtype: message.subtype,
+			sessionId: this.sessionId,
+		});
 		if (message.subtype !== "success" || message.is_error) {
 			const errors = "errors" in message ? message.errors.join("; ") : "";
 			if (message.subtype === "error_max_turns" && this.logicalTurn) {

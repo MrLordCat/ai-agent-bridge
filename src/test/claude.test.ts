@@ -24,6 +24,7 @@ import {
 	truncateLatestUserContent,
 	findPersistedClaudeConversation,
 	extractFollowUpUserText,
+	hasClaudeRateLimits,
 	resolveClaudeResumeFallbackDecision,
 	resolveClaudeSafetySettings,
 	resolveClaudeInitialInputChars,
@@ -868,6 +869,24 @@ test("marks the session stream as closed after an interrupt", async () => {
 			rate_limits: null,
 		} as unknown as UsageSnapshot;
 		assert.deepStrictEqual(buildClaudeUsageLimits(apiKeySnapshot), []);
+	});
+
+	test("distinguishes probe snapshots without rate limits from real ones", () => {
+		const real = {
+			subscription_type: "pro",
+			rate_limits_available: true,
+			rate_limits: { five_hour: { utilization: 84, resets_at: "2026-08-26T10:40:00Z" } },
+		} as unknown as UsageSnapshot;
+
+		// A fresh probe session (no real API call yet) reports null limits —
+		// it must not count as a valid snapshot.
+		const probe = {
+			subscription_type: "pro",
+			rate_limits_available: true,
+			rate_limits: null,
+		} as unknown as UsageSnapshot;
+		assert.strictEqual(hasClaudeRateLimits(probe), false);
+		assert.strictEqual(hasClaudeRateLimits(real), true);
 	});
 
 	test("advertises native thinking effort choices for Claude models", () => {
