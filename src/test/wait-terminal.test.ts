@@ -14,44 +14,21 @@ import {
 	type TerminalWaitEvents,
 } from "../tools/wait-terminal";
 
-type StartListener = Parameters<TerminalWaitEvents["onDidStartTerminalShellExecution"]>[0];
 type EndListener = Parameters<TerminalWaitEvents["onDidEndTerminalShellExecution"]>[0];
 type CloseListener = Parameters<TerminalWaitEvents["onDidCloseTerminal"]>[0];
 
-interface FakeExecution {
-	commandLine: { value: string; isTrusted: boolean; confidence: number };
-	cwd: { fsPath: string } | undefined;
-	read: () => AsyncIterable<string>;
-}
-
 interface FakeWindow {
-	startListeners: StartListener[];
 	endListeners: EndListener[];
 	closeListeners: CloseListener[];
 	events: TerminalWaitEvents;
-	fireStart(commandLine: string, confidence?: number, terminalName?: string): void;
-	fireEnd(commandLine: string, exitCode: number | undefined, terminalName?: string, cwd?: string, confidence?: number): void;
+	fireEnd(commandLine: string, exitCode: number | undefined, terminalName?: string, cwd?: string): void;
 	fireClose(): void;
 }
 
-function makeExecution(commandLine: string, confidence: number): FakeExecution {
-	return {
-		commandLine: { value: commandLine, isTrusted: confidence === 2, confidence },
-		cwd: undefined,
-		read: async function* () {},
-	};
-}
-
 function createFakeWindow(): FakeWindow {
-	const startListeners: StartListener[] = [];
 	const endListeners: EndListener[] = [];
 	const closeListeners: CloseListener[] = [];
-	let lastExecution: FakeExecution | undefined;
 	const events: TerminalWaitEvents = {
-		onDidStartTerminalShellExecution: listener => {
-			startListeners.push(listener);
-			return { dispose() {} };
-		},
 		onDidEndTerminalShellExecution: listener => {
 			endListeners.push(listener);
 			return { dispose() {} };
@@ -61,32 +38,16 @@ function createFakeWindow(): FakeWindow {
 			return { dispose() {} };
 		},
 	};
-	const fireStart = (commandLine: string, confidence = 2, terminalName = "bash"): void => {
-		lastExecution = makeExecution(commandLine, confidence);
-		for (const listener of [...startListeners]) {
-			listener({
-				terminal: { name: terminalName } as never,
-				shellIntegration: {} as never,
-				execution: lastExecution as never,
-			} as never);
-		}
-	};
-	const fireEnd = (commandLine: string, exitCode: number | undefined, terminalName = "bash", cwd?: string, confidence = 2): void => {
-		// VS Code may update the same execution's commandLine at end; recreate
-		// when the wait started without a matching start event.
-		if (!lastExecution || lastExecution.commandLine.value !== commandLine) {
-			lastExecution = makeExecution(commandLine, confidence);
-		} else {
-			lastExecution.commandLine.value = commandLine;
-			lastExecution.commandLine.confidence = confidence;
-			lastExecution.commandLine.isTrusted = confidence === 2;
-		}
-		lastExecution.cwd = cwd ? { fsPath: cwd } : undefined;
+	const fireEnd = (commandLine: string, exitCode: number | undefined, terminalName = "bash", cwd?: string): void => {
 		for (const listener of [...endListeners]) {
 			listener({
 				terminal: { name: terminalName } as never,
 				shellIntegration: {} as never,
-				execution: lastExecution as never,
+				execution: {
+					commandLine: { value: commandLine, isTrusted: true, confidence: 2 },
+					cwd: cwd ? { fsPath: cwd } : undefined,
+					read: async function* () {},
+				} as never,
 				exitCode,
 			} as never);
 		}
@@ -96,7 +57,7 @@ function createFakeWindow(): FakeWindow {
 			listener({} as never);
 		}
 	};
-	return { startListeners, endListeners, closeListeners, events, fireStart, fireEnd, fireClose };
+	return { endListeners, closeListeners, events, fireEnd, fireClose };
 }
 
 suite("Wait for terminal tool", () => {
@@ -118,31 +79,8 @@ suite("Wait for terminal tool", () => {
 		assert.ok(text.includes("Terminal: bash"), text);
 		assert.ok(text.includes("Working directory: D:/GitHub/llama-vscode-chat"), text);
 		assert.ok(text.includes("Exit code: 0"), text);
-		assert.ok(text.includes("Command line confidence: High"), text);
 		assert.ok(text.includes("FIRST command that finished"), text);
 		assert.ok(text.includes("You can continue working."), text);
-	});
-
-	test("reports the real runtime when the start event was observed", async () => {
-		const win = createFakeWindow();
-		let now = Date.parse("2026-08-26T10:00:00Z");
-		const promise = waitForTerminalNotification(win.events, {}, () => now);
-		win.fireStart("cd /d/GitHub/llama.cpp-with-GUI", 2, "python");
-		now += 42_000;
-		win.fireEnd("cd /d/GitHub/llama.cpp-with-GUI", 0, "python");
-		const text = await promise;
-		assert.ok(text.includes("Duration: 42.0s (measured from the command's start)"), text);
-	});
-
-	test("flags a fragment command line and instructs to check get_terminal_output", async () => {
-		const win = createFakeWindow();
-		const promise = waitForTerminalNotification(win.events, {});
-		// bash integration reports only the first segment of a chain, Medium confidence.
-		win.fireEnd("cd /d/GitHub/llama.cpp-with-GUI", 0, "python", undefined, 1);
-		const text = await promise;
-		assert.ok(text.includes("Command line confidence: Medium"), text);
-		assert.ok(text.includes("may be a FRAGMENT"), text);
-		assert.ok(text.includes("get_terminal_output"), text);
 	});
 
 	test("reports unknown exit code when the shell does not report one", async () => {
@@ -171,19 +109,11 @@ suite("Wait for terminal tool", () => {
 	});
 
 	test("formats result and timeout texts", () => {
-		const result = formatWaitTerminalResult({
-			commandLine: "npm run package",
-			exitCode: 1,
-			elapsedMs: 65_430,
-			durationFromStart: true,
-			terminalName: "bash",
-			cwd: "D:/repo",
-			commandLineConfidence: 2,
-		});
+		const result = formatWaitTerminalResult("npm run package", 1, 65_430, "bash", "D:/repo");
 		assert.ok(result.includes("Command: npm run package"), result);
 		assert.ok(result.includes("Terminal: bash"), result);
 		assert.ok(result.includes("Exit code: 1"), result);
-		assert.ok(result.includes("Duration: 1m 5s (measured from the command's start)"), result);
+		assert.ok(result.includes("Duration: 1m 5s"), result);
 		assert.ok(result.includes("FIRST command that finished"), result);
 
 		const timeout = formatWaitTerminalTimeout(60_000, 60_000);
