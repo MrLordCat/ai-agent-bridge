@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.16 (dev) - 2026-08-27
+
+- **`llamacpp_wait_for_terminal`: real command line and runtime.** Bash shell
+  integration reports only the FIRST segment of a chained command
+  (`cd … && python …` is reported as `cd …`), so the tool now reports the
+  shell's command-line confidence and flags a fragment when it is not High,
+  telling the agent to verify with `get_terminal_output`. The tool also pairs
+  start/end events by execution identity: `Duration` is the command's real
+  runtime when the start event was observed (otherwise time since this wait
+  began), and the result explicitly says which one it is.
+
 ## 1.15.15 (dev) - 2026-08-27
 
 - **`llamacpp_wait_for_terminal`: unambiguous mechanics and result.** The

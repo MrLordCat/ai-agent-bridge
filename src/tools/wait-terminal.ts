@@ -36,6 +36,9 @@ export function resolveWaitTerminalTimeoutMs(raw: number | undefined): number {
 }
 
 export interface TerminalWaitEvents {
+	onDidStartTerminalShellExecution(
+		listener: (event: vscode.TerminalShellExecutionStartEvent) => void
+	): { dispose(): void };
 	onDidEndTerminalShellExecution(
 		listener: (event: vscode.TerminalShellExecutionEndEvent) => void
 	): { dispose(): void };
@@ -44,6 +47,7 @@ export interface TerminalWaitEvents {
 
 export function createDefaultTerminalWaitEvents(): TerminalWaitEvents {
 	return {
+		onDidStartTerminalShellExecution: listener => vscode.window.onDidStartTerminalShellExecution(listener),
 		onDidEndTerminalShellExecution: listener => vscode.window.onDidEndTerminalShellExecution(listener),
 		onDidCloseTerminal: listener => vscode.window.onDidCloseTerminal(listener),
 	};
@@ -61,32 +65,49 @@ function formatDurationMs(elapsedMs: number): string {
 	return `${minutes}m${seconds > 0 ? ` ${seconds}s` : ""}`;
 }
 
-export function formatWaitTerminalResult(
-	commandLine: string,
-	exitCode: number | undefined,
-	elapsedMs: number,
-	terminalName?: string,
-	cwd?: string,
-	commandLineConfidence?: number
-): string {
+export interface WaitTerminalResultDetail {
+	commandLine: string;
+	exitCode: number | undefined;
+	/** Runtime of the finished execution (pair start/end), or time since this wait began when the start was missed. */
+	elapsedMs: number;
+	/** True when elapsedMs is the command's own runtime (start event observed). */
+	durationFromStart: boolean;
+	terminalName?: string;
+	cwd?: string;
+	/** vscode.TerminalShellExecutionCommandLineConfidence (0 = Low, 1 = Medium, 2 = High). */
+	commandLineConfidence?: number;
+}
+
+export function formatWaitTerminalResult(detail: WaitTerminalResultDetail): string {
 	const lines = [
 		"A terminal command finished.",
-		`- Terminal: ${terminalName || "unknown"}`,
-		`- Command: ${commandLine || "(unknown)"}`,
-		`- Exit code: ${exitCode === undefined ? "unknown" : exitCode}`,
-		`- Duration: ${formatDurationMs(elapsedMs)}`,
+		`- Terminal: ${detail.terminalName || "unknown"}`,
+		`- Command: ${detail.commandLine || "(unknown)"}`,
+		`- Exit code: ${detail.exitCode === undefined ? "unknown" : detail.exitCode}`,
+		detail.durationFromStart
+			? `- Duration: ${formatDurationMs(detail.elapsedMs)} (measured from the command's start)`
+			: `- Duration: ${formatDurationMs(detail.elapsedMs)} (since this wait started)`,
 	];
-	if (cwd) {
-		lines.push(`- Working directory: ${cwd}`);
+	if (detail.cwd) {
+		lines.push(`- Working directory: ${detail.cwd}`);
 	}
-	if (commandLineConfidence !== undefined && commandLineConfidence <= 0) {
-		lines.push("- Note: command line has low confidence (shell integration) — verify with the terminal panel.");
+	const confidence = detail.commandLineConfidence;
+	if (confidence !== undefined) {
+		const label = confidence <= 0 ? "Low" : confidence === 1 ? "Medium" : "High";
+		lines.push(`- Command line confidence: ${label} (reported by shell integration)`);
+		if (label !== "High") {
+			lines.push(
+				"- The reported command may be a FRAGMENT: bash shell integration often reports only the",
+				"  first segment of a chain (`cd … && python …` shows as `cd …`). To see the full command",
+				"  and its output, use get_terminal_output for the terminal above."
+			);
+		}
 	}
 	lines.push(
 		"NOTE: this is the FIRST command that finished AFTER this wait started, in ANY terminal.",
 		"It is not bound to the command you just started: if another agent, the user, or another terminal",
-		"completed a command first, you will see that one. If the 'Command' above is NOT the command you",
-		"started, check get_terminal_output for your terminal and call this tool again if yours is still running.",
+		"completed a command first, you will see that one.",
+		`If the command above is NOT the one you started or looks incomplete, check get_terminal_output for the "${detail.terminalName || "terminal"}" and call this tool again if yours is still running.`,
 		"You can continue working."
 	);
 	return lines.join("\n");
@@ -119,6 +140,9 @@ export async function waitForTerminalNotification(
 	return new Promise<string>(resolve => {
 		let settled = false;
 		const disposables: Array<{ dispose(): void }> = [];
+		// Pair start/end events by execution identity so "Duration" is the real
+		// command runtime, not the time this tool happened to wait.
+		const startedExecutions = new WeakMap<object, { startedAt: number }>();
 
 		const settle = (text: string): void => {
 			if (settled) {
@@ -136,18 +160,28 @@ export async function waitForTerminalNotification(
 		};
 
 		disposables.push(
+			events.onDidStartTerminalShellExecution(event => {
+				startedExecutions.set(event.execution as unknown as object, { startedAt: now() });
+			})
+		);
+
+		disposables.push(
 			events.onDidEndTerminalShellExecution(event => {
+				const execution = event.execution as unknown as object;
+				const started = startedExecutions.get(execution);
+				const elapsedMs = started ? now() - started.startedAt : now() - startedAt;
 				const commandLine = event.execution.commandLine.value;
-				const execution = event.execution as { cwd?: { fsPath?: string } };
+				const cwd = (event.execution as { cwd?: { fsPath?: string } }).cwd?.fsPath;
 				settle(
-					formatWaitTerminalResult(
+					formatWaitTerminalResult({
 						commandLine,
-						event.exitCode,
-						now() - startedAt,
-						event.terminal.name,
-						execution.cwd?.fsPath,
-						event.execution.commandLine.confidence
-					)
+						exitCode: event.exitCode,
+						elapsedMs,
+						durationFromStart: Boolean(started),
+						terminalName: event.terminal.name,
+						cwd,
+						commandLineConfidence: event.execution.commandLine.confidence,
+					})
 				);
 			})
 		);
@@ -168,7 +202,7 @@ export async function waitForTerminalNotification(
 export function createWaitForTerminalToolDefinition(): vscode.LanguageModelChatTool {
 	return {
 		name: WAIT_TERMINAL_TOOL_NAME,
-		description: "Wait for the next terminal command to finish. Call it right after starting a command instead of sleeping with a guessed duration. It resolves on the FIRST terminal-command-completion notification anywhere (your terminal, another agent's, or one typed manually) — it does NOT track a specific command or terminal. The result names the exact command line, terminal name, exit code and duration; if the reported command is NOT the one you started, another command finished first — check get_terminal_output for your terminal and call this tool again if yours is still running. timeoutMs is only a safety net (default 600000 = 10 min). Do NOT call it for a command that already finished, and do NOT expect it to match only your command. Requires terminal shell integration to be enabled.",
+		description: "Wait for the next terminal command to finish. Call it right after starting a command instead of sleeping with a guessed duration. It resolves on the FIRST terminal-command-completion notification anywhere (your terminal, another agent's, or one typed manually) — it does NOT track a specific command or terminal. The result names the terminal, command line, exit code and duration, plus the command-line confidence: bash shell integration often reports only the FIRST segment of a chained command (`cd … && python …` is reported as `cd …`), so a short or unexpected 'Command' does not mean your command finished — use get_terminal_output for the reported terminal to see the full command and output, and call this tool again if yours is still running. timeoutMs is only a safety net (default 600000 = 10 min). Do NOT call it for a command that already finished. Requires terminal shell integration to be enabled.",
 		inputSchema: {
 			type: "object",
 			properties: {
