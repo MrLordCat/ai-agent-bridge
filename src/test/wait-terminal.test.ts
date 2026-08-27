@@ -21,7 +21,7 @@ interface FakeWindow {
 	endListeners: EndListener[];
 	closeListeners: CloseListener[];
 	events: TerminalWaitEvents;
-	fireEnd(commandLine: string, exitCode: number | undefined): void;
+	fireEnd(commandLine: string, exitCode: number | undefined, terminalName?: string, cwd?: string): void;
 	fireClose(): void;
 }
 
@@ -38,14 +38,14 @@ function createFakeWindow(): FakeWindow {
 			return { dispose() {} };
 		},
 	};
-	const fireEnd = (commandLine: string, exitCode: number | undefined): void => {
+	const fireEnd = (commandLine: string, exitCode: number | undefined, terminalName = "bash", cwd?: string): void => {
 		for (const listener of [...endListeners]) {
 			listener({
-				terminal: {} as never,
+				terminal: { name: terminalName } as never,
 				shellIntegration: {} as never,
 				execution: {
 					commandLine: { value: commandLine, isTrusted: true, confidence: 2 },
-					cwd: undefined,
+					cwd: cwd ? { fsPath: cwd } : undefined,
 					read: async function* () {},
 				} as never,
 				exitCode,
@@ -72,10 +72,14 @@ suite("Wait for terminal tool", () => {
 		const win = createFakeWindow();
 		const startedAt = Date.parse("2026-08-26T10:00:00Z");
 		const promise = waitForTerminalNotification(win.events, {}, () => startedAt);
-		win.fireEnd("npm test", 0);
+		win.fireEnd("npm test", 0, "bash", "D:/GitHub/llama-vscode-chat");
 		const text = await promise;
-		assert.ok(text.includes("Terminal command finished (npm test)"), text);
+		assert.ok(text.includes("A terminal command finished."), text);
+		assert.ok(text.includes("Command: npm test"), text);
+		assert.ok(text.includes("Terminal: bash"), text);
+		assert.ok(text.includes("Working directory: D:/GitHub/llama-vscode-chat"), text);
 		assert.ok(text.includes("Exit code: 0"), text);
+		assert.ok(text.includes("FIRST command that finished"), text);
 		assert.ok(text.includes("You can continue working."), text);
 	});
 
@@ -105,9 +109,12 @@ suite("Wait for terminal tool", () => {
 	});
 
 	test("formats result and timeout texts", () => {
-		const result = formatWaitTerminalResult("npm run package", 1, 65_430);
+		const result = formatWaitTerminalResult("npm run package", 1, 65_430, "bash", "D:/repo");
+		assert.ok(result.includes("Command: npm run package"), result);
+		assert.ok(result.includes("Terminal: bash"), result);
 		assert.ok(result.includes("Exit code: 1"), result);
 		assert.ok(result.includes("Duration: 1m 5s"), result);
+		assert.ok(result.includes("FIRST command that finished"), result);
 
 		const timeout = formatWaitTerminalTimeout(60_000, 60_000);
 		assert.ok(timeout.includes("No terminal notification within 60000ms"), timeout);
@@ -119,7 +126,8 @@ suite("Wait for terminal tool", () => {
 		assert.strictEqual(tools.length, 2);
 		assert.ok(tools.some(tool => tool.name === WAIT_TERMINAL_TOOL_NAME));
 		assert.strictEqual(tools[1].name, WAIT_TERMINAL_TOOL_NAME);
-		assert.ok(tools[1].description.includes("Wait until the next terminal command finishes"));
+		assert.ok(tools[1].description.includes("Wait for the next terminal command to finish"));
+		assert.ok(tools[1].description.includes("does NOT track a specific command"), tools[1].description);
 
 		// Deduped when the host already advertises it.
 		const withHost = ensureBuiltInTools([

@@ -6,7 +6,12 @@ import * as vscode from "vscode";
  * The agent starts a command, calls this tool, and is resumed as soon as VS
  * Code reports that a terminal command finished (shell integration end
  * event). No duration guessing, no output buffering, no command matching:
- * the first notification wins.
+ * the first notification wins — ANY terminal, ANY command.
+ *
+ * The result identifies the finished command (command line, terminal name,
+ * working directory, exit code, duration) and warns the caller that the
+ * notification may belong to a different command than the one it started,
+ * so it can verify with get_terminal_output and wait again if needed.
  *
  * The only tuning is an optional safety-net timeout so a missing
  * notification (shell integration off, command already finished, terminal
@@ -56,13 +61,35 @@ function formatDurationMs(elapsedMs: number): string {
 	return `${minutes}m${seconds > 0 ? ` ${seconds}s` : ""}`;
 }
 
-export function formatWaitTerminalResult(commandLine: string, exitCode: number | undefined, elapsedMs: number): string {
-	return [
-		`Terminal command finished${commandLine ? ` (${commandLine})` : ""}.`,
-		`Exit code: ${exitCode === undefined ? "unknown" : exitCode}.`,
-		`Duration: ${formatDurationMs(elapsedMs)}.`,
-		"You can continue working.",
-	].join("\n");
+export function formatWaitTerminalResult(
+	commandLine: string,
+	exitCode: number | undefined,
+	elapsedMs: number,
+	terminalName?: string,
+	cwd?: string,
+	commandLineConfidence?: number
+): string {
+	const lines = [
+		"A terminal command finished.",
+		`- Terminal: ${terminalName || "unknown"}`,
+		`- Command: ${commandLine || "(unknown)"}`,
+		`- Exit code: ${exitCode === undefined ? "unknown" : exitCode}`,
+		`- Duration: ${formatDurationMs(elapsedMs)}`,
+	];
+	if (cwd) {
+		lines.push(`- Working directory: ${cwd}`);
+	}
+	if (commandLineConfidence !== undefined && commandLineConfidence <= 0) {
+		lines.push("- Note: command line has low confidence (shell integration) — verify with the terminal panel.");
+	}
+	lines.push(
+		"NOTE: this is the FIRST command that finished AFTER this wait started, in ANY terminal.",
+		"It is not bound to the command you just started: if another agent, the user, or another terminal",
+		"completed a command first, you will see that one. If the 'Command' above is NOT the command you",
+		"started, check get_terminal_output for your terminal and call this tool again if yours is still running.",
+		"You can continue working."
+	);
+	return lines.join("\n");
 }
 
 export function formatWaitTerminalTimeout(timeoutMs: number, elapsedMs: number): string {
@@ -110,11 +137,16 @@ export async function waitForTerminalNotification(
 
 		disposables.push(
 			events.onDidEndTerminalShellExecution(event => {
+				const commandLine = event.execution.commandLine.value;
+				const execution = event.execution as { cwd?: { fsPath?: string } };
 				settle(
 					formatWaitTerminalResult(
-						event.execution.commandLine.value,
+						commandLine,
 						event.exitCode,
-						now() - startedAt
+						now() - startedAt,
+						event.terminal.name,
+						execution.cwd?.fsPath,
+						event.execution.commandLine.confidence
 					)
 				);
 			})
@@ -136,7 +168,7 @@ export async function waitForTerminalNotification(
 export function createWaitForTerminalToolDefinition(): vscode.LanguageModelChatTool {
 	return {
 		name: WAIT_TERMINAL_TOOL_NAME,
-		description: "Wait until the next terminal command finishes. Call it right after starting a command instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished.",
+		description: "Wait for the next terminal command to finish. Call it right after starting a command instead of sleeping with a guessed duration. It resolves on the FIRST terminal-command-completion notification anywhere (your terminal, another agent's, or one typed manually) — it does NOT track a specific command or terminal. The result names the exact command line, terminal name, exit code and duration; if the reported command is NOT the one you started, another command finished first — check get_terminal_output for your terminal and call this tool again if yours is still running. timeoutMs is only a safety net (default 600000 = 10 min). Do NOT call it for a command that already finished, and do NOT expect it to match only your command. Requires terminal shell integration to be enabled.",
 		inputSchema: {
 			type: "object",
 			properties: {

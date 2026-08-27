@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.15.15 (dev) - 2026-08-27
+
+- **`llamacpp_wait_for_terminal`: unambiguous mechanics and result.** The
+  tool description now states explicitly that it resolves on the FIRST
+  terminal-command-completion notification anywhere (any terminal, any
+  command) and does NOT track a specific command or terminal. The result now
+  reports the finished command line, terminal name, working directory, exit
+  code and duration, plus a note that the finished command may not be the one
+  the caller started (then: check `get_terminal_output` and wait again).
+  Low-confidence command lines are flagged.
+
 ## 1.15.14 (dev) - 2026-08-26
 
 - **Compaction no longer collapses the tail to a tiny fragment when
