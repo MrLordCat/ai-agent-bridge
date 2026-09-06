@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.15.16 (dev) - 2026-09-06
+
+- **Copilot Chat patch now supports VS Code 1.136.1 / Copilot Chat 0.64.1.**
+  Upstream renamed minified bindings and added `modelCapabilities` and
+  `conversationId` to the `makeChatRequest2` signature, which broke every
+  `replaceOnce` anchor and made the patch fail with «Copilot request signature
+  already contains modelCapabilities without this patch marker». All anchors
+  now capture the minified names with regex groups:
+  - request signature / `modelOptions` use the upstream `modelCapabilities`
+    binding and inject `reasoningEffort` from it (older bundles keep the
+    injected `__llamaModelCapabilities` slot);
+  - `conversationId` is read directly from the signature (fallback: telemetry
+    payload) and sent to llama.cpp as `_copilotConversationId`;
+  - agent history render now captures the first parameter (`n` in 0.64.1,
+    `t` before), `getAvailableTools` captures its argument, the git
+    repositories guard matches `()=>n.repositories??[]`, and
+    `patchVsCodeWorkbenchBundle` follows the new `return{text:i.replace(...)`
+    shape and `case"text":` location;
+  - the git repositories guard counts occurrences with `RegExp.exec` instead
+    of `String.split` (the capture group skewed the count) and still requires
+    the pattern to be unique.
+  Tests: new 0.64.1 fixture shapes for the agent history cap and the git
+  guard; the real-bundle test asserts the 0.64.1 signature is kept intact.
+
 ## 1.15.15 (dev) - 2026-08-27
 
 - **`llamacpp_wait_for_terminal`: unambiguous mechanics and result.** The

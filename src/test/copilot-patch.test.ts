@@ -19,22 +19,37 @@ import {
 	VSCODE_CHAT_HISTORY_PATCH_MARKER,
 } from "../copilot-patch";
 
-	test("guards the git repositories reactive chain with Array.isArray", () => {
-		const source = 'class X{async init(){let t=await P(this.a);let r=no(this,o=>t.onDidOpenRepository(o),()=>t.repositories??[]);await Q(r,o=>o.length>0,void 0),!this.s&&fp(this,r,(o,a)=>{a.add(L())},o=>o.rootUri.toString()).recomputeInitiallyAndOnChange(this.s)}}';
-		const patched = patchCopilotGitRepositoriesGuard(source);
-		assert.ok(patched.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER), "guard marker must be present");
-		assert.ok(patched.includes("()=>Array.isArray(t.repositories)?t.repositories:[]"), "Array.isArray guard must be present");
-		assert.ok(!patched.includes("()=>t.repositories??[]"), "original unguarded expression must be gone");
-		new Function(patched);
-		// Idempotent.
-		assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
-		// Non-unique / missing pattern must throw.
-		assert.throws(() => patchCopilotGitRepositoriesGuard("class X{}"), /not unique/);
-	});
+	for (const name of ["t", "n"]) {
+		test(`guards the git repositories reactive chain with Array.isArray (${name})`, () => {
+			const source = `class X{async init(){let t=await P(this.a);let r=no(this,o=>t.onDidOpenRepository(o),()=>${name}.repositories??[]);await Q(r,o=>o.length>0,void 0),!this.s&&fp(this,r,(o,a)=>{a.add(L())},o=>o.rootUri.toString()).recomputeInitiallyAndOnChange(this.s)}}`;
+			const patched = patchCopilotGitRepositoriesGuard(source);
+			assert.ok(patched.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER), "guard marker must be present");
+			assert.ok(
+				patched.includes(`()=>Array.isArray(${name}.repositories)?${name}.repositories:[]`),
+				"Array.isArray guard must be present"
+			);
+			assert.ok(!patched.includes(`()=>${name}.repositories??[]`), "original unguarded expression must be gone");
+			new Function(patched);
+			// Idempotent.
+			assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
+			// Missing / non-unique pattern must throw with a distinct message.
+			assert.throws(
+				() => patchCopilotGitRepositoriesGuard("class X{}"),
+				/pattern not found/
+			);
+			assert.throws(
+				() => patchCopilotGitRepositoriesGuard(
+					"()=>t.repositories??[]()=>n.repositories??[]"
+				),
+				/pattern not unique/
+			);
+		});
+	}
 
 	suite("agent history cap shapes", () => {
 		const SHAPE_060 = `class X{render(t,r,o,a){_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
 		const SHAPE_061 = `class X{render(t,r,o,a){x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:E,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+		const SHAPE_0641 = `class X{render(t,r,o,a){x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass;return this.props.enableSummarization?vscpp(vscppf,null,v,vscpp(C8,{flexGrow:1,triggerSummarize:this.props.triggerSummarize,forceSimpleSummary:this.props.forceSimpleSummary,priority:900,promptContext:this.props.promptContext,location:this.props.location,maxToolResultLength:_,endpoint:this.props.endpoint,tools:this.props.promptContext.tools})):y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:_,enableCacheBreakpoints:!1}}async render(n,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let s=this.instantiationService.createChild(new mf([pkt,this.props.promptContext])),c={remaining:NPn},l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
 
 		test("patches the 0.60.x variable names (_/w/E, truncateAt:v)", () => {
 			const patched = patchAgentHistoryCap(SHAPE_060);
@@ -52,6 +67,27 @@ import {
 			assert.ok(patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:E"), "wiring must keep truncateAt:E");
 			assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
 			new Function(patched);
+		});
+
+		test("patches the 0.64.1 variable names (x/E/I, render(n,r,o,a), truncateAt:_)", () => {
+			const patched = patchAgentHistoryCap(SHAPE_0641);
+			assert.ok(
+				patched.includes("x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass"),
+				"0.64.1 original names must be preserved"
+			);
+			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+			assert.ok(
+				patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:_"),
+				"wiring must keep truncateAt:_"
+			);
+			assert.ok(patched.includes("let __llamaRounds=this.props.toolCallRounds"), "element cap header must be added to async render");
+			assert.ok(patched.includes("if(this.promptEndpoint.modelProvider===\"llamacpp\")"), "element cap must be provider-guarded");
+			assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
+			assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
+			assert.ok(!patched.includes("truncateAt:E,enableCacheBreakpoints:!1"), "no stale 0.61 wiring");
+			new Function(patched);
+			// Idempotent.
+			assert.strictEqual(patchAgentHistoryCap(patched), patched);
 		});
 	});
 
@@ -100,6 +136,13 @@ suite("Copilot patch", () => {
 		assert.ok(patched.includes('this.endpoint.modelProvider!=="llamacpp"'));
 		assert.ok(patched.includes("__llamaLastChatVendor"));
 		assert.ok(patched.includes("__llamaLastConversationId"));
+		// Copilot 0.64.x passes modelCapabilities/conversationId in the request
+		// signature; the patch must keep the upstream bindings and wire them in.
+		assert.ok(patched.includes("modelCapabilities:d"), "upstream modelCapabilities binding must be preserved");
+		assert.ok(patched.includes("reasoningEffort:d.reasoningEffort"), "reasoningEffort must be injected from modelCapabilities");
+		assert.ok(patched.includes("let __llamaConversationId=p??__llamaConversationMetadata(u)"), "conversation id binding must be wired");
+		assert.ok(patched.includes("_copilotConversationId:__llamaConversationId"), "llama conversation id must be sent to the model");
+		assert.match(patched, /\{debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p\},m\)\{/, "0.64.1 request signature must be kept intact");
 		assert.ok(patched.includes('executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId)'));
 		assert.ok(patched.includes('executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0})'));
 		assert.match(

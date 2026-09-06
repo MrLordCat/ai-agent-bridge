@@ -60,17 +60,27 @@ package is deliberately distributed outside the gallery.
 
 The VS Code installer rejects VSIX files opened from a UNC path (`\\host\...`)
 with `Extract: UNC host ... access is not allowed`. When the package sits on
-as share, double-click `install-ai-agent-bridge.cmd` placed next to it on the
-target machine instead — the script copies the VSIX to the local temp folder
-and installs it from there:
+a share, place the matching installer next to it on the target machine. The
+script copies the VSIX to the local temp folder and installs it from there.
+
+Windows (`cmd.exe`):
 
 ```sh
 .\install-ai-agent-bridge.cmd
 ```
 
-The script prefers `llama-vscode-chat-1.14.38.vsix` next to itself (update the
-`PRIMARY_VSIX` line when the version bumps) and falls back to any other
-`llama-vscode-chat-1.*.vsix` in the same folder.
+Linux (including CachyOS; VSIX installation only):
+
+```sh
+chmod +x install-ai-agent-bridge.sh
+./install-ai-agent-bridge.sh
+```
+
+The Windows script prefers the version in its `PRIMARY_VSIX` setting and the
+Linux script prefers the current `llama-vscode-chat-1.15.16.vsix`; both
+fall back to the newest `llama-vscode-chat-*.vsix` next to the script. If the
+VS Code CLI is not named `code` or `code-insiders`, set `VSCODE_CLI` when
+running the Linux script.
 
 ## Quick Start
 

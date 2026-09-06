@@ -282,16 +282,20 @@ export function patchCopilotGitRepositoriesGuard(source: string): string {
 	if (source.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)) {
 		return source;
 	}
-	const pattern = "()=>t.repositories??[]";
-	const occurrences = source.split(pattern).length - 1;
-	if (occurrences !== 1) {
-		throw new Error(
-			`Copilot git repositories pattern not unique (found ${occurrences}); VS Code shape changed.`
-		);
+	const pattern = /\(\)=>([A-Za-z_$][\w$]*)\.repositories\?\?\[\]/;
+	const matcher = new RegExp(pattern.source);
+	const first = matcher.exec(source);
+	if (!first) {
+		throw new Error("Copilot git repositories pattern not found; VS Code shape changed.");
 	}
-	return source.replace(
-		pattern,
-		`${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER}()=>Array.isArray(t.repositories)?t.repositories:[]`
+	if (matcher.exec(source.slice(first.index + first[0].length))) {
+		throw new Error("Copilot git repositories pattern not unique; VS Code shape changed.");
+	}
+	return (
+		source.slice(0, first.index) +
+		`${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER}()=>` +
+		`Array.isArray(${first[1]}.repositories)?${first[1]}.repositories:[]` +
+		source.slice(first.index + first[0].length)
 	);
 }
 
@@ -303,6 +307,12 @@ export function patchCopilotGitRepositoriesGuard(source: string): string {
  * and keep the original ones in the replacement.
  */
 export function patchAgentHistoryCap(source: string): string {
+	if (
+		source.includes("__llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;") &&
+		source.includes("l=__llamaRounds.flatMap")
+	) {
+		return source;
+	}
         let patched = replacePatternOnce(
                 source,
                 /([A-Za-z_$][\w$]*)=o\.userQueryTagName,([A-Za-z_$][\w$]*)=o\.ReminderInstructionsClass,([A-Za-z_$][\w$]*)=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
@@ -325,10 +335,10 @@ export function patchAgentHistoryCap(source: string): string {
                 match => `toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:${match[2]},enableCacheBreakpoints:!1`,
                 "extension model agent history cap wiring"
         );
-        patched = replaceOnce(
+        patched = replacePatternOnce(
                 patched,
-                'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;',
-                'async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
+                /async render\(([A-Za-z_$][\w$]*),r,o,a\)\{if\(!this\.props\.promptContext\.tools\|\|!this\.props\.toolCallRounds\?\.length\)return;/,
+                'async render($1,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
                         'let __llamaRounds=this.props.toolCallRounds;' +
                         'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
                         'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
@@ -400,18 +410,28 @@ export function patchCopilotBundle(source: string): string {
 	if (!signatureMatch) {
 		throw new Error("Copilot extension endpoint request signature was not found.");
 	}
-	if (/\bmodelCapabilities:/.test(signatureMatch[1] + signatureMatch[2])) {
-		throw new Error("Copilot request signature already contains modelCapabilities without this patch marker.");
-	}
-	const telemetryVariable = (signatureMatch[1] + signatureMatch[2])
-		.match(/\btelemetryProperties:([A-Za-z_$][\w$]*)/)?.[1];
+	const signaturePayload = signatureMatch[1] + signatureMatch[2];
+	// Copilot 0.64.x passes modelCapabilities itself (enableThinking,
+	// reasoningEffort, ...). Keep the upstream destructured binding when it is
+	// already present; older bundles get our injected slot instead.
+	const capabilitiesBinding =
+		signaturePayload.match(/\bmodelCapabilities:([A-Za-z_$][\w$]*)/)?.[1] ?? "__llamaModelCapabilities";
+	// Copilot 0.64.x also passes conversationId directly; older bundles fall
+	// back to extracting it from the telemetry payload.
+	const conversationBinding = signaturePayload.match(/\bconversationId:([A-Za-z_$][\w$]*)/)?.[1];
+	const telemetryVariable = signaturePayload.match(/\btelemetryProperties:([A-Za-z_$][\w$]*)/)?.[1];
 	if (!telemetryVariable) {
 		throw new Error("Copilot request telemetry variable was not found.");
 	}
+	const signatureAddition =
+		capabilitiesBinding === "__llamaModelCapabilities"
+			? `${signatureMatch[2]},modelCapabilities:__llamaModelCapabilities`
+			: signatureMatch[2];
 	classSource = classSource.replace(
 		methodSignature,
-		`async makeChatRequest2({${signatureMatch[1]}${signatureMatch[2]},modelCapabilities:__llamaModelCapabilities},${signatureMatch[3]}){` +
-			`let __llamaConversationId=__llamaConversationMetadata(${telemetryVariable});` +
+		`async makeChatRequest2({${signatureMatch[1]}${signatureAddition}},${signatureMatch[3]}){` +
+			`let __llamaConversationId=${conversationBinding ? `${conversationBinding}??` : ""}` +
+			`__llamaConversationMetadata(${telemetryVariable});` +
 			`globalThis.__llamaLastChatVendor=this.languageModel.vendor;` +
 			`globalThis.__llamaLastConversationId=__llamaConversationId;`
 	);
@@ -419,8 +439,8 @@ export function patchCopilotBundle(source: string): string {
 	classSource = replaceOnce(
 		classSource,
 		"modelOptions:{",
-		"modelOptions:{...(__llamaModelCapabilities?.reasoningEffort?" +
-			"{reasoningEffort:__llamaModelCapabilities.reasoningEffort}:{})," +
+		`modelOptions:{...(${capabilitiesBinding}?.reasoningEffort?` +
+			`{reasoningEffort:${capabilitiesBinding}.reasoningEffort}:{}),` +
 			'...((this.languageModel.vendor==="llamacpp"&&__llamaConversationId)?' +
 			"{_copilotConversationId:__llamaConversationId}:{}),",
 		"extension endpoint modelOptions"
@@ -453,8 +473,9 @@ export function patchCopilotBundle(source: string): string {
 	);
 	patched = replacePatternOnce(
 		patched,
-		/([A-Za-z_$][\w$]*)=t\.tools\?\.availableTools,([A-Za-z_$][\w$]*)=!!this\.endpoint\.supportsToolSearch,([A-Za-z_$][\w$]*)=\1\?\.length\?await this\.endpoint\.acquireTokenizer\(\)\.countToolTokens\(\1\):0/,
-		'$1=t.tools?.availableTools,$2=!!this.endpoint.supportsToolSearch,$3=this.endpoint.modelProvider==="llamacpp"?0:$1?.length?await this.endpoint.acquireTokenizer().countToolTokens($1):0',
+		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.tools\?\.availableTools,([A-Za-z_$][\w$]*)=!!this\.endpoint\.supportsToolSearch,([A-Za-z_$][\w$]*)=\1\?\.length\?await this\.endpoint\.acquireTokenizer\(\)\.countToolTokens\(\1\):0/,
+		'$1=$2.tools?.availableTools,$3=!!this.endpoint.supportsToolSearch,' +
+			'$4=this.endpoint.modelProvider==="llamacpp"?0:$1?.length?await this.endpoint.acquireTokenizer().countToolTokens($1):0',
 		"extension endpoint host tool reservation"
 	);
 	patched = replacePatternOnce(
@@ -477,8 +498,8 @@ export function patchCopilotBundle(source: string): string {
 	);
 	patched = replacePatternOnce(
 		patched,
-		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?this\._getOrCreateBackgroundSummarizer\(t\.conversation\?\.sessionId\):void 0/,
-		'$1=$2&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer(t.conversation?.sessionId):void 0',
+		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?this\._getOrCreateBackgroundSummarizer\(([A-Za-z_$][\w$]*)\.conversation\?\.sessionId\):void 0/,
+		'$1=$2&&this.endpoint.modelProvider!=="llamacpp"?this._getOrCreateBackgroundSummarizer($3.conversation?.sessionId):void 0',
 		"extension endpoint background compaction"
 	);
 	// Deterministic tool ordering — sort by name so the prefix cache survives Extension Host restarts.
@@ -519,8 +540,9 @@ export function patchCopilotBundle(source: string): string {
 	// For llama.cpp, set the render budget to unlimited so the trimming loop never executes.
 	patched = replacePatternOnce(
 		patched,
-		/([A-Za-z_$][\w$]*)=y\?Number\.MAX_SAFE_INTEGER:w,([A-Za-z_$][\w$]*)=p>0\?this\.endpoint\.cloneWithTokenOverride\(\1\):this\.endpoint/,
-		'$1=this.endpoint.modelProvider==="llamacpp"||y?Number.MAX_SAFE_INTEGER:w,$2=p>0?this.endpoint.cloneWithTokenOverride($1):this.endpoint',
+		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?Number\.MAX_SAFE_INTEGER:([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)>0\?this\.endpoint\.cloneWithTokenOverride\(\1\):this\.endpoint/,
+		'$1=this.endpoint.modelProvider==="llamacpp"||$2?Number.MAX_SAFE_INTEGER:$3,' +
+			'$4=$5>0?this.endpoint.cloneWithTokenOverride($1):this.endpoint',
 		"auto-compaction prevention for llama.cpp"
 	);
 	// Fix context window display — Copilot's WD()/jD() function sets max_prompt_tokens
@@ -562,10 +584,23 @@ export function patchCopilotBundle(source: string): string {
 	// Cache the confirmed signature on the tool provider instance so ordinary turns use
 	// one immediate lookup; repeat the bounded wait only when names, descriptions,
 	// or schemas really change (for example after tool activation).
-	patched = replaceOnce(
+	patched = replacePatternOnceWith(
 		patched,
-		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[];if(this.options.invocation.endpoint.supportsToolSearch)return o;',
-		'async getAvailableTools(t,r){let o=await this.options.invocation.getAvailableTools?.()??[],__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0)),__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent!==this._llamaToolsSignature){let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));o=await this.options.invocation.getAvailableTools?.()??[];__llamaToolCurrent=__llamaToolSignature(o);if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious){if(++__llamaToolMatches>=5)break}else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		/async getAvailableTools\(([A-Za-z_$][\w$]*),r\)\{let o=await this\.options\.invocation\.getAvailableTools\?\.\(\)\?\?\[\];if\(this\.options\.invocation\.endpoint\.supportsToolSearch\)return o;/,
+		match =>
+			`async getAvailableTools(${match[1]},r){let o=await this.options.invocation.getAvailableTools?.()??[],` +
+			"__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0))," +
+			"__llamaToolCurrent=__llamaToolSignature(o);" +
+			"if(__llamaToolCurrent!==this._llamaToolsSignature){" +
+			"let __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0;" +
+			"for(let i=0;i<30;i++){await new Promise(y=>setTimeout(y,100));" +
+			"o=await this.options.invocation.getAvailableTools?.()??[];" +
+			"__llamaToolCurrent=__llamaToolSignature(o);" +
+			"if(__llamaToolCurrent&&__llamaToolCurrent===__llamaToolPrevious)" +
+			"{if(++__llamaToolMatches>=5)break}" +
+			"else __llamaToolPrevious=__llamaToolCurrent,__llamaToolMatches=0}" +
+			"this._llamaToolsSignature=__llamaToolCurrent}" +
+			"if(this.options.invocation.endpoint.supportsToolSearch)return o;",
 		"tool catalog stabilisation after reload"
 	);
 	// Subagent tool parity: VS Code narrows a subagent request to a single
