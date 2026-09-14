@@ -116,15 +116,20 @@ export function createModelSources(configuration: ModelSourceConfiguration): Cha
 	};
 	const primaryIsDeepSeek = isDeepSeekEndpoint(configuration.primaryServerUrl);
 
-	addSource({
-		key: primaryIsDeepSeek ? "deepseek" : "primary",
-		label: primaryIsDeepSeek ? "DeepSeek" : "Primary",
-		serverUrl: configuration.primaryServerUrl,
-		apiKey: primaryIsDeepSeek ? configuration.deepSeekApiKey : configuration.primaryApiKey,
-		familyOverride: primaryIsDeepSeek ? "deepseek" : undefined,
-		contextLengthOverride: primaryIsDeepSeek ? configuration.deepSeekContextLength : undefined,
-		protocol: primaryIsDeepSeek ? "deepseek" : "llamacpp",
-	});
+	// The primary source represents the local llama.cpp server by default.
+	// When localEnabled is false, skip it unless the primary URL is a DeepSeek
+	// endpoint (which has its own dedicated source below).
+	if (configuration.localEnabled || primaryIsDeepSeek) {
+		addSource({
+			key: primaryIsDeepSeek ? "deepseek" : "primary",
+			label: primaryIsDeepSeek ? "DeepSeek" : "Primary",
+			serverUrl: configuration.primaryServerUrl,
+			apiKey: primaryIsDeepSeek ? configuration.deepSeekApiKey : configuration.primaryApiKey,
+			familyOverride: primaryIsDeepSeek ? "deepseek" : undefined,
+			contextLengthOverride: primaryIsDeepSeek ? configuration.deepSeekContextLength : undefined,
+			protocol: primaryIsDeepSeek ? "deepseek" : "llamacpp",
+		});
+	}
 
 	if (configuration.localEnabled) {
 		addSource({

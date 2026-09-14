@@ -49,6 +49,19 @@ suite("model source routing", () => {
 		assert.strictEqual(sources[0].key, "primary");
 	});
 
+	test("hides primary source when local is disabled", () => {
+		const sources = createModelSources({
+			primaryServerUrl: "http://localhost:8000",
+			localEnabled: false,
+			localServerUrl: "http://localhost:8000",
+			localContextLength: 65536,
+			deepSeekEnabled: false,
+			deepSeekContextLength: 258400,
+		});
+
+		assert.strictEqual(sources.length, 0);
+	});
+
 	test("keeps multiple API profiles on one endpoint isolated by source key", () => {
 		const sources = createModelSources({
 			primaryServerUrl: "http://localhost:8000",
@@ -77,8 +90,8 @@ suite("model source routing", () => {
 
 		assert.deepStrictEqual(
 			sources.map(source => source.key),
-			["primary", "api-account-a", "api-account-b"]
+			["api-account-a", "api-account-b"]
 		);
-		assert.strictEqual(sources[2].serverUrl, "https://openrouter.ai/api/v1");
+		assert.strictEqual(sources[1].serverUrl, "https://openrouter.ai/api/v1");
 	});
 });
