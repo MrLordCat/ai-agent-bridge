@@ -5,7 +5,7 @@ set -Eeuo pipefail
 # Keep this script next to the downloaded .vsix file.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-primary_vsix="$script_dir/llama-vscode-chat-1.15.16.vsix"
+primary_vsix="$script_dir/llama-vscode-chat-1.15.17.vsix"
 vsix=""
 
 if [[ -f "$primary_vsix" ]]; then

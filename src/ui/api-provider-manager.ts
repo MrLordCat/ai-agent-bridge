@@ -105,6 +105,7 @@ function renderBuiltinProviders(state: ApiProviderManagerRenderState): string {
 				</div>
 				<span class="status ${esc(status?.state ?? "checking")}">${stateLabelOf(status?.state)}</span>
 			</div>
+			${status?.detail ? `<div class="detail ${esc(status.state)}">${esc(status.detail)}</div>` : ""}
 			<div class="badges">
 				${badges.map(badge => `<span class="${esc(badge.css ?? "")}">${esc(badge.label)}</span>`).join("")}
 			</div>
@@ -192,32 +193,16 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		: undefined;
 	const editingIsNew = state.editingId === "new";
 	const formVisible = editingIsNew || editing !== undefined;
-	const statusRows = `
-		<div class="status-section">
-			<div class="section-title">Provider availability</div>
-			${state.providers.length === 0
-				? '<div class="empty">No provider status yet — recheck after the first activation.</div>'
-				: state.providers.map(provider => {
-					const stateLabel = { checking: "Checking", off: "Off", unconfigured: "Not configured", online: "Online", offline: "Offline", paused: "Paused" }[provider.state] ?? provider.state;
-					return `
-				<article class="provider-card status-row">
-					<div class="provider-head">
-						<div>
-							<div class="provider-name">${esc(provider.label)}</div>
-							<div class="endpoint">${esc(provider.detail)}</div>
-						</div>
-						<span class="status ${esc(provider.state)}">${stateLabel}</span>
-					</div>
-				</article>`;
-				}).join("")}
-		</div>
-	`;
-
 	const form = formVisible
 		? `
-		<section class="form-card">
-			<div class="section-title">${editing ? `Edit ${esc(editing.name)}` : "Add API provider"}</div>
-			<div class="grid">
+		<div class="modal-backdrop">
+			<div class="modal" role="dialog" aria-modal="true" aria-label="${editing ? `Edit ${esc(editing.name)}` : "Add API provider"}">
+				<div class="modal-head">
+					<div class="modal-title">${editing ? `Edit ${esc(editing.name)}` : "Add API provider"}</div>
+					<button class="modal-close" id="close-btn" type="button" aria-label="Close">&times;</button>
+				</div>
+				<div class="modal-body">
+				<div class="grid">
 				<label>
 					<span>Preset</span>
 					<select id="provider-preset">
@@ -273,27 +258,35 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 				</label>
 			</div>
 			<div class="form-options">
-				<label class="check"><input id="provider-enabled" type="checkbox"${editing?.enabled !== false ? " checked" : ""} /> Enabled</label>
-				${editing?.hasApiKey ? '<label class="check danger-text"><input id="provider-clear-key" type="checkbox" /> Delete saved API key</label>' : ""}
+					<label class="check"><input id="provider-enabled" type="checkbox"${editing?.enabled !== false ? " checked" : ""} /> Enabled</label>
+					${editing?.hasApiKey ? '<label class="check danger-text"><input id="provider-clear-key" type="checkbox" /> Delete saved API key</label>' : ""}
+				</div>
+				</div>
+				<div class="modal-foot">
+					<button id="cancel-btn" type="button">Cancel</button>
+					<button id="save-btn" class="primary" type="button">Save provider</button>
+				</div>
 			</div>
-			<div class="actions">
-				<button id="save-btn" class="primary" type="button">Save provider</button>
-				<button id="cancel-btn" type="button">Cancel</button>
-			</div>
-		</section>`
+		</div>`
 		: "";
 
 	const cards = state.profiles.length === 0
 		? '<div class="empty">No custom API providers yet. Add an OpenAI-compatible endpoint to load its models into the VS Code model picker.</div>'
-		: state.profiles.map(profile => `
+		: state.profiles.map(profile => {
+			const status = state.providers.find(provider => provider.key === `api-${profile.id}`);
+			const statusClass = status ? status.state : (profile.enabled ? "on" : "off");
+			const statusLabel = status ? stateLabelOf(status.state) : (profile.enabled ? "Enabled" : "Disabled");
+			const detail = status?.detail ?? (profile.enabled ? "Waiting for availability check." : "Disabled in settings.");
+			return `
 		<article class="provider-card${profile.enabled ? "" : " disabled"}">
 			<div class="provider-head">
 				<div>
 					<div class="provider-name">${esc(profile.name)}</div>
 					<div class="endpoint" title="${escAttr(profile.baseUrl)}">${esc(profile.baseUrl)}</div>
 				</div>
-				<span class="status ${profile.enabled ? "on" : "off"}">${profile.enabled ? "Enabled" : "Disabled"}</span>
+				<span class="status ${statusClass}">${statusLabel}</span>
 			</div>
+			<div class="detail ${status ? status.state : ""}">${esc(detail)}</div>
 			<div class="badges">
 				<span>${esc(profile.protocol)}</span>
 				<span>family: ${esc(profile.family)}</span>
@@ -305,7 +298,11 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 				<button class="edit-btn" data-id="${escAttr(profile.id)}" type="button">Edit</button>
 				<button class="delete-btn danger" data-id="${escAttr(profile.id)}" type="button">Delete</button>
 			</div>
-		</article>`).join("");
+		</article>`;
+		}).join("");
+
+	const onlineCount = state.providers.filter(provider => provider.state === "online").length;
+	const sourceCount = state.providers.length;
 
 	return `<!DOCTYPE html>
 <html lang="en">
@@ -328,14 +325,19 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		button.primary:hover { background: var(--vscode-button-hoverBackground); }
 		button.danger { color: var(--vscode-errorForeground); }
 		.notice { border-left: 3px solid var(--vscode-textLink-foreground); background: var(--vscode-textBlockQuote-background); padding: 10px 12px; margin-bottom: 18px; line-height: 1.45; }
-		.provider-card, .form-card { border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); border-radius: 6px; padding: 14px; margin-bottom: 12px; }
+		.provider-card { border: 1px solid var(--vscode-panel-border); background: var(--vscode-sideBar-background); border-radius: 10px; padding: 16px; margin-bottom: 12px; transition: border-color .15s ease, box-shadow .15s ease; }
+		.provider-card:hover { border-color: var(--vscode-textLink-foreground); box-shadow: 0 2px 12px rgba(0, 0, 0, 0.14); }
 		.provider-card.disabled { opacity: .68; }
 		.provider-head { justify-content: space-between; gap: 18px; }
 		.hidden { display: none; }
 		.invalid { border-color: #e51400 !important; outline: 1px solid #e51400; }
 		.provider-name { font-weight: 600; font-size: 15px; }
 		.endpoint { color: var(--vscode-descriptionForeground); margin-top: 4px; overflow-wrap: anywhere; }
-		.status, .badges span { border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 8px; font-size: 12px; white-space: nowrap; }
+		.detail { color: var(--vscode-descriptionForeground); margin-top: 4px; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+		.detail.offline { color: var(--vscode-errorForeground); }
+		.badges span { border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 9px; font-size: 12px; white-space: nowrap; background: var(--vscode-textBlockQuote-background, transparent); }
+		.status { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 500; white-space: nowrap; }
+		.status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 		.status.on, .key-set, .status.online { color: var(--vscode-testing-iconPassed); }
 		.status.off, .status.unconfigured, .status.checking { color: var(--vscode-descriptionForeground); }
 		.status.offline { color: var(--vscode-errorForeground); }
@@ -343,10 +345,12 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		.status-section { margin-bottom: 20px; }
 		.status-section .provider-card { margin-bottom: 8px; }
 		.badges { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
-		.section-title { font-weight: 600; font-size: 16px; margin-bottom: 14px; }
+		.section-title { font-weight: 600; font-size: 13px; letter-spacing: .04em; text-transform: uppercase; color: var(--vscode-descriptionForeground); margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+		.section-title::before { content: ''; width: 4px; height: 14px; border-radius: 2px; background: var(--vscode-textLink-foreground); flex-shrink: 0; }
 		.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 13px; }
-		label > span { display: block; margin-bottom: 5px; }
-		input, select { box-sizing: border-box; width: 100%; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); padding: 7px 8px; border-radius: 2px; }
+		label > span { display: block; margin-bottom: 6px; font-size: 12px; font-weight: 600; }
+		input, select { box-sizing: border-box; width: 100%; color: var(--vscode-input-foreground); background: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); padding: 8px 10px; border-radius: 6px; transition: border-color .12s ease, box-shadow .12s ease; }
+		input:focus, select:focus { outline: none; border-color: var(--vscode-focusBorder); box-shadow: 0 0 0 1px var(--vscode-focusBorder); }
 		small { display: block; color: var(--vscode-descriptionForeground); margin-top: 5px; line-height: 1.35; }
 		.form-options { margin: 14px 0; flex-wrap: wrap; }
 		.check { display: inline-flex; align-items: center; gap: 6px; }
@@ -355,6 +359,14 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		.message { min-height: 20px; margin: 8px 0; }
 		.success { color: var(--vscode-testing-iconPassed); }
 		.empty { border: 1px dashed var(--vscode-panel-border); color: var(--vscode-descriptionForeground); padding: 24px; text-align: center; border-radius: 6px; }
+		.modal-backdrop { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45); display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px; z-index: 100; overflow-y: auto; }
+		.modal { background: var(--vscode-sideBar-background); border: 1px solid var(--vscode-panel-border); border-radius: 12px; width: 100%; max-width: 620px; box-shadow: 0 16px 48px rgba(0, 0, 0, 0.4); }
+		.modal-head { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--vscode-panel-border); }
+		.modal-title { font-size: 17px; font-weight: 600; }
+		.modal-close { background: transparent; border: none; font-size: 24px; line-height: 1; color: var(--vscode-descriptionForeground); cursor: pointer; padding: 0 4px; }
+		.modal-close:hover { color: var(--vscode-foreground); }
+		.modal-body { padding: 20px; }
+		.modal-foot { display: flex; justify-content: flex-end; gap: 10px; padding: 14px 20px; border-top: 1px solid var(--vscode-panel-border); }
 		code { font-family: var(--vscode-editor-font-family); }
 	</style>
 </head>
@@ -363,7 +375,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 	<p class="subtitle">One place for every model source: Local LLM, DeepSeek, Codex, Claude, and custom API endpoints.</p>
 	<div class="notice"><strong>Availability is checked automatically.</strong> HTTP sources are probed every 5 minutes; subscription states refresh on their own. Offline providers are hidden from Quick Access and their reason is shown here.</div>
 	<div class="toolbar">
-		<div><strong>${state.profiles.filter(profile => profile.enabled).length}</strong> active · ${state.profiles.length} configured</div>
+		<div>${sourceCount > 0 ? `<strong>${onlineCount}</strong> of ${sourceCount} sources online` : `${state.profiles.length} custom provider${state.profiles.length === 1 ? "" : "s"} configured`}</div>
 		<div class="actions">
 			<button id="refresh-models-btn" type="button">Refresh models</button>
 			<button id="recheck-btn" type="button">Recheck availability</button>
@@ -371,10 +383,12 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		</div>
 	</div>
 	<div class="message ${state.error ? "error" : "success"}">${esc(state.error ?? state.status ?? "")}</div>
-	${form}
 	${builtinCards}
-	${statusRows}
-	<div id="providers">${cards}</div>
+	<div class="status-section">
+		<div class="section-title">Custom API providers</div>
+		<div id="providers">${cards}</div>
+	</div>
+	${form}
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
 		document.getElementById('add-btn').addEventListener('click', () => vscode.postMessage({ type: 'new' }));
@@ -393,6 +407,14 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		})));
 		const cancel = document.getElementById('cancel-btn');
 		if (cancel) cancel.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+		const closeBtn = document.getElementById('close-btn');
+		if (closeBtn) closeBtn.addEventListener('click', () => vscode.postMessage({ type: 'cancel' }));
+		const backdrop = document.querySelector('.modal-backdrop');
+		if (backdrop) backdrop.addEventListener('click', (event) => {
+			if (event.target === backdrop) {
+				vscode.postMessage({ type: 'cancel' });
+			}
+		});
 		const presets = ${JSON.stringify(API_PROVIDER_PRESETS)};
 		const presetSelect = document.getElementById('provider-preset');
 		if (presetSelect) {

@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.15.17 (dev) - 2026-09-14
+
+- **Providers Manager UI de-duplicated.** Each model source now appears once,
+  with its live reachability folded into the card instead of being listed both
+  as a "card" and in a separate "Provider availability" row:
+  - built-in cards (Local / DeepSeek / Codex / Claude) show a live reason line
+    (e.g. `Reachable at …` or the probe error);
+  - custom provider cards show the real live state (`Online`/`Offline`/…) and
+    reason via the directory's `api-<id>` probe, so a bad API key is visible on
+    the card itself;
+  - the redundant "Provider availability" section is removed and the custom
+    list gains a "Custom API providers" heading;
+  - the toolbar counter now reports overall reachability
+    (`N of K sources online`) instead of only counting custom profiles.
+
 ## 1.15.16 (dev) - 2026-09-06
 
 - **Copilot Chat patch now supports VS Code 1.136.1 / Copilot Chat 0.64.1.**

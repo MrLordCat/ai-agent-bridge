@@ -77,7 +77,7 @@ chmod +x install-ai-agent-bridge.sh
 ```
 
 The Windows script prefers the version in its `PRIMARY_VSIX` setting and the
-Linux script prefers the current `llama-vscode-chat-1.15.16.vsix`; both
+Linux script prefers the current `llama-vscode-chat-1.15.17.vsix`; both
 fall back to the newest `llama-vscode-chat-*.vsix` next to the script. If the
 VS Code CLI is not named `code` or `code-insiders`, set `VSCODE_CLI` when
 running the Linux script.
