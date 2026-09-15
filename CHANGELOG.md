@@ -14,6 +14,13 @@
     list gains a "Custom API providers" heading;
   - the toolbar counter now reports overall reachability
     (`N of K sources online`) instead of only counting custom profiles.
+- **Real-bundle Copilot patch test is now version-aware.** The test asserted the
+  0.64.1 `modelCapabilities:d` / `conversationId:p` bindings unconditionally, so
+  it failed whenever the located bundle was older — for example the Copilot Chat
+  0.59.0 shipped with VS Code 1.131, whose `makeChatRequest2` has neither. The
+  test now detects the upstream shape and asserts the matching wiring: preserved
+  upstream bindings for 0.64.x, injected `__llamaModelCapabilities` slot for
+  legacy bundles. The patch itself was already correct for both shapes.
 
 ## 1.15.16 (dev) - 2026-09-06
 

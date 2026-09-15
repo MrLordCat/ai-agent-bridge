@@ -136,13 +136,45 @@ suite("Copilot patch", () => {
 		assert.ok(patched.includes('this.endpoint.modelProvider!=="llamacpp"'));
 		assert.ok(patched.includes("__llamaLastChatVendor"));
 		assert.ok(patched.includes("__llamaLastConversationId"));
-		// Copilot 0.64.x passes modelCapabilities/conversationId in the request
-		// signature; the patch must keep the upstream bindings and wire them in.
-		assert.ok(patched.includes("modelCapabilities:d"), "upstream modelCapabilities binding must be preserved");
-		assert.ok(patched.includes("reasoningEffort:d.reasoningEffort"), "reasoningEffort must be injected from modelCapabilities");
-		assert.ok(patched.includes("let __llamaConversationId=p??__llamaConversationMetadata(u)"), "conversation id binding must be wired");
+		// The request signature differs across Copilot Chat releases: 0.64.x
+		// destructures modelCapabilities/conversationId itself, older bundles
+		// (for example the 0.59.x shipped with VS Code 1.131) do not. The patch
+		// keeps upstream bindings when present and injects its own slot
+		// otherwise, so these assertions must follow the shape of the bundle
+		// that is actually installed instead of assuming one release.
+		const upstreamSignature = original.match(/async makeChatRequest2\(\{[^}]*\}/)?.[0] ?? "";
+		assert.ok(upstreamSignature.length > 0, "upstream request signature must be found");
+		const upstreamHasModelCapabilities = /\bmodelCapabilities:[A-Za-z_$][\w$]*/.test(upstreamSignature);
+		const upstreamHasConversationId = /\bconversationId:[A-Za-z_$][\w$]*/.test(upstreamSignature);
+		if (upstreamHasModelCapabilities) {
+			// Copilot 0.64.x passes modelCapabilities itself; preserve the binding.
+			assert.ok(patched.includes("modelCapabilities:d"), "upstream modelCapabilities binding must be preserved");
+			assert.ok(patched.includes("reasoningEffort:d.reasoningEffort"), "reasoningEffort must be injected from modelCapabilities");
+		} else {
+			// Legacy bundles have no modelCapabilities slot; the patch adds one.
+			assert.ok(
+				patched.includes("modelCapabilities:__llamaModelCapabilities"),
+				"legacy bundles must receive the injected modelCapabilities slot"
+			);
+			assert.ok(
+				patched.includes("reasoningEffort:__llamaModelCapabilities.reasoningEffort"),
+				"reasoningEffort must be read from the injected modelCapabilities slot"
+			);
+		}
+		if (upstreamHasConversationId) {
+			assert.ok(patched.includes("let __llamaConversationId=p??__llamaConversationMetadata(u)"), "0.64 conversation id binding must be wired");
+		} else {
+			assert.ok(
+				patched.includes("let __llamaConversationId=__llamaConversationMetadata(u)"),
+				"legacy conversation id binding must be wired"
+			);
+		}
 		assert.ok(patched.includes("_copilotConversationId:__llamaConversationId"), "llama conversation id must be sent to the model");
-		assert.match(patched, /\{debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p\},m\)\{/, "0.64.1 request signature must be kept intact");
+		assert.match(
+			patched,
+			/async makeChatRequest2\(\{[^}]*telemetryProperties:u,modelCapabilities:[A-Za-z_$][\w$]*(?:,conversationId:[A-Za-z_$][\w$]*)?\}/,
+			"request signature must be kept intact for the installed Copilot shape"
+		);
 		assert.ok(patched.includes('executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId)'));
 		assert.ok(patched.includes('executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0})'));
 		assert.match(
