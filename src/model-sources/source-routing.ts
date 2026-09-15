@@ -98,6 +98,33 @@ export function resolveModelFamily(modelId: string, familyOverride: string | und
 	return normalized && normalized !== "auto" ? normalized : inferModelFamily(modelId);
 }
 
+/**
+ * Whether a DeepSeek model id accepts image input (OpenAI `image_url` blocks).
+ *
+ * DeepSeek's `GET /models` returns only `{id, object, owned_by}`, so vision
+ * cannot be read from the catalog and must be derived from the model id.
+ *
+ * Verified 2026-09-15 against https://api-docs.deepseek.com/quick_start/pricing
+ * (Models & Pricing), which lists Vision for `deepseek-flash` and
+ * "Not supported" for `deepseek-v4-pro`. The legacy names `deepseek-v4-flash`
+ * and `deepseek-v4-flash-vision-exp` are retired but still accepted, and their
+ * requests are served by the DeepSeek-V4.1-Flash model that accepts images
+ * (https://api-docs.deepseek.com/guides/vision).
+ *
+ * The Flash family is vision-capable; Pro, chat, and reasoner are not.
+ */
+export function isDeepSeekVisionModel(modelId: string): boolean {
+	const id = modelId.trim().toLowerCase();
+	if (!id) {
+		return false;
+	}
+	// Explicit opt-out for ids that name the non-vision Pro tier.
+	if (/(?:^|[-_/])pro(?:[-_/]|$)/.test(id)) {
+		return false;
+	}
+	return /vision/i.test(id) || /(?:^|[-_/])flash(?:[-_/]|$)/.test(id);
+}
+
 export function createModelSources(configuration: ModelSourceConfiguration): ChatModelSource[] {
 	const sources: ChatModelSource[] = [];
 	const seenUrls = new Set<string>();

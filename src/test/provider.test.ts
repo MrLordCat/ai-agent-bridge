@@ -320,6 +320,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 }];
                 providerAny.getRuntimeContextLengthWithCache = async () => undefined;
                 providerAny.fetchModelsWithInflightCache = async () => [
+                    { id: "deepseek-flash" },
                     { id: "deepseek-v4-flash-vision-exp" },
                     { id: "deepseek-v4-pro" },
                 ];
@@ -329,9 +330,15 @@ suite("Llama.cpp Chat Provider Extension", () => {
                     new vscode.CancellationTokenSource().token
                 );
 
+                // Current Flash model: Vision ✓ per the DeepSeek pricing table.
+                const flash = infos.find(info => info.id === "deepseek::deepseek-flash");
+                assert.ok(flash, "deepseek-flash must be advertised");
+                assert.strictEqual(flash!.capabilities.imageInput, true);
+                // Retired alias, still served by the Flash model.
                 const vision = infos.find(info => info.id === "deepseek::deepseek-v4-flash-vision-exp");
                 assert.ok(vision, "vision-exp must be advertised");
                 assert.strictEqual(vision!.capabilities.imageInput, true);
+                // V4 Pro: Vision "Not supported".
                 const pro = infos.find(info => info.id === "deepseek::deepseek-v4-pro");
                 assert.strictEqual(pro!.capabilities.imageInput, false);
             } finally {

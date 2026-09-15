@@ -83,6 +83,7 @@ import { setSubagentModelProfiles } from "./subagent-guidance";
 import {
     createModelSources,
     encodeProviderModelId,
+    isDeepSeekVisionModel,
     normalizeServerUrl,
     parseProviderModelId,
     resolveModelFamily,
@@ -769,7 +770,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     id: "deprecated-model-alias",
                     label: "DeepSeek model aliases",
                     status: "warning",
-                    detail: `${deprecatedAliases.join(", ")} are deprecated; select deepseek-v4-flash or deepseek-v4-pro.`,
+                    detail: `${deprecatedAliases.join(", ")} are deprecated; select deepseek-flash or deepseek-v4-pro.`,
                 });
             }
 
@@ -3807,12 +3808,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const maxInputTokens = Math.max(1, contextLength - maxOutputTokens);
         const maxTools = this.clampInt(this.getConfig().get("maxToolsPerRequest", 128), 0, 128, 128);
 
-        // Detect vision (image input) support from model metadata.
-        // The API itself decides whether to accept image content blocks;
-        // if the model (e.g. DeepSeek) supports vision it may use tools
-        // like view_image to inspect attached images.
-        // DeepSeek vision models (deepseek-v4-flash-vision-exp) accept
-        // OpenAI-style image_url blocks — verified 2026-08-25 against
+        // DeepSeek's /models endpoint returns only {id, object, owned_by}, so
+        // vision must be derived from the model id. The Flash family accepts
+        // image_url blocks; Pro, chat, and reasoner do not. Verified 2026-09-15
+        // against https://api-docs.deepseek.com/quick_start/pricing and
         // https://api-docs.deepseek.com/guides/vision (JPEG/PNG/GIF/WebP,
         // base64 data URLs or public URLs). Non-vision DeepSeek models still
         // reject image blocks with 400, so the flag stays generic.
@@ -3831,7 +3830,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             (Array.isArray(inputModalities) && inputModalities.includes("image")) ||
             capabilities.includes("vision") ||
             capabilities.includes("multimodal") ||
-            (family === "deepseek" && /vision/i.test(model.id));
+            (family === "deepseek" && isDeepSeekVisionModel(model.id));
 
         const info: LanguageModelChatInformation & Record<string, unknown> = {
             id: encodeProviderModelId(source.key, model.id),

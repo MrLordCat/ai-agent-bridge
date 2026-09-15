@@ -2,6 +2,7 @@ import * as assert from "node:assert";
 import {
 	createModelSources,
 	encodeProviderModelId,
+	isDeepSeekVisionModel,
 	parseProviderModelId,
 	resolveModelFamily,
 } from "../model-sources/source-routing";
@@ -14,6 +15,18 @@ suite("model source routing", () => {
 		assert.strictEqual(resolveModelFamily("Qwen3-Coder.gguf", "auto", "llama"), "qwen");
 		assert.strictEqual(resolveModelFamily("anything", "deepseek", "auto"), "deepseek");
 		assert.strictEqual(resolveModelFamily("gpt-5", "auto", "llama"), "openai");
+	});
+
+	test("marks only DeepSeek Flash-family models as vision-capable", () => {
+		// Verified 2026-09-15 against https://api-docs.deepseek.com/quick_start/pricing:
+		// deepseek-flash -> Vision, deepseek-v4-pro -> Not supported.
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-flash"), true);
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-v4-flash"), true);
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-v4-flash-vision-exp"), true);
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-v4-pro"), false);
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-chat"), false);
+		assert.strictEqual(isDeepSeekVisionModel("deepseek-reasoner"), false);
+		assert.strictEqual(isDeepSeekVisionModel(""), false);
 	});
 
 	test("keeps local and DeepSeek sources available without duplicate endpoints", () => {

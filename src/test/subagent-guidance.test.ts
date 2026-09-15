@@ -235,4 +235,18 @@ suite("subagent model guidance", () => {
 		assert.ok(guidance.includes("DeepSeek cannot process image input"));
 		assert.ok(guidance.includes("Codex Terra → Codex Luna"));
 	});
+
+	test("notes DeepSeek Flash vision support when a Flash profile is available", () => {
+		setSubagentModelProfiles("local", []);
+		setSubagentModelProfiles("deepseek", [{
+			id: "deepseek::deepseek-flash", label: "DeepSeek Flash", provider: "deepseek", defaultEffort: "high", useWhen: "Complex tasks",
+		}]);
+		setSubagentModelProfiles("codex", [{
+			id: "gpt-5.6-codex", label: "GPT-5.6 Codex", provider: "codex", defaultEffort: "high", useWhen: "Repo work",
+		}]);
+		setSubagentModelProfiles("claude", []);
+		const guidance = buildSubagentToolGuidance();
+		assert.ok(guidance.includes("DeepSeek Flash accepts image input"));
+		assert.ok(!guidance.includes("DeepSeek cannot process image input"));
+	});
 });

@@ -1,3 +1,5 @@
+import { isDeepSeekVisionModel } from "./model-sources/source-routing";
+
 type SubagentProvider = "local" | "deepseek" | "codex" | "claude";
 
 export interface SubagentModelProfile {
@@ -132,7 +134,19 @@ function buildBudgetRoutingPolicy(profiles: readonly SubagentModelProfile[]): st
 		tiers.push("cheapest — local models (e.g. Qwen 3.6 27B) for narrow, mechanical, independently verifiable subtasks (workspace search, single-file reads, grep triage, format/lint checks, visual inspection, and verifying another model's output). Local models have no token or rate limits — prefer them for any task they can handle reliably");
 	}
 	if (has("deepseek")) {
-		tiers.push("mid — DeepSeek (e.g. DeepSeek V4 Pro) for focused multi-step reasoning a local model cannot complete reliably, code analysis across files, and architecture decisions. DeepSeek cannot process image input: when the subtask needs vision, skip DeepSeek and use a local vision-capable model or Codex");
+		// DeepSeek's /models endpoint exposes no capability metadata, so vision is
+		// derived from the model id: the Flash family accepts images, V4 Pro not.
+		const deepSeekVisionCapable = profiles.some(profile => {
+			if (profile.provider !== "deepseek") {
+				return false;
+			}
+			const modelId = profile.id.toLowerCase().split("::").at(-1) ?? profile.id.toLowerCase();
+			return isDeepSeekVisionModel(modelId);
+		});
+		const visionNote = deepSeekVisionCapable
+			? "DeepSeek Flash accepts image input, but DeepSeek V4 Pro does not, so route vision subtasks to a Flash or another vision-capable model"
+			: "DeepSeek cannot process image input: when the subtask needs vision, skip DeepSeek and use a local vision-capable model or Codex";
+		tiers.push(`mid — DeepSeek (e.g. DeepSeek V4 Pro) for focused multi-step reasoning a local model cannot complete reliably, code analysis across files, and architecture decisions. ${visionNote}`);
 	}
 	if (has("codex") || has("claude")) {
 		const premiumModels: string[] = [];
@@ -147,7 +161,7 @@ function buildBudgetRoutingPolicy(profiles: readonly SubagentModelProfile[]): st
 	if (tiers.length <= 1) {
 		return "";
 	}
-	return `Budget routing policy — pick the cheapest capable tier and escalate only when it is genuinely insufficient: ${tiers.join("; ")}. Preferred subagent order: local (cheapest, unlimited) → DeepSeek (no vision needed) → Codex Terra → Codex Luna → Claude Opus 5 (last resort).`;
+	return `Budget routing policy — pick the cheapest capable tier and escalate only when it is genuinely insufficient: ${tiers.join("; ")}. Preferred subagent order: local (cheapest, unlimited) → DeepSeek (non-vision reasoning) → Codex Terra → Codex Luna → Claude Opus 5 (last resort).`;
 }
 
 let _cachedGuidance: string | undefined;
