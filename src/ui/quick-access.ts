@@ -629,6 +629,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			],
 		});
 
+		// «Usage Limit» is only a fallback for when the rate-limits endpoint has no
+		// window data — otherwise it repeats the explicit Session/Weekly rows.
+		const codexUsageLimits = this.getCodexUsageLimits();
 		const codex = new QuickAccessItem("codex", "Codex", {
 			description: codexEnabled
 				? formatProviderUsageLine(codexStatus ?? "Checking...", codexUsageLimitPercent, codexUsageLimitReset)
@@ -647,20 +650,25 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("settings"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
-				...this.getCodexUsageLimits().map((limit, index) =>
-					new QuickAccessItem(`codex.usageLimit.${index}`, limit.label, {
-						description: limit.description,
-						tooltip: "ChatGPT subscription usage windows from the official Codex rate-limits endpoint (5-hour and weekly windows on Plus/Pro plans). Refreshes automatically every minute so you can see when each limit resets.",
-						icon: new vscode.ThemeIcon("dashboard"),
-						command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
-					})
-				),
-				new QuickAccessItem("codex.usageLimit", "Usage Limit", {
-					description: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
-					tooltip: "ChatGPT subscription usage window from the official Codex rate-limits endpoint (5-hour window on Plus/Pro, weekly for some plans). Refreshes automatically every minute so you can see when the limit resets.",
-					icon: new vscode.ThemeIcon("dashboard"),
-					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
-				}),
+				...(codexUsageLimits.length > 0
+					? codexUsageLimits.map((limit, index) =>
+						new QuickAccessItem(`codex.usageLimit.${index}`, limit.label, {
+							description: limit.description,
+							tooltip: "ChatGPT subscription usage windows from the official Codex rate-limits endpoint (5-hour and weekly windows on Plus/Pro plans). Refreshes automatically every minute so you can see when each limit resets.",
+							icon: new vscode.ThemeIcon("dashboard"),
+							command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+						})
+					)
+					: [
+						// Fallback only: keeps the subscription window visible when the
+						// endpoint returns no primary/secondary rate-limit data.
+						new QuickAccessItem("codex.usageLimit", "Usage Limit", {
+							description: this.getCodexSubscriptionUsage() ?? "Usage unavailable",
+							tooltip: "ChatGPT subscription usage window from the official Codex rate-limits endpoint (5-hour window on Plus/Pro, weekly for some plans). Shown only when the endpoint returns no window data. Refreshes automatically every minute so you can see when the limit resets.",
+							icon: new vscode.ThemeIcon("dashboard"),
+							command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+						}),
+					]),
 				new QuickAccessItem("codex.settings", "Tools & Account", {
 					description: `VS Code-only · deferred ${codexDeferredToolsEnabled ? "on" : "off"}`,
 					icon: new vscode.ThemeIcon("settings-gear"),

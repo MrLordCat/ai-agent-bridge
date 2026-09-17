@@ -21,6 +21,11 @@
   test now detects the upstream shape and asserts the matching wiring: preserved
   upstream bindings for 0.64.x, injected `__llamaModelCapabilities` slot for
   legacy bundles. The patch itself was already correct for both shapes.
+- **Codex «Usage Limit» no longer duplicates the session limit.** The row is
+  documented as an endpoint-unavailable fallback, but Quick Access rendered it
+  unconditionally, so a live Plus plan showed «Usage Limit 5h · 100% used ·
+  resets …» directly under the identical «Session Limit (5h) 100% used · resets
+  …». It now renders only when `codexUsageLimitSummaries` returns no window data.
 
 ## 1.15.16 (dev) - 2026-09-06
 

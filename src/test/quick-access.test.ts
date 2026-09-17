@@ -23,6 +23,22 @@ async function getItems(
 	return result ?? [];
 }
 
+/** Builds a provider that only varies the Codex rate-limit rows. */
+function providerWithCodexUsageLimits(
+	limits: readonly { label: string; description: string }[],
+	codexSubscriptionUsage?: string
+): LlamaQuickActionsProvider {
+	return new LlamaQuickActionsProvider(
+		() => undefined, () => undefined, () => 0,
+		undefined, undefined, undefined, undefined, undefined, undefined,
+		undefined, undefined, undefined, undefined, undefined, undefined,
+		() => codexSubscriptionUsage,
+		undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+		undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+		() => limits
+	);
+}
+
 suite("quick access", () => {
 	test("formats endpoint labels without protocol noise", () => {
 		assert.strictEqual(formatEndpointLabel("http://localhost:8000"), "localhost:8000");
@@ -322,6 +338,39 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const keepAlive = (await getItems(provider, claude)).find(item => labelOf(item) === "Cache Keep-Alive");
 		assert.strictEqual(keepAlive?.description, "On (45 min)");
 		assert.strictEqual(keepAlive?.command?.command, "llamacpp.toggleClaudeCacheKeepAlive");
+	});
+
+	test("keeps the Codex Usage Limit row as an endpoint fallback only", async () => {
+		// Mirrors the duplicated sidebar seen with a live Plus plan: the explicit
+		// Session/Weekly rows already carry percent used and reset time.
+		const withLimits = providerWithCodexUsageLimits(
+			[
+				{ label: "Session Limit (5h)", description: "100% used · resets 9/17/2026, 2:45:00 PM" },
+				{ label: "Weekly Limit", description: "43% used · resets 9/23/2026, 2:04:49 PM" },
+			],
+			"5h · 100% used · resets 9/17/2026, 2:45:00 PM"
+		);
+		const codex = (await getItems(withLimits)).find(item => labelOf(item) === "Codex");
+		assert.ok(codex);
+		const labels = (await getItems(withLimits, codex)).map(labelOf);
+		assert.ok(labels.includes("Session Limit (5h)"));
+		assert.ok(labels.includes("Weekly Limit"));
+		assert.ok(
+			!labels.includes("Usage Limit"),
+			"the fallback must not duplicate the explicit Session/Weekly rows"
+		);
+
+		// Fallback still renders when the endpoint returns no window data.
+		const withoutLimits = providerWithCodexUsageLimits([], "5h · 100% used · resets 9/17/2026, 2:45:00 PM");
+		const fallbackCodex = (await getItems(withoutLimits)).find(item => labelOf(item) === "Codex");
+		assert.ok(fallbackCodex);
+		const fallback = (await getItems(withoutLimits, fallbackCodex))
+			.find(item => labelOf(item) === "Usage Limit");
+		assert.ok(fallback, "the fallback row must appear when the endpoint returns no windows");
+		assert.ok(
+			typeof fallback.description === "string" && fallback.description.includes("100% used"),
+			"the fallback must show the raw subscription usage summary"
+		);
 	});
 
 	test("formats provider usage lines with and without a reset time", () => {
