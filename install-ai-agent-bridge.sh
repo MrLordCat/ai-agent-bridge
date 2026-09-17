@@ -35,12 +35,22 @@ set -Eeuo pipefail
 # it the way to re-apply the patches after a VS Code update.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-primary_vsix="$script_dir/llama-vscode-chat-1.15.18.vsix"
+# A local `npm run package` produces "llama-vscode-chat-<version>.vsix", while
+# the GitHub release asset is "llama-vscode-chat-v<version>.vsix"; accept both so
+# the same script works whichever file the user downloaded.
 vsix=""
 
-if [[ -f "$primary_vsix" ]]; then
-	vsix="$primary_vsix"
-else
+for preferred in \
+	"$script_dir/llama-vscode-chat-1.16.0.vsix" \
+	"$script_dir/llama-vscode-chat-v1.16.0.vsix"
+do
+	if [[ -f "$preferred" ]]; then
+		vsix="$preferred"
+		break
+	fi
+done
+
+if [[ -z "$vsix" ]]; then
 	mapfile -t vsix_candidates < <(
 		find "$script_dir" -maxdepth 1 -type f -name 'llama-vscode-chat-*.vsix' -printf '%f\n' \
 			| sort -V

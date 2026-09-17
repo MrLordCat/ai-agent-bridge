@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.16.0 (stable) - 2026-09-17
+
+Stable release consolidating the 1.15.x development patches.
+
+- **One-step install** (1.15.18): the installer applies the VS Code / Copilot
+  Chat patches itself with the extension's own compiled patch code, so
+  installing and patching are a single script run. It never blocks on a terminal
+  password prompt, requests elevation only after a real permission error, and
+  uses the polkit system dialog; written files are handed back to the user.
+- **VS Code 1.136.1 / Copilot Chat 0.64.1 support** (1.15.16-18): the Copilot
+  patch follows the renamed minified bindings and the new `modelCapabilities` /
+  `conversationId` signature, the agent-host patch is capability-detected
+  instead of failing on newer builds, and builds such as 1.131 are still patched
+  exactly as before.
+- **Agent tool `llamacpp_wait_for_terminal`** (1.15.11-15): wait for a real
+  terminal command instead of sleeping, and built-in tools are injected into the
+  catalog even when the host does not propagate them without a restart.
+- **Claude reliability** (1.15.2, 1.15.7-10): cross-provider context recovery
+  with a 256K replay budget, sign-out clearing durable sessions, recovery
+  without a usage snapshot, a warning when recovery is bounded, and usage no
+  longer erased by background probes.
+- **Accurate subscription and billing state** (1.15.4-6, 1.15.17): Codex shows
+  both rate-limit windows and no longer duplicates the «Usage Limit» row,
+  DeepSeek peak hours are weekday-aware, and DeepSeek vision models are
+  advertised as image-capable.
+- **Long conversations stay usable** (1.15.2, 1.15.14): compaction trims
+  reasoning content instead of dropping the tail, keeping turns and their tool
+  results in context.
+- **Memory hygiene** (1.15.3): store guardrails, a search output budget, pinned
+  entries always injected, and a Memory Health report.
+- **Tests**: 492 extension-host tests.
+
 ## 1.15.18 (dev) - 2026-09-17
 
 - **Installer applies the VS Code patches itself, in one run.** Installing the
