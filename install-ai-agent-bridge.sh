@@ -363,7 +363,10 @@ if [[ "${FORCE_PATCH_SUDO:-0}" == "1" ]] \
 	|| grep -qiE 'eacces|eperm|erofs|permission denied|read-only' "$patch_output_file"; then
 	echo
 	echo "Administrator rights are needed for this VS Code installation."
-	denied_paths="$(grep -oE "'[^']+\.js'" "$patch_output_file" | tr -d "'" | sort -u)"
+	# The patch writes through a temporary validation file, so an EACCES can name
+	# "<bundle>.llama-vscode-chat.tmp.js"; report the real bundle instead.
+	denied_paths="$(grep -oE "'[^']+\.m?js'" "$patch_output_file" | tr -d "'" \
+		| sed 's/\.llama-vscode-chat\.tmp\.[^.]*$//' | sort -u)"
 	if [[ -n "$denied_paths" ]]; then
 		echo "Your user cannot write these files:"
 		while IFS= read -r denied_path; do
@@ -463,7 +466,9 @@ fi
 
 # Artifacts written by an elevated run stay root-owned otherwise, and the
 # extension's own auto-patch and restore (which run unelevated) could not touch
-# them afterwards. Hand them back to the invoking user.
+# them afterwards. Hand both the files and their directories back to the
+# invoking user: writing a bundle only needs the file, but creating or deleting
+# a backup needs write access to the directory itself.
 if [[ "$patch_used_sudo" == "1" && "$elevation_cancelled" == "0" ]]; then
 	set +e
 	run_elevated find \
@@ -471,7 +476,7 @@ if [[ "$patch_used_sudo" == "1" && "$elevation_cancelled" == "0" ]]; then
 		"$app_root/out/vs/workbench" \
 		"$app_root/out/vs/platform/agentHost/node" \
 		-maxdepth 1 \
-		\( -name '*.llama-vscode-chat.*' -o -name 'extension.js' \
+		\( -type d -o -name '*.llama-vscode-chat.*' -o -name 'extension.js' \
 		-o -name 'workbench.desktop.main.js' -o -name 'agentHostMain.js' \) \
 		-exec chown "$invoking_uid:$invoking_gid" {} + 2>/dev/null
 	set -e
