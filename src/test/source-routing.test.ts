@@ -3,6 +3,7 @@ import {
 	createModelSources,
 	encodeProviderModelId,
 	isDeepSeekVisionModel,
+	isLoopbackServerUrl,
 	parseProviderModelId,
 	resolveModelFamily,
 } from "../model-sources/source-routing";
@@ -73,6 +74,62 @@ suite("model source routing", () => {
 		});
 
 		assert.strictEqual(sources.length, 0);
+	});
+
+	test("recognises loopback server URLs only", () => {
+		assert.strictEqual(isLoopbackServerUrl("http://localhost:8000"), true);
+		assert.strictEqual(isLoopbackServerUrl("http://127.0.0.1:8080/v1"), true);
+		assert.strictEqual(isLoopbackServerUrl("http://127.1.2.3:9000"), true);
+		assert.strictEqual(isLoopbackServerUrl("http://[::1]:8000"), true);
+		assert.strictEqual(isLoopbackServerUrl("localhost:8000"), true);
+		assert.strictEqual(isLoopbackServerUrl("https://api.nodividin.ee/v1"), false);
+		assert.strictEqual(isLoopbackServerUrl("https://api.deepseek.com"), false);
+		// Private LAN addresses are treated as remote so a configured server is
+		// never silently dropped.
+		assert.strictEqual(isLoopbackServerUrl("http://192.168.1.50:8000"), false);
+	});
+
+	test("keeps a remote primary while the local source is disabled", () => {
+		// Regression: gating the primary on localEnabled alone silently removed
+		// explicitly configured remote OpenAI-compatible servers.
+		const sources = createModelSources({
+			primaryServerUrl: "https://api.nodividin.ee/v1",
+			primaryApiKey: "remote-key",
+			localEnabled: false,
+			localServerUrl: "http://localhost:8000",
+			localContextLength: 65536,
+			deepSeekEnabled: false,
+			deepSeekContextLength: 258400,
+		});
+
+		assert.deepStrictEqual(sources.map(source => source.key), ["primary"]);
+		assert.strictEqual(sources[0].serverUrl, "https://api.nodividin.ee/v1");
+		assert.strictEqual(sources[0].apiKey, "remote-key");
+	});
+
+	test("hides a primary that mirrors the disabled local server only when it is loopback", () => {
+		// Same URL as the local source but reached over a non-loopback host:
+		// the primary is an explicit remote endpoint and must survive.
+		const remote = createModelSources({
+			primaryServerUrl: "http://192.168.1.50:8000",
+			localEnabled: false,
+			localServerUrl: "http://192.168.1.50:8000",
+			localContextLength: 65536,
+			deepSeekEnabled: false,
+			deepSeekContextLength: 258400,
+		});
+		assert.deepStrictEqual(remote.map(source => source.key), ["primary"]);
+
+		// Loopback primary: this is the on-machine server, so it stays hidden.
+		const loopback = createModelSources({
+			primaryServerUrl: "http://127.0.0.1:8000",
+			localEnabled: false,
+			localServerUrl: "http://localhost:8000",
+			localContextLength: 65536,
+			deepSeekEnabled: false,
+			deepSeekContextLength: 258400,
+		});
+		assert.deepStrictEqual(loopback.map(source => source.key), []);
 	});
 
 	test("keeps multiple API profiles on one endpoint isolated by source key", () => {

@@ -51,6 +51,36 @@ export function normalizeServerUrl(serverUrl: string): string {
 	return normalized || DEFAULT_SERVER_URL;
 }
 
+/**
+ * True when a server URL points at the local machine (loopback only).
+ *
+ * Used to decide whether the primary source really is the on-machine
+ * llama.cpp server that the dedicated `local` source can switch off.
+ * Merely private addresses (for example 192.168.x.x) count as remote, so an
+ * explicitly configured server is never silently dropped.
+ */
+export function isLoopbackServerUrl(serverUrl: string): boolean {
+	const normalized = normalizeServerUrl(serverUrl);
+	for (const candidate of [normalized, `http://${normalized}`]) {
+		let hostname: string;
+		try {
+			hostname = new URL(candidate).hostname.toLowerCase();
+		} catch {
+			continue;
+		}
+		if (!hostname) {
+			continue;
+		}
+		const bare = hostname.startsWith("[") && hostname.endsWith("]")
+			? hostname.slice(1, -1)
+			: hostname;
+		if (bare === "localhost" || bare === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 export function encodeProviderModelId(sourceKey: string, modelId: string): string {
 	return `${sourceKey}${MODEL_SOURCE_SEPARATOR}${modelId}`;
 }
@@ -143,10 +173,14 @@ export function createModelSources(configuration: ModelSourceConfiguration): Cha
 	};
 	const primaryIsDeepSeek = isDeepSeekEndpoint(configuration.primaryServerUrl);
 
-	// The primary source represents the local llama.cpp server by default.
-	// When localEnabled is false, skip it unless the primary URL is a DeepSeek
-	// endpoint (which has its own dedicated source below).
-	if (configuration.localEnabled || primaryIsDeepSeek) {
+	// Disabling the dedicated `local` source must hide the on-machine server,
+	// but it must not hide an explicitly configured remote primary:
+	// `llamacpp.serverUrl` is a general OpenAI-compatible endpoint ("Kept for
+	// backward compatibility"), so a remote primary is a supported setup.
+	// Only a loopback primary can be nothing other than this machine.
+	const primaryIsLocalServer = isLoopbackServerUrl(configuration.primaryServerUrl);
+
+	if (configuration.localEnabled || primaryIsDeepSeek || !primaryIsLocalServer) {
 		addSource({
 			key: primaryIsDeepSeek ? "deepseek" : "primary",
 			label: primaryIsDeepSeek ? "DeepSeek" : "Primary",
