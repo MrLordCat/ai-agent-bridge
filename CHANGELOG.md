@@ -1,5 +1,48 @@
 # Changelog
 
+## 1.15.18 (dev) - 2026-09-17
+
+- **Installer applies the VS Code patches itself, in one run.** Installing the
+  extension and patching VS Code are now a single script invocation instead of
+  requiring a window reload plus a manual Command Palette step.
+  - The patch step reuses the extension's own compiled patch code, so the
+    installer and the runtime can never disagree, and the runner is generated at
+    `~/.local/share/llama-vscode-chat/apply-patches.sh` so it can be re-run after
+    a VS Code update.
+  - It never blocks on a terminal password prompt. Elevation is requested only
+    after an unelevated pass actually hits a permission error, and then in this
+    order: passwordless `sudo`, the **polkit system dialog** (`pkexec
+    --disable-internal-agent`, i.e. the desktop password window), a graphical
+    `SUDO_ASKPASS` helper, or — if none is available — it applies what it can and
+    prints the single `sudo bash …` command to finish the rest.
+  - The reason for the privilege request is printed explicitly: each unwritable
+    bundle is listed together with the feature it unlocks, and the text states
+    that nothing is downloaded, no package is changed, originals are backed up
+    next to the file, and `AI Agent Bridge: Restore Copilot Patch` reverts them.
+  - Files written under elevation are handed back to the invoking user, so the
+    extension's own auto-patch and restore keep working afterwards.
+- **Agent-host patch is now capability-detected instead of failing on newer
+  VS Code builds, while older builds keep the patch.** VS Code 1.136.1
+  implements all three agent-host behaviours itself (verified 2026-09-17 in the
+  shipped `agentHostMain.js`): the BYOK thinking-level picker is derived from the
+  provider's `configurationSchema.properties.reasoningEffort`
+  (`_createThinkingLevelConfigSchemaProperty`), the proxy answers non-streaming
+  requests with JSON instead of always using SSE, and the request builder
+  forwards `reasoningEffort`. Previously the resulting pattern mismatch was
+  reported as «VS Code version mismatch?» and the installer asked for root over
+  a file that needed no patching. `inspectAgentHostPatchSupport` now classifies
+  each capability as `applied` / `patchable` / `native` / `unsupported`, so:
+  - a build that provides them natively is reported as such, mutates nothing and
+    creates no backup;
+  - builds such as 1.131, which contain none of these signatures, are still
+    patched exactly as before;
+  - only a genuinely unknown bundle shape raises an error, and it names the
+    capabilities it could not satisfy.
+  The thinking-level picker itself already works on 1.136.1 without any patch,
+  because `createReasoningConfigurationSchema` supplies
+  `properties.reasoningEffort` and VS Code maps it to
+  `supportedReasoningEfforts` / `defaultReasoningEffort`.
+
 ## 1.15.17 (dev) - 2026-09-14
 
 - **Providers Manager UI de-duplicated.** Each model source now appears once,

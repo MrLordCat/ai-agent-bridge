@@ -52,6 +52,73 @@ const THINKING_LEVEL_CONFIG_SCHEMA =
 	`enumDescriptions:["Minimal reasoning for fast responses","Balanced reasoning","Deep reasoning","Maximum reasoning"],` +
 	`default:"high"}}}`;
 
+/**
+ * Signatures of the upstream implementations that replace the agent-host patch.
+ *
+ * Verified 2026-09-17 against the VS Code 1.136.1 bundle
+ * (`out/vs/platform/agentHost/node/agentHostMain.js`):
+ *  - `_refreshByokModels` now calls `_createThinkingLevelConfigSchemaProperty`, so
+ *    the picker is derived from the model provider's
+ *    `configurationSchema.properties.reasoningEffort` instead of needing it.
+ *  - The BYOK proxy answers a non-streaming request with `application/json`
+ *    rather than always writing an SSE response.
+ *  - The request builder forwards `reasoningEffort` from the SDK body.
+ *
+ * Older builds (for example 1.131) contain none of these and still need every
+ * part of the patch, so support is detected per capability instead of being
+ * inferred from the VS Code version string.
+ */
+export const AGENT_HOST_NATIVE_THINKING_LEVEL_SIGNATURE = "_createThinkingLevelConfigSchemaProperty";
+export const AGENT_HOST_NATIVE_NON_STREAMING_PATTERN =
+	/else\s+[\w$]+\.writeHead\(200,\{"Content-Type":"application\/json"\}\)/;
+export const AGENT_HOST_NATIVE_REASONING_EFFORT_PATTERN = /reasoningEffort:[\w$]+\.reasoning\?\.effort/;
+
+export type AgentHostPatchCapabilityId = "thinking-level" | "non-streaming" | "reasoning-effort";
+export type AgentHostPatchCapabilityState = "applied" | "patchable" | "native" | "unsupported";
+
+export interface AgentHostPatchCapability {
+	id: AgentHostPatchCapabilityId;
+	state: AgentHostPatchCapabilityState;
+}
+
+/**
+ * Reports, per capability, whether this bundle already has it, still needs the
+ * patch, or matches neither known shape. Used to avoid reporting a normal
+ * upstream improvement as a version mismatch.
+ */
+export function inspectAgentHostPatchSupport(source: string): AgentHostPatchCapability[] {
+	const capabilities: Array<{ id: AgentHostPatchCapabilityId; applied: string; native: boolean; patchable: string }> = [
+		{
+			id: "thinking-level",
+			applied: AGENT_HOST_THINKING_PATCH_MARKER,
+			native: source.includes(AGENT_HOST_NATIVE_THINKING_LEVEL_SIGNATURE),
+			patchable: BYOK_SNAPSHOT_PATTERN,
+		},
+		{
+			id: "non-streaming",
+			applied: AGENT_HOST_NON_STREAMING_PATCH_MARKER,
+			native: AGENT_HOST_NATIVE_NON_STREAMING_PATTERN.test(source),
+			patchable: PROXY_NON_STREAMING_PATTERN,
+		},
+		{
+			id: "reasoning-effort",
+			applied: AGENT_HOST_REASONING_EFFORT_PATCH_MARKER,
+			native: AGENT_HOST_NATIVE_REASONING_EFFORT_PATTERN.test(source),
+			patchable: PROXY_REASONING_EFFORT_PATTERN,
+		},
+	];
+	return capabilities.map(capability => ({
+		id: capability.id,
+		state: source.includes(capability.applied)
+			? "applied"
+			: source.split(capability.patchable).length - 1 === 1
+				? "patchable"
+				: capability.native
+					? "native"
+					: "unsupported",
+	}));
+}
+
 function sha256(filePath: string): string {
 	return crypto.createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
@@ -122,6 +189,8 @@ export function patchAgentHostBundle(source: string): string {
 export interface AgentHostThinkingPatchStatus {
 	bundlePath: string;
 	applied: boolean;
+	/** True when this VS Code build implements all three behaviours itself. */
+	nativeSupport: boolean;
 	backupExists: boolean;
 	backupPath: string;
 	metadataPath: string;
@@ -138,12 +207,16 @@ export function getAgentHostThinkingPatchStatus(bundlePath: string): AgentHostTh
 	const backupPath = bundlePath + ".llama-vscode-chat.bak";
 	const metadataPath = bundlePath + ".llama-vscode-chat.agent-host-thinking.json";
 	const installed = fs.readFileSync(bundlePath, "utf8");
+	const capabilities = inspectAgentHostPatchSupport(installed);
 	return {
 		bundlePath,
 		applied:
 			installed.includes(AGENT_HOST_THINKING_PATCH_MARKER) &&
 			installed.includes(AGENT_HOST_NON_STREAMING_PATCH_MARKER) &&
 			installed.includes(AGENT_HOST_REASONING_EFFORT_PATCH_MARKER),
+		nativeSupport: capabilities.every(
+			capability => capability.state === "native" || capability.state === "applied"
+		),
 		backupExists: fs.existsSync(backupPath),
 		backupPath,
 		metadataPath,
@@ -156,13 +229,30 @@ export function applyAgentHostThinkingPatch(bundlePath: string, force = false): 
 	if (status.applied) {
 		return { changed: false, status, message: "The agent-host thinking patch is already applied." };
 	}
+	const original = fs.readFileSync(bundlePath, "utf8");
+	const capabilityIds = inspectAgentHostPatchSupport(original);
+	// An updated VS Code that implements all of this itself must not be reported
+	// as a version mismatch, and it needs no backup handling either.
+	if (capabilityIds.every(capability => capability.state === "native")) {
+		return {
+			changed: false,
+			status,
+			message:
+				"This VS Code build already provides the thinking-level picker, non-streaming JSON responses, "
+				+ `and reasoning-effort forwarding natively (${capabilityIds.map(capability => capability.id).join(", ")}), `
+				+"so no agent-host patch is needed.",
+		};
+	}
 	if (status.backupExists && !force) {
 		throw new Error(`Backup already exists: ${status.backupPath}. Restore it first or force the patch after inspection.`);
 	}
-	const original = fs.readFileSync(bundlePath, "utf8");
 	const patched = patchAgentHostBundle(original);
 	if (patched === original) {
-		throw new Error("The installed agent host bundle does not contain any of the expected agent-host patterns (VS Code version mismatch?).");
+		const unmatched = capabilityIds.filter(capability => capability.state !== "native");
+		throw new Error(
+			"The installed agent host bundle does not contain any of the expected agent-host patterns "
+			+ `(VS Code version mismatch? unmatched: ${unmatched.map(capability => capability.id).join(", ")}).`,
+		);
 	}
 	const validationPath = bundlePath + ".llama-vscode-chat.tmp.mjs";
 	fs.writeFileSync(validationPath, patched);

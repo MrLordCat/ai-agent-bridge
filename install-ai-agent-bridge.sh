@@ -16,15 +16,18 @@ set -Eeuo pipefail
 #   VSCODE_EXTENSIONS_DIR=<dir>   Extensions directory (auto-detected)
 #   SKIP_PATCHES=1                Install the extension only
 #   FORCE_PATCH_SUDO=1            Elevate even when the files look writable
+#   DRY_RUN=1                     Show what would be done, then exit
+#   LLAMACPP_INSTALLER_NO_PKEXEC=1  Do not use the polkit password dialog
 #   SUDO_ASKPASS=<helper>         Graphical password helper (auto-detected)
 #
 # Root is only needed when the VS Code application files are not writable by
 # your user (the usual case for system-wide installs such as /usr/lib/code).
 # User-local VS Code installations are patched without any elevation.
 #
-# The installer never blocks on a password prompt. It uses passwordless sudo
-# when configured, otherwise a graphical askpass helper, and if neither is
-# available it applies what it can and prints one command to finish the rest:
+# The installer never blocks on a terminal password prompt. It uses passwordless
+# sudo when configured, otherwise the polkit dialog (pkexec) that asks for the
+# sudo password in a system window, then an askpass helper. If none is available
+# it applies what it can and prints one command to finish the rest:
 #
 #   sudo bash ~/.local/share/llama-vscode-chat/apply-patches.sh
 #
@@ -32,7 +35,7 @@ set -Eeuo pipefail
 # it the way to re-apply the patches after a VS Code update.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-primary_vsix="$script_dir/llama-vscode-chat-1.15.17.vsix"
+primary_vsix="$script_dir/llama-vscode-chat-1.15.18.vsix"
 vsix=""
 
 if [[ -f "$primary_vsix" ]]; then
@@ -229,7 +232,12 @@ run("VS Code workbench", () => {
 run("Agent-host thinking level", () => {
 	const target = agentHost.findAgentHostBundle(appRoot);
 	const result = agentHost.applyAgentHostThinkingPatch(target.bundlePath);
-	return result.changed ? "applied" : "already applied";
+	if (result.changed) {
+		return "applied";
+	}
+	// A build that implements this itself says so in the message; reporting
+	// "already applied" would wrongly imply that the patch marker is present.
+	return /natively/i.test(result.message) ? "provided natively by this VS Code build" : "already applied";
 });
 
 for (const result of results) {
@@ -314,38 +322,54 @@ else
 	write_patch_runner "$runner"
 fi
 
-# Report exactly which files need elevation, and which feature each one unlocks,
-# so the reason for the privilege request is always explicit.
-patch_targets=(
-	"$app_root/extensions/copilot/dist/extension.js|Copilot Chat|native model controls and bounded stored tool output"
-	"$app_root/out/vs/workbench/workbench.desktop.main.js|VS Code workbench|reuse of idle background tool terminals"
-	"$app_root/out/vs/platform/agentHost/node/agentHostMain.js|VS Code agent host|reasoning-effort picker for BYOK models"
-)
-unwritable_targets=()
-for patch_target in "${patch_targets[@]}"; do
-	patch_file="${patch_target%%|*}"
-	if [[ -e "$patch_file" && ! -w "$patch_file" ]]; then
-		unwritable_targets+=("$patch_target")
-	fi
-done
+# Captured before any elevation: the patched files must be handed back to the
+# user who started this script, never left owned by root.
+invoking_uid="$(id -u)"
+invoking_gid="$(id -g)"
 
-# Elevation strategy, decided up front and never blocking:
-#   direct        the files are writable, so no privilege change at all
+# Turns a bundle path into the feature it unlocks, so the privilege request is
+# always self-explanatory.
+patch_target_help() {
+	case "$1" in
+		*"/extensions/copilot/"*) printf '%s' "native model controls and bounded stored tool output" ;;
+		*"/vs/workbench/"*) printf '%s' "reuse of idle background tool terminals" ;;
+		*"/agentHost/"*) printf '%s' "reasoning-effort picker for BYOK models" ;;
+		*) printf '%s' "AI Agent Bridge integration" ;;
+	esac
+}
+
+patch_output_file="$temp_dir/patch-output.txt"
+
+# Elevation strategy. It is decided only after an unelevated pass really hit a
+# permission error, so a password is never requested for work that is already
+# done or that this VS Code build supports natively:
+#   direct        everything was writable, so no privilege change at all
 #   sudo-n        passwordless sudo is configured, so no prompt
+#   pkexec        polkit shows the desktop password dialog (the sudo password)
 #   sudo-askpass  a graphical helper shows the password dialog
 #   manual        nothing available: apply what is possible and print the rest
 patch_used_sudo=0
 elevation="direct"
-if [[ ${#unwritable_targets[@]} -gt 0 || "${FORCE_PATCH_SUDO:-0}" == "1" ]]; then
+
+# Pass 1: no elevation. Applies everything the user can write and reports
+# exactly what is left over.
+set +e
+"$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+patch_status=$?
+set -e
+
+# Only a real permission error justifies asking for a password.
+if [[ "${FORCE_PATCH_SUDO:-0}" == "1" ]] \
+	|| grep -qiE 'eacces|eperm|erofs|permission denied|read-only' "$patch_output_file"; then
 	echo
 	echo "Administrator rights are needed for this VS Code installation."
-	if ((${#unwritable_targets[@]} > 0)); then
+	denied_paths="$(grep -oE "'[^']+\.js'" "$patch_output_file" | tr -d "'" | sort -u)"
+	if [[ -n "$denied_paths" ]]; then
 		echo "Your user cannot write these files:"
-		for patch_target in "${unwritable_targets[@]}"; do
-			patch_file="${patch_target%%|*}"
-			patch_rest="${patch_target#*|}"
-			printf '  %s\n      %s -> %s\n' "$patch_file" "${patch_rest%%|*}" "${patch_rest#*|}"
-		done
+		while IFS= read -r denied_path; do
+			[[ -n "$denied_path" ]] || continue
+			printf '  %s\n      %s\n' "$denied_path" "$(patch_target_help "$denied_path")"
+		done <<<"$denied_paths"
 	else
 		echo "  (forced with FORCE_PATCH_SUDO=1)"
 	fi
@@ -356,52 +380,80 @@ if [[ ${#unwritable_targets[@]} -gt 0 || "${FORCE_PATCH_SUDO:-0}" == "1" ]]; the
 	echo "Command Palette can put the originals back at any time."
 
 	elevation="manual"
-	if command -v sudo >/dev/null 2>&1 && [[ -n "$patch_helper" ]]; then
-		if sudo -n true 2>/dev/null; then
-			elevation="sudo-n"
-			patch_used_sudo=1
-			echo
-			echo "Passwordless sudo is available; applying the patches without a prompt."
-		elif askpass_command="$(find_askpass)"; then
-			elevation="sudo-askpass"
-			patch_used_sudo=1
-			echo
-			echo "Using the graphical password dialog: $askpass_command"
-		fi
+	if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+		elevation="sudo-n"
+		patch_used_sudo=1
+		echo
+		echo "Passwordless sudo is available; applying the patches without a prompt."
+	elif [[ -z "${LLAMACPP_INSTALLER_NO_PKEXEC:-}" ]] \
+		&& command -v pkexec >/dev/null 2>&1 \
+		&& [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+		# polkit asks for the sudo password in a system window, so a single
+		# script run is enough even when the installer was started from a file
+		# manager or another tool that cannot answer a terminal prompt.
+		elevation="pkexec"
+		patch_used_sudo=1
+		echo
+		echo "Requesting administrator rights: enter your password in the system dialog."
+	elif askpass_command="$(find_askpass)"; then
+		elevation="sudo-askpass"
+		patch_used_sudo=1
+		echo
+		echo "Using the graphical password dialog: $askpass_command"
 	fi
 	echo
 fi
 
-patch_output_file="$temp_dir/patch-output.txt"
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+	echo "[dry run] elevation mode: $elevation"
+	echo "[dry run] patch runner:   $node_command $runner"
+	echo "[dry run] extension:      $extension_dir"
+	echo "[dry run] VS Code root:   $app_root"
+	if [[ -n "$patch_helper" ]]; then
+		echo "[dry run] finish command: sudo bash '$patch_helper'"
+	fi
+	exit 0
+fi
 
-# Runs the runner at the privilege level chosen above. Output is captured so the
-# per-patch report can be printed uniformly; no invocation can block on input.
-run_patch_runner() {
-	set +e
-	case "$1" in
+# Runs a command with the chosen elevation. The absolute node path is passed
+# explicitly because sudo and pkexec use a restricted PATH (secure_path) that
+# would not find an nvm/fnm/volta interpreter.
+run_elevated() {
+	case "$elevation" in
 		direct)
-			"$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+			"$@"
 			;;
 		sudo-n)
-			sudo -n -- "$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+			sudo -n -- "$@"
+			;;
+		pkexec)
+			# --disable-internal-agent forces the desktop polkit agent, so the
+			# password is collected in a system dialog instead of a text prompt.
+			pkexec --disable-internal-agent "$@"
 			;;
 		sudo-askpass)
-			# sudo's own PATH (secure_path) would not find an nvm/fnm/volta node, so
-			# the absolute interpreter resolved above is passed explicitly.
-			SUDO_ASKPASS="$askpass_command" sudo -A -- "$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+			SUDO_ASKPASS="$askpass_command" sudo -A -- "$@"
 			;;
 		*)
-			sudo -- "$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+			return 1
 			;;
 	esac
-	patch_status=$?
-	set -e
 }
 
-if [[ "$elevation" == "manual" ]]; then
-	run_patch_runner direct
-else
-	run_patch_runner "$elevation"
+# Pass 2: repeat with the chosen elevation. The runner is idempotent, so the
+# parts already applied by pass 1 are reported as "already applied".
+if [[ "$elevation" != "manual" ]]; then
+	set +e
+	run_elevated "$node_command" "$runner" "$extension_dir" "$app_root" >"$patch_output_file" 2>&1
+	patch_status=$?
+	set -e
+fi
+
+# pkexec reports 126 when the password dialog is dismissed, in which case there
+# is nothing to hand back to the user.
+elevation_cancelled=0
+if [[ "$elevation" == "pkexec" && "$patch_status" == "126" ]]; then
+	elevation_cancelled=1
 fi
 
 if [[ ! -s "$patch_output_file" ]]; then
@@ -412,15 +464,17 @@ fi
 # Artifacts written by an elevated run stay root-owned otherwise, and the
 # extension's own auto-patch and restore (which run unelevated) could not touch
 # them afterwards. Hand them back to the invoking user.
-if [[ "$patch_used_sudo" == "1" && -n "${SUDO_UID:-}" ]]; then
-	sudo -- find \
+if [[ "$patch_used_sudo" == "1" && "$elevation_cancelled" == "0" ]]; then
+	set +e
+	run_elevated find \
 		"$app_root/extensions/copilot/dist" \
 		"$app_root/out/vs/workbench" \
 		"$app_root/out/vs/platform/agentHost/node" \
 		-maxdepth 1 \
 		\( -name '*.llama-vscode-chat.*' -o -name 'extension.js' \
 		-o -name 'workbench.desktop.main.js' -o -name 'agentHostMain.js' \) \
-		-exec chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" {} + 2>/dev/null || true
+		-exec chown "$invoking_uid:$invoking_gid" {} + 2>/dev/null
+	set -e
 fi
 
 patch_failed=0
@@ -438,6 +492,16 @@ while IFS=$'\t' read -r patch_state patch_name patch_detail; do
 done <"$patch_output_file"
 
 echo
+if [[ "$elevation_cancelled" == "1" ]]; then
+	echo "Administrator authorization was dismissed, so the patches were not applied."
+	if [[ -n "$patch_helper" ]]; then
+		echo "Finish them later with: sudo bash '$patch_helper'"
+	fi
+	echo
+	echo "Done. If VS Code is running, reload the window: Ctrl+Shift+P > Developer: Reload Window."
+	exit 0
+fi
+
 patch_needs_root_hint=0
 if [[ "$patch_status" -ne 0 || "$patch_failed" -ne 0 ]]; then
 	# A permission failure is actionable. A shape mismatch (unsupported VS Code
