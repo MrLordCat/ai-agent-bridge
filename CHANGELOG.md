@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.16.2 (dev) - 2026-09-18
+
+- **The reasoning level now actually reaches the server.** Only
+  `enable_thinking` and `thinking_budget_tokens` were sent, and the `thinking`
+  level selected in the model picker changed nothing but that unused budget:
+  the Qwen3 chat template shipped with llama.cpp reads its effort from
+  `chat_template_kwargs.reasoning_effort` and never looks at
+  `thinking_budget_tokens`, so every conversation ran at the template default
+  regardless of the pick. The level is now forwarded as `reasoning_effort`
+  using the canonical names the template validates — `low` for Light, `medium`
+  for Balanced and `high` for Deep — while `auto` is omitted so the server
+  default applies. This matters because the template maps `high` onto `xhigh`,
+  validates the value and raises a template exception for anything else, so
+  forwarding our internal level names (`deep`, `balanced`, `light`) verbatim
+  would have failed every request with a 400. Measured against a live llama.cpp
+  b9506 server: `low` produced 108 reasoning characters, `xhigh` produced 625,
+  confirming the field changes model behaviour and not just the request body.
+- **`thinking_budget_tokens` still applies where a server honours it**, so
+  older llama.cpp builds that consume the budget keep working unchanged.
+
 ## 1.16.1 (dev) - 2026-09-18
 
 - **Model reasoning now reaches a llama.cpp server that sits behind an

@@ -1,5 +1,5 @@
 import * as assert from "assert";
-import { buildChatCompletionRequest } from "../request/chat-request";
+import { buildChatCompletionRequest, toLlamaCppReasoningEffort } from "../request/chat-request";
 import type { OpenAIFunctionToolDef } from "../types";
 
 const tools: OpenAIFunctionToolDef[] = [{
@@ -41,7 +41,7 @@ suite("chat request profiles", () => {
 			min_p: 0,
 			presence_penalty: 0,
 			cache_prompt: true,
-			chat_template_kwargs: { enable_thinking: true, preserve_thinking: true },
+			chat_template_kwargs: { enable_thinking: true, reasoning_effort: "medium", preserve_thinking: true },
 			thinking_budget_tokens: 2048,
 			tools,
 			tool_choice: "auto",
@@ -104,7 +104,7 @@ suite("chat request profiles", () => {
 		});
 
 		assert.strictEqual(request.cache_prompt, true);
-		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: true });
+		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: true, reasoning_effort: "high" });
 		assert.strictEqual(request.thinking_budget_tokens, 16384);
 		assert.strictEqual(request.temperature, 0.7, "sampling fields must stay in place");
 	});
@@ -125,6 +125,33 @@ suite("chat request profiles", () => {
 		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: false });
 		assert.strictEqual(request.thinking_budget_tokens, 0);
 		assert.strictEqual(request.cache_prompt, false);
+	});
+
+	test("maps thinking levels onto the reasoning_effort a llama.cpp template accepts", () => {
+		// The template validates this value and raises on anything unexpected, so
+		// only the canonical names may be sent.
+		assert.strictEqual(toLlamaCppReasoningEffort("light"), "low");
+		assert.strictEqual(toLlamaCppReasoningEffort("balanced"), "medium");
+		assert.strictEqual(toLlamaCppReasoningEffort("deep"), "high");
+		// "auto" must stay undefined so the template keeps its own default, and
+		// "off" is expressed through enable_thinking instead.
+		assert.strictEqual(toLlamaCppReasoningEffort("auto"), undefined);
+		assert.strictEqual(toLlamaCppReasoningEffort("off"), undefined);
+	});
+
+	test("omits reasoning_effort in auto mode so the server default applies", () => {
+		const request = buildChatCompletionRequest({
+			model: "qwen-local",
+			family: "qwen",
+			protocol: "llamacpp",
+			maxTokens: 8192,
+			temperature: 0.7,
+			cachePrompt: true,
+			thinkingMode: "auto",
+			reasoningBudget: 16384,
+		});
+
+		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: true });
 	});
 
 	test("ignores llamaCppCompat when the protocol is DeepSeek-native", () => {

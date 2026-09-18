@@ -35,6 +35,35 @@ export type ChatCompletionRequestBody = Record<string, unknown> & {
 	max_tokens: number;
 };
 
+/**
+ * Maps a thinking level onto the `reasoning_effort` value a llama.cpp chat
+ * template expects.
+ *
+ * Canonical OpenAI names are used because templates validate them: the Qwen3
+ * template shipped with llama.cpp b9506 accepts only `xhigh`/`medium`/`low`,
+ * silently maps `high` to `xhigh`, and raises a template exception for any
+ * other value. That template never reads `thinking_budget_tokens`, so without
+ * this field the level picked in the model picker has no effect at all and the
+ * model always runs at the template default. `auto` is deliberately left
+ * undefined so the template keeps its own default.
+ */
+export function toLlamaCppReasoningEffort(
+	mode: ThinkingMode
+): "low" | "medium" | "high" | undefined {
+	switch (mode) {
+		case "light":
+			return "low";
+		case "balanced":
+			return "medium";
+		case "deep":
+			return "high";
+		case "off":
+		case "auto":
+		default:
+			return undefined;
+	}
+}
+
 export function buildChatCompletionRequest(
 	input: BuildChatCompletionRequestInput
 ): ChatCompletionRequestBody {
@@ -82,9 +111,11 @@ export function buildChatCompletionRequest(
 			request.reasoning_effort = reasoningEffort;
 		}
 	} else if (isLlamaCpp) {
+		const reasoningEffort = toLlamaCppReasoningEffort(input.thinkingMode);
 		request.cache_prompt = input.cachePrompt;
 		request.chat_template_kwargs = {
 			enable_thinking: input.thinkingMode !== "off",
+			...(reasoningEffort === undefined ? {} : { reasoning_effort: reasoningEffort }),
 			...(input.preserveThinking ? { preserve_thinking: true } : {}),
 		};
 		request.thinking_budget_tokens = input.reasoningBudget;
