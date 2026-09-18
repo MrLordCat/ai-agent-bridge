@@ -63,6 +63,90 @@ suite("chat request profiles", () => {
 		assert.strictEqual(request.thinking_budget_tokens, 0);
 	});
 
+	test("keeps the plain OpenAI profile free of llama.cpp-only fields", () => {
+		// A real OpenAI-compatible endpoint rejects unknown request arguments, so
+		// the llama.cpp fields must stay opt-in.
+		const request = buildChatCompletionRequest({
+			model: "gpt-4.1",
+			family: "openai",
+			protocol: "openai",
+			maxTokens: 4096,
+			temperature: 0.7,
+			cachePrompt: true,
+			thinkingMode: "deep",
+			reasoningBudget: 4096,
+			tools,
+			toolChoice: "auto",
+		});
+
+		assert.ok(!("cache_prompt" in request), "cache_prompt must not be sent");
+		assert.ok(!("chat_template_kwargs" in request), "chat_template_kwargs must not be sent");
+		assert.ok(!("thinking_budget_tokens" in request), "thinking_budget_tokens must not be sent");
+		assert.strictEqual(request.temperature, 0.7);
+	});
+
+	test("sends the llama.cpp thinking fields for an OpenAI-protocol gateway when opted in", () => {
+		// llama.cpp behind an OpenAI-compatible gateway: the protocol stays
+		// "openai", but without enable_thinking a Qwen3 template emits no
+		// reasoning at all, which looked like the provider losing its thoughts.
+		const request = buildChatCompletionRequest({
+			model: "Qwen3.8-27B-UD-Q4_K_M.gguf",
+			family: "qwen",
+			protocol: "openai",
+			llamaCppCompat: true,
+			maxTokens: 32768,
+			temperature: 0.7,
+			cachePrompt: true,
+			thinkingMode: "deep",
+			reasoningBudget: 16384,
+			tools,
+			toolChoice: "auto",
+		});
+
+		assert.strictEqual(request.cache_prompt, true);
+		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: true });
+		assert.strictEqual(request.thinking_budget_tokens, 16384);
+		assert.strictEqual(request.temperature, 0.7, "sampling fields must stay in place");
+	});
+
+	test("honours thinkingMode=off for an OpenAI-protocol gateway with llama.cpp fields", () => {
+		const request = buildChatCompletionRequest({
+			model: "Qwen3.8-27B-UD-Q4_K_M.gguf",
+			family: "qwen",
+			protocol: "openai",
+			llamaCppCompat: true,
+			maxTokens: 4096,
+			temperature: 0.7,
+			cachePrompt: false,
+			thinkingMode: "off",
+			reasoningBudget: 0,
+		});
+
+		assert.deepStrictEqual(request.chat_template_kwargs, { enable_thinking: false });
+		assert.strictEqual(request.thinking_budget_tokens, 0);
+		assert.strictEqual(request.cache_prompt, false);
+	});
+
+	test("ignores llamaCppCompat when the protocol is DeepSeek-native", () => {
+		// DeepSeek has its own thinking shape; the llama.cpp fields must not
+		// leak into it even if the flag is set.
+		const request = buildChatCompletionRequest({
+			model: "deepseek-v4-pro",
+			family: "deepseek",
+			protocol: "deepseek",
+			llamaCppCompat: true,
+			maxTokens: 65536,
+			temperature: 1,
+			cachePrompt: true,
+			thinkingMode: "deep",
+			reasoningBudget: 4096,
+		});
+
+		assert.deepStrictEqual(request.thinking, { type: "enabled" });
+		assert.ok(!("chat_template_kwargs" in request), "DeepSeek must keep its own shape");
+		assert.ok(!("cache_prompt" in request), "cache_prompt is llama.cpp-only");
+	});
+
 	test("omits unsupported sampling and tool choice in DeepSeek thinking mode", () => {
 		const request = buildChatCompletionRequest({
 			model: "deepseek-v4-pro",

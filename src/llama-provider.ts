@@ -873,6 +873,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private cloneForLog(value: unknown): unknown {
+        // JSON.stringify(undefined) returns undefined, and JSON.parse(undefined)
+        // then throws and reported the literal string "undefined" in the log,
+        // making it look like a bogus field was sent to the server.
+        if (value === undefined) {
+            return undefined;
+        }
         try {
             return JSON.parse(JSON.stringify(value));
         } catch {
@@ -4510,6 +4516,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             model: requestModelId,
             family: resolvedFamily,
             protocol: source.protocol,
+            llamaCppCompat: source.llamaCppCompat,
             maxTokens,
             temperature,
             cachePrompt,

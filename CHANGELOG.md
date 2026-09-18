@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.16.1 (dev) - 2026-09-18
+
+- **Model reasoning now reaches a llama.cpp server that sits behind an
+  OpenAI-compatible gateway.** Reasoning was only ever switched on for the
+  `llamacpp` API format, so a provider configured as OpenAI-compatible never
+  received `chat_template_kwargs.enable_thinking` — and a Qwen3 chat template
+  with thinking disabled emits no reasoning at all. The same model therefore
+  showed its thoughts when called directly and appeared silent through the
+  gateway, and the thinking level picked in the model picker had no effect.
+  Custom API providers gained a **llama.cpp server behind this endpoint**
+  option (Providers Manager → provider → Edit). When enabled, the provider
+  sends `cache_prompt`, `chat_template_kwargs.enable_thinking` and
+  `thinking_budget_tokens` on top of the OpenAI-compatible shape, keeping the
+  gateway format but restoring native thinking. It stays off by default because
+  a strict OpenAI endpoint rejects unknown request arguments, and the
+  DeepSeek-native format keeps its own fields regardless.
+- **The installer finds the newest VSIX by itself.** It previously preferred a
+  hardcoded file name for the release it shipped with, so once two `.vsix`
+  files sat in the download folder the older one could win. It now parses the
+  version out of `llama-vscode-chat-<version>.vsix` and
+  `llama-vscode-chat-v<version>.vsix` and always picks the highest, and
+  `LLAMACPP_VSIX=<path>` overrides the choice.
+- **Log no longer claims a bogus `chat_template_kwargs` field was sent.**
+  `cloneForLog(undefined)` fell through `JSON.stringify`, which returns
+  `undefined`, then threw in `JSON.parse` and reported the literal string
+  `"undefined"`. Every non-llama.cpp request logged
+  `"chat_template_kwargs":"undefined"`, which made it look like a malformed
+  field was going to the server. The value was never part of the real request;
+  it now logs as `undefined`.
+
 ## 1.16.0 (stable) - 2026-09-17
 
 Stable release consolidating the 1.15.x development patches.

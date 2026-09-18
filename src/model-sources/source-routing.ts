@@ -17,6 +17,17 @@ export interface ChatModelSource {
 	contextLengthOverride?: number;
 	contextLengthFallback?: number;
 	protocol?: ApiRequestProtocol;
+	/**
+	 * Send the llama.cpp-only request fields (`cache_prompt`,
+	 * `chat_template_kwargs.enable_thinking`, `thinking_budget_tokens`) even
+	 * though the protocol is a generic OpenAI-compatible one.
+	 *
+	 * Needed when a llama.cpp server sits behind an OpenAI-compatible gateway:
+	 * the gateway speaks the OpenAI format, so the protocol stays `openai`, but
+	 * without `enable_thinking` a Qwen3 chat template never emits reasoning, and
+	 * the provider appears to think only when talked to directly.
+	 */
+	llamaCppCompat?: boolean;
 }
 
 export interface LlamaCppModelInfo {

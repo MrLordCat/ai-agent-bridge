@@ -39,6 +39,13 @@ export interface ApiProviderProfile {
 	protocol: ApiRequestProtocol;
 	family: ApiProviderFamily;
 	contextLength: number;
+	/**
+	 * Send llama.cpp-only request fields through this endpoint. Needed when a
+	 * llama.cpp server is reached through an OpenAI-compatible gateway: the
+	 * protocol stays `openai`, but `enable_thinking` must still be sent or the
+	 * model produces no reasoning at all.
+	 */
+	llamaCppCompat: boolean;
 	enabled: boolean;
 	createdAt: string;
 	updatedAt: string;
@@ -55,6 +62,7 @@ export interface ApiProviderDraft {
 	protocol?: ApiRequestProtocol;
 	family?: ApiProviderFamily;
 	contextLength?: number;
+	llamaCppCompat?: boolean;
 	enabled?: boolean;
 }
 
@@ -70,6 +78,7 @@ export interface QuickAccessApiProvider {
 	baseUrl: string;
 	protocol: ApiRequestProtocol;
 	contextLength: number;
+	llamaCppCompat: boolean;
 	enabled: boolean;
 	hasApiKey: boolean;
 	balance?: ApiProviderBalanceInfo;
@@ -167,6 +176,7 @@ function normalizeStoredProfile(value: unknown): ApiProviderProfile | undefined 
 			protocol: normalizeProtocol(record.protocol),
 			family: normalizeFamily(record.family),
 			contextLength: normalizeContextLength(record.contextLength),
+			llamaCppCompat: record.llamaCppCompat === true,
 			enabled: record.enabled !== false,
 			createdAt: typeof record.createdAt === "string" ? record.createdAt : now,
 			updatedAt: typeof record.updatedAt === "string" ? record.updatedAt : now,
@@ -243,6 +253,7 @@ export class ApiProviderService implements vscode.Disposable {
 				baseUrl: profile.baseUrl,
 				protocol: profile.protocol,
 				contextLength: profile.contextLength,
+				llamaCppCompat: profile.llamaCppCompat,
 				enabled: profile.enabled,
 				hasApiKey: profile.hasApiKey,
 				balance: await this.getBalanceInfo(profile.id),
@@ -282,6 +293,7 @@ export class ApiProviderService implements vscode.Disposable {
 			familyOverride: profile.family,
 			contextLengthOverride: profile.contextLength,
 			protocol: profile.protocol,
+			llamaCppCompat: profile.llamaCppCompat,
 		})));
 	}
 
@@ -306,6 +318,7 @@ export class ApiProviderService implements vscode.Disposable {
 			protocol: normalizeProtocol(draft.protocol),
 			family: normalizeFamily(draft.family),
 			contextLength: normalizeContextLength(draft.contextLength),
+			llamaCppCompat: draft.llamaCppCompat === true,
 			enabled: draft.enabled !== false,
 			createdAt: existing?.createdAt ?? now,
 			updatedAt: now,

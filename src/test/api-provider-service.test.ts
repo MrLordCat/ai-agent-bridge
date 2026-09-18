@@ -75,9 +75,52 @@ suite("API provider service", () => {
 			familyOverride: "auto",
 			contextLengthOverride: 200_000,
 			protocol: "openai",
+			llamaCppCompat: false,
 		});
 
 		service.dispose();
+	});
+
+	test("persists the llama.cpp compatibility flag and forwards it to the model source", async () => {
+		const state = new MockMemento();
+		const service = new ApiProviderService(state, new MockSecretStorage());
+
+		const created = await service.upsert({
+			name: "TestLocal",
+			baseUrl: "https://api.example.test/v1",
+			protocol: "openai",
+			family: "qwen",
+			contextLength: 191_488,
+			llamaCppCompat: true,
+		});
+
+		assert.strictEqual(created.llamaCppCompat, true, "the flag must survive the write");
+		// A second service reads the persisted state, i.e. a VS Code restart.
+		const reopened = new ApiProviderService(state, new MockSecretStorage());
+		assert.strictEqual(reopened.list()[0].llamaCppCompat, true, "the flag must survive a reload");
+		assert.strictEqual((await reopened.getModelSources())[0].llamaCppCompat, true,
+			"the flag must reach the request builder through the model source");
+
+		await reopened.upsert({ ...created, llamaCppCompat: false });
+		assert.strictEqual(reopened.list()[0].llamaCppCompat, false, "the flag must be switchable off");
+		assert.strictEqual((await reopened.getModelSources())[0].llamaCppCompat, false);
+
+		// Profiles stored before the option existed must read back as disabled.
+		await state.update("llamacpp.apiProviders.v1", [{
+			id: "legacy-1",
+			name: "Legacy",
+			baseUrl: "https://legacy.example/v1",
+			protocol: "openai",
+			family: "auto",
+			contextLength: 200_000,
+			enabled: true,
+			createdAt: "2026-08-09T00:00:00.000Z",
+			updatedAt: "2026-08-09T00:00:00.000Z",
+		}]);
+		assert.strictEqual(reopened.list()[0].llamaCppCompat, false, "older profiles default to off");
+
+		service.dispose();
+		reopened.dispose();
 	});
 
 	test("preserves an existing key on ordinary edits and deletes it with the profile", async () => {

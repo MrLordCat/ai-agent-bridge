@@ -10,6 +10,7 @@ function profile(overrides: Partial<QuickAccessApiProvider> = {}): QuickAccessAp
                 baseUrl: "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
                 protocol: "openai",
                 contextLength: 131_072,
+                llamaCppCompat: false,
                 enabled: true,
                 hasApiKey: true,
                 ...overrides,

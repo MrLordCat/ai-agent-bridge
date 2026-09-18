@@ -232,6 +232,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 						${selectOption("llamacpp", editing?.protocol ?? "openai", "llama.cpp")}
 					</select>
 					<small>Controls request fields. Gateways such as OpenRouter normally use OpenAI-compatible.</small>
+					<small>Even a llama.cpp endpoint reached through a gateway must keep OpenAI-compatible here; tick the llama.cpp option below to restore native thinking.</small>
 				</label>
 				<label>
 					<span>Model family</span>
@@ -259,6 +260,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 			</div>
 			<div class="form-options">
 					<label class="check"><input id="provider-enabled" type="checkbox"${editing?.enabled !== false ? " checked" : ""} /> Enabled</label>
+					<label class="check" title="Adds cache_prompt, chat_template_kwargs.enable_thinking and thinking_budget_tokens to every request."><input id="provider-llamacpp-compat" type="checkbox"${editing?.llamaCppCompat ? " checked" : ""} /> llama.cpp server behind this endpoint</label>
 					${editing?.hasApiKey ? '<label class="check danger-text"><input id="provider-clear-key" type="checkbox" /> Delete saved API key</label>' : ""}
 				</div>
 				</div>
@@ -291,6 +293,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 				<span>${esc(profile.protocol)}</span>
 				<span>family: ${esc(profile.family)}</span>
 				<span>ctx ${profile.contextLength.toLocaleString("en-US")}</span>
+				${profile.llamaCppCompat ? '<span title="Sends cache_prompt, enable_thinking and thinking_budget_tokens.">llama.cpp fields</span>' : ""}
 				<span class="${profile.hasApiKey ? "key-set" : ""}">${profile.hasApiKey ? "key saved" : "no key"}</span>
 			</div>
 			<div class="actions">
@@ -480,6 +483,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 						protocol: document.getElementById('provider-protocol').value,
 						family: document.getElementById('provider-family').value,
 						contextLength: Number(document.getElementById('provider-context').value),
+						llamaCppCompat: document.getElementById('provider-llamacpp-compat').checked,
 						enabled: document.getElementById('provider-enabled').checked,
 					},
 					apiKey: document.getElementById('provider-key').value,

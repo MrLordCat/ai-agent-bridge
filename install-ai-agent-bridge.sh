@@ -35,33 +35,40 @@ set -Eeuo pipefail
 # it the way to re-apply the patches after a VS Code update.
 
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-# A local `npm run package` produces "llama-vscode-chat-<version>.vsix", while
-# the GitHub release asset is "llama-vscode-chat-v<version>.vsix"; accept both so
-# the same script works whichever file the user downloaded.
-vsix=""
-
-for preferred in \
-	"$script_dir/llama-vscode-chat-1.16.0.vsix" \
-	"$script_dir/llama-vscode-chat-v1.16.0.vsix"
-do
-	if [[ -f "$preferred" ]]; then
-		vsix="$preferred"
-		break
+# Pick the newest llama-vscode-chat-*.vsix sitting next to this script. Both
+# naming styles occur: a local `npm run package` writes
+# "llama-vscode-chat-<version>.vsix", while the GitHub release asset is
+# "llama-vscode-chat-v<version>.vsix". The version is parsed out of either and
+# the highest one wins, so this keeps working across releases with no edits.
+vsix="${LLAMACPP_VSIX:-}"
+if [[ -n "$vsix" ]]; then
+	if [[ ! -f "$vsix" ]]; then
+		echo "ERROR: LLAMACPP_VSIX does not point at a file: $vsix" >&2
+		exit 1
 	fi
-done
-
-if [[ -z "$vsix" ]]; then
-	mapfile -t vsix_candidates < <(
-		find "$script_dir" -maxdepth 1 -type f -name 'llama-vscode-chat-*.vsix' -printf '%f\n' \
-			| sort -V
-	)
-	if ((${#vsix_candidates[@]} > 0)); then
-		vsix="$script_dir/${vsix_candidates[${#vsix_candidates[@]} - 1]}"
-	fi
+else
+	newest_vsix=""
+	newest_version=""
+	for candidate in "$script_dir"/llama-vscode-chat-*.vsix; do
+		[[ -f "$candidate" ]] || continue
+		candidate_name="${candidate##*/}"
+		candidate_version="${candidate_name#llama-vscode-chat-}"
+		candidate_version="${candidate_version%.vsix}"
+		candidate_version="${candidate_version#v}"
+		if [[ -z "$newest_version" ]] \
+			|| { [[ "$candidate_version" != "$newest_version" ]] \
+				&& [[ "$(printf '%s\n' "$candidate_version" "$newest_version" | sort -V | tail -n 1)" == "$candidate_version" ]]; }; then
+			newest_vsix="$candidate"
+			newest_version="$candidate_version"
+		fi
+	done
+	vsix="$newest_vsix"
 fi
 
 if [[ -z "$vsix" ]]; then
 	echo "ERROR: llama-vscode-chat-*.vsix not found next to this script: $script_dir" >&2
+	echo "Download it from https://github.com/MrLordCat/ai-agent-bridge/releases/latest" >&2
+	echo "or point LLAMACPP_VSIX at an existing .vsix file." >&2
 	exit 1
 fi
 

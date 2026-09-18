@@ -172,6 +172,7 @@ suite("Providers Manager webview", () => {
                                 protocol: "openai",
                                 family: "auto",
                                 contextLength: 131072,
+                                llamaCppCompat: false,
                                 enabled: true,
                                 hasApiKey: true,
                                 createdAt: "2026-08-19T00:00:00.000Z",

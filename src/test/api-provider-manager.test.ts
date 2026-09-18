@@ -14,6 +14,7 @@ suite("API provider manager", () => {
 				protocol: "openai",
 				family: "deepseek",
 				contextLength: 262_144,
+				llamaCppCompat: false,
 				enabled: true,
 				createdAt: "2026-08-09T00:00:00.000Z",
 				updatedAt: "2026-08-09T00:00:00.000Z",

@@ -23,6 +23,8 @@ export interface BuildChatCompletionRequestInput {
 	preserveThinking?: boolean;
 	tools?: OpenAIFunctionToolDef[];
 	toolChoice?: OpenAIToolChoice;
+	/** See {@link ChatModelSource.llamaCppCompat}: forces the llama.cpp field set. */
+	llamaCppCompat?: boolean;
 }
 
 export type ChatCompletionRequestBody = Record<string, unknown> & {
@@ -38,7 +40,11 @@ export function buildChatCompletionRequest(
 ): ChatCompletionRequestBody {
 	const isDeepSeek = input.protocol === "deepseek"
 		|| (input.protocol === undefined && input.family === "deepseek");
-	const isLlamaCpp = input.protocol === "llamacpp"
+	// An OpenAI-compatible gateway in front of llama.cpp keeps protocol "openai"
+	// but still needs the llama.cpp-only thinking fields, otherwise the model
+	// never receives enable_thinking and produces no reasoning at all.
+	const isLlamaCpp = input.llamaCppCompat === true
+		|| input.protocol === "llamacpp"
 		|| (input.protocol === undefined && !isDeepSeek);
 	const isDeepSeekThinkingRequest = isDeepSeek && input.thinkingMode !== "off";
 	const request: ChatCompletionRequestBody = {
