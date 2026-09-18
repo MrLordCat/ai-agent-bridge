@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.16.2 (dev) - 2026-09-18
+## 1.16.2 (stable) - 2026-09-18
 
 - **The reasoning level now actually reaches the server.** Only
   `enable_thinking` and `thinking_budget_tokens` were sent, and the `thinking`
@@ -20,7 +20,7 @@
 - **`thinking_budget_tokens` still applies where a server honours it**, so
   older llama.cpp builds that consume the budget keep working unchanged.
 
-## 1.16.1 (dev) - 2026-09-18
+## 1.16.1 (dev, shipped in 1.16.2) - 2026-09-18
 
 - **Model reasoning now reaches a llama.cpp server that sits behind an
   OpenAI-compatible gateway.** Reasoning was only ever switched on for the
