@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.16.3 (dev) - 2026-09-23
+
+- **Quick Access: subscription limit rows no longer truncate the reset moment.**
+  The Codex `Session Limit (5h)` and `Weekly Limit` rows packed the percent used
+  and the reset time into a single line, so `resets 9/23/2026, 3:11:00 PM` was cut
+  off exactly where the reset time begins. Each row now keeps the short
+  `0% used` summary on the parent row and shows `Next Reset` on an indented
+  child row that starts at the left edge of the tree, so the timestamp is fully
+  visible. The rows render expanded by default, and the fallback `Usage Limit`
+  row uses the same layout.
+
 ## 1.16.2 (stable) - 2026-09-18
 
 - **The reasoning level now actually reaches the server.** Only

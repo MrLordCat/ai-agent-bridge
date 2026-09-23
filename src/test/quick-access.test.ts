@@ -329,10 +329,20 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const balance = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Balance");
 		assert.strictEqual(balance?.description, "110.00 CNY");
 
+		// Limit rows keep the short used summary on the parent row and show the
+		// reset moment on an indented child row, so the reset time is not cut off.
 		const fiveHour = (await getItems(provider, codex)).find(item => labelOf(item) === "Session Limit (5h)");
-		assert.strictEqual(fiveHour?.description, "87% used · resets 2.08 14:00");
+		assert.strictEqual(fiveHour?.description, "87% used");
+		assert.strictEqual(
+			(await getItems(provider, fiveHour)).find(item => labelOf(item) === "Next Reset")?.description,
+			"2.08 14:00"
+		);
 		const weekly = (await getItems(provider, codex)).find(item => labelOf(item) === "Weekly Limit");
-		assert.strictEqual(weekly?.description, "20% used · resets 7.08 21:45");
+		assert.strictEqual(weekly?.description, "20% used");
+		assert.strictEqual(
+			(await getItems(provider, weekly)).find(item => labelOf(item) === "Next Reset")?.description,
+			"7.08 21:45"
+		);
 
 		// Claude cache keep-alive toggle is visible and defaults to on.
 		const keepAlive = (await getItems(provider, claude)).find(item => labelOf(item) === "Cache Keep-Alive");
