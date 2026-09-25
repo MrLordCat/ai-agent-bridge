@@ -82,6 +82,16 @@ Dev-патчи **НЕ тэгаются** в git и **НЕ выпускаются
 
 Автоматизировано скриптом `scripts/stable-release.sh`.
 
+### Релиз патча (по явной команде)
+```bash
+git tag -a v1.16.3 -m "Release 1.16.3"
+git push origin main v1.16.3
+```
+Тег `v*` запускает workflow Release: lint + тесты + `npm run package`,
+затем GitHub Release с VSIX и `install-ai-agent-bridge.sh`. Описание релиза
+берётся из `docs/RELEASE_NOTES.md`, поэтому его и `CHANGELOG.md` обновляют
+ДО тега. Патчи тэгуются только по явной команде пользователя.
+
 ### Откат к стабильной версии
 ```bash
 git checkout v1.9.0

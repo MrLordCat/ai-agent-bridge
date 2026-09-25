@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.16.3 (dev) - 2026-09-23
+## 1.16.3 (patch release) - 2026-09-25
 
 - **Quick Access: subscription limit rows no longer truncate the reset moment.**
   The Codex `Session Limit (5h)` and `Weekly Limit` rows packed the percent used
@@ -10,6 +10,30 @@
   child row that starts at the left edge of the tree, so the timestamp is fully
   visible. The rows render expanded by default, and the fallback `Usage Limit`
   row uses the same layout.
+
+- **Both installers pick the newest VSIX by version.** The Windows script no
+  longer holds a hardcoded `PRIMARY_VSIX` from the release it shipped with, and
+  the name-based fallback is gone as well: it sorted names, so `1.16.9` beat
+  `1.16.10` and the older file was installed. The choice is now made with a
+  version comparison (`PRIMARY_VSIX` still forces one file, `LLAMACPP_VSIX`
+  still overrides both scripts). Verified in an isolated fixture with a stub
+  CLI and a stub VS Code tree — newest-version selection, temp copy, patch
+  phase, `SKIP_PATCHES=1`, `DRY_RUN=1` and the missing-VSIX error path — and
+  end-to-end on Windows, where the script selected 1.16.3 out of four VSIX
+  files and installed it.
+- **The README matches the project again.** It claimed Windows was the only
+  supported platform and called the Linux installer "VSIX installation only",
+  while that installer applies the VS Code / Copilot Chat patches in the same
+  run. The install section now documents both platforms, the real installer
+  behaviour and every environment override, and its examples use the current
+  version; the development block names 1.16.2 as stable and 499 tests.
+
+- **Releases are published from a tag.** Pushing `v*` runs the Release
+  workflow (lint, tests, `npm run package`), which attaches the VSIX and
+  `install-ai-agent-bridge.sh` to the GitHub Release and uses
+  `docs/RELEASE_NOTES.md` as its description — so the notes and the changelog
+  have to be updated before tagging. `AGENTS.md` now says so next to the
+  versioning rules.
 
 ## 1.16.2 (stable) - 2026-09-18
 

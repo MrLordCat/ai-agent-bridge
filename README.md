@@ -40,9 +40,10 @@ recent conversation history.*
 
 ## Install
 
-VS Code **1.131 or newer is required** (the agent-host patches and the
-Copilot Chat patch are validated against 1.131; older versions degrade
-silently). Windows is the only supported platform.
+VS Code **1.131 or newer is required** (the agent-host and Copilot Chat
+patches are validated against 1.131 and 1.136.1; older versions degrade
+silently). Windows and Linux are supported, including the bundle patches
+that need write access to the VS Code application directory.
 
 The extension ships as a VSIX from GitHub Releases. It is not on the VS Code
 Marketplace: the optional Copilot Chat patch is not a Marketplace API, so the
@@ -52,35 +53,50 @@ package is deliberately distributed outside the gallery.
    [Releases](https://github.com/MrLordCat/ai-agent-bridge/releases/latest).
 2. Install it:
    ```sh
-   code --install-extension llama-vscode-chat-v1.14.3.vsix
+   code --install-extension llama-vscode-chat-v1.16.3.vsix
    ```
 3. Run `Developer: Reload Window`.
 
-### Installer script (recommended when the VSIX lives on a network share)
+### Installer script
 
-The VS Code installer rejects VSIX files opened from a UNC path (`\\host\...`)
-with `Extract: UNC host ... access is not allowed`. When the package sits on
-a share, place the matching installer next to it on the target machine. The
-script copies the VSIX to the local temp folder and installs it from there.
+Both installers copy the VSIX to the local temp folder before handing it to
+VS Code, because the installer rejects VSIX files opened from a UNC path
+(`\\host\...`) with `Extract: UNC host ... access is not allowed`. Both also
+pick the **newest** `llama-vscode-chat-*.vsix` sitting next to the script,
+compared as versions so `1.16.10` wins over `1.16.9`: drop the script and the
+VSIX in one folder and run the script.
 
-Windows (`cmd.exe`):
+Windows (`cmd.exe`) — installs the extension; the extension applies the bundle
+patches itself on the next window reload:
 
 ```sh
 .\install-ai-agent-bridge.cmd
 ```
 
-Linux (including CachyOS; VSIX installation only):
+Linux (including CachyOS) — installs the extension and then applies the
+VS Code / Copilot Chat patches in the same run, reusing the extension's own
+compiled patch code:
 
 ```sh
 chmod +x install-ai-agent-bridge.sh
 ./install-ai-agent-bridge.sh
 ```
 
-The Windows script prefers the version in its `PRIMARY_VSIX` setting and the
-Linux script prefers the current `llama-vscode-chat-1.15.17.vsix`; both
-fall back to the newest `llama-vscode-chat-*.vsix` next to the script. If the
-VS Code CLI is not named `code` or `code-insiders`, set `VSCODE_CLI` when
-running the Linux script.
+The Linux script never blocks on a password typed into a terminal: admin
+rights are requested only after an unelevated pass really hit a permission
+error, in the order passwordless `sudo`, the polkit system dialog, a graphical
+`SUDO_ASKPASS` helper — or, when none is available, everything writable is
+applied and the single command that finishes the rest is printed. The runner
+is kept at `~/.local/share/llama-vscode-chat/apply-patches.sh`, which is also
+how the patches are re-applied after a VS Code update. A user-local VS Code
+installation needs no elevation at all.
+
+Overrides for unusual setups: `LLAMACPP_VSIX=<path>` picks a specific VSIX,
+`VSCODE_CLI=<command>` names a CLI that is not `code`/`code-insiders`,
+`VSCODE_APP_ROOT` and `VSCODE_EXTENSIONS_DIR` describe a custom layout,
+`SKIP_PATCHES=1` installs the extension only, `DRY_RUN=1` prints what would
+happen, `FORCE_PATCH_SUDO=1` elevates even when the files look writable, and
+`LLAMACPP_INSTALLER_NO_PKEXEC=1` skips the polkit dialog.
 
 ## Quick Start
 
@@ -352,18 +368,18 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.15.0. Current local development build: 1.15.1.** The
-stable line consolidates the 1.13.x development patches: Claude follow-up
-messages are forwarded to the resumed session, the active-turn timeout is
-300 s with a pending-tool guard, DeepSeek peak-hours billing is shown in
-Quick Access, and the README is now a full storefront with branding,
-screenshots, and measured cache-hit numbers.
+**Stable release: 1.16.2. Current build: 1.16.3.** The 1.16 line forwards
+reasoning to gateway-backed llama.cpp servers, sends the picked thinking
+level as `reasoning_effort`, shows each subscription limit with its reset
+moment in Quick Access, adds the `wait_for_terminal` tool, recovers Claude
+sessions across providers, and applies the VS Code / Copilot Chat patches
+from the installer itself in one run.
 
 ```sh
 npm install
 npm run compile
 npm run lint
-npm test              # 459 extension-host tests in the current 1.15.1 dev patch
+npm test              # 499 extension-host tests in the current 1.16.3 build
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```
@@ -373,6 +389,10 @@ fork of a llama.cpp provider, it is now an independent extension; the
 `llamacpp.*` setting and command namespace remains for compatibility.
 Creating a Git tag or publishing a release is intentionally separate from
 building a local VSIX; see `scripts/stable-release.sh` for the clean-tree gate.
+Pushing a `v*` tag is what publishes a release: the Release workflow runs lint
+and tests, packages the VSIX, and attaches it plus `install-ai-agent-bridge.sh`
+to the GitHub Release, using `docs/RELEASE_NOTES.md` as the release text —
+update that file and `CHANGELOG.md` before tagging.
 
 ## License
 

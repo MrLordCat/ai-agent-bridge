@@ -4,13 +4,17 @@ rem AI Agent Bridge installer for VS Code.
 rem The VS Code installer rejects vsix files opened from a network share
 rem ("Extract: UNC host ... access is not allowed"), so this script copies
 rem the vsix next to itself to the local temp folder and installs from there.
-rem Update PRIMARY_VSIX on every version bump (the file next to this script).
+rem Drop the .vsix next to this script and run it: the newest version in the
+rem folder is installed, so this file needs no edit on a version bump. Set
+rem PRIMARY_VSIX below only to force one specific file.
 
-set "PRIMARY_VSIX=%~dp0llama-vscode-chat-1.15.17.vsix"
+set "PRIMARY_VSIX="
 set "VSIX="
-if exist "%PRIMARY_VSIX%" set "VSIX=%PRIMARY_VSIX%"
+if defined PRIMARY_VSIX if exist "%PRIMARY_VSIX%" set "VSIX=%PRIMARY_VSIX%"
 if not defined VSIX (
-    for %%F in ("%~dp0llama-vscode-chat-1.*.vsix") do set "VSIX=%%~fF"
+    rem Compared as versions, not as names: a plain sort puts 1.16.9 after
+    rem 1.16.10 and would install the older one.
+    for /f "usebackq delims=" %%F in (`powershell -NoProfile -ExecutionPolicy Bypass -Command "$best = $null; $seen = [version]'0.0.0'; foreach ($file in Get-ChildItem -LiteralPath '%~dp0' -Filter 'llama-vscode-chat-*.vsix' -File) { $version = [version]($file.BaseName -replace 'llama-vscode-chat-v?', ''); if ($version -gt $seen) { $seen = $version; $best = $file } }; if ($best) { $best.FullName }"`) do set "VSIX=%%F"
 )
 if not defined VSIX (
     echo ERROR: llama-vscode-chat-*.vsix not found next to this script: %~dp0
