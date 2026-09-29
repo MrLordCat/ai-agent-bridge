@@ -92,6 +92,23 @@ import {
 	});
 
 suite("Copilot patch", () => {
+	for (const mimeType of [
+		'"text/plain"',
+		'a.text.trimStart().startsWith("{")?"application/json":sr.text',
+	]) {
+		test(`bounds native tool results while preserving MIME detection: ${mimeType}`, () => {
+			const source = 'function terminal(e){return{text:e.replace(/\\r?\\n/g,`\\r' + '\n' + '`)}}' +
+				`function native(s){let r=[],a;switch(a.type){case"text":r.push({type:"embed",value:a.text,isText:!0,mimeType:${mimeType}});break;case"embeddedResource":r.push({type:"embed",value:a.data,mimeType:a.contentType});break}}` +
+				'let item={terminalCommandOutput:typeof l.output?.text=="string"?{text:l.output.text}:void 0};';
+			const patched = patchVsCodeWorkbenchBundle(source);
+			assert.ok(patched.includes(`value:__llamaBoundToolText(a.text),isText:!0,mimeType:${mimeType}`));
+			assert.ok(patched.includes('value:__llamaBoundToolPayload(a.data,a.contentType)'));
+			assert.ok(patched.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER));
+			assert.strictEqual(patchVsCodeWorkbenchBundle(patched), patched);
+			new Script(patched);
+		});
+	}
+
 	test("keeps v16 prompt rendering and stored tool output bounded", function () {
 		// GitHub-hosted Windows runners only have the bare VS Code
 		// archive (no bundled extensions), so the real-bundle test is

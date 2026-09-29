@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.16.5 (patch release) - 2026-09-29
+
+- **API keys stay with their intended endpoint.** The primary key is no longer
+  sent to DeepSeek unless the primary server is the official HTTPS DeepSeek
+  API. A workspace setting cannot redirect a key stored for the global primary
+  URL to another host. DeepSeek host detection now requires the exact official
+  hostname instead of accepting lookalike domains.
+- **HTTP error bodies no longer reach logs or user-facing errors.** The small
+  part needed for retry and compatibility detection is read with an 8 KiB cap
+  and a three-second deadline;
+  the rest of the stream is cancelled. This also prevents a provider from
+  exhausting memory or disk with a large error response.
+- **The Linux/macOS installer no longer elevates or changes ownership of VS Code
+  files.** It runs as the current user and reports when a system-wide VS Code
+  installation needs a user-owned installation for patching.
+- **Copilot Chat patch handles the current VS Code workbench serializer.**
+  Regression tests cover both the older and current bundle shapes; user-owned
+  VS Code installations can apply the patch without administrator rights.
+- **Dependency lockfile updated.** `npm audit` reports zero vulnerabilities in
+  the full dependency tree as of this release.
+
 ## 1.16.3 (patch release) - 2026-09-25
 
 - **Quick Access: subscription limit rows no longer truncate the reset moment.**

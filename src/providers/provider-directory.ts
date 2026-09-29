@@ -92,16 +92,10 @@ export function defaultProbeHttp(
 	return fetch(endpoint, { method: "GET", headers, signal: controller.signal })
 		.then(async response => {
 			if (!response.ok) {
-				let bodySnippet = "";
-				try {
-					bodySnippet = (await response.text()).trim().slice(0, 160);
-				} catch {
-					// Keep the empty snippet when the body cannot be read.
-				}
 				return {
 					ok: false,
 					status: response.status,
-					error: `HTTP ${response.status} ${response.statusText}${bodySnippet ? ` (${bodySnippet})` : ""}`,
+					error: `HTTP ${response.status} ${response.statusText}`,
 				} satisfies HttpProbeResult;
 			}
 			return { ok: true } satisfies HttpProbeResult;

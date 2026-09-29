@@ -254,11 +254,11 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 		match => `${helper}${match[1]}__llamaBoundToolText(${match[2]})`,
 		"terminal tool output serializer"
 	);
-	patched = replacePatternOnce(
+	patched = replacePatternOnceWith(
 		patched,
-		/case"text":([A-Za-z_$][\w$]*)\.push\(\{type:"embed",value:([A-Za-z_$][\w$]*)\.text,isText:!0,mimeType:"text\/plain"\}\);break;case"embeddedResource":\1\.push\(\{type:"embed",value:\2\.data,mimeType:\2\.contentType\}\);break/,
-		'case"text":$1.push({type:"embed",value:__llamaBoundToolText($2.text),isText:!0,mimeType:"text/plain"});break;' +
-			'case"embeddedResource":$1.push({type:"embed",value:__llamaBoundToolPayload($2.data,$2.contentType),mimeType:$2.contentType});break',
+		/case"text":([A-Za-z_$][\w$]*)\.push\(\{type:"embed",value:([A-Za-z_$][\w$]*)\.text,isText:!0,mimeType:([^;]{1,160}?)\}\);break;case"embeddedResource":\1\.push\(\{type:"embed",value:\2\.data,mimeType:\2\.contentType\}\);break/,
+		match => `case"text":${match[1]}.push({type:"embed",value:__llamaBoundToolText(${match[2]}.text),isText:!0,mimeType:${match[3]}});break;` +
+			`case"embeddedResource":${match[1]}.push({type:"embed",value:__llamaBoundToolPayload(${match[2]}.data,${match[2]}.contentType),mimeType:${match[2]}.contentType});break`,
 		"native tool result serializer"
 	);
 	patched = replacePatternOnce(

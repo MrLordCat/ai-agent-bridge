@@ -114,6 +114,7 @@ import {
     isTransientHttpStatus,
     OpenAIHttpTransport,
     parseRetryAfterMs,
+    readHttpErrorText,
 } from "./transport/openai-http";
 import type { OpenAIChatMessage } from "./types";
 
@@ -3749,7 +3750,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private async getModelSources(): Promise<ChatModelSource[]> {
         const cfg = this.getConfig();
         const configuredServerUrl = await this.getServerUrl();
-        const apiKey = await this.getApiKey();
+        const apiKey = await this.getPrimaryApiKeyForServerUrl(configuredServerUrl);
         const deepSeekApiKey = await this.getDeepSeekApiKey();
         const apiSources = await this.getApiModelSources?.() ?? [];
         return createModelSources({
@@ -3787,7 +3788,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 serverUrl: legacyServerUrl,
                 apiKey: this.isDeepSeekServer(legacyServerUrl)
                     ? await this.getDeepSeekApiKey()
-                    : await this.getApiKey(),
+                    : await this.getPrimaryApiKeyForServerUrl(legacyServerUrl),
                 familyOverride: this.isDeepSeekServer(legacyServerUrl) ? "deepseek" : undefined,
                 contextLengthOverride: this.isDeepSeekServer(legacyServerUrl)
                     ? this.getConfiguredDeepSeekContextLength()
@@ -4588,7 +4589,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         return response;
                     }
 
-                    const errorText = await response.text();
+                    await readHttpErrorText(response);
                     const retryAfterMs = parseRetryAfterMs(response.headers.get("retry-after"));
                     const exponentialDelay = transientRetryBaseDelayMs * (2 ** (transportAttempt - 1));
                     const delayMs = Math.min(30_000, retryAfterMs ?? Math.round(exponentialDelay + Math.random() * transientRetryBaseDelayMs * 0.25));
@@ -4599,7 +4600,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         status: response.status,
                         statusText: response.statusText,
                         delayMs,
-                        errorText: errorText.slice(0, 1000),
                     });
                     await waitForRetry(delayMs);
                 } catch (error) {
@@ -5249,13 +5249,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             let retriedAfterOverflow = false;
 
             if (!response.ok && retryOnOverflow) {
-                const errText = await response.text();
+                const errText = await readHttpErrorText(response);
                 this.log("chat.request.error", {
                     requestId,
                     attemptNo,
                     status: response.status,
                     statusText: response.statusText,
-                    errorText: errText,
                 });
                 if (this.isContextOverflowError(response.status, errText)) {
                     const overflowCompaction = selectContextCompaction({
@@ -5377,13 +5376,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             }
 
             if (!response.ok) {
-                const errorText = await response.text();
+                const errorText = await readHttpErrorText(response);
                 this.log("chat.request.final_error", {
                     requestId,
                     attemptNo,
                     status: response.status,
                     statusText: response.statusText,
-                    errorText,
                     retriedAfterOverflow,
                 });
                 return {
@@ -5470,7 +5468,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                         to: "user",
                         status: attempt.status,
                         statusText: attempt.statusText,
-                        errorText: attempt.errorText,
                     });
                     activeToolResultMode = "user";
                     usedMessages = convertForMode(activeToolResultMode);
@@ -5481,7 +5478,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     const retryHint = attempt.retriedAfterOverflow
                         ? "\nRetry after automatic compaction did not fit context."
                         : "";
-                    throw new Error(`Llama.cpp API error: ${attempt.status} ${attempt.statusText}\n${attempt.errorText}${retryHint}`);
+                    throw new Error(`Llama.cpp API error: ${attempt.status} ${attempt.statusText}${retryHint}`);
                 }
 
                 return { attempt, usedMessages };
@@ -6137,18 +6134,43 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return await this.secrets.get("llamacpp.apiKey");
     }
 
-    private async getDeepSeekApiKey(): Promise<string | undefined> {
-        return (await this.secrets.get("llamacpp.deepSeekApiKey")) ?? (await this.getApiKey());
+    /** A workspace URL may override the primary endpoint, but it cannot redirect its global key. */
+    private async getPrimaryApiKeyForServerUrl(serverUrl: string): Promise<string | undefined> {
+        const globalUrl = this.getConfig().inspect<string>("serverUrl")?.globalValue;
+        const trustedUrl = typeof globalUrl === "string" && globalUrl.trim()
+            ? globalUrl
+            : (await this.secrets.get("llamacpp.serverUrl")) || DEFAULT_SERVER_URL;
+        const credentialScope = (value: string): string | undefined => {
+            try {
+                const url = new URL(value);
+                if ((url.protocol !== "http:" && url.protocol !== "https:")
+                    || url.username || url.password || url.search || url.hash) {
+                    return undefined;
+                }
+                return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+            } catch {
+                return undefined;
+            }
+        };
+        const trustedScope = credentialScope(trustedUrl);
+        return trustedScope && credentialScope(serverUrl) === trustedScope
+            ? this.getApiKey()
+            : undefined;
     }
 
-    private async getCompactionDeepSeekApiKey(): Promise<string | undefined> {
+    private async getDeepSeekApiKey(): Promise<string | undefined> {
         const dedicated = await this.secrets.get("llamacpp.deepSeekApiKey");
         if (dedicated) {
             return dedicated;
         }
-        // A primary API key is valid for DeepSeek only when the primary endpoint
-        // itself is DeepSeek. Never send a local/private server key to DeepSeek.
-        return this.isDeepSeekServer(await this.getServerUrl()) ? await this.getApiKey() : undefined;
+        const serverUrl = await this.getServerUrl();
+        return this.isDeepSeekServer(serverUrl)
+            ? this.getPrimaryApiKeyForServerUrl(serverUrl)
+            : undefined;
+    }
+
+    private async getCompactionDeepSeekApiKey(): Promise<string | undefined> {
+        return this.getDeepSeekApiKey();
     }
 
     /**
@@ -6172,16 +6194,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             return this.deepSeekBalanceInflight;
         }
         this.deepSeekBalanceInflight = (async () => {
-            const config = this.getConfig();
-            // Balance lives on the official DeepSeek API. A fresh install has no
-            // serverUrl configured (defaults to localhost), so use api.deepseek.com
-            // unless the configured server actually IS a DeepSeek endpoint.
-            const configuredUrl = String(config.get("serverUrl", "") || "").trim();
+            const configuredUrl = await this.getServerUrl();
             const serverUrl = isDeepSeekEndpoint(configuredUrl) ? configuredUrl : DEEPSEEK_SERVER_URL;
-            // Never send a local/private server key to api.deepseek.com: the
-            // primary key counts only when the primary endpoint is DeepSeek.
-            const apiKey = (await this.secrets.get("llamacpp.deepSeekApiKey"))
-                ?? (isDeepSeekEndpoint(configuredUrl) ? await this.getApiKey() : undefined);
+            const apiKey = await this.getDeepSeekApiKey();
             if (!apiKey) {
                 return undefined;
             }
@@ -6269,15 +6284,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         });
 
         if (!response.ok) {
-            let bodySnippet = "";
-            try {
-                const bodyText = await response.text();
-                bodySnippet = bodyText.trim().slice(0, 300);
-            } catch {
-                // Keep the empty snippet when the body cannot be read.
-            }
-            const details = bodySnippet ? `\n${bodySnippet}` : "";
-            throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}${details}`);
+            throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
         }
 
         const data = (await response.json()) as { data?: unknown[]; models?: unknown[]; result?: unknown[] };

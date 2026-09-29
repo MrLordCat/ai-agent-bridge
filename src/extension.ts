@@ -1565,10 +1565,8 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					}
 
 					if (!response.ok) {
-						const details = (await response.text()).trim().slice(0, 200);
-						const suffix = details.length > 0 ? `: ${details}` : "";
 						vscode.window.showErrorMessage(
-							`DeepSeek key check failed (${response.status} ${response.statusText})${suffix}`
+							`DeepSeek key check failed (${response.status} ${response.statusText})`
 						);
 					}
 				} catch (error) {

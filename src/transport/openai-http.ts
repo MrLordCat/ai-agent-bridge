@@ -9,7 +9,8 @@ export type FetchImplementation = (input: string | URL | Request, init?: Request
 
 export function isDeepSeekEndpoint(serverUrl: string): boolean {
 	try {
-		return new URL(serverUrl).hostname.toLowerCase().endsWith("deepseek.com");
+		const url = new URL(serverUrl);
+		return url.protocol === "https:" && url.hostname.toLowerCase() === "api.deepseek.com";
 	} catch {
 		return false;
 	}
@@ -104,6 +105,46 @@ export function getOpenAiApiRoot(serverUrl: string): string {
 
 export function isTransientHttpStatus(status: number): boolean {
 	return status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+/** Read only enough of an error response to classify it, without buffering or waiting indefinitely. */
+export async function readHttpErrorText(response: Response, maxBytes = 8_192, timeoutMs = 3_000): Promise<string> {
+	if (!response.body || maxBytes <= 0) {
+		return "";
+	}
+	const reader = response.body.getReader();
+	const decoder = new TextDecoder();
+	let remaining = maxBytes;
+	let result = "";
+	let done = false;
+	let timedOut = false;
+	const timeout = setTimeout(() => {
+		timedOut = true;
+		void reader.cancel().catch(() => undefined);
+	}, timeoutMs);
+	try {
+		while (remaining > 0) {
+			const chunk = await reader.read();
+			if (chunk.done) {
+				done = true;
+				break;
+			}
+			const bytes = chunk.value.subarray(0, remaining);
+			result += decoder.decode(bytes, { stream: true });
+			remaining -= bytes.byteLength;
+		}
+	} catch (error) {
+		if (!timedOut) {
+			throw error;
+		}
+	} finally {
+		clearTimeout(timeout);
+		if (!done) {
+			void reader.cancel().catch(() => undefined);
+		}
+		reader.releaseLock();
+	}
+	return result + decoder.decode();
 }
 
 export function parseRetryAfterMs(value: string | null, now = Date.now()): number | undefined {

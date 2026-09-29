@@ -1,46 +1,34 @@
-# AI Agent Bridge 1.16.3 — release notes
+# AI Agent Bridge 1.16.5 — release notes
 
-A patch release on top of 1.16.2. Everything from 1.16.0 is included — the
-sections about reasoning, patches, tools, sessions and memory in the 1.16.2
-notes still describe that feature set.
+A security patch release with updated dependencies and safer handling of API
+keys, HTTP errors, and installer privileges. It also includes the Copilot Chat
+bundle compatibility fix from the 1.16.4 development build.
 
-## 1. Subscription limits read as two lines
+## API keys stay with their configured server
 
-The Codex rows `Session Limit (5h)` and `Weekly Limit` packed the percent used
-and the reset moment into a single line, and a VS Code tree row is too narrow
-for both: `resets 9/23/2026, 3:11:00 PM` was cut off exactly where the
-timestamp begins. Each row now keeps the short `0% used` summary on its own
-line and shows `Next Reset` on an indented child row, which starts at the left
-edge of the tree and therefore shows the whole timestamp. The rows open
-expanded, and the fallback `Usage Limit` row uses the same layout.
+The primary API key is used for the configured global server. A workspace can
+still choose another server, but that override does not receive the global
+key. The key reaches DeepSeek only when the primary server is the official
+HTTPS DeepSeek API, or when a separate DeepSeek key is saved. Host detection
+rejects lookalike domains.
 
-## 2. The installers pick the newest VSIX by version
+## HTTP errors are bounded and kept out of diagnostics
 
-Both installer scripts compare the VSIX files next to them as versions instead
-of as names, so `llama-vscode-chat-1.16.10.vsix` wins over `1.16.9` — a plain
-name sort installs the older file. The Windows script no longer carries a
-hardcoded `PRIMARY_VSIX` pointing at the release it shipped with; set it only
-to force one specific file.
+Only the first 8 KiB of an HTTP error body is read, within three seconds, when
+the provider needs to classify a context overflow or a tool format error. The
+body is not written to logs or shown in errors. Other error paths report the
+HTTP status without reading the body.
 
-Verified in an isolated fixture (a stub CLI and a stub VS Code tree), so no
-real installation was modified: the script selects the newest version, copies
-the VSIX to a temp folder, calls the CLI, finds the application root and the
-installed extension, applies what it can, reports every patch and exits 0.
-Against a bundle it does not recognise it reports the failure instead of
-claiming success; with no VSIX next to it, it prints the download link; and
-`SKIP_PATCHES=1` / `DRY_RUN=1` do exactly what they say.
+## Installer and Copilot patch
 
-## 3. Platform and install notes in the README
+The Linux/macOS installer no longer runs the patch code through `sudo` or
+`pkexec`, or transfers ownership of system VS Code files. Run it as a regular
+user. If your VS Code installation is system-owned, use a user-owned or portable
+installation to apply bundle patches without administrator rights.
 
-The README claimed Windows was the only supported platform and described the
-Linux installer as "VSIX installation only". Both were stale: the Linux
-installer applies the VS Code / Copilot Chat patches in the same run, using
-the extension's own compiled patch code, and the Codex runtime is chosen per
-platform in `src/codex/app-server-client.ts`. The install section now covers
-Windows and Linux, the real installer behaviour (temp copy, newest-version
-selection, polkit password dialog, ownership hand-back,
-`~/.local/share/llama-vscode-chat/apply-patches.sh`), every environment
-override, and the current version in its examples.
+The VS Code workbench patch now recognizes the serializer shape in the current
+bundle. It was verified against the installed VS Code build. The installation
+requirements and error meanings are documented in `docs/COPILOT_PATCH.md`.
 
 ## Install in one step
 
@@ -58,20 +46,12 @@ chmod +x install-ai-agent-bridge.sh
 install-ai-agent-bridge.cmd
 ```
 
-The Linux script installs the extension and then applies the patches itself.
-It never blocks on a password typed into a terminal: admin rights are
-requested only after an unelevated pass actually hits a permission error, and
-then through passwordless `sudo`, the polkit system dialog, or a graphical
-`SUDO_ASKPASS` helper. Files written under elevation are handed back to your
-user, so **AI Agent Bridge: Restore Copilot Patch** keeps working without root
-later. On Windows the extension applies the patches on the next window reload.
+The Linux script installs the extension and applies compatible patches when
+the application files are writable by the current user. On Windows the
+extension applies patches on the next window reload.
 
 ## Verification
 
-- 499 extension-host tests passing; lint and TypeScript compilation clean.
-- The Windows installer was run end-to-end: it selected `1.16.3` out of four
-  VSIX files in the folder and installed it, and the installed extension
-  reports `1.16.3` with `source: vsix`.
-- The Linux installer was exercised in the isolated fixture described above,
-  including the missing-VSIX error path and the `SKIP_PATCHES=1` branch.
-- GitHub Actions CI and Release workflows green for this tag.
+- `npm audit` reports zero vulnerabilities in the complete dependency tree.
+- TypeScript and lint checks pass; the extension-host suite contains 506 tests.
+- The Linux installer passed `bash -n` and its non-mutating dry run.

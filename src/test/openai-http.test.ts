@@ -4,11 +4,13 @@ import {
 	cloudflareSessionAffinity,
 	getModelsEndpoint,
 	isCloudflareWorkersAiBase,
+	isDeepSeekEndpoint,
 	pickModelCatalogId,
 	normalizeProviderBaseUrl,
 	isTransientHttpStatus,
 	OpenAIHttpTransport,
 	parseRetryAfterMs,
+	readHttpErrorText,
 } from "../transport/openai-http";
 
 	test("cloudflareSessionAffinity pins a conversation to a model instance", () => {
@@ -48,6 +50,13 @@ import {
 	});
 
 suite("OpenAI HTTP transport", () => {
+	test("recognises only the official HTTPS DeepSeek API host", () => {
+		assert.strictEqual(isDeepSeekEndpoint("https://api.deepseek.com/v1"), true);
+		assert.strictEqual(isDeepSeekEndpoint("https://evil-deepseek.com"), false);
+		assert.strictEqual(isDeepSeekEndpoint("https://api.deepseek.com.evil.example"), false);
+		assert.strictEqual(isDeepSeekEndpoint("http://api.deepseek.com"), false);
+	});
+
 	test("resolves Cloudflare AI Gateway and Workers AI endpoints", () => {
 		const gateway = "https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai";
 		assert.strictEqual(getChatCompletionsEndpoint(gateway), "https://gateway.ai.cloudflare.com/v1/abc123/my-gateway/openai/chat/completions");
@@ -112,5 +121,34 @@ suite("OpenAI HTTP transport", () => {
 		assert.strictEqual(parseRetryAfterMs("1.5", 0), 1500);
 		assert.strictEqual(parseRetryAfterMs("Thu, 01 Jan 1970 00:00:02 GMT", 1000), 1000);
 		assert.strictEqual(parseRetryAfterMs("invalid", 0), undefined);
+	});
+
+	test("limits error body reads and cancels the remainder", async () => {
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(new TextEncoder().encode("context overflow: " + "x".repeat(10_000)));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const response = new Response(body, { status: 400 });
+		const detail = await readHttpErrorText(response, 64);
+		assert.strictEqual(detail.length, 64);
+		assert.match(detail, /^context overflow:/);
+		assert.strictEqual(cancelled, true);
+	});
+
+	test("stops waiting when an error body stalls after headers", async () => {
+		let cancelled = false;
+		const body = new ReadableStream<Uint8Array>({
+			cancel() {
+				cancelled = true;
+			},
+		});
+		const response = new Response(body, { status: 503 });
+		assert.strictEqual(await readHttpErrorText(response, 64, 10), "");
+		assert.strictEqual(cancelled, true);
 	});
 });

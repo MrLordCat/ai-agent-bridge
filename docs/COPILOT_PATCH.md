@@ -212,6 +212,20 @@ The new installation has a new Copilot bundle. With auto-patch enabled, activate
 AI Agent Bridge once and accept its reload prompt. Otherwise run `AI Agent Bridge: Apply
 Copilot Chat Patch`. Do not copy a patched bundle from an older VS Code build.
 
+### Patch Installation Without Administrator Rights
+
+Open the `AI Agent Bridge Copilot Patch` output channel to identify the failure.
+`Copilot bundle shape changed` or `VS Code workbench shape changed` means the
+patch needs an update for the installed VS Code build; elevation cannot fix it.
+
+For `EACCES` or `EPERM`, use the VS Code **User Installer** or a portable VS Code
+installation in a directory owned by your account, then install the AI Agent
+Bridge VSIX with the VS Code CLI and reload the window. The extension patches
+the active `vscode.env.appRoot` in that installation. A system-wide VS Code
+installation with read-only application files cannot be patched through the
+extension API without administrator rights. Do not change ownership of the
+system installation or copy patched bundles between VS Code versions.
+
 ### Patch Guardian Keeps Offering Changes
 
 `llama-vscode-chat` 1.6.0 embeds both the Copilot native-controls patch and the

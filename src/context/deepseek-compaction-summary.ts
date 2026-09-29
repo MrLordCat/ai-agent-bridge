@@ -542,8 +542,7 @@ export async function requestDeepSeekCompactionSummary(
 		input.cancellation
 	);
 	if (!response.ok) {
-		const detail = (await response.text()).trim().slice(0, 300);
-		throw new Error(`DeepSeek compaction request failed (${response.status} ${response.statusText})${detail ? `: ${detail}` : ""}`);
+		throw new Error(`DeepSeek compaction request failed (${response.status} ${response.statusText})`);
 	}
 	const parsed = parseDeepSeekCompactionResponse(await response.json(), input.maxSummaryChars);
 	return { ...parsed, inputChars, inputDiagnostics: transcript.diagnostics };

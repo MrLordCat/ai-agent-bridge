@@ -123,6 +123,51 @@ suite("Llama.cpp Chat Provider Extension", () => {
 			assert.strictEqual(sources.find(source => source.key === "deepseek")?.apiKey, "deepseek-key");
 		});
 
+        test("does not send the global primary key to a workspace server override", async () => {
+            const secrets = new MockSecretStorage();
+            await secrets.store("llamacpp.apiKey", "primary-key");
+            const isolated = new LlamaCppChatModelProvider(secrets, "test-user-agent");
+            const isolatedAny = isolated as unknown as {
+                getConfig: () => vscode.WorkspaceConfiguration;
+                getModelSources: () => Promise<Array<{ key: string; serverUrl: string; apiKey?: string }>>;
+            };
+            let workspaceUrl = "https://untrusted.example/v1";
+            isolatedAny.getConfig = () => ({
+                get: <T>(_section: string, fallback?: T) => fallback,
+                inspect: (section: string) => section === "serverUrl"
+                    ? { globalValue: "https://trusted.example/v1", workspaceValue: workspaceUrl }
+                    : undefined,
+            } as unknown as vscode.WorkspaceConfiguration);
+
+            let sources = await isolatedAny.getModelSources();
+            assert.strictEqual(sources.find(source => source.key === "primary")?.serverUrl, workspaceUrl);
+            assert.strictEqual(sources.find(source => source.key === "primary")?.apiKey, undefined);
+            assert.strictEqual(sources.some(source => source.key === "deepseek"), false);
+
+            workspaceUrl = "https://trusted.example:443/v1/";
+            sources = await isolatedAny.getModelSources();
+            assert.strictEqual(sources.find(source => source.key === "primary")?.apiKey, "primary-key");
+        });
+
+        test("uses the primary key for DeepSeek only when the trusted primary URL is DeepSeek", async () => {
+            const secrets = new MockSecretStorage();
+            await secrets.store("llamacpp.apiKey", "primary-key");
+            const isolated = new LlamaCppChatModelProvider(secrets, "test-user-agent");
+            const isolatedAny = isolated as unknown as {
+                getConfig: () => vscode.WorkspaceConfiguration;
+                getModelSources: () => Promise<Array<{ key: string; apiKey?: string }>>;
+            };
+            isolatedAny.getConfig = () => ({
+                get: <T>(_section: string, fallback?: T) => fallback,
+                inspect: (section: string) => section === "serverUrl"
+                    ? { globalValue: "https://api.deepseek.com" }
+                    : undefined,
+            } as unknown as vscode.WorkspaceConfiguration);
+
+            const sources = await isolatedAny.getModelSources();
+            assert.strictEqual(sources.find(source => source.key === "deepseek")?.apiKey, "primary-key");
+        });
+
 		test("health check warns about retired DeepSeek aliases", async () => {
 			const providerAny = provider as unknown as {
 				getModelSources: () => Promise<Array<{
