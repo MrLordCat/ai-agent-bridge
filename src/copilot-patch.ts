@@ -4,6 +4,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
+import { collectAppRoots, collectExtensionRoots, findWorkbenchCandidates, workbenchPathFor, type SearchOptions } from "./vscode-app-root";
+
 export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v22";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID = "llama-vscode-chat:copilot-git-repositories-guard:v1";
@@ -43,18 +45,28 @@ interface CopilotManifest {
 
 export interface CopilotPatchTarget {
 	bundlePath: string;
-	workbenchPath: string;
 	packagePath: string;
 	manifest: CopilotManifest;
+	/** Application root that owns this bundle, when the layout allows deriving it. */
+	appRoot?: string;
+	/**
+	 * Desktop workbench bundle that belongs to the same window, when one exists.
+	 * A Remote-WSL extension host finds its Copilot Chat in the Linux server
+	 * (which has no workbench) and the workbench in the Windows installation, so
+	 * the two paths do not have to share an application root.
+	 */
+	workbenchPath?: string;
+	/** Where this bundle was found, for the status log. */
+	source?: string;
 }
 
 export interface CopilotPatchStatus {
 	patchId: string;
 	copilotVersion: string;
 	bundlePath: string;
-	workbenchPath: string;
+	workbenchPath?: string;
 	backupPath: string;
-	workbenchBackupPath: string;
+	workbenchBackupPath?: string;
 	metadataPath: string;
 	applied: boolean;
 	workbenchApplied: boolean;
@@ -62,7 +74,9 @@ export interface CopilotPatchStatus {
 	backupExists: boolean;
 	workbenchBackupExists: boolean;
 	sha256: string;
-	workbenchSha256: string;
+	workbenchSha256?: string;
+	/** Non-fatal findings: a part that was skipped, or a search that came short. */
+	notices: string[];
 }
 
 export interface CopilotPatchResult {
@@ -75,79 +89,97 @@ function sha256(filePath: string): string {
 	return createHash("sha256").update(fs.readFileSync(filePath)).digest("hex");
 }
 
-function addCandidate(candidates: string[], candidate: string | undefined): void {
-	if (!candidate) {
-		return;
-	}
-	const resolved = path.resolve(candidate);
-	for (const variant of [
-		resolved,
-		path.join(resolved, "extension.js"),
-		path.join(resolved, "dist", "extension.js"),
-		path.join(resolved, "extensions", "copilot", "dist", "extension.js"),
-		path.join(resolved, "resources", "app", "extensions", "copilot", "dist", "extension.js"),
-	]) {
-		if (!candidates.includes(variant)) {
-			candidates.push(variant);
-		}
-	}
-}
-
-function addCodeInstallationCandidates(candidates: string[], codeCommandPath: string): void {
-	if (!codeCommandPath || !fs.existsSync(codeCommandPath)) {
-		return;
-	}
-	const installRoot = path.dirname(path.dirname(codeCommandPath));
-	addCandidate(candidates, installRoot);
-
-	const commandText = fs.readFileSync(codeCommandPath, "utf8");
-	const versionDir = commandText.match(/\.\.\\([^\\"/]+)\\resources\\app\\out\\cli\.js/i)?.[1];
-	if (versionDir) {
-		addCandidate(candidates, path.join(installRoot, versionDir));
-	}
-
-	for (const entry of fs.readdirSync(installRoot, { withFileTypes: true })) {
-		if (entry.isDirectory()) {
-			addCandidate(candidates, path.join(installRoot, entry.name));
-		}
-	}
-}
-
-export function findCopilotBundle(explicitRoot?: string): CopilotPatchTarget {
-	const candidates: string[] = [];
-	addCandidate(candidates, explicitRoot);
-
-	if (process.platform === "win32") {
-		try {
-			const output = execFileSync("where.exe", ["code.cmd"], { encoding: "utf8" });
-			for (const commandPath of output.split(/\r?\n/).filter(Boolean)) {
-				addCodeInstallationCandidates(candidates, commandPath.trim());
-			}
-		} catch {
-			// An explicit root can still locate portable and test installations.
-		}
-	}
-
-	for (const candidate of candidates) {
-		if (path.basename(candidate) !== "extension.js" || !fs.existsSync(candidate)) {
-			continue;
-		}
-		const packagePath = path.resolve(path.dirname(candidate), "..", "package.json");
-		if (!fs.existsSync(packagePath)) {
-			continue;
-		}
+function readCopilotManifest(packagePath: string): CopilotManifest | undefined {
+	try {
 		const manifest = JSON.parse(fs.readFileSync(packagePath, "utf8")) as CopilotManifest;
-		if (manifest.name === "copilot-chat") {
-			const appRoot = path.resolve(path.dirname(packagePath), "..", "..");
-			const workbenchPath = path.join(appRoot, "out", "vs", "workbench", "workbench.desktop.main.js");
-			if (!fs.existsSync(workbenchPath)) {
+		return manifest.name === "copilot-chat" ? manifest : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Every Copilot Chat bundle the running window could use.
+ *
+ * One copy is normally enough, but a remote session has two: the Linux server
+ * ships its own `extensions/copilot` (the extension host that runs chat) and
+ * the Windows installation the window is rendered by has another one. Both are
+ * returned so the caller can patch each of them.
+ */
+export function findCopilotBundles(explicitRoot?: string, options?: SearchOptions): CopilotPatchTarget[] {
+	const bundleCandidates: Array<{ bundlePath: string; source: string }> = [];
+	const pushBundleCandidate = (bundlePath: string, source: string): void => {
+		const resolved = path.resolve(bundlePath);
+		if (fs.existsSync(resolved) && !bundleCandidates.some(entry => entry.bundlePath === resolved)) {
+			bundleCandidates.push({ bundlePath: resolved, source });
+		}
+	};
+
+	// Application bundles first: the active build, then the standard
+	// installations (including the Windows side of a WSL session).
+	const roots = collectAppRoots(explicitRoot, options);
+	for (const { root, source } of roots) {
+		for (const variant of [
+			path.join(root, "extension.js"),
+			path.join(root, "dist", "extension.js"),
+			path.join(root, "extensions", "copilot", "dist", "extension.js"),
+			path.join(root, "resources", "app", "extensions", "copilot", "dist", "extension.js"),
+		]) {
+			pushBundleCandidate(variant, `${source} built-in Copilot Chat`);
+		}
+	}
+	// Then user-installed copies (Code - OSS, Marketplace, remote servers).
+	for (const { root, source } of collectExtensionRoots(explicitRoot, options)) {
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(root, { withFileTypes: true });
+		} catch {
+			continue;
+		}
+		for (const entry of entries) {
+			if (!entry.isDirectory() || !entry.name.includes("copilot-chat")) {
 				continue;
 			}
-			return { bundlePath: candidate, workbenchPath, packagePath, manifest };
+			pushBundleCandidate(path.join(root, entry.name, "dist", "extension.js"), `${source}: ${entry.name}`);
 		}
 	}
 
-	throw new Error("Could not locate the bundled Copilot Chat extension. Pass an explicit VS Code app root.");
+	const workbenches = findWorkbenchCandidates(explicitRoot, options);
+	const targets: CopilotPatchTarget[] = [];
+	for (const { bundlePath, source } of bundleCandidates) {
+		const packagePath = path.resolve(path.dirname(bundlePath), "..", "package.json");
+		const manifest = readCopilotManifest(packagePath);
+		if (!manifest) {
+			continue;
+		}
+		// A bundle inside an application root uses that root's workbench; a
+		// user-installed bundle (or a server bundle without a workbench) uses
+		// the first workbench found for this window.
+		const owningRoot = path.resolve(path.dirname(packagePath), "..", "..");
+		const workbenchPath = fs.existsSync(workbenchPathFor(owningRoot))
+			? workbenchPathFor(owningRoot)
+			: workbenches[0]?.workbenchPath;
+		targets.push({
+			bundlePath,
+			packagePath,
+			manifest,
+			appRoot: owningRoot,
+			workbenchPath,
+			source,
+		});
+	}
+	return targets;
+}
+
+export function findCopilotBundle(explicitRoot?: string, options?: SearchOptions): CopilotPatchTarget {
+	const targets = findCopilotBundles(explicitRoot, options);
+	if (targets.length > 0) {
+		return targets[0];
+	}
+	throw new Error(
+		"Could not locate the bundled Copilot Chat extension. " +
+			"Pass an explicit VS Code app root, install Copilot Chat, or check the search log."
+	);
 }
 
 function replaceOnce(source: string, search: string, replacement: string, description: string): string {
@@ -671,49 +703,86 @@ export function patchExtensionTokenizerCache(source: string): string {
 	);
 }
 
+function readFileIfExists(filePath: string | undefined): string | undefined {
+	if (!filePath || !fs.existsSync(filePath)) {
+		return undefined;
+	}
+	return fs.readFileSync(filePath, "utf8");
+}
+
 export function getCopilotPatchStatus(target: CopilotPatchTarget): CopilotPatchStatus {
 	const backupPath = target.bundlePath + BACKUP_SUFFIX;
-	const workbenchBackupPath = target.workbenchPath + BACKUP_SUFFIX;
+	const workbenchPath = target.workbenchPath;
+	const workbenchExists = Boolean(workbenchPath && fs.existsSync(workbenchPath));
+	const workbenchBackupPath = workbenchPath ? workbenchPath + BACKUP_SUFFIX : undefined;
 	const metadataPath = target.bundlePath + METADATA_SUFFIX;
 	const installed = fs.readFileSync(target.bundlePath, "utf8");
-	const installedWorkbench = fs.readFileSync(target.workbenchPath, "utf8");
+	const installedWorkbench = workbenchExists ? fs.readFileSync(workbenchPath as string, "utf8") : undefined;
+	const notices: string[] = [];
+	if (!workbenchExists) {
+		notices.push(
+			"VS Code workbench bundle not found for this session: the chat-history bounds patch is skipped. " +
+				"Set VSCODE_APP_ROOT or install VS Code where the extension can read it."
+		);
+	}
 	return {
 		patchId: COPILOT_PATCH_ID,
 		copilotVersion: target.manifest.version ?? "unknown",
 		bundlePath: target.bundlePath,
-		workbenchPath: target.workbenchPath,
+		workbenchPath: workbenchExists ? workbenchPath : undefined,
 		backupPath,
 		workbenchBackupPath,
 		metadataPath,
 		applied: installed.includes(COPILOT_PATCH_MARKER),
-		workbenchApplied: installedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER),
+		workbenchApplied: installedWorkbench ? installedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER) : false,
 		legacyPatch: LEGACY_PATCH_MARKERS.some(marker => installed.includes(marker)),
 		backupExists: fs.existsSync(backupPath),
-		workbenchBackupExists: fs.existsSync(workbenchBackupPath),
+		workbenchBackupExists: Boolean(workbenchBackupPath && fs.existsSync(workbenchBackupPath)),
 		sha256: sha256(target.bundlePath),
-		workbenchSha256: sha256(target.workbenchPath),
+		workbenchSha256: workbenchExists ? sha256(workbenchPath as string) : undefined,
+		notices,
 	};
 }
 
 export function formatCopilotPatchStatus(status: CopilotPatchStatus): string {
-	return [
+	const lines = [
 		`Copilot Chat: ${status.copilotVersion}`,
 		`Bundle: ${status.bundlePath}`,
 		`Patch: ${status.applied ? "applied" : status.legacyPatch ? "legacy" : "not applied"}`,
 		`Backup: ${status.backupExists ? status.backupPath : "not found"}`,
 		`SHA-256: ${status.sha256}`,
-		`VS Code workbench: ${status.workbenchPath}`,
-		`Chat history bounds: ${status.workbenchApplied ? "applied" : "not applied"}`,
-		`Workbench backup: ${status.workbenchBackupExists ? status.workbenchBackupPath : "not found"}`,
-		`Workbench SHA-256: ${status.workbenchSha256}`,
-	].join("\n");
+	];
+	if (status.workbenchPath) {
+		lines.push(
+			`VS Code workbench: ${status.workbenchPath}`,
+			`Chat history bounds: ${status.workbenchApplied ? "applied" : "not applied"}`,
+			`Workbench backup: ${status.workbenchBackupExists ? status.workbenchBackupPath : "not found"}`,
+			`Workbench SHA-256: ${status.workbenchSha256}`
+		);
+	} else {
+		lines.push("VS Code workbench: not found (chat-history bounds patch skipped)");
+	}
+	lines.push(...status.notices.map(notice => `Notice: ${notice}`));
+	return lines.join("\n");
 }
 
 export function applyCopilotPatch(target: CopilotPatchTarget, force = false): CopilotPatchResult {
 	const initialStatus = getCopilotPatchStatus(target);
 	const installed = fs.readFileSync(target.bundlePath, "utf8");
-	if (initialStatus.applied && initialStatus.workbenchApplied && installed.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)) {
-		return { changed: false, status: initialStatus, message: "Copilot Chat patch is already applied." };
+	const workbenchPath = target.workbenchPath;
+	const hasWorkbench = Boolean(workbenchPath && initialStatus.workbenchPath);
+	if (
+		initialStatus.applied
+		&& (!hasWorkbench || initialStatus.workbenchApplied)
+		&& installed.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)
+	) {
+		return {
+			changed: false,
+			status: initialStatus,
+			message: hasWorkbench
+				? "Copilot Chat patch is already applied."
+				: "Copilot Chat patch is already applied; the VS Code workbench part is not available in this session.",
+		};
 	}
 	if (initialStatus.legacyPatch && !initialStatus.backupExists) {
 		throw new Error("Cannot upgrade the legacy Copilot patch because its original bundle backup is missing.");
@@ -733,8 +802,10 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	}
 	// An installed v1 workbench patch (legacy marker) upgrades in place: the
 	// helper is replaced by the v2 definition, so the existing backup stays valid.
-	const installedWorkbenchBefore = fs.readFileSync(target.workbenchPath, "utf8");
-	const workbenchLegacyUpgrade = installedWorkbenchBefore.includes(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER);
+	const installedWorkbenchBefore = hasWorkbench ? (readFileIfExists(workbenchPath) as string) : undefined;
+	const workbenchLegacyUpgrade = Boolean(
+		installedWorkbenchBefore && installedWorkbenchBefore.includes(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER)
+	);
 	if (initialStatus.workbenchBackupExists && !force && !initialStatus.workbenchApplied && !workbenchLegacyUpgrade) {
 		throw new Error(
 			`Backup already exists: ${initialStatus.workbenchBackupPath}. Restore it first or explicitly force the patch after inspection.`
@@ -742,46 +813,79 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	}
 
 	const patched = patchCopilotGitRepositoriesGuard(patchCopilotBundle(original));
-	const patchedWorkbench = patchVsCodeWorkbenchBundle(installedWorkbenchBefore);
+	const patchedWorkbench = installedWorkbenchBefore
+		? patchVsCodeWorkbenchBundle(installedWorkbenchBefore)
+		: undefined;
 	const validationPath = target.bundlePath + ".llama-vscode-chat.tmp.js";
-	const workbenchValidationPath = target.workbenchPath + ".llama-vscode-chat.tmp.mjs";
+	const workbenchValidationPath = workbenchPath ? workbenchPath + ".llama-vscode-chat.tmp.mjs" : undefined;
 	fs.writeFileSync(validationPath, patched);
-	fs.writeFileSync(workbenchValidationPath, patchedWorkbench);
+	if (patchedWorkbench && workbenchValidationPath) {
+		fs.writeFileSync(workbenchValidationPath, patchedWorkbench);
+	}
 	try {
 		new Script(patched, { filename: validationPath });
-		execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
+		if (workbenchValidationPath) {
+			execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
+		}
 	} catch (error) {
 		throw new Error(`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	} finally {
 		fs.rmSync(validationPath, { force: true });
-		fs.rmSync(workbenchValidationPath, { force: true });
+		if (workbenchValidationPath) {
+			fs.rmSync(workbenchValidationPath, { force: true });
+		}
 	}
 
 	if (!initialStatus.backupExists || (force && !initialStatus.legacyPatch && !initialStatus.applied)) {
 		fs.copyFileSync(target.bundlePath, initialStatus.backupPath);
 	}
-	if (!initialStatus.workbenchBackupExists) {
-		fs.copyFileSync(target.workbenchPath, initialStatus.workbenchBackupPath);
+	// The Copilot bundle is the part this function owns: write it first, so a
+	// permission problem on the workbench (a system-wide VS Code installation)
+	// cannot roll the whole patch back. The workbench is written on a best-effort
+	// basis and reported through a notice instead of throwing.
+	let workbenchWritten = false;
+	let workbenchWriteError: string | undefined;
+	if (patchedWorkbench && workbenchPath) {
+		try {
+			if (!initialStatus.workbenchBackupExists) {
+				fs.copyFileSync(workbenchPath, initialStatus.workbenchBackupPath as string);
+			}
+			fs.writeFileSync(workbenchPath, patchedWorkbench);
+			workbenchWritten = true;
+		} catch (error) {
+			workbenchWriteError = error instanceof Error ? error.message : String(error);
+		}
 	}
 	fs.writeFileSync(target.bundlePath, patched);
-	fs.writeFileSync(target.workbenchPath, patchedWorkbench);
-	fs.writeFileSync(
-		initialStatus.metadataPath,
-		JSON.stringify({
-			patchId: COPILOT_PATCH_ID,
-			copilotVersion: target.manifest.version,
-			appliedAt: new Date().toISOString(),
-			originalSha256: sha256(initialStatus.backupPath),
-			patchedSha256: sha256(target.bundlePath),
-			originalWorkbenchSha256: sha256(initialStatus.workbenchBackupPath),
-			patchedWorkbenchSha256: sha256(target.workbenchPath),
-		}, null, 2) + "\n"
-	);
+	const metadata: Record<string, string> = {
+		patchId: COPILOT_PATCH_ID,
+		copilotVersion: target.manifest.version ?? "unknown",
+		appliedAt: new Date().toISOString(),
+		originalSha256: sha256(initialStatus.backupPath),
+		patchedSha256: sha256(target.bundlePath),
+	};
+	if (workbenchWritten && initialStatus.workbenchBackupPath && workbenchPath) {
+		metadata.originalWorkbenchSha256 = sha256(initialStatus.workbenchBackupPath);
+		metadata.patchedWorkbenchSha256 = sha256(workbenchPath);
+	}
+	if (workbenchWriteError) {
+		metadata.workbenchError = workbenchWriteError;
+	}
+	fs.writeFileSync(initialStatus.metadataPath, JSON.stringify(metadata, null, 2) + "\n");
 
+	const status = getCopilotPatchStatus(target);
+	if (workbenchWriteError) {
+		status.notices.push(
+			`Copilot Chat patch applied, but the VS Code workbench could not be updated: ${workbenchWriteError}. ` +
+				"Re-run with administrator rights, or use a user-owned VS Code installation, to get the chat-history bounds patch."
+		);
+	}
 	return {
 		changed: true,
-		status: getCopilotPatchStatus(target),
-		message: "Applied native model controls and bounded chat-history tool output. Reload all VS Code windows to activate them.",
+		status,
+		message: workbenchWritten
+			? "Applied native model controls and bounded chat-history tool output. Reload all VS Code windows to activate them."
+			: "Applied native model controls. Reload all VS Code windows to activate them. The VS Code workbench part was skipped; see the status log.",
 	};
 }
 
@@ -791,15 +895,26 @@ export function restoreCopilotPatch(target: CopilotPatchTarget): CopilotPatchRes
 		throw new Error(`Backup not found: ${initialStatus.backupPath}`);
 	}
 	fs.copyFileSync(initialStatus.backupPath, target.bundlePath);
-	if (initialStatus.workbenchBackupExists) {
-		fs.copyFileSync(initialStatus.workbenchBackupPath, target.workbenchPath);
+	let workbenchRestoreError: string | undefined;
+	if (initialStatus.workbenchBackupExists && initialStatus.workbenchPath && initialStatus.workbenchBackupPath) {
+		try {
+			fs.copyFileSync(initialStatus.workbenchBackupPath, initialStatus.workbenchPath);
+		} catch (error) {
+			workbenchRestoreError = error instanceof Error ? error.message : String(error);
+		}
 	}
 	fs.rmSync(initialStatus.backupPath, { force: true });
-	fs.rmSync(initialStatus.workbenchBackupPath, { force: true });
+	if (initialStatus.workbenchBackupPath) {
+		fs.rmSync(initialStatus.workbenchBackupPath, { force: true });
+	}
 	fs.rmSync(initialStatus.metadataPath, { force: true });
+	const status = getCopilotPatchStatus(target);
+	if (workbenchRestoreError) {
+		status.notices.push(`The original VS Code workbench backup could not be restored: ${workbenchRestoreError}`);
+	}
 	return {
 		changed: true,
-		status: getCopilotPatchStatus(target),
+		status,
 		message: "Restored the original Copilot Chat and VS Code workbench bundles. Reload all VS Code windows to activate them.",
 	};
 }

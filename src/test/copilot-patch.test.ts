@@ -7,15 +7,18 @@ import { Script } from "node:vm";
 import * as vscode from "vscode";
 
 import {
+	applyCopilotPatch,
 	COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER,
 	COPILOT_PATCH_ID,
 	COPILOT_PATCH_MARKER,
 	findCopilotBundle,
+	findCopilotBundles,
 	patchCopilotGitRepositoriesGuard,
 	patchAgentHistoryCap,
 	patchCopilotBundle,
 	patchExtensionTokenizerCache,
 	patchVsCodeWorkbenchBundle,
+	restoreCopilotPatch,
 	VSCODE_CHAT_HISTORY_PATCH_MARKER,
 } from "../copilot-patch";
 
@@ -121,12 +124,19 @@ suite("Copilot patch", () => {
 			this.skip();
 			return;
 		}
+		const workbenchPath = target.workbenchPath;
+		if (!workbenchPath) {
+			// Remote extension hosts (WSL, SSH, containers) have no workbench of
+			// their own; the part of the test below needs a real workbench bundle.
+			this.skip();
+			return;
+		}
 		const bundleBackup = target.bundlePath + ".llama-vscode-chat.backup";
-		const workbenchBackup = target.workbenchPath + ".llama-vscode-chat.backup";
+		const workbenchBackup = workbenchPath + ".llama-vscode-chat.backup";
 		const original = fs.readFileSync(fs.existsSync(bundleBackup) ? bundleBackup : target.bundlePath, "utf8");
 		const patched = patchCopilotBundle(original);
 		const originalWorkbench = fs.readFileSync(
-			fs.existsSync(workbenchBackup) ? workbenchBackup : target.workbenchPath,
+			fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath,
 			"utf8"
 		);
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
@@ -260,5 +270,48 @@ suite("Copilot patch", () => {
 		const builtIn = new Tokenizer({ ...languageModel, vendor: "copilot" });
 		await builtIn._textTokenLength("description");
 		assert.strictEqual(upstreamCalls, 4);
+	});
+
+	test("applies and restores the Copilot bundle when no workbench exists", function () {
+		// A remote extension host (WSL/SSH/container) ships Copilot Chat but has
+		// no desktop workbench; the patch must still apply to the bundle instead
+		// of failing the whole operation.
+		const targets = findCopilotBundles(vscode.env.appRoot);
+		const target = targets.find(entry => fs.existsSync(entry.bundlePath + ".llama-vscode-chat.backup"))
+			?? targets.find(entry => !fs.readFileSync(entry.bundlePath, "utf8").includes(COPILOT_PATCH_MARKER));
+		if (!target) {
+			this.skip();
+			return;
+		}
+		const backupPath = target.bundlePath + ".llama-vscode-chat.backup";
+		const sourcePath = fs.existsSync(backupPath) ? backupPath : target.bundlePath;
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-copilot-no-workbench-"));
+		try {
+			const bundlePath = path.join(tempDir, "extension.js");
+			const packagePath = path.join(tempDir, "package.json");
+			const original = fs.readFileSync(sourcePath);
+			fs.writeFileSync(bundlePath, original);
+			fs.writeFileSync(packagePath, JSON.stringify({ name: "copilot-chat", version: "0.64.1" }));
+			const tempTarget = {
+				bundlePath,
+				packagePath,
+				manifest: { name: "copilot-chat", version: "0.64.1" },
+			};
+
+			const result = applyCopilotPatch(tempTarget, true);
+			assert.strictEqual(result.changed, true);
+			assert.strictEqual(result.status.workbenchApplied, false);
+			assert.ok(
+				result.status.notices.some(notice => /workbench/i.test(notice)),
+				"the skipped workbench must be reported as a notice"
+			);
+			assert.ok(fs.readFileSync(bundlePath, "utf8").includes(COPILOT_PATCH_MARKER));
+
+			const restored = restoreCopilotPatch(tempTarget);
+			assert.strictEqual(restored.changed, true);
+			assert.ok(fs.readFileSync(bundlePath).equals(original), "restore must bring the original bundle back");
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
 	});
 });

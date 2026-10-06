@@ -1,42 +1,64 @@
-# AI Agent Bridge 1.16.5 — release notes
+# AI Agent Bridge 1.16.6 — release notes
 
-A security patch release with updated dependencies and safer handling of API
-keys, HTTP errors, and installer privileges. It also includes the Copilot Chat
-bundle compatibility fix from the 1.16.4 development build.
+A patch release on top of 1.16.5. Everything from 1.16.0 is included.
 
-## API keys stay with their configured server
+## 1. Patching no longer needs administrator rights
 
-The primary API key is used for the configured global server. A workspace can
-still choose another server, but that override does not receive the global
-key. The key reaches DeepSeek only when the primary server is the official
-HTTPS DeepSeek API, or when a separate DeepSeek key is saved. Host detection
-rejects lookalike domains.
+The previous releases looked for Copilot Chat in exactly one place: the
+`extensions/copilot` folder of `vscode.env.appRoot`. That fails as soon as the
+extension host is not the process that renders the window, and the error it
+reports — `Could not locate the bundled Copilot Chat extension` — is misleading,
+because Copilot Chat is usually installed and simply lives elsewhere:
 
-## HTTP errors are bounded and kept out of diagnostics
+- **Remote-WSL / SSH / containers.** `vscode.env.appRoot` is the Linux server
+  (`~/.vscode-server/bin/<commit>`). It ships Copilot Chat, but it has no
+  `out/vs/workbench/workbench.desktop.main.js` — the workbench runs on the
+  client — and the old lookup required both next to each other, so the candidate
+  was discarded and the message claimed Copilot Chat was missing.
+- **Code - OSS and CachyOS.** Copilot Chat is a normal user extension in
+  `~/.vscode-oss/extensions` or `~/.vscode/extensions`, outside any application
+  root.
 
-Only the first 8 KiB of an HTTP error body is read, within three seconds, when
-the provider needs to classify a context overflow or a tool format error. The
-body is not written to logs or shown in errors. Other error paths report the
-HTTP status without reading the body.
+The patch code now searches the way VS Code actually installs things: the active
+application root, the user extension directories, the Linux server of a remote
+session, and — from WSL — the Windows installation under
+`/mnt/c/Users/<you>/AppData/Local/Programs/Microsoft VS Code/<commit>`, matched
+by the commit of the running server. Every copy found is patched, and each one
+borrows the workbench of the window, because the server has none.
 
-## Installer and Copilot patch
+Verified on a real WSL session: two bundles found (the Linux server at
+`~/.vscode-server/bin/<commit>/extensions/copilot` and the Windows installation
+at `/mnt/c/.../Microsoft VS Code/<commit>/resources/app/extensions/copilot`),
+each patched and restored byte-for-byte, **without any elevation**. The Windows
+files under `/mnt/c` are owned by the user (User Installer), which is why this
+works at all.
 
-The Linux/macOS installer no longer runs the patch code through `sudo` or
-`pkexec`, or transfers ownership of system VS Code files. Run it as a regular
-user. If your VS Code installation is system-owned, use a user-owned or portable
-installation to apply bundle patches without administrator rights.
+## 2. Parts are applied independently, and the log says what was searched
 
-The VS Code workbench patch now recognizes the serializer shape in the current
-bundle. It was verified against the installed VS Code build. The installation
-requirements and error meanings are documented in `docs/COPILOT_PATCH.md`.
+The Copilot Chat bundle and the VS Code workbench are now separate parts: if a
+workbench is missing or read-only, it is reported as a `Notice:` in the status
+output and the Copilot patch still applies. “Could not locate” is impossible
+when the bundle was found, and a failure lists every application root and
+extension directory that was checked in the `AI Agent Bridge Copilot Patch`
+output channel.
+
+## 3. Elevation is offered when it is genuinely needed
+
+For a system-wide Linux installation (`/usr/share/code`, `/usr/lib/code`),
+`AI Agent Bridge: Apply Copilot Chat Patch` now offers **Retry with
+administrator rights**: the extension writes a small runner to the temp folder
+and starts it through `pkexec` (policy-kit password dialog) or passwordless
+`sudo`, then reloads. When neither is available it prints the exact command to
+run. A WSL extension host cannot elevate into Windows and says so instead of
+offering a broken retry.
 
 ## Install in one step
 
-This release ships the extension **and** the installer script together.
-Download both files into the same folder and run the script for your platform:
+Download the VSIX and the installer script for your platform into one folder and
+run the script:
 
 ```bash
-# Linux (including CachyOS)
+# Linux (including CachyOS; also from a WSL terminal)
 chmod +x install-ai-agent-bridge.sh
 ./install-ai-agent-bridge.sh
 ```
@@ -46,12 +68,16 @@ chmod +x install-ai-agent-bridge.sh
 install-ai-agent-bridge.cmd
 ```
 
-The Linux script installs the extension and applies compatible patches when
-the application files are writable by the current user. On Windows the
-extension applies patches on the next window reload.
+The script installs the extension and applies the patches in the same run with
+the extension's own compiled patch code. `SKIP_PATCHES=1` installs only,
+`DRY_RUN=1` prints what would happen, `VSCODE_APP_ROOT` and `VSCODE_EXTENSIONS_DIR`
+describe custom layouts.
 
 ## Verification
 
-- `npm audit` reports zero vulnerabilities in the complete dependency tree.
-- TypeScript and lint checks pass; the extension-host suite contains 506 tests.
-- The Linux installer passed `bash -n` and its non-mutating dry run.
+- 513 extension-host tests passing, including the new search tests (WSL commit
+  matching, user-extension installs, a server bundle without a workbench) and a
+  patch/restore round trip with no workbench present.
+- Lint and TypeScript compilation clean.
+- The apply/restore round trip above was run on a real WSL session against both
+  real bundles, using copies so the installed VS Code stayed untouched.

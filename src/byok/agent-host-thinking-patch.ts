@@ -2,7 +2,7 @@ import * as crypto from "crypto";
 import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
-import { findCopilotBundle } from "../copilot-patch";
+import { findAgentHostBundles } from "../vscode-app-root";
 
 /**
  * Patches the VS Code agent-host bundle so BYOK models get a thinking-level
@@ -133,24 +133,14 @@ export interface AgentHostThinkingPatchTarget {
 
 /** Locates the agent-host bundle of the installed VS Code. */
 export function findAgentHostBundle(explicitRoot?: string): AgentHostThinkingPatchTarget {
-	// The agent-host bundle lives at a deterministic path under the app root, so
-	// an explicit root (or the running extension host) needs no Copilot-bundle
-	// lookup — bare VS Code archives on CI runners have no bundled extensions.
-	if (explicitRoot) {
-		const directPath = agentHostBundlePathFromAppRoot(explicitRoot);
-		if (fs.existsSync(directPath)) {
-			return { bundlePath: directPath };
-		}
-	}
-	try {
-		const copilot = findCopilotBundle(explicitRoot);
-		const appRoot = path.resolve(path.dirname(copilot.workbenchPath), "..", "..", "..");
-		const bundlePath = agentHostBundlePathFromAppRoot(appRoot);
-		if (fs.existsSync(bundlePath)) {
-			return { bundlePath };
-		}
-	} catch {
-		// Fall through to the error below with both candidates reported.
+	// The agent-host bundle lives at a deterministic path under an application
+	// root, so an explicit root (or the running extension host) needs no
+	// Copilot-bundle lookup — bare VS Code archives on CI runners have no
+	// bundled extensions. A remote extension host has no agent host of its own
+	// when the window runs on another machine, so every known root is checked.
+	const candidates = findAgentHostBundles(explicitRoot);
+	if (candidates.length > 0) {
+		return { bundlePath: candidates[0].bundlePath };
 	}
 	throw new Error(`Could not locate the VS Code agent host bundle (tried the app root and installed VS Code installations)`);
 }

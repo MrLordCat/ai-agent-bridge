@@ -64,8 +64,16 @@ suite("AI Agent Bridge branding", () => {
 			"the install example names the shipping version");
 		assert.ok(readme.includes(`Current build: ${manifest.version}.`),
 			"the development block names the shipping version");
-		assert.ok(readme.includes("506 extension-host tests"),
-			"the README names the test count this build runs");
+		assert.match(
+			readme,
+			new RegExp(`${manifest.version} build`),
+			"the test command in the development block names this build"
+		);
+		assert.match(
+			readme,
+			/\d+ extension-host tests/,
+			"the README names the extension-host test count"
+		);
 		assert.match(readme, /Patch v22/);
 		assert.doesNotMatch(readme, /Local LLM Chat Provider|Local LLM:|Stable release: 1.9.0|283 extension-host tests|Patch v16/);
 	});

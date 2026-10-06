@@ -53,7 +53,7 @@ package is deliberately distributed outside the gallery.
    [Releases](https://github.com/MrLordCat/ai-agent-bridge/releases/latest).
 2. Install it:
    ```sh
-  code --install-extension llama-vscode-chat-v1.16.5.vsix
+   code --install-extension llama-vscode-chat-v1.16.6.vsix
    ```
 3. Run `Developer: Reload Window`.
 
@@ -82,11 +82,18 @@ chmod +x install-ai-agent-bridge.sh
 ./install-ai-agent-bridge.sh
 ```
 
-The Linux script runs only as a regular user and never requests administrator
-rights. Use a user-owned VS Code installation (User Installer or portable build)
-if you want the application bundle patches. A system-wide read-only VS Code
-installation can still receive the VSIX, but its bundles cannot be patched
-without administrator rights. Re-run the installer after a VS Code update.
+The installer scripts run as a regular user and never ask for a password: the
+Copilot Chat bundle is patched on its own, and the workbench part is skipped
+with a `Notice:` when the application files belong to another user. The patch
+code looks for Copilot Chat instead of trusting one path — the bundled copy in
+the application root, a user extension in `~/.vscode-oss/extensions` or
+`~/.vscode/extensions`, the Linux server of a remote session, and, from WSL,
+the Windows installation under `/mnt/c/...` matched by the commit of the running
+server. Re-run the installer after a VS Code update.
+
+If a system-wide Linux installation really needs its application bundles
+patched, `AI Agent Bridge: Apply Copilot Chat Patch` offers **Retry with
+administrator rights** (a `pkexec` password dialog, or passwordless `sudo`).
 
 Overrides for unusual setups: `LLAMACPP_VSIX=<path>` picks a specific VSIX,
 `VSCODE_CLI=<command>` names a CLI that is not `code`/`code-insiders`,
@@ -364,7 +371,7 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.16.2. Current build: 1.16.5.** The 1.16 line forwards
+**Stable release: 1.16.2. Current build: 1.16.6.** The 1.16 line forwards
 reasoning to gateway-backed llama.cpp servers, sends the picked thinking
 level as `reasoning_effort`, shows each subscription limit with its reset
 moment in Quick Access, adds the `wait_for_terminal` tool, recovers Claude
@@ -375,7 +382,7 @@ from the installer itself in one run.
 npm install
 npm run compile
 npm run lint
-npm test              # 506 extension-host tests in the current 1.16.5 build
+npm test              # 514 extension-host tests in the current 1.16.6 build
 npm run package       # → llama-vscode-chat-{version}.vsix
 code --install-extension ./llama-vscode-chat-{version}.vsix --force
 ```

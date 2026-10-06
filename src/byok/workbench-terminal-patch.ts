@@ -2,6 +2,8 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 
+import { findWorkbenchCandidates } from "../vscode-app-root";
+
 /**
  * Patches the VS Code workbench bundle so the RunInTerminalTool reuses an
  * idle background tool terminal for foreground (sync) commands instead of
@@ -64,15 +66,16 @@ export interface WorkbenchTerminalPatchTarget {
 
 /** Locates the workbench bundle of the installed VS Code. */
 export function findWorkbenchBundle(explicitRoot?: string): WorkbenchTerminalPatchTarget {
-        if (explicitRoot) {
-                const directPath = workbenchBundlePathFromAppRoot(explicitRoot);
-                if (fs.existsSync(directPath)) {
-                        return { bundlePath: directPath };
-                }
-        }
-        throw new Error(
-                `Could not locate the VS Code workbench bundle (tried ${explicitRoot ?? "<no app root>"})`
-        );
+	// The active application root comes first; a remote extension host has no
+	// workbench of its own, so the known installations (including the Windows
+	// side of a WSL session) are checked as well.
+	const candidates = findWorkbenchCandidates(explicitRoot);
+	if (candidates.length > 0) {
+		return { bundlePath: candidates[0].workbenchPath };
+	}
+	throw new Error(
+		`Could not locate the VS Code workbench bundle (tried ${explicitRoot ?? "<no app root>"} and the known installations)`
+	);
 }
 
 /** Applies the idle background terminal reuse branch to the bundle source. */

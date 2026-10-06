@@ -218,13 +218,37 @@ Open the `AI Agent Bridge Copilot Patch` output channel to identify the failure.
 `Copilot bundle shape changed` or `VS Code workbench shape changed` means the
 patch needs an update for the installed VS Code build; elevation cannot fix it.
 
-For `EACCES` or `EPERM`, use the VS Code **User Installer** or a portable VS Code
-installation in a directory owned by your account, then install the AI Agent
-Bridge VSIX with the VS Code CLI and reload the window. The extension patches
-the active `vscode.env.appRoot` in that installation. A system-wide VS Code
-installation with read-only application files cannot be patched through the
-extension API without administrator rights. Do not change ownership of the
-system installation or copy patched bundles between VS Code versions.
+The patch code searches for Copilot Chat instead of trusting one path, so most
+installations need no administrator rights at all:
+
+- **Official Windows/macOS build** — the bundled `extensions/copilot` inside the
+  application root.
+- **Code - OSS, CachyOS, Marketplace installs** — the user extension in
+  `~/.vscode-oss/extensions`, `~/.vscode/extensions`, or the matching insiders
+  folder, which always belongs to your account.
+- **Remote-WSL** — both copies: the Linux server that runs chat
+  (`~/.vscode-server/extensions` or the server's own `extensions/copilot`) and
+  the Windows installation that renders the window, found through
+  `/mnt/c/Users/<you>/AppData/Local/Programs/Microsoft VS Code/<commit>` by
+  matching the commit of the running server. The workbench bundle is always the
+  Windows one, because a server installation has no `workbench.desktop.main.js`.
+- **Remote-SSH and containers** — `~/.vscode-server/extensions` and the server
+  application root on the remote side.
+
+The Copilot Chat bundle is patched on its own and the workbench/agent-host parts
+are applied on a best-effort basis: a read-only workbench no longer fails the
+whole operation, it is reported as `Notice:` in the status output.
+
+For `EACCES` or `EPERM` on a system-wide Linux installation (packages that live
+in `/usr/share/code` or `/usr/lib/code`), `AI Agent Bridge: Apply Copilot Chat
+Patch` offers **Retry with administrator rights**: it writes a small runner into
+the temporary folder and starts it through `pkexec` (policy-kit dialog) or
+passwordless `sudo`. If neither is available, the log prints the exact `sudo`
+command to run. On Windows use the VS Code **User Installer** or a portable
+installation in a directory owned by your account: those files are writable
+without elevation, and a WSL extension host cannot elevate into Windows. Do not
+change ownership of a system installation or copy patched bundles between VS
+Code versions.
 
 ### Patch Guardian Keeps Offering Changes
 

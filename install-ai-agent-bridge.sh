@@ -232,10 +232,19 @@ function run(name, apply) {
 }
 
 run("Copilot Chat bundle", () => {
-	const target = copilot.findCopilotBundle(appRoot);
-	const result = copilot.applyCopilotPatch(target);
-	const version = target.manifest && target.manifest.version ? ` (Copilot Chat ${target.manifest.version})` : "";
-	return (result.changed ? "applied" : "already applied") + version;
+	const targets = copilot.findCopilotBundles(appRoot);
+	if (targets.length === 0) {
+		throw new Error("no Copilot Chat bundle found");
+	}
+	const parts = [];
+	for (const target of targets) {
+		const result = copilot.applyCopilotPatch(target);
+		const version = target.manifest && target.manifest.version ? `Copilot Chat ${target.manifest.version}` : "Copilot Chat";
+		const where = target.source || target.bundlePath;
+		const skipped = result.status && !result.status.workbenchApplied ? ", workbench part skipped" : "";
+		parts.push(`${version} [${where}]: ${result.changed ? "applied" : "already applied"}${skipped}`);
+	}
+	return parts.join("; ");
 });
 
 run("VS Code workbench", () => {
@@ -275,11 +284,10 @@ app_root="$(resolve_app_root || true)"
 extension_dir="$(resolve_extension_dir || true)"
 
 if [[ -z "$app_root" ]]; then
-	echo "WARNING: could not locate the VS Code application root; skipping patches." >&2
-	echo "Re-run with VSCODE_APP_ROOT=<dir> if your VS Code uses a custom layout." >&2
-	echo
-	echo "Done. If VS Code is running, reload the window: Ctrl+Shift+P > Developer: Reload Window."
-	exit 0
+	# Not fatal: the patch code searches the known installations itself, which
+	# is what a WSL extension host needs (the Copilot bundle lives in the Linux
+	# server, the workbench in the Windows installation under /mnt/c).
+	echo "NOTE: no VS Code application root found by path; the patch code will search the known installations." >&2
 fi
 
 if [[ -z "$extension_dir" ]]; then
@@ -291,7 +299,7 @@ if [[ -z "$extension_dir" ]]; then
 fi
 
 echo "Applying patches"
-echo "  VS Code:   $app_root"
+echo "  VS Code:   ${app_root:-<search the known installations>}"
 echo "  extension: $extension_dir"
 
 node_command="$(command -v node 2>/dev/null || true)"

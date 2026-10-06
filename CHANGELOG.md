@@ -1,5 +1,31 @@
 # Changelog
 
+## 1.16.6 (patch release) - 2026-10-06
+
+- **Patches no longer require administrator rights, and no longer fail when
+  they are unavailable.** Copilot Chat is now searched the way it is actually
+  installed instead of only inside the application root: a remote extension
+  host finds the Linux server copy (which has no
+  `out/vs/workbench/workbench.desktop.main.js`), a Code - OSS installation
+  finds the user extension in `~/.vscode-oss/extensions`, and a WSL session
+  finds the Windows installation under
+  `/mnt/c/Users/<you>/AppData/Local/Programs/Microsoft VS Code/<commit>` by
+  matching the commit of the running server. Every copy is patched, and each
+  one borrows the workbench of the window.
+- **The Copilot bundle and the VS Code workbench are applied independently.**
+  A read-only or missing workbench is reported as a `Notice:` in the status
+  output instead of aborting the whole patch, so `Could not locate the bundled
+  Copilot Chat extension` cannot happen when the Copilot bundle is found.
+- **A failed write reports what was searched.** The `AI Agent Bridge Copilot
+  Patch` output channel lists every application root and extension directory
+  that was checked.
+- **Elevation is offered when it is actually needed.** On a system-wide Linux
+  installation, `AI Agent Bridge: Apply Copilot Chat Patch` offers **Retry with
+  administrator rights**, which runs the patch through `pkexec` (policy-kit
+  dialog) or passwordless `sudo`, and prints the exact `sudo` command when
+  neither is available. A WSL extension host explains that it cannot elevate
+  into Windows and points at the User Installer instead.
+
 ## 1.16.5 (patch release) - 2026-09-29
 
 - **API keys stay with their intended endpoint.** The primary key is no longer
