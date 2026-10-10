@@ -6,16 +6,16 @@ import { getModelsEndpoint, isCloudflareWorkersAiBase, isDeepSeekEndpoint } from
 
 /**
  * Unified provider directory: one place that knows every model source
- * (Local, DeepSeek, Codex, Claude, and custom API profiles) and whether it is
+ * (Local, DeepSeek, Codex, Claude, Coco, and custom API profiles) and whether it is
  * currently reachable.
  *
  * HTTP sources (Local, DeepSeek, custom API profiles) are probed with a
  * lightweight GET /models request on a TTL-guarded interval (default 5 min).
- * Codex and Claude states are supplied by their providers, which already
+ * Codex, Claude, and Coco states are supplied by their providers, which already
  * refresh their own status periodically.
  */
 
-export type ProviderKind = "local" | "deepseek" | "codex" | "claude" | "api";
+export type ProviderKind = "local" | "deepseek" | "codex" | "claude" | "coco" | "api";
 
 export type ProviderState =
 	| "checking"
@@ -67,6 +67,7 @@ export interface ProviderDirectoryOptions {
 	getApiProfileKey?: (id: string) => Promise<string | undefined>;
 	getCodexStatus?: () => SubscriptionProviderStatus | undefined;
 	getClaudeStatus?: () => SubscriptionProviderStatus | undefined;
+	getCocoStatus?: () => SubscriptionProviderStatus | undefined;
 	probeHttp?: HttpProbeFn;
 	probeIntervalMs?: number;
 	probeTimeoutMs?: number;
@@ -126,6 +127,8 @@ export function resolveSubscriptionState(status: SubscriptionProviderStatus | un
 			return { state: "off", detail: "Disabled in settings." };
 		case "signedOut":
 			return { state: "unconfigured", detail: "Not signed in." };
+		case "unconfigured":
+			return { state: "unconfigured", detail: status.summary || "Provider not configured." };
 		case "wrongAuth":
 			return { state: "unconfigured", detail: status.summary || "Authentication rejected." };
 		case "connected":
@@ -192,6 +195,7 @@ export class ProviderDirectory implements vscode.Disposable {
 		const deepSeekEnabled = config.getConfigValue("enableDeepSeek", true) !== false;
 		const codexEnabled = config.getConfigValue("enableCodexSubscription", true) !== false;
 		const claudeEnabled = config.getConfigValue("enableClaudeSubscription", true) !== false;
+		const cocoEnabled = config.getConfigValue("enableCoco", true) !== false;
 
 		const deepSeekKey = await secrets("llamacpp.deepSeekApiKey").catch(() => undefined);
 		const deepSeekEndpoint = getModelsEndpoint(this.deepSeekServerUrl());
@@ -209,6 +213,8 @@ export class ProviderDirectory implements vscode.Disposable {
 		this.setMapped("codex", "Codex", "codex", codexEnabled, codex.state, codex.detail);
 		const claude = resolveSubscriptionState(config.getClaudeStatus?.());
 		this.setMapped("claude", "Claude", "claude", claudeEnabled, claude.state, claude.detail);
+		const coco = resolveSubscriptionState(config.getCocoStatus?.());
+		this.setMapped("coco", "Coco", "coco", cocoEnabled, coco.state, coco.detail);
 
 		for (const profile of profiles) {
 			const key = `api-${profile.id}`;

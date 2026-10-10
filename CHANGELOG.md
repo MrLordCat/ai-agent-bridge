@@ -1,5 +1,153 @@
 # Changelog
 
+## 1.17.0 (stable release) - 2026-10-10
+
+- Add Snowflake Cortex Code (Coco) to native Chat and Quick Access: discover
+  models through ACP, reuse the configured Azure OAuth connection, expose
+  reasoning choices, stream thinking and forward image input when supported.
+- Delegate actions to native Chat tools and approvals. Coco command tools use
+  interactive VS Code terminals, reuse idle shells, preserve state and allow
+  user input, cancellation and closing the actual process.
+- Bound and cancel connection checks; keep context usage and runtime window
+  sizes across tool continuations. Validate ACP messages, accept string request
+  IDs and contain handler failures.
+- Apply compatible patches on extension startup. On Linux, prepare a writable
+  desktop copy under the user's home without modifying system files or needing
+  root. Native capabilities and read-only files remain visible in patch status.
+- Ship separate Windows x64 and Linux x64 VSIX packages, each built and tested
+  on its platform. Remove external installers and the repository patch wrapper;
+  install the VSIX normally and use the extension's patch commands.
+- Update vulnerable dependencies and the VSIX packager. Full dependency audit
+  reports zero known vulnerabilities as of this release.
+
+## 1.16.16 (local development patch) - 2026-10-10
+
+- Add **Prepare User VS Code (Linux, no root)** to create a writable copy of
+  the current desktop build and a launcher in the user's home directory. The
+  copy applies patches on normal extension startup while leaving system files
+  untouched. Existing extensions are shared through the CLI; a separate user
+  profile prevents forwarding into an already-running system VS Code.
+- Offer this route after Linux patch permission failures. Repeated preparation
+  preserves existing patches; cancellation removes incomplete copies, and
+  application symlinks are copied into independent writable files.
+- Apply the agent-host thinking and response compatibility patch on normal
+  startup too; previously this part required the installer or a manual command.
+  Skip it when VS Code provides those capabilities natively. It can be disabled
+  with `llamacpp.agentHostThinkingPatchEnabled`.
+- Extend Debian verification to migrate a root-owned installation as UID 1000,
+  install through the generated launcher, and check automatic patches on the
+  resulting desktop application.
+
+## 1.16.15 (local development patch) - 2026-10-10
+
+- Forward Coco ACP `usage_update` snapshots to the native Chat context usage
+  channel. Use the runtime's current `used` count and update the model's total
+  context window from `size`, instead of the fallback 128k window.
+- Keep the latest snapshot across Chat tool-result continuations and accept
+  reduced usage after compaction. Clear observed windows when changing the CLI
+  or Snowflake connection. Cumulative billing totals and unreported output/cache
+  counts are not used as measured context.
+
+## 1.16.14 (local development patch) - 2026-10-10
+
+- Advertise Coco image input when the active ACP runtime reports
+  `promptCapabilities.image`. Preserve the negotiated capability while refreshing
+  the same source and clear it when the Snowflake connection or CLI changes.
+- Send image attachments as ACP image blocks with their original bytes and MIME
+  types, preserving their position in the conversation. Include image attachments
+  in context estimates and reject unsupported runtimes instead of dropping images.
+- Verify real image recognition through the bundled Cortex CLI and cover vision
+  discovery, multimodal requests and attachment handling with regression tests.
+
+## 1.16.13 (local development patch) - 2026-10-10
+
+- Bound the complete Coco connection check to 45 seconds, including startup and
+  session creation. Timeout, cancellation, launch failure and source changes
+  settle the caller without relying on the CLI to answer or reject its RPC.
+- Make the progress notification cancellable and show its current stage. Share
+  repeated status/model refresh clicks, reuse fresh status, and keep the known
+  catalog and thinking controls while checking the same connection.
+- Discard late replies, allow explicit retry, and accept a live Chat session's
+  catalog as proof of connection. Preserve status after stale probes finish.
+- Match Snowflake's CLI launch environment by removing VS Code's Node hooks and
+  adding the CLI directory to PATH. On Windows, stop the owned CLI process tree
+  on disposal so helper processes are also closed.
+- Cover stuck initialization, late replies, cancellation, concurrent refreshes,
+  launch errors and progress notifications. Verify live ACP discovery without
+  running model inference.
+
+## 1.16.12 (local development patch) - 2026-10-10
+
+- Automatically reuse the last idle Coco terminal when a command omits
+  `terminalId`, preserving the shell process, directory and variables. A failed
+  command no longer causes a new terminal for the next command.
+- Reserve the selected terminal before asynchronous initialization. Skip running,
+  closed and user-occupied terminals; honor the requested directory and expose
+  `newTerminal` for commands that explicitly need a separate shell.
+- Cover default reuse, explicit selection, concurrent commands and closure.
+  Verify preserved variables and the same process in a live PowerShell terminal.
+
+## 1.16.11 (local development patch) - 2026-10-09
+
+- Give Coco registered Chat tools for commands in ordinary interactive VS Code
+  terminals. Users can type, interrupt with Ctrl+C, or close the terminal tab.
+  Commands retain native Chat approval; terminal output and status return to Coco.
+- Exclude Agents Window background `powershell`/`bash` tools from Coco's ACP
+  catalog. Preserve the caller's registered tool names and reference aliases.
+- Capture bounded output through shell integration, reuse idle terminals, and
+  resolve waits when a terminal closes. Do not interrupt commands started by the
+  user or rerun commands on timeout or output failure.
+- Verify input and actual shell process termination in a live PowerShell 7
+  terminal, alongside routing, cancellation, isolation and output bounds.
+
+## 1.16.10 (local development patch) - 2026-10-09
+
+- Delegate Coco tool calls through native Chat tool-call and tool-result parts,
+  including private Copilot tools. Chat now applies its permission mode and
+  displays command execution and results in the current conversation.
+- Keep the ACP prompt alive across tool steps, route results by call ID, and
+  close cancelled, expired or invalid continuations. Preserve historical tool
+  output when starting a new user turn.
+- Stop built-in Cortex actions that bypass Chat. Remove the separate ACP
+  permission picker instead of auto-approving an independent agent flow.
+- Verify the native provider loop against a live Azure-authorized ACP session
+  and cover delegation, parallel conversations, cancellation and invalid results.
+
+## 1.16.9 (local development patch) - 2026-10-09
+
+- Add Coco to Quick Access with ACP connection status, discovered model count,
+  source toggle, Snowflake connection selection, catalog refresh, and links to
+  thinking controls, settings, and the Snowflake Coco panel.
+- Check Coco status without model inference. Keep its recovery controls visible
+  while offline, deduplicate concurrent checks, and discard outdated results
+  after changing connections. Disabled sources refuse new chat requests.
+- Integrate Coco with the provider status directory and refresh its status
+  when its configuration changes.
+
+## 1.16.8 (local development patch) - 2026-10-09
+
+- Expose Coco's ACP thinking levels in the native model configuration picker.
+  Send the selected effort through `session/set_config_option` before the
+  prompt, using the active runtime's `thought_level` option and supported values.
+- Stream `agent_thought_chunk` events into native VS Code thinking parts,
+  separate from answer text. Preserve consecutive thought deltas in one block
+  and stop emitting them when the request is cancelled.
+- Add regression coverage for thinking schemas, unsupported levels, and
+  reasoning/answer stream separation.
+
+## 1.16.7 (local development patch) - 2026-10-09
+
+- Add Snowflake Cortex Code (Coco) as a native VS Code Chat model source via
+  the ACP server bundled with the Snowflake extension. The picker starts with
+  Auto and adds the models available to the active Snowflake role after ACP
+  discovery. Model responses stream into Chat.
+- Reuse the configured Snowflake CLI connection and its Azure OAuth flow.
+  No Snowflake credentials are copied into AI Agent Bridge. Coco receives the
+  registered VS Code tools offered for the turn and asks for approval before built-in
+  actions that require it.
+- Give the real-bundle Copilot patch regression test enough time on slower
+  hosts. The build remains a local VSIX until a release is requested.
+
 ## 1.16.6 (patch release) - 2026-10-06
 
 - **Patches no longer require administrator rights, and no longer fail when

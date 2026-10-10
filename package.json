@@ -2,13 +2,13 @@
 	"name": "llama-vscode-chat",
 	"publisher": "mrlordcat",
 	"displayName": "AI Agent Bridge",
-	"description": "Bridge local models, DeepSeek, Codex, and Claude subscriptions into native VS Code Chat with tools, subagents, memory, context control, and diagnostics.",
+	"description": "Bridge local models, DeepSeek, Codex, Claude, and Snowflake Coco into native VS Code Chat with tools, subagents, memory, context control, and diagnostics.",
 	"icon": "assets/logo.png",
 	"repository": {
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.16.6",
+	"version": "1.17.0",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -93,6 +93,28 @@
 					"minimum": 32768,
 					"maximum": 1048576,
 					"description": "Maximum context window advertised for DeepSeek models. This is independent of the local llama.cpp/Qwen server context."
+				},
+				"llamacpp.enableCoco": {
+					"type": "boolean",
+					"default": true,
+					"description": "Advertise Snowflake Cortex Code (Coco) models from the locally installed Snowflake extension. Coco uses its own Snowflake connection and Azure sign-in."
+				},
+				"llamacpp.cocoCliPath": {
+					"type": "string",
+					"default": "",
+					"description": "Optional path to the Coco CLI executable. Empty uses the CLI bundled with the Snowflake VS Code extension."
+				},
+				"llamacpp.cocoConnection": {
+					"type": "string",
+					"default": "",
+					"description": "Snowflake CLI connection name for Coco. Empty uses the sole configured connection, or the CLI default if more than one exists."
+				},
+				"llamacpp.cocoContextLength": {
+					"type": "number",
+					"default": 128000,
+					"minimum": 4096,
+					"maximum": 1048576,
+					"description": "Fallback context window advertised for Coco models. The server still enforces the selected model limit."
 				},
 				"llamacpp.enableCodexSubscription": {
 					"type": "boolean",
@@ -304,6 +326,11 @@
 					"type": "boolean",
 					"default": true,
 					"description": "Reuse an idle background tool terminal for sync commands instead of spawning a new terminal per call (patches the VS Code workbench bundle; requires a window restart to take effect)."
+				},
+				"llamacpp.agentHostThinkingPatchEnabled": {
+					"type": "boolean",
+					"default": true,
+					"description": "Apply the BYOK thinking-level and response compatibility fixes to the agent-host bundle at startup when VS Code does not provide them natively. Requires writable application files and a window restart."
 				},
 				"llamacpp.claudeMaxCumulativeInputTokens": {
 					"type": "number",
@@ -904,6 +931,157 @@
 				}
 			},
 			{
+				"name": "llamacpp_coco_run_in_terminal",
+				"displayName": "Run in Coco Terminal",
+				"toolReferenceName": "cocoRunInTerminal",
+				"modelDescription": "Run a shell command in a normal interactive VS Code terminal visible in the terminal panel. Automatically reuses the last idle Coco terminal and preserves its shell state. A new terminal is created when none is idle, when cwd requires a different directory, or when newTerminal is true. Prefer sync for finite commands (waits up to timeoutMs, default 120000); async for servers/watchers (returns after 1 second). Returns terminalId, state, exitCode and bounded output. If state is running, read that terminal instead of rerunning the command. The user can type, press Ctrl+C, or close it; respect their interruption. Uses the configured default terminal shell; shell integration must be enabled.",
+				"userDescription": "Run a command in an interactive VS Code terminal.",
+				"canBeReferencedInPrompt": true,
+				"icon": "$(terminal)",
+				"tags": [
+					"terminal",
+					"llamacpp",
+					"coco"
+				],
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"command": {
+							"type": "string",
+							"description": "Exact command for the default terminal shell (PowerShell on Windows)."
+						},
+						"terminalId": {
+							"type": "string",
+							"description": "Select a particular idle Coco terminal. Omit to reuse the last idle terminal automatically."
+						},
+						"newTerminal": {
+							"type": "boolean",
+							"default": false,
+							"description": "Create a separate terminal even if another is idle. Mutually exclusive with terminalId."
+						},
+						"cwd": {
+							"type": "string",
+							"description": "Reuse a terminal already in this directory, otherwise create one there. With terminalId, must match its reported directory. Omit to preserve the reused shell's current directory."
+						},
+						"mode": {
+							"type": "string",
+							"enum": [
+								"sync",
+								"async"
+							],
+							"default": "sync"
+						},
+						"timeoutMs": {
+							"type": "number",
+							"minimum": 0,
+							"maximum": 3600000,
+							"description": "Sync wait limit; timeout leaves the command running in the visible terminal."
+						}
+					},
+					"required": [
+						"command"
+					],
+					"additionalProperties": false
+				}
+			},
+			{
+				"name": "llamacpp_coco_read_terminal",
+				"displayName": "Read Coco Terminal",
+				"toolReferenceName": "cocoReadTerminal",
+				"modelDescription": "Read the bounded output and current state of a command started by cocoRunInTerminal. Use its returned terminalId. Optional waitMs waits for that command to finish, up to 60000ms; do not repeatedly poll. Returns output, state, exitCode and truncation flag.",
+				"userDescription": "Read a Coco terminal command's output and status.",
+				"canBeReferencedInPrompt": true,
+				"icon": "$(terminal)",
+				"tags": [
+					"terminal",
+					"llamacpp",
+					"coco"
+				],
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"terminalId": {
+							"type": "string"
+						},
+						"waitMs": {
+							"type": "number",
+							"minimum": 0,
+							"maximum": 60000
+						},
+						"maxChars": {
+							"type": "number",
+							"minimum": 1,
+							"maximum": 128000,
+							"description": "Most recent output characters to return (default 12000)."
+						}
+					},
+					"required": [
+						"terminalId"
+					],
+					"additionalProperties": false
+				}
+			},
+			{
+				"name": "llamacpp_coco_send_to_terminal",
+				"displayName": "Send to Coco Terminal",
+				"toolReferenceName": "cocoSendToTerminal",
+				"modelDescription": "Send input to a command currently running in an interactive Coco terminal. Requires terminalId from cocoRunInTerminal. addNewLine defaults to true; for Ctrl+C send text \\u0003 with addNewLine false. To start a new command use cocoRunInTerminal. Never ask the user to supply passwords or tokens through this tool; they can type directly in the terminal.",
+				"userDescription": "Send input to a running Coco terminal command.",
+				"canBeReferencedInPrompt": true,
+				"icon": "$(terminal)",
+				"tags": [
+					"terminal",
+					"llamacpp",
+					"coco"
+				],
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"terminalId": {
+							"type": "string"
+						},
+						"text": {
+							"type": "string"
+						},
+						"addNewLine": {
+							"type": "boolean",
+							"default": true
+						}
+					},
+					"required": [
+						"terminalId",
+						"text"
+					],
+					"additionalProperties": false
+				}
+			},
+			{
+				"name": "llamacpp_coco_kill_terminal",
+				"displayName": "Close Coco Terminal",
+				"toolReferenceName": "cocoKillTerminal",
+				"modelDescription": "Close the interactive Coco terminal and terminate its shell. Requires terminalId from cocoRunInTerminal. Resolves any outstanding command wait as closed. The user can also close the terminal with the trash icon in VS Code.",
+				"userDescription": "Close a Coco terminal and stop its shell.",
+				"canBeReferencedInPrompt": true,
+				"icon": "$(trash)",
+				"tags": [
+					"terminal",
+					"llamacpp",
+					"coco"
+				],
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"terminalId": {
+							"type": "string"
+						}
+					},
+					"required": [
+						"terminalId"
+					],
+					"additionalProperties": false
+				}
+			},
+			{
 				"name": "llamacpp_wait_for_terminal",
 				"displayName": "Wait for Terminal Command",
 				"toolReferenceName": "waitForTerminal",
@@ -995,6 +1173,30 @@
 				"title": "AI Agent Bridge: Toggle Claude Subscription Source"
 			},
 			{
+				"command": "llamacpp.toggleCoco",
+				"title": "AI Agent Bridge: Toggle Coco Source"
+			},
+			{
+				"command": "llamacpp.cocoShowStatus",
+				"title": "AI Agent Bridge: Show Coco Connection Status"
+			},
+			{
+				"command": "llamacpp.cocoSelectConnection",
+				"title": "AI Agent Bridge: Select Coco Snowflake Connection"
+			},
+			{
+				"command": "llamacpp.cocoRefreshModels",
+				"title": "AI Agent Bridge: Refresh Coco Models"
+			},
+			{
+				"command": "llamacpp.cocoOpenSettings",
+				"title": "AI Agent Bridge: Open Coco Settings"
+			},
+			{
+				"command": "llamacpp.cocoOpenSnowflake",
+				"title": "AI Agent Bridge: Open Snowflake Coco"
+			},
+			{
 				"command": "llamacpp.claudeSignIn",
 				"title": "AI Agent Bridge: Sign In to Claude Subscription"
 			},
@@ -1077,6 +1279,11 @@
 			{
 				"command": "llamacpp.applyCopilotPatch",
 				"title": "AI Agent Bridge: Apply Copilot Chat Patch"
+			},
+			{
+				"command": "llamacpp.prepareUserVsCode",
+				"title": "AI Agent Bridge: Prepare User VS Code (Linux, no root)",
+				"enablement": "isLinux && !remoteName"
 			},
 			{
 				"command": "llamacpp.copilotPatchStatus",
@@ -1180,9 +1387,6 @@
 	"scripts": {
 		"vscode:prepublish": "npm run clean && npm run compile",
 		"clean": "node -e \"require('node:fs').rmSync('out', { recursive: true, force: true })\"",
-		"patch:copilot": "npm run compile --silent && node ./scripts/patch-copilot-chat.mjs apply",
-		"patch:copilot:status": "npm run compile --silent && node ./scripts/patch-copilot-chat.mjs status",
-		"patch:copilot:restore": "npm run compile --silent && node ./scripts/patch-copilot-chat.mjs restore",
 		"update-vscode-api": "dts main && node ./scripts/move-vscode-api.mjs",
 		"compile": "tsc -p ./",
 		"lint": "eslint",
@@ -1203,7 +1407,7 @@
 		"@vscode/dts": "^0.4.1",
 		"@vscode/test-cli": "^0.0.15",
 		"@vscode/test-electron": "^3.1.0",
-		"@vscode/vsce": "3.9.2",
+		"@vscode/vsce": "4.0.0",
 		"eslint": "^10.8.1",
 		"prettier": "^3.9.6",
 		"typescript": "^5.9.3",

@@ -113,6 +113,8 @@ suite("Copilot patch", () => {
 	}
 
 	test("keeps v16 prompt rendering and stored tool output bounded", function () {
+		// Parsing both installed minified bundles can exceed the suite's 20s limit.
+		this.timeout(60_000);
 		// GitHub-hosted Windows runners only have the bare VS Code
 		// archive (no bundled extensions), so the real-bundle test is
 		// skipped when Copilot Chat cannot be located. Local machines
@@ -273,6 +275,7 @@ suite("Copilot patch", () => {
 	});
 
 	test("applies and restores the Copilot bundle when no workbench exists", function () {
+		this.timeout(60_000);
 		// A remote extension host (WSL/SSH/container) ships Copilot Chat but has
 		// no desktop workbench; the patch must still apply to the bundle instead
 		// of failing the whole operation.

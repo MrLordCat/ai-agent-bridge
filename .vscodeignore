@@ -1,8 +1,12 @@
 .vscode/**
 .vscode-test/**
+artifacts/**
 .vscode-test.mjs
 .vscode-test.local.mjs
 .agents/**
+.cortex/**
+Dockerfile
+.dockerignore
 .playwright-mcp/**
 AGENTS.md
 .venv/**

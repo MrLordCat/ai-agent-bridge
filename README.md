@@ -49,51 +49,47 @@ The extension ships as a VSIX from GitHub Releases. It is not on the VS Code
 Marketplace: the optional Copilot Chat patch is not a Marketplace API, so the
 package is deliberately distributed outside the gallery.
 
-1. Download `llama-vscode-chat-v{version}.vsix` from
+1. Download the VSIX for your platform (`win32-x64` or `linux-x64`) from
    [Releases](https://github.com/MrLordCat/ai-agent-bridge/releases/latest).
 2. Install it:
    ```sh
-   code --install-extension llama-vscode-chat-v1.16.6.vsix
+    # Windows
+    code --install-extension llama-vscode-chat-v1.17.0-win32-x64.vsix
+    # Linux x64
+    code --install-extension llama-vscode-chat-v1.17.0-linux-x64.vsix
    ```
 3. Run `Developer: Reload Window`.
 
-### Installer script
+### Automatic patches
 
-Both installers copy the VSIX to the local temp folder before handing it to
-VS Code, because the installer rejects VSIX files opened from a UNC path
-(`\\host\...`) with `Extract: UNC host ... access is not allowed`. Both also
-pick the **newest** `llama-vscode-chat-*.vsix` sitting next to the script,
-compared as versions so `1.16.10` wins over `1.16.9`: drop the script and the
-VSIX in one folder and run the script.
+The extension applies compatible Copilot Chat, terminal and agent-host patches
+on startup. Reload once after its patch notification. Native capabilities are
+detected and skipped; read-only application files are reported in patch status.
+External installers and patch scripts have been removed. For a downloaded VSIX
+on a UNC share, first copy it to a local folder and install that local file.
 
-Windows (`cmd.exe`) — installs the extension; the extension applies the bundle
-patches itself on the next window reload:
-
-```sh
-.\install-ai-agent-bridge.cmd
-```
-
-Linux (including CachyOS) — installs the extension and then applies the
-VS Code / Copilot Chat patches in the same run, reusing the extension's own
-compiled patch code:
+For a system-wide Linux installation, install the VSIX normally, reload VS Code,
+and run **AI Agent Bridge: Prepare User VS Code (Linux, no root)**. It copies the
+current desktop application into `~/.local/share/ai-agent-bridge/vscode/` and
+adds **AI Agent Bridge Code** to the application menu. You can also launch it with:
 
 ```sh
-chmod +x install-ai-agent-bridge.sh
-./install-ai-agent-bridge.sh
+~/.local/bin/code-ai-agent-bridge /path/to/project
 ```
 
-The installer scripts run as a regular user and never ask for a password: the
-Copilot Chat bundle is patched on its own, and the workbench part is skipped
-with a `Notice:` when the application files belong to another user. The patch
-code looks for Copilot Chat instead of trusting one path — the bundled copy in
-the application root, a user extension in `~/.vscode-oss/extensions` or
-`~/.vscode/extensions`, the Linux server of a remote session, and, from WSL,
-the Windows installation under `/mnt/c/...` matched by the commit of the running
-server. Re-run the installer after a VS Code update.
+Open that copy and reload its window after the automatic patch notification.
+Application files are writable by your user; the system installation stays
+unchanged. Installed extensions are shared using `--extensions-dir`; they are
+never copied or registered by hand. This copy uses a separate profile under
+`~/.config/ai-agent-bridge-code/` so launching it cannot forward into a running
+system VS Code. Configure your settings and accounts in that profile.
 
-If a system-wide Linux installation really needs its application bundles
-patched, `AI Agent Bridge: Apply Copilot Chat Patch` offers **Retry with
-administrator rights** (a `pkexec` password dialog, or passwordless `sudo`).
+After a system VS Code update, run the preparation command from the updated
+system window to create a copy of the new build. Repeating it for the same build
+reuses the existing copy and preserves its patches. This command is for a local
+Linux desktop window; SSH, WSL and containers need the desktop application
+prepared on the computer that displays the window. Explicit patch commands
+also retain the administrator option for users who prefer to patch system files.
 
 Overrides for unusual setups: `LLAMACPP_VSIX=<path>` picks a specific VSIX,
 `VSCODE_CLI=<command>` names a CLI that is not `code`/`code-insiders`,
@@ -143,10 +139,81 @@ does not substitute for the required ChatGPT account mode.
 | DeepSeek API | Models returned by the configured DeepSeek endpoint | API-backed reasoning and implementation with explicit key storage and usage tracking. |
 | Codex (ChatGPT account) | Models discovered from the installed Codex app-server | Subscription-backed coding with configurable reasoning effort and native VS Code tools. The catalog can change with account and runtime availability. |
 | Claude (Agent SDK) | Supported Claude subscription profiles | Long-running analysis, implementation, and review through durable Agent SDK sessions. |
+| Snowflake Coco | Models available to your Snowflake role through Cortex Code | Native VS Code Chat backed by the Coco ACP agent and your configured Snowflake connection. |
 
 All sources appear together in the native picker. Custom entries use the profile
-name you assign; built-in entries retain `(Local)`, `(DeepSeek)`, `(Codex)`, and `(Claude)`.
+name you assign; built-in entries retain `(Local)`, `(DeepSeek)`, `(Codex)`, `(Claude)`, and `(Coco)`.
 Internal prefixes route requests, never sent upstream.
+
+### Snowflake Coco
+
+Install the Snowflake VS Code extension. AI Agent Bridge uses its bundled
+`cortex` CLI through the Agent Client Protocol (ACP). If your Snowflake CLI has
+one connection, its name is selected automatically; otherwise set
+`llamacpp.cocoConnection`. The `Auto (Coco)` entry is available immediately.
+The models granted to your Snowflake role appear after an ACP connection
+succeeds. Use **AI Agent Bridge: Refresh Models** to retry discovery.
+
+The Snowflake extension's Azure sign-in session is passed to its own Coco panel
+through a private API. AI Agent Bridge uses the CLI's Snowflake connection and
+credential cache, so an Azure browser sign-in may be required once for the CLI.
+No token is copied from the Snowflake extension. Coco delegates tools offered
+for the turn, including private Copilot tools, to the native Chat tool loop.
+Chat controls approvals (including Allow All), execution cards and results.
+The same ACP prompt stays alive while Chat executes each tool and returns its
+result. Tool aliases distinguish these client tools from Cortex built-ins.
+The bridge stops built-in Cortex actions that attempt to bypass Chat, reporting
+the problem in Chat instead of opening a separate permission picker.
+Use the Snowflake Coco panel for its own built-in SQL and other agent tools.
+Commands run through **cocoRunInTerminal** in ordinary integrated terminals
+named `Coco 1`, `Coco 2`, etc., including in the Agents Window. Sequential commands
+automatically reuse the last idle terminal, preserving its directory and shell
+variables even when the model omits `terminalId`. Occupied or closed terminals
+are skipped. Set `newTerminal: true` only when a separate shell is needed. If
+`cwd` is specified, reuse requires that terminal's reported directory to match.
+Open the terminal
+panel to type input, press **Ctrl+C**, or close a terminal with its trash icon.
+Chat still controls approval of the command. Native Agents `powershell`/`bash`
+Background Shell tools are excluded from Coco's catalog. The companion tools
+**cocoReadTerminal**, **cocoSendToTerminal**, and **cocoKillTerminal** read output,
+send input, and close a terminal using the returned `terminalId`.
+Finite commands use sync mode; a timeout leaves the command running and returns
+its status. Servers can use async mode. Closing a terminal releases any pending
+tool wait without automatically restarting the command. Shell integration must
+be enabled with a supported default shell (PowerShell 7, bash or zsh). If it
+cannot activate, the bridge reports the problem before sending the command.
+After installing this patch, reload VS Code and start a new request so Coco
+receives the updated tool catalog. Existing Background Shells remain separate.
+The bridge sends text and image attachments and starts a fresh ACP session for
+each new user request. The picker enables vision after the active ACP runtime
+advertises image input. Images retain their original bytes and MIME types in
+separate ACP content blocks. Warm reuse between user turns is not yet supported.
+
+The model picker exposes **Thinking Effort** using the levels advertised by
+Coco (currently Auto, Minimal, Low, Medium, High, and Max). The chosen value is
+sent to the session before the prompt. ACP thought deltas appear in the native
+thinking block, separately from the answer. A model or endpoint that does not
+return thought deltas will only show its answer.
+
+Coco also reports measured context usage to the native Chat indicator when ACP
+sends `usage_update`. The current token count and total window come from the
+runtime's `used` and `size` fields; the snapshot persists across tool-result
+continuations and can decrease after compaction. Observed windows replace the
+configured fallback for that model. The bridge does not treat cumulative billing
+tokens as context or invent a measured count when the runtime sends none.
+
+Quick Access has a **Coco** section with live ACP connection status, the
+discovered model count, an on/off source toggle, Snowflake connection selection,
+catalog refresh, and links to the native thinking picker, Coco settings, and the
+Snowflake Coco panel. Status checks open an ACP session without running inference.
+Fresh status results are reused. **Refresh Models** forces one shared check,
+preserving the catalog and thinking levels while it runs. The notification shows
+the current stage and supports **Cancel**. Startup and model discovery together
+have a 45-second deadline; a timeout or cancellation stops the owned CLI and
+reports an actionable status. Repeated refresh clicks share the same operation
+instead of restarting it or adding more notifications.
+The section stays visible when Coco is offline so reconnect and setup controls
+remain available.
 
 ### Prompt cache behavior (Cloudflare)
 
@@ -368,24 +435,30 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 | [Agent Tools Guide](docs/AGENT_TOOLS_GUIDE.md) | Compact CLI workflows for agent sessions |
 | [Knowledge Verification](docs/KNOWLEDGE_VERIFICATION.md) | Source policy, cache-stable instructions |
 | [Project Audit](docs/AUDIT.md) | Quality gates, refactoring status, residual risks |
+| [1.17.0 Audit](docs/AUDIT_1_17_0.md) | Coco, Linux installation, dependency and release checks |
 
 ## Development
 
-**Stable release: 1.16.2. Current build: 1.16.6.** The 1.16 line forwards
-reasoning to gateway-backed llama.cpp servers, sends the picked thinking
-level as `reasoning_effort`, shows each subscription limit with its reset
-moment in Quick Access, adds the `wait_for_terminal` tool, recovers Claude
-sessions across providers, and applies the VS Code / Copilot Chat patches
-from the installer itself in one run.
+**Stable release: 1.17.0. Current build: 1.17.0.** This release adds Snowflake
+Coco with reasoning controls, streamed thinking, image input, context usage,
+native Chat tools and reusable interactive terminals. Linux desktop users can
+prepare a writable VS Code copy without root. Windows and Linux release packages
+contain the matching native runtime; patches apply inside the extension.
 
 ```sh
 npm install
 npm run compile
 npm run lint
-npm test              # 514 extension-host tests in the current 1.16.6 build
+npm test              # 582 extension-host tests in the current 1.17.0 build
 npm run package       # → llama-vscode-chat-{version}.vsix
-code --install-extension ./llama-vscode-chat-{version}.vsix --force
+code --install-extension ./llama-vscode-chat-1.17.0.vsix --force
 ```
+
+Debian Docker verification covers VSIX installation, automatic patches and real
+bash terminals as a normal user on VS Code 1.131 and 1.141. Run `docker build -t
+ai-agent-bridge-debian .` followed by `docker run --name ai-agent-bridge-debian-check
+--shm-size=1g ai-agent-bridge-debian`. See [the Debian verification report](docs/DEBIAN_VERIFICATION.md)
+for the writable/system installation results and artifact paths.
 
 The independent extension id is `mrlordcat.llama-vscode-chat`. Originally a
 fork of a llama.cpp provider, it is now an independent extension; the
@@ -393,8 +466,8 @@ fork of a llama.cpp provider, it is now an independent extension; the
 Creating a Git tag or publishing a release is intentionally separate from
 building a local VSIX; see `scripts/stable-release.sh` for the clean-tree gate.
 Pushing a `v*` tag is what publishes a release: the Release workflow runs lint
-and tests, packages the VSIX, and attaches it plus `install-ai-agent-bridge.sh`
-to the GitHub Release, using `docs/RELEASE_NOTES.md` as the release text —
+and tests on Windows and Linux, builds platform-specific VSIX files, and attaches
+them to the GitHub Release, using `docs/RELEASE_NOTES.md` as the release text —
 update that file and `CHANGELOG.md` before tagging.
 
 ## License

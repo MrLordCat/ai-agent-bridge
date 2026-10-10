@@ -24,6 +24,7 @@ import { getCurrentWorkspaceScopeId, filterEntriesVisibleInWorkspace } from "./m
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
 import { registerWaitForTerminalTool } from "./tools/wait-terminal";
+import { registerCocoTerminalTools } from "./coco/terminal-tools";
 import { registerContextControlCommand } from "./ui/context-control";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
@@ -36,6 +37,8 @@ import { applyAgentHostThinkingPatch, findAgentHostBundle, getAgentHostThinkingP
 import { applyWorkbenchTerminalPatch, findWorkbenchBundle, getWorkbenchTerminalPatchStatus, restoreWorkbenchTerminalPatch } from "./byok/workbench-terminal-patch";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
+import { CocoChatModelProvider, type CocoProviderStatus } from "./coco/coco-provider";
+import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
@@ -569,6 +572,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	await Promise.all([logService.initialize(), memoryService.initialize()]);
 	registerMemoryTools(context, memoryService);
 	registerWaitForTerminalTool(context);
+	registerCocoTerminalTools(context);
 	registerCopilotPatchIntegration(context);
 
 	// Expose agent history caps to the prompt-tsx patch via globalThis.
@@ -598,6 +602,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// Unified provider directory: one status model for every source.
 	let lastCodexStatus: { state: string; summary: string } | undefined;
 	let lastClaudeStatus: { state: string; summary: string } | undefined;
+	let lastCocoStatus: CocoProviderStatus | undefined;
 	const providerDirectory = new ProviderDirectory({
 		getSecret: key => Promise.resolve(context.secrets.get(key)),
 		getConfigValue: (key, fallback) => vscode.workspace.getConfiguration(CONFIG_SECTION).get(key, fallback),
@@ -605,6 +610,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getApiProfileKey: id => apiProviderService.getApiKey(id),
 		getCodexStatus: () => lastCodexStatus,
 		getClaudeStatus: () => lastClaudeStatus,
+		getCocoStatus: () => lastCocoStatus,
 	});
 	context.subscriptions.push(providerDirectory);
 
@@ -620,9 +626,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
+	const cocoProvider = new CocoChatModelProvider();
 	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
-	const compositeProvider = new CompositeChatModelProvider(llamaProvider, codexProvider, claudeProvider);
+	context.subscriptions.push(cocoProvider);
+	const compositeProvider = new CompositeChatModelProvider(llamaProvider, codexProvider, claudeProvider, cocoProvider);
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
 
@@ -666,7 +674,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		key => providerDirectory.stateOf(key),
 		() => memoryService.count,
 		() => apiProviderService.quickAccessApiProviders(),
-		() => codexProvider.codexUsageLimitSummaries
+		() => codexProvider.codexUsageLimitSummaries,
+		() => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels })
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
@@ -684,6 +693,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		void providerDirectory.refresh();
 		quickActionsProvider.refresh();
 		ApiProviderManagerPanel.refreshIfOpen();
+	}));
+	context.subscriptions.push(cocoProvider.onDidChangeStatus(status => {
+		lastCocoStatus = status;
+		void providerDirectory.refresh();
+		quickActionsProvider.refresh();
+		ApiProviderManagerPanel.refreshIfOpen();
+	}));
+	context.subscriptions.push(cocoProvider.onDidChangeLanguageModelChatInformation(() => quickActionsProvider.refresh()));
+	registerCocoCommands(context, cocoProvider, () => quickActionsProvider.refresh());
+	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
+		if (event.affectsConfiguration("snowflake.connectionsConfigFile")) {
+			cocoProvider.refreshLanguageModelChatInformation();
+			void cocoProvider.refreshStatus();
+		}
 	}));
 	context.subscriptions.push(apiProviderService.onDidChange(() => {
 		// Probe newly saved/edited profiles right away; a plain refresh()
@@ -737,6 +760,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	llamaProvider.refreshLanguageModelChatInformation();
 	codexProvider.refreshLanguageModelChatInformation();
 	claudeProvider.refreshLanguageModelChatInformation();
+	cocoProvider.refreshLanguageModelChatInformation();
+	void cocoProvider.refreshStatus();
 	void codexProvider.refreshStatus().then(status => {
 		lastCodexStatus = { state: status.state, summary: status.summary };
 	}).catch(error => logService.logError("codex.initial_status.failed", error));
@@ -825,6 +850,19 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// Thinking-level picker for BYOK models in the Agents Window. VS Code
 	// 1.131 omits the configSchema from BYOK snapshot models, so the UI has no
 	// reasoning-effort switch; this patch adds it to the agent-host bundle.
+	if (context.extensionMode !== vscode.ExtensionMode.Test
+		&& vscode.workspace.getConfiguration(CONFIG_SECTION).get<boolean>("agentHostThinkingPatchEnabled", true)) {
+		try {
+			const target = findAgentHostBundle(vscode.env.appRoot);
+			const status = getAgentHostThinkingPatchStatus(target.bundlePath);
+			if (!status.applied && !status.nativeSupport) {
+				const result = applyAgentHostThinkingPatch(target.bundlePath);
+				logService.log("byok.bridge.thinking_patch_applied", { sha256: result.status.sha256, message: result.message });
+			}
+		} catch (error) {
+			logService.logError("byok.bridge.thinking_patch_failed", error);
+		}
+	}
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleAgentHostThinkingPatch", async () => {
 			try {
@@ -1662,10 +1700,11 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			llamaProvider.refreshLanguageModelChatInformation();
 			codexProvider.refreshLanguageModelChatInformation();
 			claudeProvider.refreshLanguageModelChatInformation();
+			cocoProvider.refreshLanguageModelChatInformation();
 			void codexProvider.refreshStatus();
 			void claudeProvider.refreshStatus();
 			quickActionsProvider.refresh();
-			vscode.window.showInformationMessage("Local, DeepSeek, Codex, and Claude models refreshed.");
+			vscode.window.showInformationMessage("Local, DeepSeek, Codex, Claude, and Coco models refreshed.");
 		})
 	);
 
@@ -1807,6 +1846,15 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				) {
 					claudeProvider.refreshLanguageModelChatInformation();
 					void claudeProvider.refreshStatus();
+				}
+				if (
+					event.affectsConfiguration("llamacpp.enableCoco") ||
+					event.affectsConfiguration("llamacpp.cocoCliPath") ||
+					event.affectsConfiguration("llamacpp.cocoConnection") ||
+					event.affectsConfiguration("llamacpp.cocoContextLength")
+				) {
+					cocoProvider.refreshLanguageModelChatInformation();
+					void cocoProvider.refreshStatus();
 				}
 				if (
 					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveEnabled") ||

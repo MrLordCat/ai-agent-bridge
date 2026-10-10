@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+assert.equal(process.getuid(), 1000, 'The migration itself must run without root');
+const [appRoot, home, report] = process.argv.slice(2);
+const registry = JSON.parse(fs.readFileSync(path.join(home, '.vscode/extensions/extensions.json'), 'utf8'));
+const installed = registry.find(e => e.identifier?.id === 'mrlordcat.llama-vscode-chat');
+assert.equal(installed.metadata.source, 'vsix');
+const extensionDir = path.join(home, '.vscode/extensions', installed.relativeLocation);
+const { prepareUserVsCode } = require(path.join(extensionDir, 'out/user-vscode.js'));
+const sourceBundle = path.join(appRoot, 'out/vs/workbench/workbench.desktop.main.js');
+const original = fs.readFileSync(sourceBundle);
+const installation = await prepareUserVsCode(appRoot, home);
+const second = await prepareUserVsCode(appRoot, home);
+assert.equal(second.reused, true, 'Repeated preparation must reuse the same copy');
+assert.ok(fs.readFileSync(sourceBundle).equals(original), 'The system workbench must be untouched');
+assert.equal(fs.statSync(installation.executable).uid, 1000);
+assert.equal(fs.statSync(sourceBundle).uid, 0);
+assert.equal(fs.statSync(installation.appRoot).uid, 1000);
+assert.equal(fs.existsSync(path.join(installation.installationRoot, 'data')), false);
+fs.writeFileSync(report, JSON.stringify({ ...installation, uid: process.getuid(), systemUnchanged: true, repeatReused: second.reused }, null, 2));
+console.log(JSON.stringify({ prepared: installation.installationRoot, uid: process.getuid(), reused: second.reused, systemUnchanged: true }));

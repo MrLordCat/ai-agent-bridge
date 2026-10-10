@@ -3,6 +3,8 @@ import * as vscode from "vscode";
 import { decodeCodexModelId } from "./codex/model-adapter";
 import type { ClaudeChatModelProvider } from "./claude/claude-provider";
 import { decodeClaudeModelId } from "./claude/message-adapter";
+import { decodeCocoModelId } from "./coco/model-adapter";
+import type { CocoChatModelProvider } from "./coco/coco-provider";
 
 /** Combines independent transports under the existing picker-compatible vendor. */
 export class CompositeChatModelProvider implements vscode.LanguageModelChatProvider, vscode.Disposable {
@@ -13,12 +15,14 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 	constructor(
 		private readonly defaultProvider: vscode.LanguageModelChatProvider,
 		private readonly codexProvider: vscode.LanguageModelChatProvider,
-		private readonly claudeProvider?: ClaudeChatModelProvider
+		private readonly claudeProvider?: ClaudeChatModelProvider,
+		private readonly cocoProvider?: CocoChatModelProvider
 	) {
 		this.subscriptions = [
 			defaultProvider.onDidChangeLanguageModelChatInformation?.(() => this.modelChanges.fire()),
 			codexProvider.onDidChangeLanguageModelChatInformation?.(() => this.modelChanges.fire()),
 			claudeProvider?.onDidChangeLanguageModelChatInformation?.(() => this.modelChanges.fire()),
+			cocoProvider?.onDidChangeLanguageModelChatInformation?.(() => this.modelChanges.fire()),
 		].filter((value): value is vscode.Disposable => value !== undefined);
 	}
 
@@ -31,6 +35,9 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 			this.codexProvider.provideLanguageModelChatInformation(options, token),
 			...(this.claudeProvider
 				? [this.claudeProvider.provideLanguageModelChatInformation(options, token)]
+				: []),
+			...(this.cocoProvider
+				? [this.cocoProvider.provideLanguageModelChatInformation(options, token)]
 				: []),
 		]);
 		const all: vscode.LanguageModelChatInformation[] = [];
@@ -85,6 +92,9 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		}
 		if (this.claudeProvider && decodeClaudeModelId(modelId) !== undefined) {
 			return this.claudeProvider;
+		}
+		if (this.cocoProvider && decodeCocoModelId(modelId) !== undefined) {
+			return this.cocoProvider;
 		}
 		return this.defaultProvider;
 	}

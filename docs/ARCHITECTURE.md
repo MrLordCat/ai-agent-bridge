@@ -73,9 +73,8 @@ uses an independent transport and lifecycle.
   command handlers.
 - `src/constants.ts` contains shared product, provider, endpoint, and limit
   constants.
-- `scripts/patch-copilot-chat.mjs` is an opt-in external patcher for Copilot's
-  extension-model wrapper. It is development/release tooling, not runtime
-  extension code.
+- Patch commands and automatic startup patching use the compiled implementation
+  shipped in the VSIX; installation does not depend on an external patch script.
 
 `src/vscode.d.ts` is a checked-in VS Code API declaration used for the language
 model provider surface. Update it explicitly with `npm run update-vscode-api`.

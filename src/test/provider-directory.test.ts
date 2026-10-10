@@ -31,6 +31,27 @@ function probeResult(ok: boolean, error?: string) {
 }
 
 suite("provider directory", () => {
+	test("maps Coco connectivity, missing CLI, and disabled settings into provider states", async () => {
+		const config: Record<string, unknown> = { enableCoco: true };
+		let status = { state: "connected", summary: "Connected" };
+		const directory = new ProviderDirectory(fakeOptions({ config, getCocoStatus: () => status }));
+		try {
+			await directory.refresh();
+			assert.strictEqual(directory.stateOf("coco"), "online");
+			assert.strictEqual(directory.list().find(entry => entry.key === "coco")?.kind, "coco");
+			status = { state: "unavailable", summary: "Connection failed" };
+			await directory.refresh();
+			assert.strictEqual(directory.stateOf("coco"), "offline");
+			status = { state: "unconfigured", summary: "Install Snowflake" };
+			await directory.refresh();
+			assert.strictEqual(directory.stateOf("coco"), "unconfigured");
+			assert.strictEqual(directory.list().find(entry => entry.key === "coco")?.detail, "Install Snowflake");
+			config.enableCoco = false;
+			await directory.refresh();
+			assert.strictEqual(directory.stateOf("coco"), "off");
+		} finally { directory.dispose(); }
+	});
+
 	test("maps subscription provider states", () => {
 		assert.deepStrictEqual(resolveSubscriptionState(undefined), {
 			state: "checking",

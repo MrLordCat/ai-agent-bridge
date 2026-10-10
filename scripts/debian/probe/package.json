@@ -1,0 +1,8 @@
+{
+  "name": "debian-install-probe",
+  "publisher": "ai-agent-bridge-tests",
+  "version": "0.0.1",
+  "engines": { "vscode": "^1.131.0" },
+  "activationEvents": ["onStartupFinished"],
+  "main": "./index.cjs"
+}

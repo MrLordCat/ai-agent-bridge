@@ -3,6 +3,8 @@ dist
 node_modules
 .tools/
 .vscode-test/
+artifacts/
+/.cortex/
 *.vsix
 .DS_Store
 pics

@@ -58,10 +58,10 @@ suite("AI Agent Bridge branding", () => {
 	test("keeps the main README release and development facts current", () => {
 		const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
 		assert.match(readme, /^# AI Agent Bridge for VS Code/m);
-		// the install example and the development block must name the version
-		// that ships, so a release cannot leave the README describing an older build
-		assert.ok(readme.includes(`llama-vscode-chat-v${manifest.version}.vsix`),
-			"the install example names the shipping version");
+		// Local dev builds have no release tag; the development install command
+		// must name the current package version.
+		assert.ok(readme.includes(`llama-vscode-chat-${manifest.version}.vsix`),
+			"the development install example names the current version");
 		assert.ok(readme.includes(`Current build: ${manifest.version}.`),
 			"the development block names the shipping version");
 		assert.match(

@@ -1,9 +1,12 @@
 import * as assert from "assert";
 import * as vscode from "vscode";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 import {
 	formatEndpointLabel,
 	formatProviderUsageLine,
+	buildCocoItem,
 	LlamaQuickActionsProvider,
 	type QuickAccessItem,
 } from "../ui/quick-access";
@@ -40,6 +43,27 @@ function providerWithCodexUsageLimits(
 }
 
 suite("quick access", () => {
+	test("provides registered Coco recovery commands and accurate source and catalog status", () => {
+		const manifest = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../../package.json"), "utf8")) as {
+			contributes: { commands: Array<{ command: string }> };
+		};
+		const commands = new Set(manifest.contributes.commands.map(item => item.command));
+		const item = buildCocoItem(true, {
+			state: "connected", summary: "Connected", connection: "Azure SSO", modelCount: 24,
+			thinkingLevels: ["Low", "Medium", "High"],
+		}, 128_000);
+		assert.strictEqual(item.description, "Connected");
+		assert.strictEqual(item.children?.find(child => child.id?.endsWith(".connection"))?.description, "Azure SSO");
+		assert.strictEqual(item.children?.find(child => child.id?.endsWith(".models"))?.description, "24 models");
+		assert.ok(item.children?.every(child => child.command && commands.has(child.command.command)));
+		const failed = buildCocoItem(true, { state: "unavailable", summary: "Connection failed", modelCount: 0 }, 128_000);
+		assert.strictEqual(failed.description, "Connection failed");
+		assert.ok(failed.children?.some(child => child.command?.command === "llamacpp.cocoSelectConnection"));
+		const off = buildCocoItem(false, undefined, 128_000);
+		assert.strictEqual(off.description, "Off");
+		assert.strictEqual(off.children?.find(child => child.id?.endsWith(".source"))?.description, "Off");
+	});
+
 	test("formats endpoint labels without protocol noise", () => {
 		assert.strictEqual(formatEndpointLabel("http://localhost:8000"), "localhost:8000");
 		assert.strictEqual(formatEndpointLabel("https://api.deepseek.com/v1/"), "api.deepseek.com/v1");
@@ -56,7 +80,7 @@ suite("quick access", () => {
 
 		assert.deepStrictEqual(
 			root.map(labelOf),
-			["Providers", "Local LLM", "DeepSeek", "Codex", "Claude", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
+			["Providers", "Local LLM", "DeepSeek", "Codex", "Claude", "Coco", "Token Usage", "Usage Experiments", "Subagents", "Model Behavior", "Memory", "Diagnostics", "Copilot Patches"]
 		);
 		assert.ok(root.every(item => item.collapsibleState === vscode.TreeItemCollapsibleState.Collapsed));
 		assert.ok(root.every(item => item.id?.startsWith("llamacpp.quickAccess.")));
@@ -624,7 +648,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 	});
 
 	test("hides enabled-but-offline providers and restores them when online", async () => {
-		const stateMap: Record<string, string | undefined> = { local: "offline", deepseek: "offline" };
+		const stateMap: Record<string, string | undefined> = { local: "offline", deepseek: "offline", coco: "offline" };
 		const provider = new LlamaQuickActionsProvider(
 			() => undefined,
 			() => undefined,
@@ -661,6 +685,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.ok(!labels.includes("DeepSeek"), "offline DeepSeek must be hidden");
 		assert.ok(labels.includes("Codex"), "healthy Codex must stay visible");
 		assert.ok(labels.includes("Claude"), "healthy Claude must stay visible");
+		assert.ok(labels.includes("Coco"), "Coco recovery controls must stay visible when offline");
 		assert.ok(labels.includes("Providers"), "Providers group must stay visible for offline reasons");
 
 		stateMap.local = "online";

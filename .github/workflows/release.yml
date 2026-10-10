@@ -9,8 +9,16 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32-x64
+          - os: ubuntu-latest
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -19,8 +27,28 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run lint
-      - run: npm test
-      - run: npm run package -- --out llama-vscode-chat-${{ github.ref_name }}.vsix
-      - run: gh release create "${{ github.ref_name }}" "llama-vscode-chat-${{ github.ref_name }}.vsix" "install-ai-agent-bridge.sh" --notes-file docs/RELEASE_NOTES.md --verify-tag
+      - name: Test Windows
+        if: runner.os == 'Windows'
+        run: npm test
+      - name: Test Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm test
+      - run: npm run package -- --target ${{ matrix.target }} --out llama-vscode-chat-${{ github.ref_name }}-${{ matrix.target }}.vsix
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix-${{ matrix.target }}
+          path: llama-vscode-chat-${{ github.ref_name }}-${{ matrix.target }}.vsix
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: vsix-*
+          merge-multiple: true
+      - run: gh release create "${{ github.ref_name }}" ./*.vsix --title "AI Agent Bridge ${{ github.ref_name }}" --notes-file docs/RELEASE_NOTES.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}

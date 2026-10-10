@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 
 import type { QuickAccessApiProvider } from "../api-providers/api-provider-service";
 import type { ProviderState } from "../providers/provider-directory";
+import type { CocoProviderStatus } from "../coco/coco-provider";
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
 import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
@@ -52,6 +53,10 @@ export interface QuickAccessUsageLimit {
 export interface QuickAccessApiProviderSummary {
 	total: number;
 	enabled: number;
+}
+
+export interface QuickAccessCocoStatus extends CocoProviderStatus {
+	thinkingLevels?: readonly string[];
 }
 
 interface QuickAccessItemOptions {
@@ -399,6 +404,61 @@ export function buildApiProfileItem(
 	});
 }
 
+export function buildCocoItem(
+	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number
+): QuickAccessItem {
+	const summary = enabled ? status?.summary ?? "Checking..." : "Off";
+	const tooltip = [
+		"Snowflake Cortex Code connection checked through ACP; no model request is sent.",
+		status?.checkedAt ? `Last check: ${new Date(status.checkedAt).toLocaleString()}` : undefined,
+	].filter(Boolean).join("\n");
+	return new QuickAccessItem("coco", "Coco", {
+		description: summary,
+		icon: new vscode.ThemeIcon("cloud"),
+		tooltip,
+		children: [
+			new QuickAccessItem("coco.status", "Connection Status", {
+				description: summary, tooltip,
+				icon: new vscode.ThemeIcon(status?.state === "connected" && enabled ? "pass-filled" : "info"),
+				command: command("llamacpp.cocoShowStatus", "Check Coco Connection Status"),
+			}),
+			new QuickAccessItem("coco.source", "Source", {
+				description: enabled ? "On" : "Off", icon: toggleIcon(enabled),
+				command: command("llamacpp.toggleCoco", "Toggle Coco Source"),
+			}),
+			new QuickAccessItem("coco.connection", "Snowflake Connection", {
+				description: status?.connection ?? "Automatic / CLI default", icon: new vscode.ThemeIcon("plug"),
+				command: command("llamacpp.cocoSelectConnection", "Select Coco Snowflake Connection"),
+			}),
+			new QuickAccessItem("coco.models", "Refresh Models", {
+				description: status?.modelCount ? `${status.modelCount} models` : "Catalog not loaded",
+				icon: new vscode.ThemeIcon("refresh"),
+				command: command("llamacpp.cocoRefreshModels", "Refresh Coco Models"),
+			}),
+			new QuickAccessItem("coco.thinking", "Thinking Effort", {
+				description: "In model picker",
+				tooltip: status?.thinkingLevels?.length ? `Available levels: ${status.thinkingLevels.join(", ")}` : "Choose thinking effort in the native model picker after the catalog loads.",
+				icon: new vscode.ThemeIcon("lightbulb"),
+				command: command("llamacpp.openCopilotModelPicker", "Open Model Picker"),
+			}),
+			new QuickAccessItem("coco.context", "Maximum Context", {
+				description: formatCompactTokenCount(contextLength), icon: new vscode.ThemeIcon("symbol-numeric"),
+				tooltip: "Configured fallback context window; the selected model still enforces its server limit.",
+				command: command("llamacpp.cocoOpenSettings", "Open Coco Settings"),
+			}),
+			new QuickAccessItem("coco.settings", "Coco Settings", {
+				icon: new vscode.ThemeIcon("settings-gear"),
+				command: command("llamacpp.cocoOpenSettings", "Open Coco Settings"),
+			}),
+			new QuickAccessItem("coco.snowflake", "Open Snowflake Coco", {
+				tooltip: "Open the Snowflake Coco panel, or find the Snowflake extension if it is not installed.",
+				icon: new vscode.ThemeIcon("link-external"),
+				command: command("llamacpp.cocoOpenSnowflake", "Open Snowflake Coco"),
+			}),
+		],
+	});
+}
+
 export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickAccessItem> {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
@@ -436,6 +496,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		private readonly getTotalMemoryCount: () => number | undefined = () => undefined,
 	private readonly getApiProviders: () => Promise<readonly QuickAccessApiProvider[]> = async () => [],
 		private readonly getCodexUsageLimits: () => readonly { label: string; description: string }[] = () => [],
+		private readonly getCocoStatus: () => QuickAccessCocoStatus | undefined = () => undefined,
 	) {}
 
 	refresh(): void {
@@ -1109,9 +1170,14 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			{ key: "deepseek", item: deepSeek },
 			{ key: "codex", item: codex },
 			{ key: "claude", item: claude },
+			{ key: "coco", item: buildCocoItem(
+				config.get<boolean>("enableCoco", true), this.getCocoStatus(),
+				config.get<number>("cocoContextLength", 128_000)
+			) },
 		];
 		const visibleProviders = providerRoots
-			.filter(({ key }) => this.getProviderState(key) !== "offline")
+			// Keep Coco's reconnect and setup controls visible when its runtime is unavailable.
+			.filter(({ key }) => key === "coco" || this.getProviderState(key) !== "offline")
 			.map(({ item }) => item);
 
 		const apiProfileItems = (await this.getApiProviders()).map(profile =>

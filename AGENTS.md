@@ -41,9 +41,9 @@ console.log('version:', ext?.version, 'source:', ext?.metadata?.source);
 
 - **Publisher**: `mrlordcat`
 - **Extension ID**: `mrlordcat.llama-vscode-chat`
-- **VS Code API**: `^1.104.0`
-- **TypeScript**: `^5.9.2`
-- **Пакетирование**: `@vscode/vsce 3.9.2`
+- **VS Code API**: `^1.131.0`
+- **TypeScript**: `^5.9.3`
+- **Пакетирование**: `@vscode/vsce 4.0.0`
 - **Python venv**: `.venv/` (активировать: `source .venv/Scripts/activate` на Windows bash)
 
 ## Скрипты npm
@@ -88,7 +88,7 @@ git tag -a v1.16.3 -m "Release 1.16.3"
 git push origin main v1.16.3
 ```
 Тег `v*` запускает workflow Release: lint + тесты + `npm run package`,
-затем GitHub Release с VSIX и `install-ai-agent-bridge.sh`. Описание релиза
+затем GitHub Release с платформенными VSIX для Windows и Linux. Описание релиза
 берётся из `docs/RELEASE_NOTES.md`, поэтому его и `CHANGELOG.md` обновляют
 ДО тега. Патчи тэгуются только по явной команде пользователя.
 

@@ -12,6 +12,7 @@ export default tseslint.config(
 	{
 		ignores: [
 			'.vscode-test',
+			'artifacts',
 			'.venv',
 			'out',
 			'subprojects',
@@ -33,6 +34,16 @@ export default tseslint.config(
 				URL: 'readonly'
 			}
 		}
+	},
+	{
+		files: ['scripts/debian/**/*.cjs'],
+		languageOptions: {
+			sourceType: 'commonjs',
+			globals: {
+				require: 'readonly', exports: 'readonly', process: 'readonly', setTimeout: 'readonly', console: 'readonly'
+			}
+		},
+		rules: { '@typescript-eslint/no-require-imports': 'off' }
 	},
 	{
 		plugins: {

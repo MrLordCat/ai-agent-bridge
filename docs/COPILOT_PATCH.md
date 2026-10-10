@@ -57,9 +57,9 @@ available; the configured fallback is used otherwise.
 ## Built-In Bundle Patch
 
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
-for the `llamacpp` vendor. `scripts/patch-copilot-chat.mjs` is a thin development
-CLI over that same implementation, so runtime and repository commands cannot
-drift apart. Patch v22 makes the following changes:
+for the `llamacpp` vendor. The extension applies compatible patches on startup
+and exposes apply, status and restore commands; no installer or external patch
+script is required. Patch v22 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -133,23 +133,9 @@ Command Palette exposes:
 - `AI Agent Bridge: Show Copilot Chat Patch Status`;
 - `AI Agent Bridge: Restore Original Copilot Chat`.
 
-The repository CLI remains useful before installing a VSIX or for recovery:
-
-Run from the repository with the Node environment used to build the extension:
-
-```sh
-npm run patch:copilot:status
-npm run patch:copilot
-npm run patch:copilot:restore
-```
-
-The CLI locates the active Windows VS Code installation through `code.cmd`.
-For a portable or test build, pass the application root explicitly:
-
-```sh
-npm run patch:copilot:status -- --root <path>
-npm run patch:copilot -- --root <path>
-```
+On Linux, a system-owned application remains read-only. Use
+`AI Agent Bridge: Prepare User VS Code (Linux, no root)` to create and launch
+a user-owned desktop copy, then let the extension apply its patches there.
 
 Run `Developer: Reload Window` in every open VS Code window after applying or
 restoring the patch.

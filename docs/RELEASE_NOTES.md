@@ -1,83 +1,58 @@
-# AI Agent Bridge 1.16.6 — release notes
+# AI Agent Bridge 1.17.0
 
-A patch release on top of 1.16.5. Everything from 1.16.0 is included.
+Snowflake Cortex Code (Coco) now works in native VS Code Chat with visible,
+controllable tools and terminals. Linux desktop installations can apply the
+required patches using a user-owned copy of VS Code, without root.
 
-## 1. Patching no longer needs administrator rights
+## Coco in native Chat
 
-The previous releases looked for Copilot Chat in exactly one place: the
-`extensions/copilot` folder of `vscode.env.appRoot`. That fails as soon as the
-extension host is not the process that renders the window, and the error it
-reports — `Could not locate the bundled Copilot Chat extension` — is misleading,
-because Copilot Chat is usually installed and simply lives elsewhere:
+- Models and supported reasoning choices come from the active ACP session.
+  Thinking streams into Chat, and image input is enabled when ACP advertises it.
+- Native Chat owns tool execution and approvals. Commands use interactive VS
+  Code terminals that reuse idle shells and preserve state. Users can type,
+  interrupt commands or close the actual terminal.
+- Quick Access exposes Coco status, connection, refresh and reasoning controls.
+  Connection checks have a deadline and can be cancelled.
+- Context usage comes from ACP usage snapshots and the runtime context window,
+  including across tool-result continuations.
+- Azure OAuth uses the configured Snowflake CLI connection and its credential
+  cache; credentials are not copied from the Snowflake extension.
 
-- **Remote-WSL / SSH / containers.** `vscode.env.appRoot` is the Linux server
-  (`~/.vscode-server/bin/<commit>`). It ships Copilot Chat, but it has no
-  `out/vs/workbench/workbench.desktop.main.js` — the workbench runs on the
-  client — and the old lookup required both next to each other, so the candidate
-  was discarded and the message claimed Copilot Chat was missing.
-- **Code - OSS and CachyOS.** Copilot Chat is a normal user extension in
-  `~/.vscode-oss/extensions` or `~/.vscode/extensions`, outside any application
-  root.
+## Install from VSIX
 
-The patch code now searches the way VS Code actually installs things: the active
-application root, the user extension directories, the Linux server of a remote
-session, and — from WSL — the Windows installation under
-`/mnt/c/Users/<you>/AppData/Local/Programs/Microsoft VS Code/<commit>`, matched
-by the commit of the running server. Every copy found is patched, and each one
-borrows the workbench of the window, because the server has none.
+Download the package for your platform from this release:
 
-Verified on a real WSL session: two bundles found (the Linux server at
-`~/.vscode-server/bin/<commit>/extensions/copilot` and the Windows installation
-at `/mnt/c/.../Microsoft VS Code/<commit>/resources/app/extensions/copilot`),
-each patched and restored byte-for-byte, **without any elevation**. The Windows
-files under `/mnt/c` are owned by the user (User Installer), which is why this
-works at all.
-
-## 2. Parts are applied independently, and the log says what was searched
-
-The Copilot Chat bundle and the VS Code workbench are now separate parts: if a
-workbench is missing or read-only, it is reported as a `Notice:` in the status
-output and the Copilot patch still applies. “Could not locate” is impossible
-when the bundle was found, and a failure lists every application root and
-extension directory that was checked in the `AI Agent Bridge Copilot Patch`
-output channel.
-
-## 3. Elevation is offered when it is genuinely needed
-
-For a system-wide Linux installation (`/usr/share/code`, `/usr/lib/code`),
-`AI Agent Bridge: Apply Copilot Chat Patch` now offers **Retry with
-administrator rights**: the extension writes a small runner to the temp folder
-and starts it through `pkexec` (policy-kit password dialog) or passwordless
-`sudo`, then reloads. When neither is available it prints the exact command to
-run. A WSL extension host cannot elevate into Windows and says so instead of
-offering a broken retry.
-
-## Install in one step
-
-Download the VSIX and the installer script for your platform into one folder and
-run the script:
-
-```bash
-# Linux (including CachyOS; also from a WSL terminal)
-chmod +x install-ai-agent-bridge.sh
-./install-ai-agent-bridge.sh
+```sh
+# Windows x64
+code --install-extension llama-vscode-chat-v1.17.0-win32-x64.vsix
+# Linux x64
+code --install-extension llama-vscode-chat-v1.17.0-linux-x64.vsix
 ```
 
-```bat
-:: Windows
-install-ai-agent-bridge.cmd
-```
+Run **Developer: Reload Window**. Compatible Copilot Chat, terminal and agent-host
+patches apply on extension startup; reload again after a patch notification.
+External installer scripts and the repository patch wrapper have been removed.
 
-The script installs the extension and applies the patches in the same run with
-the extension's own compiled patch code. `SKIP_PATCHES=1` installs only,
-`DRY_RUN=1` prints what would happen, `VSCODE_APP_ROOT` and `VSCODE_EXTENSIONS_DIR`
-describe custom layouts.
+For Linux with a system-owned VS Code installation, run
+**AI Agent Bridge: Prepare User VS Code (Linux, no root)**. Open **AI Agent Bridge
+Code** from the application menu or use `~/.local/bin/code-ai-agent-bridge`.
+The copy lives under your home and uses a separate profile. Configure accounts
+and settings in that profile. System files remain unchanged; repeating the
+command for the same build preserves existing patches.
 
-## Verification
+Native capabilities are detected before patching. Unknown bundle layouts and
+read-only files remain visible in patch status. Remote SSH/WSL/container windows
+need the desktop application prepared locally.
 
-- 513 extension-host tests passing, including the new search tests (WSL commit
-  matching, user-extension installs, a server bundle without a workbench) and a
-  patch/restore round trip with no workbench present.
-- Lint and TypeScript compilation clean.
-- The apply/restore round trip above was run on a real WSL session against both
-  real bundles, using copies so the installed VS Code stayed untouched.
+## Audit and verification
+
+- Hardened ACP parsing and request handling, including string IDs, fragmented
+  replies, malformed messages, process shutdown and synchronous handler errors.
+- Updated dependency fixes and the VSIX packager; npm audit reports zero known
+  vulnerabilities on 2026-10-10.
+- Platform-specific Windows/Linux builds and tests gate publication.
+- Debian verification covers ordinary VSIX installation, automatic patches,
+  root-owned files, migration without root, and real bash terminal control on
+  VS Code 1.131 and 1.141 as UID 1000.
+- Paid provider authentication and generation are not exercised in the Debian
+  fixture. See `docs/DEBIAN_VERIFICATION.md` for the tested scope.
