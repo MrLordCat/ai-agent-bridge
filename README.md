@@ -2,7 +2,7 @@
 
 # AI Agent Bridge for VS Code
 
-**Bridge local models, DeepSeek, Codex, and Claude into one native VS Code agent workflow.**
+**Bridge local models, custom APIs, DeepSeek, Codex, Claude, and Snowflake Coco into one native VS Code agent workflow.**
 
 [![GitHub release](https://img.shields.io/github/v/release/MrLordCat/ai-agent-bridge?label=release)](https://github.com/MrLordCat/ai-agent-bridge/releases/latest)
 [![License](https://img.shields.io/github/license/MrLordCat/ai-agent-bridge)](https://github.com/MrLordCat/ai-agent-bridge/blob/main/LICENSE)
@@ -12,7 +12,7 @@ Every enabled source appears in the normal VS Code model picker. The selected
 model keeps the existing Chat UI, workspace context, tool cards, approval
 prompts, cancellation, and diagnostics — only the model transport changes:
 local llama.cpp, custom OpenAI-compatible APIs, DeepSeek, a ChatGPT-backed
-Codex runtime, and Claude Agent SDK sessions all work through the same native
+Codex runtime, Claude Agent SDK sessions, and Snowflake Coco all work through the same native
 workflow.
 
 > **Measured cache efficiency — 99.3% prompt cache hit.** A real long-running
@@ -40,10 +40,10 @@ recent conversation history.*
 
 ## Install
 
-VS Code **1.131 or newer is required** (the agent-host and Copilot Chat
-patches are validated against 1.131 and 1.136.1; older versions degrade
-silently). Windows and Linux are supported, including the bundle patches
-that need write access to the VS Code application directory.
+VS Code **1.131 or newer** and GitHub Copilot Chat are required. Windows x64
+and Linux x64 are supported. Debian installation and automatic patches have
+been verified on VS Code 1.131 and 1.141; native agent-host capabilities were
+also checked on 1.136.1. Compatibility is checked against the installed bundle.
 
 The extension ships as a VSIX from GitHub Releases. It is not on the VS Code
 Marketplace: the optional Copilot Chat patch is not a Marketplace API, so the
@@ -54,9 +54,9 @@ package is deliberately distributed outside the gallery.
 2. Install it:
    ```sh
     # Windows
-    code --install-extension llama-vscode-chat-v1.17.0-win32-x64.vsix
+    code --install-extension llama-vscode-chat-v1.17.3-win32-x64.vsix
     # Linux x64
-    code --install-extension llama-vscode-chat-v1.17.0-linux-x64.vsix
+    code --install-extension llama-vscode-chat-v1.17.3-linux-x64.vsix
    ```
 3. Run `Developer: Reload Window`.
 
@@ -68,8 +68,47 @@ detected and skipped; read-only application files are reported in patch status.
 External installers and patch scripts have been removed. For a downloaded VSIX
 on a UNC share, first copy it to a local folder and install that local file.
 
-For a system-wide Linux installation, install the VSIX normally, reload VS Code,
-and run **AI Agent Bridge: Prepare User VS Code (Linux, no root)**. It copies the
+**Why patch Copilot?** The public model-provider API connects models to Chat,
+but some Copilot controls and history handling need integration with its
+installed code. The patches add:
+
+- **Copilot Chat:** Thinking Effort, the model's output/context limits, stable
+  conversation identity for session reuse, and provider-managed compaction.
+- **Workbench:** bounded tool output in saved chat history and reuse of idle
+  background terminals.
+- **Agents Window on older builds:** the thinking picker, reasoning-effort
+  forwarding and correct JSON responses for non-streaming BYOK requests.
+
+The native context-usage indicator comes from provider metadata. Its measured
+token counts do not need a Copilot patch. Patches preserve original backups
+and can be restored; see [Copilot Chat Integration](docs/COPILOT_PATCH.md).
+Automatic Copilot patching can be disabled with `llamacpp.autoPatchCopilot`.
+The terminal and Agents patches have their own `workbenchTerminalPatchEnabled`
+and `agentHostThinkingPatchEnabled` settings under `llamacpp`.
+
+### System-owned VS Code on Linux
+
+Install the VSIX normally and reload VS Code. If system files are read-only,
+the patch notification offers two choices:
+
+- **Prepare User VS Code (no root):** create a writable desktop copy.
+- **Apply patches with administrator rights:** patch the current system
+  installation after you approve the operating system's authorization request.
+  If graphical authorization is unavailable or cancelled, **Run sudo in
+  Terminal** is offered when sudo is installed; otherwise **Run su in Terminal**
+  uses `su - root -c`. Enter your user's password for sudo or root's password
+  for su directly in the terminal. After a failed attempt, **Apply Patch** in
+  Quick Access reopens that terminal and offers **Retry in Terminal**.
+  **Close Attempt** starts a fresh patch workflow.
+
+The administrator option is also available after partial application and from
+the individual terminal/Agents patch commands. Compatible patches still use
+their backup and syntax checks. VS Code itself continues to run as your user.
+Reload its window after a successful patch. An OS update can replace patched
+files, so the extension checks the new build on its next startup.
+
+The no-root command is also available as
+**AI Agent Bridge: Prepare User VS Code (Linux, no root)**. It copies the
 current desktop application into `~/.local/share/ai-agent-bridge/vscode/` and
 adds **AI Agent Bridge Code** to the application menu. You can also launch it with:
 
@@ -87,15 +126,9 @@ system VS Code. Configure your settings and accounts in that profile.
 After a system VS Code update, run the preparation command from the updated
 system window to create a copy of the new build. Repeating it for the same build
 reuses the existing copy and preserves its patches. This command is for a local
-Linux desktop window; SSH, WSL and containers need the desktop application
-prepared on the computer that displays the window. Explicit patch commands
-also retain the administrator option for users who prefer to patch system files.
-
-Overrides for unusual setups: `LLAMACPP_VSIX=<path>` picks a specific VSIX,
-`VSCODE_CLI=<command>` names a CLI that is not `code`/`code-insiders`,
-`VSCODE_APP_ROOT` and `VSCODE_EXTENSIONS_DIR` describe a custom layout,
-`SKIP_PATCHES=1` installs the extension only, `DRY_RUN=1` prints what would
-happen without installing or patching.
+Linux desktop window; SSH, WSL and Dev Containers need the desktop application
+prepared on the computer that displays the window. A Debian desktop running
+inside the [GUI container](docs/DEBIAN_GUI.md) is a local Linux desktop.
 
 ## Quick Start
 
@@ -128,7 +161,15 @@ does not substitute for the required ChatGPT account mode.
 **Claude:** the VSIX includes the supported platform runtime. Sign in, then run
 `AI Agent Bridge: Sign In to Claude Subscription`.
 
-**Agents Window (BYOK):** register the model catalog in the VS Code Agents Window without any manual endpoint setup: the extension enables `chat.agentHost.byokModels.enabled` automatically, and the whole catalog — Local, DeepSeek, Codex, Claude, and custom API profiles — appears in the Agents model picker directly through the built-in language-model provider. For a reasoning-effort switch in the Agents model picker, run `AI Agent Bridge: Toggle Thinking Picker Patch` (Quick Access → Copilot Patches → Thinking picker (Agents)) and restart the agent host; the patch also fixes the VS Code 1.131 BYOK loopback proxy for non-streaming SDK requests.
+**Coco:** install the Snowflake extension and configure its CLI connection,
+then use Quick Access → Coco to check status and refresh models. See
+[Snowflake Coco](#snowflake-coco) for Azure sign-in, images, thinking and terminals.
+
+**Agents Window (BYOK):** the extension enables `chat.agentHost.byokModels.enabled`
+and exposes every enabled source through the built-in model provider. Compatible
+Agents patches apply automatically; builds with native support need no changes.
+Quick Access → Copilot Patches → Thinking picker (Agents) shows the current
+state and provides the manual toggle. Restart the agent host after a change.
 
 ## Model Sources
 
@@ -235,7 +276,7 @@ frequently, so it remains the most cache-stable option for long agentic chats.
 | | AI Agent Bridge | Continue | Cline / Roo Code |
 |---|---|---|---|
 | Where it runs | Inside VS Code Copilot Chat | Own sidebar UI | Own agent UI |
-| Model sources | Local llama.cpp, custom OpenAI-compatible APIs, DeepSeek, Codex (ChatGPT), Claude | Local + cloud APIs | Any API |
+| Model sources | Local llama.cpp, custom OpenAI-compatible APIs, DeepSeek, Codex (ChatGPT), Claude, Snowflake Coco | Local + cloud APIs | Any API |
 | Subscription accounts (ChatGPT / Claude) | Yes — official runtimes | No | No |
 | Tools & approvals | Native VS Code tool cards and approval policy | Own tools | Own tools, auto-approve mode |
 | Usage and cache diagnostics | Live Report, Session Quality, token history | Basic | Basic |
@@ -253,7 +294,7 @@ The project has five concrete goals:
 1. **Use one editor workflow for different compute sources.** Move between a
    local OpenAI-compatible server, multiple independent API gateways/accounts,
    DeepSeek API models, a ChatGPT-backed Codex runtime, and Claude Agent SDK
-   sessions without replacing the global Copilot endpoint.
+  sessions, and Snowflake Coco without replacing the global Copilot endpoint.
 2. **Keep actions visible and controlled by VS Code.** Subscription runtimes do
    not receive a hidden shell or file-edit backdoor. Model actions return as
    native tool calls and use the active VS Code approval policy.
@@ -271,10 +312,10 @@ The project has five concrete goals:
 
 | Capability | What it provides |
 |---|---|
-| Unified model picker | Local, custom API, DeepSeek, Codex, and Claude models appear beside other VS Code Chat models. Provider prefixes route requests internally and are never sent upstream. |
+| Unified model picker | Local, custom API, DeepSeek, Codex, Claude, and Coco models appear beside other VS Code Chat models. Provider prefixes route requests internally and are never sent upstream. |
 | Central API Provider Manager | A dedicated Quick Access webview can add, edit, enable, disable, and delete multiple OpenAI-compatible endpoints/accounts. Metadata is global; each API key stays in VS Code SecretStorage. |
 | Native agent tools | File, search, terminal, diagnostics, MCP, and other registered tools execute through VS Code tool cards with normal confirmation and cancellation behavior. Availability still depends on the current VS Code/Copilot installation and workspace policy. |
-| Model-specific reasoning controls | Local thinking modes, DeepSeek reasoning, Codex effort levels such as `xhigh`, and Claude thinking profiles are mapped to the selected backend. |
+| Model-specific reasoning controls | Local thinking modes, DeepSeek reasoning, Codex effort levels such as `xhigh`, Claude profiles, and Coco's advertised reasoning choices are mapped to the selected backend. |
 | Durable subscription sessions | Codex threads and Claude sessions persist in `workspaceState`, can reattach after reload, and can continue in a clean chat when the visible transcript becomes too large. |
 | Cache-aware context handling | Deterministic tool/schema ordering, exact continuation matching, bounded results, and provider-aware compaction reduce prefix churn and oversized cold starts. Local/DeepSeek HTTP history can compact to 25–90% retained. Long DeepSeek sessions reach 99%+ prompt cache hit (measured 99.3% over 266 turns). |
 | Semantic compaction | An opt-in paid `deepseek-v4-flash` pass merges a deterministic turn digest into a structured engineering handoff while preserving objectives, decisions, verification, failed approaches, and exact next work. |
@@ -362,7 +403,7 @@ current-context value without indicating a context overflow.
 | Command | Purpose |
 |---|---|
 | `AI Agent Bridge: Open Sidebar` | Quick Access with connections, provider context sliders, behavior, memory, diagnostics |
-| `AI Agent Bridge: Providers Manager` | One place for every source: Local LLM, DeepSeek, Codex, Claude, and custom API profiles, with live availability and offline reasons |
+| `AI Agent Bridge: Providers Manager` | Source availability, including Coco, and custom API profiles with live status and offline reasons |
 | `AI Agent Bridge: Refresh Models` | Refresh every enabled source |
 | `AI Agent Bridge: Configure DeepSeek` | Store DeepSeek API key |
 | `AI Agent Bridge: Sign In to Codex Subscription` | Authenticate Codex app-server |
@@ -376,6 +417,8 @@ current-context value without indicating a context overflow.
 | `AI Agent Bridge: Open Shared Memory` | Inspect/edit durable shared memory |
 | `AI Agent Bridge: Apply Copilot Chat Patch` | Enable native Thinking Effort, context budgets, session resume |
 | `AI Agent Bridge: Restore Original Copilot Chat` | Restore exact pre-patch bundle backup |
+| `AI Agent Bridge: Prepare User VS Code (Linux, no root)` | Create a writable desktop copy for automatic patches |
+| `AI Agent Bridge: Refresh Coco Models` | Cancelable ACP connection and catalog check without inference |
 
 All settings use `llamacpp.*`. Source availability, tool catalogs, and approval
 behavior remain subject to the installed VS Code/Copilot versions, workspace
@@ -390,7 +433,8 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
   extension asks those runtimes for account status and never reads credential
   files directly.
 - Codex internal action items are denied. Claude tools are restricted to the
-  allowlisted native VS Code MCP namespace.
+  allowlisted native VS Code MCP namespace. Coco built-in actions are blocked;
+  its commands use visible integrated terminals and Chat approvals.
 - Session-quality records contain metrics and identifiers, not prompt or tool
   result bodies. Compaction diagnostics separately keep bounded summary/tail
   samples for quality audits. Reports are written to extension-owned global storage.
@@ -412,8 +456,8 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
   treated as a permanent catalog promised by the extension.
 - Custom API profiles currently target OpenAI-compatible Bearer-token services
   with `/models` and streaming `/chat/completions`. The flow is implemented and
-  covered by unit tests, but has not been exercised end-to-end against real
-  third-party gateways yet. Vendor-specific schemes such as Azure `api-key`
+  covered by unit tests, with field checks against OpenRouter and Cloudflare
+  Workers AI. Vendor-specific schemes such as Azure `api-key`
   headers/deployment URLs require a future compatibility profile.
 - DeepSeek semantic summaries are opt-in paid API calls. Deterministic local
   summarization remains the fallback when disabled or unavailable.
@@ -439,19 +483,22 @@ trust and policy, account entitlements, and enabled connectors/MCP servers.
 
 ## Development
 
-**Stable release: 1.17.0. Current build: 1.17.0.** This release adds Snowflake
+**Stable release: 1.17.3. Current build: 1.17.3.** The 1.17 release adds Snowflake
 Coco with reasoning controls, streamed thinking, image input, context usage,
 native Chat tools and reusable interactive terminals. Linux desktop users can
 prepare a writable VS Code copy without root. Windows and Linux release packages
 contain the matching native runtime; patches apply inside the extension.
+The 1.17.3 release supports administrator patching through sudo or su on
+system-owned Linux installations. Quick Access resumes failed authorization
+attempts in the same terminal, and commands wait for shell integration readiness.
 
 ```sh
 npm install
 npm run compile
 npm run lint
-npm test              # 582 extension-host tests in the current 1.17.0 build
+npm test              # 602 extension-host tests in the current 1.17.3 build
 npm run package       # → llama-vscode-chat-{version}.vsix
-code --install-extension ./llama-vscode-chat-1.17.0.vsix --force
+code --install-extension ./llama-vscode-chat-1.17.3.vsix --force
 ```
 
 Debian Docker verification covers VSIX installation, automatic patches and real
@@ -459,6 +506,10 @@ bash terminals as a normal user on VS Code 1.131 and 1.141. Run `docker build -t
 ai-agent-bridge-debian .` followed by `docker run --name ai-agent-bridge-debian-check
 --shm-size=1g ai-agent-bridge-debian`. See [the Debian verification report](docs/DEBIAN_VERIFICATION.md)
 for the writable/system installation results and artifact paths.
+
+For manual installation and visual testing, use the separate
+[Debian GUI image](docs/DEBIAN_GUI.md). It runs VS Code and XFCE through a local
+noVNC browser session and leaves AI Agent Bridge uninstalled for you to install.
 
 The independent extension id is `mrlordcat.llama-vscode-chat`. Originally a
 fork of a llama.cpp provider, it is now an independent extension; the

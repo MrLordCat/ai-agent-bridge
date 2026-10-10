@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VS Code (system-owned)
+Comment=Read-only application; test permission reporting and no-root preparation
+Exec=/usr/local/bin/code-system /home/node/workspace
+Icon=/opt/vscode-system/resources/app/resources/linux/code.png
+Terminal=false
+Categories=Development;

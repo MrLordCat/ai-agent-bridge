@@ -6,6 +6,7 @@ artifacts/**
 .agents/**
 .cortex/**
 Dockerfile
+Dockerfile.gui
 .dockerignore
 .playwright-mcp/**
 AGENTS.md

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VS Code (user-owned)
+Comment=Writable VS Code; automatic patches can apply without root
+Exec=/usr/local/bin/code /home/node/workspace
+Icon=/opt/vscode-system/resources/app/resources/linux/code.png
+Terminal=false
+Categories=Development;

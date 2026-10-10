@@ -5,7 +5,25 @@ Bridge 1.17.0. Every VS Code instance and extension ran as UID 1000. Docker's
 root setup process only created application fixtures, including a root-owned
 installation to reproduce the permissions of a system package.
 
-## Results
+## Local 1.17.1 follow-up
+
+The 2026-10-10 follow-up passed 591 Linux tests (one Windows-only test skipped)
+and the same six installation scenarios on VS Code 1.131 and 1.141. Windows
+passed 588 tests, with four Linux-only tests skipped. Both VSIX packages were
+built; the Windows copy was installed through the Code CLI as `source: vsix`.
+
+`scripts/debian/verify-elevation.mjs` checks the administrator runner in a
+disposable container: normal users can read but cannot patch system fixtures;
+root applies compatible patches, a repeated application succeeds, user-owned
+backups retain their owner, and restoration returns exact original workbench
+and agent-host bytes. Both VS Code versions passed. Real `pkexec` authorization
+and interactive sudo password entry remain manual checks.
+
+Evidence is in `artifacts/debian/patch-1.17.1/`, including `elevation.log`.
+The Linux VSIX is available in the running GUI container at
+`/packages/llama-vscode-chat-1.17.1-linux-x64.vsix` for manual installation.
+
+## 1.17.0 results
 
 The Linux extension-host suite passed **581 tests**, with **one Windows-only
 PowerShell test skipped**. Compilation, ESLint and Linux VSIX packaging passed.
@@ -98,3 +116,44 @@ driver and artifacts are excluded from the extension package. Local evidence:
 	no-root migration, all patch statuses and live bash checks.
 - `artifacts/debian/release-1.17.0/unit-tests.log`: 581 passing, one platform skip.
 - `artifacts/debian/llama-vscode-chat-1.17.0-linux-x64.vsix`: Linux-built 1.17.0.
+
+## Debian su follow-up: local 1.17.2
+
+The Debian GUI fixture has su but no sudo or pkexec. Administrator patching now
+selects the installed terminal command and passes the runner through
+`su - root -c`. Failed terminal attempts retain the runner for a retry.
+
+The local 1.17.2 verification passed 594 Linux tests (one Windows-only skip),
+all six installation scenarios above, and real su commands on root-owned
+VS Code 1.131.0 and 1.141.0 fixtures. Those commands checked denied ordinary-user
+writes, successful application, idempotence, backup ownership and exact restore.
+The su fixture runs as root and exercises command parsing and patch behavior;
+interactive password authentication is a separate manual GUI check.
+See [the GUI instructions](DEBIAN_GUI.md) for root password setup.
+
+Evidence:
+
+- `artifacts/debian/patch-1.17.2/unit-tests.log`: 594 passing, one platform skip.
+- `artifacts/debian/patch-1.17.2/summary.json`: six installation scenarios.
+- `artifacts/debian/patch-1.17.2/su-elevation.log`: apply/restore through real su.
+- `artifacts/debian/llama-vscode-chat-1.17.2-linux-x64.vsix`: Linux-built 1.17.2.
+
+## Patch authorization retry: local 1.17.3
+
+Quick Access Apply Patch now resumes a retained authorization attempt instead
+of being blocked after a failed password entry. A failed attempt offers a retry
+in the same terminal or closure followed by a fresh workflow. Commands wait
+for shell integration and use execution identity to observe completion.
+
+Verification passed 601 Linux tests (one platform skip), all six installation
+scenarios, and a separate seven-test retry suite on VS Code 1.141.0.
+The real bash test on both 1.131.0 and 1.141.0 runs a command that deliberately
+fails once, retries in the same shell, then verifies successful cleanup.
+Interactive sudo/su password entry remains a manual GUI check.
+
+Evidence:
+
+- `artifacts/debian/patch-1.17.3/unit-tests.log`: Linux suite on VS Code 1.131.0.
+- `artifacts/debian/patch-1.17.3/patch-retry-1.141.log`: retry suite on 1.141.0.
+- `artifacts/debian/patch-1.17.3/summary.json`: six installation scenarios.
+- `artifacts/debian/llama-vscode-chat-1.17.3-linux-x64.vsix`: Linux-built 1.17.3.

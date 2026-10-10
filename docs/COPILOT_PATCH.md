@@ -121,9 +121,9 @@ that chat request.
 ## Apply And Restore
 
 `llamacpp.autoPatchCopilot` defaults to `true`. On extension startup, the
-runtime checks only `vscode.env.appRoot`, which is the active VS Code build. It
-does not scan old extension or application directories. If patch v16 is already
-present, startup is silent. If the active bundle is changed, the extension asks
+runtime discovers installed Copilot bundles and associates them with the active
+desktop workbench. Read-only bundles from another Linux installation are
+skipped. If patch v22 is already present, startup is silent. If a bundle is changed, the extension asks
 for one window reload. A repeated compatibility failure is logged but shown at
 most once per VS Code build.
 
@@ -133,9 +133,24 @@ Command Palette exposes:
 - `AI Agent Bridge: Show Copilot Chat Patch Status`;
 - `AI Agent Bridge: Restore Original Copilot Chat`.
 
-On Linux, a system-owned application remains read-only. Use
-`AI Agent Bridge: Prepare User VS Code (Linux, no root)` to create and launch
-a user-owned desktop copy, then let the extension apply its patches there.
+On a local Linux desktop, permission failures and partial application offer
+**Prepare User VS Code (no root)** and **Apply patches with administrator rights**.
+The first creates a writable desktop copy. The second asks the operating system
+to authorize patching the current installation through `pkexec`. If graphical
+authorization cannot complete, a visible VS Code terminal uses sudo when
+installed, or su otherwise. **Run sudo in Terminal** asks for your user's
+password; **Run su in Terminal** runs `su - root -c` and asks for root's password.
+Enter it directly in the terminal. The runner is retained after a failed attempt:
+use **Retry in Terminal**, or press **Apply Patch** in Quick Access to reopen
+the retry workflow. **Close Attempt** discards the retained runner and starts
+a fresh workflow. While a command is active, Apply Patch reveals its terminal
+and does not send another command into the password prompt.
+
+No elevation occurs until the administrator action is selected. The runner uses
+paths discovered as the desktop user, so root does not search another profile;
+it retains the ordinary compatibility, syntax and backup checks. It also applies
+enabled terminal/Agents patches for that desktop build. Individual patch toggles
+and restoration offer recovery when permissions prevent their operation.
 
 Run `Developer: Reload Window` in every open VS Code window after applying or
 restoring the patch.
@@ -153,7 +168,7 @@ Before writing, the patcher:
 6. creates separate restorable backups beside both bundles;
 7. records original and patched SHA-256 hashes for both files.
 
-Applying patch v16 over an older supported patch marker uses the preserved
+Applying patch v22 over an older supported patch marker uses the preserved
 original backup rather than stacking edits on the already modified bundle.
 
 The patch is deliberately fail-closed. If a Copilot update changes the bundle
@@ -162,9 +177,10 @@ the active bundle unchanged. VS Code updates normally install a new application
 directory, so the next extension startup checks and patches that new active
 directory without touching older installs.
 
-The implementation has been exercised against the local VS Code 1.127 /
-bundled Copilot Chat 0.55 installation and the repository's VS Code 1.130 test
-host. These are verification snapshots, not a promise that future minified
+The 1.17.0 Debian verification exercised VS Code 1.131 and 1.141 as UID 1000
+with writable, system-owned and prepared user-owned application files.
+The agent-host native capabilities were also checked on 1.136.1.
+These are verification snapshots, not a promise that future minified
 bundles retain the same structure.
 
 ## Troubleshooting
@@ -225,12 +241,11 @@ The Copilot Chat bundle is patched on its own and the workbench/agent-host parts
 are applied on a best-effort basis: a read-only workbench no longer fails the
 whole operation, it is reported as `Notice:` in the status output.
 
-For `EACCES` or `EPERM` on a system-wide Linux installation (packages that live
-in `/usr/share/code` or `/usr/lib/code`), `AI Agent Bridge: Apply Copilot Chat
-Patch` offers **Retry with administrator rights**: it writes a small runner into
-the temporary folder and starts it through `pkexec` (policy-kit dialog) or
-passwordless `sudo`. If neither is available, the log prints the exact `sudo`
-command to run. On Windows use the VS Code **User Installer** or a portable
+For `EACCES`, `EPERM` or `EROFS` on a system-wide local Linux installation,
+use either recovery choice described above. Syntax validation uses a private
+temporary directory rather than writing test files beside a read-only bundle.
+Failed restoration retains the backups for an authorized retry. On Windows use
+the VS Code **User Installer** or a portable
 installation in a directory owned by your account: those files are writable
 without elevation, and a WSL extension host cannot elevate into Windows. Do not
 change ownership of a system installation or copy patched bundles between VS
@@ -241,8 +256,8 @@ Code versions.
 `llama-vscode-chat` 1.6.0 embeds both the Copilot native-controls patch and the
 required subagent `model` schema for its Codex and Claude bridges. Patch Guardian
 is not needed for this extension and can be disabled or uninstalled. The built-in
-runtime targets only the active VS Code application root, so stale side-by-side
-extension versions cannot inflate the applied-target count.
+runtime reports discovered bundle paths in its output channel. The elevated
+runner limits application patches to the active desktop installation.
 
 ## Ownership Boundary
 

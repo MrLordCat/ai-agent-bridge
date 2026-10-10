@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
@@ -816,13 +817,14 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	const patchedWorkbench = installedWorkbenchBefore
 		? patchVsCodeWorkbenchBundle(installedWorkbenchBefore)
 		: undefined;
-	const validationPath = target.bundlePath + ".llama-vscode-chat.tmp.js";
-	const workbenchValidationPath = workbenchPath ? workbenchPath + ".llama-vscode-chat.tmp.mjs" : undefined;
-	fs.writeFileSync(validationPath, patched);
-	if (patchedWorkbench && workbenchValidationPath) {
-		fs.writeFileSync(workbenchValidationPath, patchedWorkbench);
-	}
+	const validationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-agent-bridge-patch-check-"));
+	const validationPath = path.join(validationDirectory, "copilot.js");
+	const workbenchValidationPath = patchedWorkbench ? path.join(validationDirectory, "workbench.mjs") : undefined;
 	try {
+		fs.writeFileSync(validationPath, patched, { mode: 0o600 });
+		if (patchedWorkbench && workbenchValidationPath) {
+			fs.writeFileSync(workbenchValidationPath, patchedWorkbench, { mode: 0o600 });
+		}
 		new Script(patched, { filename: validationPath });
 		if (workbenchValidationPath) {
 			execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
@@ -830,10 +832,7 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	} catch (error) {
 		throw new Error(`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
 	} finally {
-		fs.rmSync(validationPath, { force: true });
-		if (workbenchValidationPath) {
-			fs.rmSync(workbenchValidationPath, { force: true });
-		}
+		fs.rmSync(validationDirectory, { recursive: true, force: true });
 	}
 
 	if (!initialStatus.backupExists || (force && !initialStatus.legacyPatch && !initialStatus.applied)) {
@@ -894,24 +893,22 @@ export function restoreCopilotPatch(target: CopilotPatchTarget): CopilotPatchRes
 	if (!initialStatus.backupExists) {
 		throw new Error(`Backup not found: ${initialStatus.backupPath}`);
 	}
-	fs.copyFileSync(initialStatus.backupPath, target.bundlePath);
-	let workbenchRestoreError: string | undefined;
 	if (initialStatus.workbenchBackupExists && initialStatus.workbenchPath && initialStatus.workbenchBackupPath) {
 		try {
 			fs.copyFileSync(initialStatus.workbenchBackupPath, initialStatus.workbenchPath);
 		} catch (error) {
-			workbenchRestoreError = error instanceof Error ? error.message : String(error);
+			// Keep both backups so a user can retry with administrator rights.
+			throw new Error("Could not restore the original VS Code workbench: " +
+				(error instanceof Error ? error.message : String(error)), { cause: error });
 		}
 	}
+	fs.copyFileSync(initialStatus.backupPath, target.bundlePath);
 	fs.rmSync(initialStatus.backupPath, { force: true });
 	if (initialStatus.workbenchBackupPath) {
 		fs.rmSync(initialStatus.workbenchBackupPath, { force: true });
 	}
 	fs.rmSync(initialStatus.metadataPath, { force: true });
 	const status = getCopilotPatchStatus(target);
-	if (workbenchRestoreError) {
-		status.notices.push(`The original VS Code workbench backup could not be restored: ${workbenchRestoreError}`);
-	}
 	return {
 		changed: true,
 		status,

@@ -828,9 +828,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleWorkbenchTerminalPatch", async () => {
+			let restoring = false;
 			try {
 				const target = findWorkbenchBundle(vscode.env.appRoot);
 				const status = getWorkbenchTerminalPatchStatus(target.bundlePath);
+				restoring = status.applied;
 				if (status.applied) {
 					const result = restoreWorkbenchTerminalPatch(target.bundlePath);
 					logService.log("byok.bridge.workbench_terminal_patch_restored", { sha256: result.status.sha256 });
@@ -842,6 +844,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				vscode.window.showInformationMessage(result.message);
 			} catch (error) {
 				logService.logError("byok.bridge.workbench_terminal_patch_failed", error);
+				if (/eperm|eacces|erofs|access is denied|permission denied/i.test(String(error))) {
+					await vscode.commands.executeCommand("llamacpp.recoverPatchPermissions", "terminal", restoring);
+					return;
+				}
 				vscode.window.showErrorMessage(`Workbench terminal patch failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}),
@@ -865,9 +871,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleAgentHostThinkingPatch", async () => {
+			let restoring = false;
 			try {
 				const target = findAgentHostBundle(vscode.env.appRoot);
 				const status = getAgentHostThinkingPatchStatus(target.bundlePath);
+				restoring = status.applied;
 				if (status.applied) {
 					const result = restoreAgentHostThinkingPatch(target.bundlePath);
 					logService.log("byok.bridge.thinking_patch_restored", { sha256: result.status.sha256 });
@@ -879,6 +887,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				vscode.window.showInformationMessage(result.message);
 			} catch (error) {
 				logService.logError("byok.bridge.thinking_patch_failed", error);
+				if (/eperm|eacces|erofs|access is denied|permission denied/i.test(String(error))) {
+					await vscode.commands.executeCommand("llamacpp.recoverPatchPermissions", "thinking", restoring);
+					return;
+				}
 				vscode.window.showErrorMessage(`Agent-host thinking patch failed: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}),

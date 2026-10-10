@@ -1,6 +1,47 @@
 # Changelog
 
-## 1.17.0 (stable release) - 2026-10-10
+## 1.17.3 (patch release) - 2026-10-10
+
+- Replace the withdrawn 1.17.0 release with the verified Windows/Linux packages,
+  retaining Coco integration, vision, thinking, context usage and native tools.
+- Offer a user-owned VS Code copy or administrator authorization for Linux
+  system installations. Detect sudo or su, preserve selected user paths,
+  validate syntax in a private temporary directory and retain restore backups
+  when system files cannot be written.
+
+- Fix Quick Access Apply Patch after failed sudo/su authorization: reopen the
+  retained terminal and offer a retry or a fresh workflow instead of leaving
+  the global authorization guard active.
+- Wait for shell integration before sending the administrator command, track
+  its execution directly, and retain a failed runner until retry or closure.
+  Prevent duplicate commands while the password prompt is active.
+- Check failed-command recovery, integration readiness and cleanup, including
+  retry in a real Linux bash terminal.
+
+## 1.17.2 (local development patch) - 2026-10-10
+
+- Administrator patching detects sudo or su instead of assuming sudo exists.
+  On Debian without sudo, the visible terminal passes the quoted patch command
+  through su - root -c and lets the user enter root's password directly.
+- Keep the patch runner after a failed terminal attempt and offer a retry.
+  Remove it after success or when the terminal is closed.
+- Document the GUI fixture's locked root account and manual password setup.
+  Verify su command parsing, literal paths and patch/restore on real Linux files.
+
+## 1.17.1 (local development patch) - 2026-10-10
+
+- Offer a user-owned VS Code copy or explicit administrator authorization when
+  Linux patching fails or only applies part of the patches. Individual terminal
+  and Agents patch commands offer the same recovery choices.
+- Use asynchronous graphical authorization, with an optional visible sudo
+  terminal. Preserve the user's selected paths and ordinary compatibility and
+  backup checks instead of rediscovering extensions under root.
+- Validate patch syntax in a private temporary directory; keep original backups
+  when restoring a read-only workbench fails.
+- Update the main README: explain the patches, document current Linux choices,
+  include Coco consistently, and remove obsolete installer environment flags.
+
+## 1.17.0 (withdrawn; replaced by 1.17.3) - 2026-10-10
 
 - Add Snowflake Cortex Code (Coco) to native Chat and Quick Access: discover
   models through ACP, reuse the configured Azure OAuth connection, expose
