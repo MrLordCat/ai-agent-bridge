@@ -9,7 +9,9 @@ function profile(overrides: Partial<QuickAccessApiProvider> = {}): QuickAccessAp
                 name: "Cloud",
                 baseUrl: "https://api.cloudflare.com/client/v4/accounts/abc/ai/v1",
                 protocol: "openai",
-                contextLength: 131_072,
+                contextLength: 500_000,
+                maximumContextLength: 1_000_000,
+                contextMaximumReported: true,
                 llamaCppCompat: false,
                 enabled: true,
                 hasApiKey: true,
@@ -26,11 +28,14 @@ suite("Quick Access API provider roots", () => {
                 const labels = (item.children ?? []).map(child => child.label);
                 assert.ok(labels.includes("Balance"), `children: ${labels.join(", ")}`);
                 assert.ok(labels.includes("Maximum Context"));
+                assert.ok(labels.includes("Working Context"));
                 assert.ok(labels.includes("Providers Manager"));
                 const balance = (item.children ?? []).find(child => child.label === "Balance");
                 assert.strictEqual(balance?.description, "n/a");
                 const context = (item.children ?? []).find(child => child.label === "Maximum Context");
-                assert.strictEqual(context?.description, "131.1K");
+                assert.match(String(context?.description), /^1(?:\.0+)?M$/);
+                const working = (item.children ?? []).find(child => child.label === "Working Context");
+                assert.match(String(working?.description), /^500(?:\.0+)?K$/);
         });
 
         test("offline profile is labeled offline; no-key profile shows the hint", () => {

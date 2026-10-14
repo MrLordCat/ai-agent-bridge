@@ -277,7 +277,9 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				if (effort !== undefined && thinking) {
 					await client.setSessionConfigOption(sessionId, thinking.configId, effort);
 				}
-				const prompt = serializeCocoMessages(messages);
+				const toolTokens = Math.ceil(JSON.stringify(options.tools ?? []).length / 4);
+				const promptBudget = Math.min(500_000, Math.max(4_096, (model.maxInputTokens - toolTokens - 8_192) * 3));
+				const prompt = serializeCocoMessages(messages, promptBudget);
 				if (prompt.length === 0) { throw new Error("Coco received an empty conversation."); }
 				if (!imageInput && prompt.some(part => part.type === "image")) {
 					throw new Error("This Coco ACP runtime does not support image input. Update the Snowflake extension and refresh Coco models.");

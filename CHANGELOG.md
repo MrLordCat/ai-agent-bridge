@@ -1,5 +1,109 @@
 # Changelog
 
+## 1.17.12 (local development patch) - 2026-10-14
+
+- Show Cursor's remaining team spending budget, current-cycle on-demand
+  charges and enforced per-user limit in Quick Access. Report total usage
+  including subscription credits separately; refresh the budget every minute.
+- Add budget access and manual refresh actions to the existing Cursor profile.
+  Save an optional Admin API key separately from the chat key and allow selecting
+  the team member's email. Budget changes do not interrupt active SDK chats.
+- Match the exact team member and report missing limits or access errors without
+  inventing a balance. Cover currency conversion, access, caching, stale requests
+  and Quick Access rendering with regression tests.
+
+## 1.17.11 (local development patch) - 2026-10-14
+
+- Fix Cursor runs failing with `unknown option '--system-prompt'`. Send the
+  VS Code bridge instructions in the prompt instead of the unsupported SDK
+  systemPrompt override; retain callback-only tools and settings isolation.
+- Surface the original SDK run error message and code, redacting saved API keys
+  and authentication tokens instead of replacing diagnostics with status error.
+- Verify compatibility with a runtime rejecting systemPrompt, preservation of
+  model reasoning parameters and images, and safe diagnostic reporting.
+
+## 1.17.10 (local development patch) - 2026-10-14
+
+- Expose Cursor reasoning parameters as the native Thinking Effort navigation
+  picker next to the chat model. Preserve catalog labels and defaults and show
+  only values advertised in model parameters or variants.
+- Map VS Code's reasoningEffort selection to the original Cursor parameter ID
+  when calling the SDK/API. Keep legacy raw parameter options supported and
+  reject unsupported values before starting a run.
+- Verify picker metadata, parameter aliases, variant-only catalogs and delivery
+  of the selected effort to the SDK across native tool-call continuations.
+
+## 1.17.9 (local development patch) - 2026-10-14
+
+- Make Cursor models available in Agent mode with real VS Code Tools support
+  through the official local Cursor SDK. Continue using the saved API profile
+  and key; inference stays on Cursor's servers.
+- Restrict the SDK to supplied callback tools. Emit native Copilot tool calls,
+  wait for their results, and resume the same run. Handle parallel calls,
+  cancellation, changed credentials, revoked tools and historical results.
+- Load the SDK lazily and use its JSONL store without requiring node:sqlite.
+  Keep chat-only Cloud Agents fallback when the host cannot run the local SDK.
+- Verify initialization of the installed SDK in the VS Code extension host,
+  native callback handoffs, image results, profile isolation and picker mode.
+
+## 1.17.8 (local development patch) - 2026-10-14
+
+- Add Models by Provider to the chat and Quick Access title bars and command
+  palette. Choose a provider first, then only its models, with back navigation.
+- Keep API profiles distinct by ID, show unavailable enabled profiles, and
+  retain existing native model IDs and labels. Selection updates the current
+  chat without sending a prompt; chat-only models switch to Ask mode.
+- Preserve the native model picker for model configuration. Add regression
+  coverage for grouping, duplicate names, selection, navigation and cancellation.
+
+## 1.17.7 (local development patch) - 2026-10-14
+
+- Integrate Cursor Cloud Agents through saved Providers Manager profiles, with
+  a Cursor preset and API format. Existing Cursor profile IDs and keys survive
+  automatic detection; disabling a profile removes its models.
+- Discover model names, supported parameters and reported context windows.
+  Route chat to the official agent/run API, handle streaming and remote
+  cancellation, and isolate conversations, profiles and changed credentials.
+- Remove the standalone Cursor provider, global enableCursor setting and
+  artificial Unsupported API badge. Cloud actions are identified in the UI.
+- Add regression coverage for profile routing, credentials, SSE, continuation,
+  cancellation, authentication failures and failed runs.
+
+## 1.17.6 (local development patch) - 2026-10-14
+
+- Discover API model context limits automatically. The add/edit form no longer
+  requests a context maximum; each provider card has a working-context slider
+  and an automatic reset. Keep reported maxima separate from smaller user caps,
+  retain existing caps on edits, and support reported windows above 1M.
+- Read model catalogs wrapped in `items` as well as `data`, `models` and `result`.
+  Explain that api.cursor.com serves Cursor Cloud Agents instead of displaying
+  it as a ready OpenAI-compatible provider with no usable models.
+- Shorten large Coco histories while preserving the latest request, current
+  images and recent results. Reserve space for tools and agent instructions.
+  Count oversized historical messages without throwing a prompt-size error.
+- Verify automatic/working context, UI controls, API compatibility and bounded
+  Coco prompts, including preserved image bytes and the ends of large logs.
+
+## 1.17.5 (local development patch) - 2026-10-12
+
+- Keep the native VS Code question tool in Codex's immediately visible catalog.
+  Clarification questions no longer require discovering a deferred tool first.
+- Instruct Codex to use the native question card for clarifications and choices.
+  Namespace a contributed `request_user_input` tool to avoid confusing it with
+  Codex's built-in tool, whose availability depends on collaboration mode.
+- Verify question visibility and namespace routing on VS Code 1.141.
+
+## 1.17.4 (local development patch) - 2026-10-12
+
+- Stream Codex raw reasoning deltas alongside readable reasoning summaries.
+  Show a brief activity status when a reasoning item starts, including when
+  the runtime supplies no readable thoughts.
+- Update native Chat context usage as Codex reports measured token counts,
+  rather than waiting until the entire agent task ends. Restore the latest
+  snapshot on native tool continuations and retain known context between turns.
+- Verify live reasoning, late usage updates during tool execution, context
+  reductions after compaction and separation from cumulative billing totals.
+
 ## 1.17.3 (patch release) - 2026-10-10
 
 - Replace the withdrawn 1.17.0 release with the verified Windows/Linux packages,

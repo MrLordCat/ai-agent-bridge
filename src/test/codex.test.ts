@@ -609,9 +609,33 @@ suite("Codex subscription provider", () => {
 		const firstBoundary = await firstBoundaryPromise;
 		assert.strictEqual(firstBoundary.kind, "delegated");
 		assert.ok(firstParts.some(part => part instanceof vscode.LanguageModelToolCallPart));
+		const readNativeUsage = (parts: vscode.LanguageModelResponsePart[]) => parts
+			.filter((part): part is vscode.LanguageModelDataPart => part instanceof vscode.LanguageModelDataPart && part.mimeType === "usage")
+			.map(part => JSON.parse(new TextDecoder().decode(part.data)));
+		assert.deepStrictEqual(readNativeUsage(firstParts), [{
+			prompt_tokens: 1_100, completion_tokens: 100, total_tokens: 1_200,
+			prompt_tokens_details: { cached_tokens: 1_000 },
+		}]);
+		// Usage may arrive while Chat owns the tool card and this response is closed.
+		notifications.fire({
+			method: "thread/tokenUsage/updated",
+			params: {
+				threadId: "thread-1", turnId: "turn-1",
+				tokenUsage: {
+					total: { totalTokens: 40_000, inputTokens: 37_000, cachedInputTokens: 36_000, outputTokens: 3_000, reasoningOutputTokens: 100 },
+					last: { totalTokens: 3_000, inputTokens: 2_900, cachedInputTokens: 2_800, outputTokens: 100, reasoningOutputTokens: 10 },
+					modelContextWindow: 258_400,
+				},
+			},
+		});
+		assert.strictEqual(readNativeUsage(firstParts).length, 1, "late usage must not write to the closed response");
 
 		const toolResponse = { contentItems: [{ type: "inputText" as const, text: "file contents" }], success: true };
 		const resumed = bridge.resume(new Map([["call-1", toolResponse]]), { report: part => secondParts.push(part) }, tokenSource.token);
+		assert.deepStrictEqual(readNativeUsage(secondParts), [{
+			prompt_tokens: 2_900, completion_tokens: 100, total_tokens: 3_000,
+			prompt_tokens_details: { cached_tokens: 2_800 },
+		}], "resuming publishes the latest measured request, rather than cumulative billing tokens");
 		assert.deepStrictEqual(await dynamicResponsePromise, toolResponse);
 		const toolStep = bridge.liveMetrics.steps.find(step => step.kind === "tool");
 		assert.strictEqual(toolStep?.label, "read_file");
@@ -630,7 +654,7 @@ suite("Codex subscription provider", () => {
 		assert.ok(secondParts.some(part => part instanceof vscode.LanguageModelTextPart));
 		assert.strictEqual(bridge.finalText, "predone");
 		assert.strictEqual(bridge.segmentText, "done");
-		assert.deepStrictEqual(usageSnapshots, [1_200]);
+		assert.deepStrictEqual(usageSnapshots, [1_200, 3_000], "replaying metadata must not account usage again");
 		assert.ok(outputEstimates.length >= 2);
 		assert.strictEqual(outputEstimates.at(-1), 1);
 		bridge.dispose();
@@ -1661,6 +1685,7 @@ suite("Codex subscription provider", () => {
 		const tools: vscode.LanguageModelChatTool[] = [
 			{ name: "read_file", description: "Read a workspace file", inputSchema: { type: "object" } },
 			{ name: "run_in_terminal", description: "Run a command", inputSchema: { type: "object" } },
+			{ name: "vscode_askQuestions", description: "Ask the user", inputSchema: { type: "object" } },
 			{ name: "llamacpp_search_memory", description: "Search memory", inputSchema: { type: "object" } },
 			{ name: "specialized_private_tool", description: "Rare tool", inputSchema: { type: "object" } },
 		];
@@ -1669,7 +1694,7 @@ suite("Codex subscription provider", () => {
 			.filter(tool => tool.type === "function")
 			.map(tool => tool.name);
 		const namespace = dynamic.specs.find(tool => tool.type === "namespace");
-		assert.deepStrictEqual(eagerNames, ["read_file", "run_in_terminal"]);
+		assert.deepStrictEqual(eagerNames, ["read_file", "run_in_terminal", "vscode_askQuestions"]);
 		assert.ok(namespace && namespace.type === "namespace");
 		assert.strictEqual(namespace.name, CODEX_DEFERRED_TOOL_NAMESPACE);
 		assert.deepStrictEqual(namespace.tools.map(tool => tool.name), ["llamacpp_search_memory", "specialized_private_tool"]);
@@ -1689,6 +1714,7 @@ suite("Codex subscription provider", () => {
 		const tools: vscode.LanguageModelChatTool[] = [
 			{ name: "read_file", description: "Read a workspace file", inputSchema: { type: "object" } },
 			{ name: "apply_patch", description: "Apply a patch", inputSchema: { type: "object" } },
+			{ name: "request_user_input", description: "Ask using the native VS Code UI", inputSchema: { type: "object" } },
 			{ name: "view_image", description: "View an image", inputSchema: { type: "object" } },
 		];
 		const dynamic = buildCodexDynamicTools(tools, { deferNonCoreTools: true });
@@ -1696,15 +1722,16 @@ suite("Codex subscription provider", () => {
 			tool => tool.type === "namespace" && tool.name === CODEX_NATIVE_TOOL_NAMESPACE
 		);
 		assert.ok(nativeNamespace && nativeNamespace.type === "namespace");
-		assert.deepStrictEqual(nativeNamespace.tools.map(tool => tool.name), ["apply_patch", "view_image"]);
+		assert.deepStrictEqual(nativeNamespace.tools.map(tool => tool.name), ["apply_patch", "request_user_input", "view_image"]);
 		assert.ok(nativeNamespace.tools.every(tool => tool.deferLoading !== true));
 		assert.deepStrictEqual(dynamic.toolNamespaces, new Map([
 			["apply_patch", CODEX_NATIVE_TOOL_NAMESPACE],
+			["request_user_input", CODEX_NATIVE_TOOL_NAMESPACE],
 			["view_image", CODEX_NATIVE_TOOL_NAMESPACE],
 		]));
 		assert.deepStrictEqual(
 			dynamic.runtimeSignatures.filter(tool => tool.namespace === CODEX_NATIVE_TOOL_NAMESPACE).map(tool => tool.name),
-			["apply_patch", "view_image"]
+			["apply_patch", "request_user_input", "view_image"]
 		);
 	});
 

@@ -38,6 +38,8 @@ import { applyWorkbenchTerminalPatch, findWorkbenchBundle, getWorkbenchTerminalP
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { CocoChatModelProvider, type CocoProviderStatus } from "./coco/coco-provider";
+import { showProviderModelPicker } from "./ui/provider-model-picker";
+import { registerCursorBudgetCommand } from "./api-providers/cursor-budget-commands";
 import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
@@ -622,9 +624,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		memoryService,
 		context.globalState,
 		context.globalStorageUri.fsPath,
-		() => apiProviderService.getModelSources()
+		() => apiProviderService.getModelSources(),
+		(sourceKey, maximum, reported) => apiProviderService.recordContextMaximum(sourceKey, maximum, reported)
 	);
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
+	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
 	const cocoProvider = new CocoChatModelProvider();
 	context.subscriptions.push(codexProvider);
@@ -678,6 +682,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		() => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels })
 	);
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
+	context.subscriptions.push(apiProviderService.onDidChangeContext(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(apiProviderService.onDidChangeBalance(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(registerCursorBudgetCommand(apiProviderService));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
@@ -709,6 +716,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		}
 	}));
 	context.subscriptions.push(apiProviderService.onDidChange(() => {
+		llamaProvider.refreshLanguageModelChatInformation();
 		// Probe newly saved/edited profiles right away; a plain refresh()
 		// would leave them stuck on "Checking" until the 5-minute timer.
 		void providerDirectory.recheck().catch(error =>
@@ -1740,6 +1748,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			const dynamicCandidate = allCommands.find(
 				command => command.toLowerCase().includes("modelpicker") && command.includes("copilot")
 			);
+
 			if (dynamicCandidate) {
 				try {
 					await vscode.commands.executeCommand(dynamicCandidate);
@@ -1753,8 +1762,25 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 		})
 	);
 
-	context.subscriptions.push(
-		vscode.commands.registerCommand("llamacpp.openLogsFolder", async () => {
+	context.subscriptions.push(vscode.commands.registerCommand("llamacpp.chooseModelByProvider", async () => {
+		try {
+			let cancelled = false;
+			const models = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: "Loading models by provider", cancellable: true }, async (_progress, token) => {
+				const result = await compositeProvider.provideLanguageModelChatInformation({ silent: false }, token);
+				cancelled = token.isCancellationRequested;
+				return result;
+			});
+			if (!cancelled) { await showProviderModelPicker(models, apiProviderService.list()); }
+		} catch (error) {
+			if (error instanceof vscode.CancellationError) { return; }
+			logService.logError("models.grouped_picker.failed", error);
+			vscode.window.showErrorMessage(`Unable to choose a model: ${error instanceof Error ? error.message : String(error)}`);
+		}
+	}));
+
+        context.subscriptions.push(
+                vscode.commands.registerCommand("llamacpp.openLogsFolder", async () => {
+
 			await logService.openLogsFolder();
 		})
 	);

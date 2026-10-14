@@ -2,8 +2,9 @@ import type { ApiProviderDraft } from "./api-provider-service";
 
 /**
  * Ready-made provider profiles. Selecting a preset in the Providers Manager
- * form fills baseUrl/protocol/family/contextLength and shows the key/notes
- * hints. Presets account for provider-specific quirks:
+ * form fills baseUrl/protocol/family and shows the key/notes
+ * hints. Context limits come from model discovery, not from preset defaults.
+ * Presets account for provider-specific quirks:
  *  - Cloudflare Workers AI has no OpenAI-style GET /models (HTTP 405) — the
  *    catalog is read from /ai/models/search (see getModelsEndpoint in
  *    ../transport/openai-http).
@@ -14,7 +15,7 @@ export interface ApiProviderPreset {
         label: string;
         description: string;
         baseUrl: string;
-        protocol: "openai" | "deepseek" | "llamacpp";
+        protocol: "openai" | "deepseek" | "llamacpp" | "cursor";
         family: "auto" | "openai" | "deepseek" | "qwen" | "llama" | "mistral" | "gemma" | "phi";
         contextLength: number;
         keyLabel: string;
@@ -22,6 +23,12 @@ export interface ApiProviderPreset {
 }
 
 export const API_PROVIDER_PRESETS: ApiProviderPreset[] = [
+        {
+                id: "cursor", label: "Cursor", description: "Cursor with VS Code tools",
+                baseUrl: "https://api.cursor.com/v1", protocol: "cursor", family: "auto",
+                contextLength: 131_072, keyLabel: "Cursor API key",
+                notes: "Uses the local Cursor SDK with native VS Code tools. Models and supported parameters are discovered using this profile's saved key. Inference runs on Cursor's servers.",
+        },
         {
                 id: "openrouter",
                 label: "OpenRouter",
@@ -79,7 +86,6 @@ export function presetToDraft(preset: ApiProviderPreset): ApiProviderDraft {
                 baseUrl: preset.baseUrl,
                 protocol: preset.protocol,
                 family: preset.family,
-                contextLength: preset.contextLength,
                 enabled: true,
         };
 }

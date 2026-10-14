@@ -46,6 +46,7 @@ import {
 	CodexInternalToolBlockedError,
 	CodexStaleTurnError,
 	CodexTurnBridge,
+	createCodexNativeContextUsage,
 	type CodexDelegatedToolCall,
 	type CodexTurnBoundary,
 	type CodexTurnInputDiagnostics,
@@ -106,6 +107,7 @@ const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"Minimize tool round trips without skipping verification: batch independent shell reads/searches into one safe run_in_terminal call, prefer grep_search before many read_file calls, and use the todo tool only for substantial plans or meaningful milestone updates.",
 	"Keep every native tool result small. Filter potentially large command output with rg, counts, head, or tail; never dump full logs, JSON/JSONL files, repository file lists, generated artifacts, or binary/base64 data into chat.",
 	"Some less common dynamic tools are loaded on demand. Use tool_search when the required outer tool is not already visible.",
+	"When a native VS Code question tool is advertised, use it for clarification and user choices instead of asking only in ordinary chat text. Examples are vscode_askQuestions and vscode_native.request_user_input. Follow the advertised schema. Do not use Codex's built-in request_user_input; its availability depends on collaboration mode.",
 	"Dynamic tool results return through native VS Code tool execution while this Codex turn remains active. Continue directly from each result without repeating the call.",
 	"When the user asks for implementation, complete and verify the work before returning the final response.",
 ].join("\n");
@@ -1395,13 +1397,19 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				delegate: call => bridge.delegate(call),
 			});
 		}
+		const nativeContextUsage = bridge.tokenUsage ?? this.tokenUsageByThread.get(threadId);
+		if (nativeContextUsage) {
+			progress.report(vscode.LanguageModelDataPart.text(
+				JSON.stringify(createCodexNativeContextUsage(nativeContextUsage)), "usage"
+			));
+		}
 		this.beginRuntimeMetrics(
 			threadId,
 			model.id,
 			modelInfo,
 			input.text,
 			toolSchemaChars,
-			bridge.tokenUsage ?? this.tokenUsageByThread.get(threadId)
+			nativeContextUsage
 		);
 		const segmentStartedAt = Date.now();
 		let keepBridge = false;
@@ -1618,12 +1626,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				idleGapSeconds: inputDiagnostics?.idleGapSeconds,
 				};
 				this.recordTokenUsage(threadId, model.id, bridge.tokenUsage, "completed", turnDiag);
-				const usage = {
-					prompt_tokens: bridge.tokenUsage.last.inputTokens,
-					completion_tokens: bridge.tokenUsage.last.outputTokens,
-					total_tokens: bridge.tokenUsage.last.totalTokens,
-					prompt_tokens_details: { cached_tokens: bridge.tokenUsage.last.cachedInputTokens },
-				};
+				const usage = createCodexNativeContextUsage(bridge.tokenUsage);
 				progress.report(vscode.LanguageModelDataPart.text(JSON.stringify(usage), "usage"));
 				this.logSink?.log("chat.cache.report", buildCacheDiagnostics({
 					provider: "codex",

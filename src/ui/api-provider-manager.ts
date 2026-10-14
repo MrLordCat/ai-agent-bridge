@@ -77,6 +77,7 @@ function stateLabelOf(state: string | undefined): string {
 		unconfigured: "Not configured",
 		online: "Online",
 		offline: "Offline",
+		unsupported: "Unsupported API",
 		paused: "Paused",
 	};
 	return labels[state ?? "checking"] ?? "—";
@@ -230,6 +231,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 						${selectOption("openai", editing?.protocol ?? "openai", "OpenAI-compatible")}
 						${selectOption("deepseek", editing?.protocol ?? "openai", "DeepSeek native")}
 						${selectOption("llamacpp", editing?.protocol ?? "openai", "llama.cpp")}
+											${selectOption("cursor", editing?.protocol ?? "openai", "Cursor SDK (VS Code tools)")}
 					</select>
 					<small>Controls request fields. Gateways such as OpenRouter normally use OpenAI-compatible.</small>
 					<small>Even a llama.cpp endpoint reached through a gateway must keep OpenAI-compatible here; tick the llama.cpp option below to restore native thinking.</small>
@@ -248,10 +250,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 					</select>
 					<small>Controls context/output defaults independently from the API format.</small>
 				</label>
-				<label>
-					<span>Context length</span>
-					<input id="provider-context" type="number" min="4096" max="1048576" step="1024" value="${editing?.contextLength ?? DEFAULT_API_PROVIDER_CONTEXT}" />
-				</label>
+				<p class="form-note">The maximum context is discovered from the provider. After saving, choose a smaller working context with the slider on its card.</p>
 				<label>
 					<span>API key</span>
 					<input id="provider-key" type="password" autocomplete="new-password" placeholder="${editing?.hasApiKey ? "Saved — leave blank to keep" : "Optional for keyless endpoints"}" />
@@ -275,6 +274,8 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 	const cards = state.profiles.length === 0
 		? '<div class="empty">No custom API providers yet. Add an OpenAI-compatible endpoint to load its models into the VS Code model picker.</div>'
 		: state.profiles.map(profile => {
+			const maximum = profile.maximumContextLength ?? DEFAULT_API_PROVIDER_CONTEXT;
+			const working = Math.min(profile.contextLength ?? maximum, maximum);
 			const status = state.providers.find(provider => provider.key === `api-${profile.id}`);
 			const statusClass = status ? status.state : (profile.enabled ? "on" : "off");
 			const statusLabel = status ? stateLabelOf(status.state) : (profile.enabled ? "Enabled" : "Disabled");
@@ -291,14 +292,22 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 			<div class="detail ${status ? status.state : ""}">${esc(detail)}</div>
 			<div class="badges">
 				<span>${esc(profile.protocol)}</span>
+				${profile.protocol === "cursor" ? '<span>Cursor SDK · tools run through VS Code Chat</span>' : ""}
 				<span>family: ${esc(profile.family)}</span>
-				<span>ctx ${profile.contextLength.toLocaleString("en-US")}</span>
+				<span>${profile.contextMaximumReported ? "Provider maximum" : "Fallback context"}: ${maximum.toLocaleString("en-US")}</span>
 				${profile.llamaCppCompat ? '<span title="Sends cache_prompt, enable_thinking and thinking_budget_tokens.">llama.cpp fields</span>' : ""}
 				<span class="${profile.hasApiKey ? "key-set" : ""}">${profile.hasApiKey ? "key saved" : "no key"}</span>
+			</div>
+			<div class="context-control">
+				<label>Working context: <output id="context-value-${escAttr(profile.id)}">${profile.contextLength === undefined ? "Auto · " : ""}${working.toLocaleString("en-US")}</output>
+				<input class="working-context" data-id="${escAttr(profile.id)}" type="range" min="4096" max="${maximum}" step="1" value="${working}" style="width:100%" /></label>
+				${profile.contextMaximumReported ? "" : '<small>The API has not reported its maximum; the slider uses a safe fallback.</small>'}
+				<button class="context-auto" data-id="${escAttr(profile.id)}" type="button">Use automatic context</button>
 			</div>
 			<div class="actions">
 				<button class="toggle-btn" data-id="${escAttr(profile.id)}" data-enabled="${profile.enabled}" type="button">${profile.enabled ? "Disable" : "Enable"}</button>
 				<button class="edit-btn" data-id="${escAttr(profile.id)}" type="button">Edit</button>
+				${profile.protocol === "cursor" ? `<button class="budget-btn" data-id="${escAttr(profile.id)}" type="button">Budget access</button>` : ""}
 				<button class="delete-btn danger" data-id="${escAttr(profile.id)}" type="button">Delete</button>
 			</div>
 		</article>`;
@@ -337,13 +346,16 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		.provider-name { font-weight: 600; font-size: 15px; }
 		.endpoint { color: var(--vscode-descriptionForeground); margin-top: 4px; overflow-wrap: anywhere; }
 		.detail { color: var(--vscode-descriptionForeground); margin-top: 4px; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
-		.detail.offline { color: var(--vscode-errorForeground); }
+		.detail.offline, .detail.unsupported { color: var(--vscode-errorForeground); }
 		.badges span { border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 2px 9px; font-size: 12px; white-space: nowrap; background: var(--vscode-textBlockQuote-background, transparent); }
 		.status { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--vscode-panel-border); border-radius: 999px; padding: 3px 10px; font-size: 12px; font-weight: 500; white-space: nowrap; }
 		.status::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; flex-shrink: 0; }
 		.status.on, .key-set, .status.online { color: var(--vscode-testing-iconPassed); }
 		.status.off, .status.unconfigured, .status.checking { color: var(--vscode-descriptionForeground); }
-		.status.offline { color: var(--vscode-errorForeground); }
+		.status.offline, .status.unsupported { color: var(--vscode-errorForeground); }
+		.context-control { margin: 12px 0; padding: 10px; border: 1px solid var(--vscode-widget-border); border-radius: 4px; }
+		.context-control label, .context-control small { display: block; margin-bottom: 8px; }
+		.context-control small, .form-note { color: var(--vscode-descriptionForeground); }
 		.status.paused { color: var(--vscode-charts-yellow, #e2c08d); }
 		.status-section { margin-bottom: 20px; }
 		.status-section .provider-card { margin-bottom: 8px; }
@@ -398,6 +410,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		document.getElementById('refresh-models-btn').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
 		document.getElementById('recheck-btn').addEventListener('click', () => vscode.postMessage({ type: 'recheck' }));
 		document.querySelectorAll('.edit-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'edit', id: button.dataset.id })));
+		document.querySelectorAll('.budget-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'budget', id: button.dataset.id })));
 		document.querySelectorAll('.delete-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'delete', id: button.dataset.id })));
 		document.querySelectorAll('.toggle-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({
 			type: 'toggle',
@@ -429,7 +442,6 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 				document.getElementById('provider-url').value = preset.baseUrl;
 				document.getElementById('provider-protocol').value = preset.protocol;
 				document.getElementById('provider-family').value = preset.family;
-				document.getElementById('provider-context').value = String(preset.contextLength);
 				const notes = document.getElementById('provider-preset-notes');
 				if (notes) {
 					notes.textContent = preset.notes;
@@ -452,6 +464,15 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 			}
 			element.classList.toggle('invalid', !valid);
 		};
+		document.querySelectorAll('.working-context').forEach(input => {
+			input.addEventListener('input', () => {
+				document.getElementById('context-value-' + input.dataset.id).textContent = Number(input.value).toLocaleString('en-US');
+			});
+			input.addEventListener('change', () => vscode.postMessage({ type: 'context', id: input.dataset.id, contextLength: Number(input.value) }));
+		});
+		document.querySelectorAll('.context-auto').forEach(button => {
+			button.addEventListener('click', () => vscode.postMessage({ type: 'context', id: button.dataset.id, contextLength: null }));
+		});
 		if (urlInput) {
 			urlInput.addEventListener('input', syncAccountField);
 			syncAccountField();
@@ -482,7 +503,6 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 						baseUrl: accountValue ? urlValue.split('{account_id}').join(accountValue) : urlValue,
 						protocol: document.getElementById('provider-protocol').value,
 						family: document.getElementById('provider-family').value,
-						contextLength: Number(document.getElementById('provider-context').value),
 						llamaCppCompat: document.getElementById('provider-llamacpp-compat').checked,
 						enabled: document.getElementById('provider-enabled').checked,
 					},
@@ -498,6 +518,7 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 
 interface ApiProviderManagerMessage {
 	type?: string;
+	contextLength?: number | null;
 	id?: string;
 	enabled?: boolean;
 	command?: string;
@@ -535,6 +556,7 @@ export class ApiProviderManagerPanel {
 	) {
 		this.disposables.push(
 			this.service.onDidChange(this.renderUnlessEditing),
+			this.service.onDidChangeContext(this.renderUnlessEditing),
 			this.directory.onDidChange(this.renderUnlessEditing),
 			this.panel.webview.onDidReceiveMessage(message => void this.handleMessage(message)),
 			this.panel.onDidDispose(() => {
@@ -603,6 +625,15 @@ export class ApiProviderManagerPanel {
 					// Render even while a form is open: the tail render is skipped
 					// while editing, and the list must not show stale cards.
 					await this.render();
+					break;
+				case "context":
+					if (data.contextLength === undefined) { throw new Error("Working context is missing."); }
+					await this.service.setWorkingContextLength(String(data.id ?? ""), data.contextLength);
+					this.status = data.contextLength === null ? "Working context is automatic." : "Working context updated.";
+					this.refreshModels();
+					break;
+				case "budget":
+					await vscode.commands.executeCommand("llamacpp.cursorBudget", String(data.id ?? ""));
 					break;
 				case "delete": {
 					const profile = this.service.get(String(data.id ?? ""));

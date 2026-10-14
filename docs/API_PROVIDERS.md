@@ -21,9 +21,92 @@ model picker without replacing the built-in Local LLM or DeepSeek source.
 | Base URL | API root, with or without a trailing version segment such as `/v1` |
 | API format | Controls request fields: OpenAI-compatible, DeepSeek native, or llama.cpp |
 | Model family | Controls context/output/reasoning defaults independently from API format |
-| Context length | Advertised model context when the endpoint does not provide a usable runtime value |
+| Context | Discovered automatically from the model catalog or runtime; choose a smaller working limit with the card's slider after saving |
 | Enabled | Adds or removes the profile from discovery without deleting it |
 | API key | Optional Bearer token stored only in VS Code SecretStorage |
+
+The add/edit form does not require a context size. For example, when the API
+reports a 1,000,000-token model window, choose 500,000 with **Working context**.
+**Use automatic context** restores the discovered maximum. Each model still
+uses its own limit when a provider offers models with different windows.
+If no maximum is reported, the card labels its safe fallback explicitly.
+Existing saved context values become working caps; editing the connection
+preserves them. Presets do not override discovered context limits.
+
+### Choose models by provider
+
+Click **Models by Provider** (the tree icon) in the Chat or Quick Access title
+bar, or run **AI Agent Bridge: Models by Provider** from the command palette.
+Choose a provider first, then one of its models. Use **Back to providers** to
+change the group. API profiles remain separate even when their names match;
+an enabled profile with an unavailable catalog stays visible with zero models.
+
+Choosing a model updates the current chat without sending a message. Models
+without local tool calling use Ask mode. Cursor SDK models with Tools remain
+available in Agent mode.
+The regular VS Code model dropdown remains available for model configuration.
+
+### Cursor team budget in Quick Access
+
+Expand **Quick Access → Cursor → Budget** to see the remaining budget, **Used**
+and **Limit** for the current billing cycle. These values come from the
+[Cursor Admin API](https://cursor.com/docs/account/teams/admin-api) and apply
+to the exact team member identified by the saved chat key or selected email.
+The budget is an enforced cap on on-demand charges. **Total usage**, when
+reported, also includes subscription usage and is shown separately.
+If the API does not report a limit, the card shows usage without inventing
+a remaining balance.
+
+The budget refreshes every minute. Click **Budget** for a manual refresh,
+access settings or the Cursor usage dashboard. The same settings are available
+through **Budget access** on the Cursor card in Providers Manager, or through
+**AI Agent Bridge: Cursor Budget** in the command palette.
+
+If **Admin access required** appears, choose **Configure Admin API key** and
+enter a team key with Admin API access in the password field. This optional
+key is stored in VS Code SecretStorage separately from the chat key. For a
+service-account key, choose **Select budget user** and enter the team member's
+email. Clear the email to detect the owner of the chat key again. Budget access
+changes refresh Quick Access without interrupting an active Cursor chat.
+
+### Cursor official API
+
+`https://api.cursor.com/v1` supplies the [Cursor model catalog](https://cursor.com/docs/cloud-agent/api/endpoints).
+Choose the **Cursor** preset or **Cursor SDK (VS Code tools)** API
+format in Providers Manager. Existing profiles on `api.cursor.com` are detected
+automatically and retain their saved key, profile ID and enable/disable control.
+The profile discovers available models and their supported configuration values;
+reported context windows feed the same working-context slider as other profiles.
+When Cursor does not report a numeric maximum, the card labels the fallback.
+
+When a model reports reasoning levels, **Thinking Effort** appears next to the
+model in the native chat input. Values and defaults come from Cursor's catalog,
+including variant-only metadata. The bridge translates the native
+`reasoningEffort` option to Cursor's original parameter name (`effort`,
+`reasoning_effort`, `thinking_level`, etc.) before starting the SDK run.
+Models whose catalog has no supported reasoning levels do not show this picker.
+
+Chat uses the official [Cursor TypeScript SDK](https://cursor.com/docs/sdk/typescript)
+in local mode. Inference runs on Cursor's servers. Commands, edits, questions
+and other actions use the tools supplied by Copilot Chat: the SDK callback waits
+while VS Code displays and approves the tool call, then resumes with its result.
+The SDK's built-in filesystem, shell and web tools are excluded. Project/user
+configuration and external MCP servers are not loaded into this bridge.
+
+The bridge instruction is included in the request text. It does not use the
+SDK's `systemPrompt` override, which some Cursor runtimes reject as
+`unknown option '--system-prompt'`. Failed runs report Cursor's original error
+message and code, with credentials redacted, instead of only `status error`.
+
+Cursor models advertise **Tools** and **Vision**, making them selectable in the
+native Agent picker. The SDK requires Node.js 22.13 or newer in the extension
+host and its supported platform package (Windows x64, Linux/macOS x64 or arm64).
+It loads only when Cursor is used; the JSONL store avoids a node:sqlite dependency.
+On unsupported hosts the Cloud Agents transport remains a chat-only fallback
+and the models do not advertise Tools. Cancelling stops the active SDK run;
+profile/key changes and stale tool results cannot resume another conversation.
+Compatible gateways remain ordinary OpenAI-compatible profiles. There is no
+separate Cursor enable setting or key store.
 
 The API format and model family are deliberately separate. For example, a
 DeepSeek model routed through OpenRouter normally uses:

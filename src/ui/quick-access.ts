@@ -370,8 +370,9 @@ export function buildApiProfileItem(
 	profile: QuickAccessApiProvider,
 	state: ProviderState | undefined
 ): QuickAccessItem {
+	const budgetCommand: vscode.Command = { command: "llamacpp.cursorBudget", title: "Cursor Budget", arguments: [profile.id] };
 	return new QuickAccessItem(`api.${profile.id}`, profile.name, {
-		description: state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
+		description: state === "unsupported" ? "Unsupported API" : state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
 		icon: new vscode.ThemeIcon("cloud"),
 		tooltip: profile.baseUrl,
 		children: [
@@ -382,18 +383,26 @@ export function buildApiProfileItem(
 				command: command("llamacpp.openApiProviders", "Manage API Providers"),
 			}),
 			...(profile.balance
-				? [new QuickAccessItem(`api.${profile.id}.balance`, "Balance", {
+				? [new QuickAccessItem(`api.${profile.id}.balance`, profile.balance.label ?? "Balance", {
 					description: profile.balance.summary,
 					tooltip: profile.balance.tooltip,
 					icon: new vscode.ThemeIcon("credit-card"),
-					command: command("llamacpp.openApiProviders", "Manage API Providers"),
+					command: profile.balance.label === "Budget" ? budgetCommand : command("llamacpp.openApiProviders", "Manage API Providers"),
+					expanded: true,
+					children: profile.balance.rows?.length ? profile.balance.rows.map(row => new QuickAccessItem(`api.${profile.id}.balance.${row.id}`, row.label, { description: row.summary, tooltip: row.tooltip, icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })) : undefined,
 				})]
 				: []),
 			new QuickAccessItem(`api.${profile.id}.context`, "Maximum Context", {
-				description: formatCompactTokenCount(profile.contextLength),
-				tooltip: "Context window advertised for this provider. Edit it in the Providers Manager.",
+				description: profile.maximumContextLength === undefined ? "Detecting" : formatCompactTokenCount(profile.maximumContextLength),
+				tooltip: profile.contextMaximumReported ? "Maximum context discovered from the provider's models." : "The API has not reported a maximum; discovery may use a fallback.",
 				icon: new vscode.ThemeIcon("symbol-numeric"),
 				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+			}),
+			new QuickAccessItem(`api.${profile.id}.workingContext`, "Working Context", {
+				description: profile.contextLength === undefined ? "Automatic" : formatCompactTokenCount(profile.contextLength),
+				tooltip: "Choose a smaller working context with the slider in the Providers Manager.",
+				icon: new vscode.ThemeIcon("settings"),
+				command: command("llamacpp.openApiProviders", "Adjust Working Context"),
 			}),
 			new QuickAccessItem(`api.${profile.id}.manage`, "Providers Manager", {
 				description: "Edit, disable or delete",

@@ -24,6 +24,7 @@ const EAGER_TOOL_SUFFIXES = [
 	"runtests",
 	"testfailure",
 	"requestuserinput",
+	"askquestions",
 	"websearch",
 	"fetchwebpage",
 	"viewimage",
@@ -34,6 +35,7 @@ const EXCLUDED_VSCODE_TOOLS = new Set([
 ]);
 const CODEX_BUILTIN_TOOL_COLLISIONS = new Set([
 	"apply_patch",
+	"request_user_input",
 	"view_image",
 ]);
 

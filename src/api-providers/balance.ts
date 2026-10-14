@@ -1,11 +1,15 @@
 import {
         getOpenAiApiRoot,
         isCloudflareWorkersAiBase,
+        isCursorCloudAgentBase,
 } from "../transport/openai-http";
+import { fetchCursorBudget, type CursorBudgetAccess } from "./cursor-budget";
 
 /**
  * Human-readable balance/usage info for a custom API provider, fetched from
  * provider-specific endpoints:
+ *  - Cursor: Admin API spending and enforced per-user budget for the exact
+ *    team member, with optional separate Admin credentials.
  *  - OpenRouter: GET {base}/credits (fallback {base}/auth/key) returns the
  *    remaining credits / usage for the API key.
  *  - Cloudflare Workers AI: no public balance API exists — the account
@@ -15,8 +19,10 @@ import {
  *    (the row is hidden).
  */
 export interface ApiProviderBalanceInfo {
+        label?: string;
         summary: string;
         tooltip: string;
+        rows?: Array<{ id: string; label: string; summary: string; tooltip: string }>;
 }
 
 interface BalanceJson {
@@ -117,9 +123,11 @@ async function fetchOpenRouterBalance(root: string, apiKey: string): Promise<Api
 
 export async function fetchApiProviderBalance(
         baseUrl: string,
-        apiKey: string
+        apiKey: string,
+        cursorAccess: CursorBudgetAccess = {}
 ): Promise<ApiProviderBalanceInfo | undefined> {
         try {
+                if (isCursorCloudAgentBase(baseUrl)) { return await fetchCursorBudget(apiKey, cursorAccess); }
                 if (!apiKey) {
                         return undefined;
                 }

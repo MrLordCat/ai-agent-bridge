@@ -6,7 +6,7 @@ import { isDeepSeekEndpoint } from "../transport/openai-http";
 
 const MODEL_SOURCE_SEPARATOR = "::";
 
-export type ApiRequestProtocol = "openai" | "deepseek" | "llamacpp";
+export type ApiRequestProtocol = "openai" | "deepseek" | "llamacpp" | "cursor";
 
 export interface ChatModelSource {
 	key: string;
@@ -16,6 +16,8 @@ export interface ChatModelSource {
 	familyOverride?: string;
 	contextLengthOverride?: number;
 	contextLengthFallback?: number;
+	/** Optional user-selected cap; never increases the model's discovered window. */
+	workingContextLength?: number;
 	protocol?: ApiRequestProtocol;
 	/**
 	 * Send the llama.cpp-only request fields (`cache_prompt`,

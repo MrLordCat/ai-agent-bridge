@@ -6,6 +6,7 @@ import {
 	type ApiRequestProtocol,
 	type ChatModelSource,
 } from "../model-sources/source-routing";
+import { isCursorCloudAgentBase } from "../transport/openai-http";
 import {
 	fetchApiProviderBalance,
 	type ApiProviderBalanceInfo,
@@ -13,10 +14,13 @@ import {
 
 const API_PROVIDER_STORAGE_KEY = "llamacpp.apiProviders.v1";
 const API_PROVIDER_SECRET_PREFIX = "llamacpp.apiProvider.";
+const CURSOR_BUDGET_USERS_STORAGE_KEY = "llamacpp.cursorBudgetUsers.v1";
 
 export function apiProviderSecretKey(id: string): string {
 	return `${API_PROVIDER_SECRET_PREFIX}${id}.apiKey`;
 }
+
+export function cursorBudgetAdminSecretKey(id: string): string { return `${API_PROVIDER_SECRET_PREFIX}${id}.cursorAdminApiKey`; }
 
 export const API_PROVIDER_CONTEXT_MIN = 4_096;
 export const API_PROVIDER_CONTEXT_MAX = 1_048_576;
@@ -38,7 +42,8 @@ export interface ApiProviderProfile {
 	baseUrl: string;
 	protocol: ApiRequestProtocol;
 	family: ApiProviderFamily;
-	contextLength: number;
+	/** User-selected working context; absent means automatic. */
+	contextLength?: number;
 	/**
 	 * Send llama.cpp-only request fields through this endpoint. Needed when a
 	 * llama.cpp server is reached through an OpenAI-compatible gateway: the
@@ -53,6 +58,8 @@ export interface ApiProviderProfile {
 
 export interface ApiProviderSummary extends ApiProviderProfile {
 	hasApiKey: boolean;
+	maximumContextLength?: number;
+	contextMaximumReported?: boolean;
 }
 
 export interface ApiProviderDraft {
@@ -77,14 +84,16 @@ export interface QuickAccessApiProvider {
 	name: string;
 	baseUrl: string;
 	protocol: ApiRequestProtocol;
-	contextLength: number;
+	contextLength?: number;
+	maximumContextLength?: number;
+	contextMaximumReported?: boolean;
 	llamaCppCompat: boolean;
 	enabled: boolean;
 	hasApiKey: boolean;
 	balance?: ApiProviderBalanceInfo;
 }
 
-const PROTOCOLS = new Set<ApiRequestProtocol>(["openai", "deepseek", "llamacpp"]);
+const PROTOCOLS = new Set<ApiRequestProtocol>(["openai", "deepseek", "llamacpp", "cursor"]);
 const FAMILIES = new Set<ApiProviderFamily>([
 	"auto",
 	"openai",
@@ -135,7 +144,9 @@ function normalizeBaseUrl(value: unknown): string {
 	return normalizeServerUrl(parsed.toString());
 }
 
-function normalizeProtocol(value: unknown): ApiRequestProtocol {
+function normalizeProtocol(value: unknown, baseUrl?: unknown): ApiRequestProtocol {
+	// Existing Cursor profiles retain their id and SecretStorage key.
+	if (typeof baseUrl === "string" && isCursorCloudAgentBase(baseUrl)) { return "cursor"; }
 	return typeof value === "string" && PROTOCOLS.has(value as ApiRequestProtocol)
 		? value as ApiRequestProtocol
 		: "openai";
@@ -147,14 +158,15 @@ function normalizeFamily(value: unknown): ApiProviderFamily {
 		: "auto";
 }
 
-function normalizeContextLength(value: unknown): number {
+function normalizeContextLength(value: unknown, maximum = Number.MAX_SAFE_INTEGER): number | undefined {
+	if (value === undefined || value === null || value === "") { return undefined; }
 	const parsed = typeof value === "number" ? value : Number(value);
 	if (!Number.isFinite(parsed)) {
-		return DEFAULT_API_PROVIDER_CONTEXT;
+		return undefined;
 	}
 	return Math.max(
 		API_PROVIDER_CONTEXT_MIN,
-		Math.min(API_PROVIDER_CONTEXT_MAX, Math.round(parsed))
+		Math.min(maximum, Math.round(parsed))
 	);
 }
 
@@ -173,7 +185,7 @@ function normalizeStoredProfile(value: unknown): ApiProviderProfile | undefined 
 			id,
 			name: normalizeName(record.name),
 			baseUrl: normalizeBaseUrl(record.baseUrl),
-			protocol: normalizeProtocol(record.protocol),
+						protocol: normalizeProtocol(record.protocol, record.baseUrl),
 			family: normalizeFamily(record.family),
 			contextLength: normalizeContextLength(record.contextLength),
 			llamaCppCompat: record.llamaCppCompat === true,
@@ -189,6 +201,36 @@ function normalizeStoredProfile(value: unknown): ApiProviderProfile | undefined 
 export class ApiProviderService implements vscode.Disposable {
 	private readonly _onDidChange = new vscode.EventEmitter<void>();
 	readonly onDidChange = this._onDidChange.event;
+	private readonly _onDidChangeContext = new vscode.EventEmitter<void>();
+	readonly onDidChangeContext = this._onDidChangeContext.event;
+	private readonly _onDidChangeBalance = new vscode.EventEmitter<void>();
+	readonly onDidChangeBalance = this._onDidChangeBalance.event;
+	private readonly contextMaxima = new Map<string, { maximumContextLength: number; contextMaximumReported: boolean }>();
+
+	recordContextMaximum(sourceKey: string, maximum: number, reported: boolean): void {
+		if (!sourceKey.startsWith("api-") || !Number.isFinite(maximum)) { return; }
+		const id = sourceKey.slice(4);
+		if (!this.get(id)) { return; }
+		const maximumContextLength = normalizeContextLength(maximum)!;
+		const previous = this.contextMaxima.get(id);
+		if (previous?.maximumContextLength === maximumContextLength && previous.contextMaximumReported === reported) { return; }
+		this.contextMaxima.set(id, { maximumContextLength, contextMaximumReported: reported });
+		this._onDidChangeContext.fire();
+	}
+
+	async setWorkingContextLength(id: string, value: number | null): Promise<void> {
+		const profiles = this.list();
+		const profile = profiles.find(candidate => candidate.id === id);
+		if (!profile) { throw new Error("The API provider no longer exists."); }
+		if (value !== null && (!Number.isFinite(value) || value < API_PROVIDER_CONTEXT_MIN)) {
+			throw new Error("Working context must be a finite token count.");
+		}
+		const maximum = this.contextMaxima.get(id)?.maximumContextLength ?? API_PROVIDER_CONTEXT_MAX;
+		profile.contextLength = value === null ? undefined : normalizeContextLength(value, maximum);
+		profile.updatedAt = new Date().toISOString();
+		await this.state.update(API_PROVIDER_STORAGE_KEY, profiles);
+		this._onDidChange.fire();
+	}
 
 	constructor(
 		private readonly state: vscode.Memento,
@@ -205,18 +247,54 @@ export class ApiProviderService implements vscode.Disposable {
 
 	private readonly balances = new Map<string, { info: ApiProviderBalanceInfo; fetchedAt: number }>();
 	private readonly balanceInflight = new Map<string, Promise<ApiProviderBalanceInfo | undefined>>();
+	private readonly balanceRevisions = new Map<string, number>();
+
+	private invalidateBalance(id: string): void {
+		this.balances.delete(id); this.balanceInflight.delete(id);
+		this.balanceRevisions.set(id, (this.balanceRevisions.get(id) ?? 0) + 1);
+	}
+
+	getCursorBudgetUserEmail(id: string): string | undefined {
+		const value = this.state.get<Record<string, string>>(CURSOR_BUDGET_USERS_STORAGE_KEY, {})[id];
+		return typeof value === "string" && value ? value : undefined;
+	}
+
+	async setCursorBudgetAccess(id: string, update: { adminApiKey?: string; clearAdminApiKey?: boolean; userEmail?: string }): Promise<void> {
+		const profile = this.get(id);
+		if (!profile || !isCursorCloudAgentBase(profile.baseUrl)) { throw new Error("Select an existing Cursor API profile."); }
+		const userEmail = update.userEmail?.trim().toLowerCase();
+		if (userEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail)) { throw new Error("Enter a valid team member email."); }
+		if (update.adminApiKey?.trim()) { await this.secrets.store(cursorBudgetAdminSecretKey(id), update.adminApiKey.trim()); }
+		else if (update.clearAdminApiKey) { await this.secrets.delete(cursorBudgetAdminSecretKey(id)); }
+		if (update.userEmail !== undefined) {
+			const users = { ...this.state.get<Record<string, string>>(CURSOR_BUDGET_USERS_STORAGE_KEY, {}) };
+			if (userEmail) { users[id] = userEmail; } else { delete users[id]; }
+			await this.state.update(CURSOR_BUDGET_USERS_STORAGE_KEY, users);
+		}
+		this.invalidateBalance(id); this._onDidChangeBalance.fire();
+	}
+
+	async refreshBalance(id: string): Promise<ApiProviderBalanceInfo | undefined> {
+		const info = await this.getBalanceInfo(id, true);
+		this._onDidChangeBalance.fire();
+		return info;
+	}
 
 	/**
 	 * Balance/usage info for a profile, fetched from provider-specific
 	 * endpoints and cached for 60 seconds (like the DeepSeek balance).
 	 */
-	async getBalanceInfo(id: string): Promise<ApiProviderBalanceInfo | undefined> {
+	async getBalanceInfo(id: string, force = false): Promise<ApiProviderBalanceInfo | undefined> {
 		const profile = this.get(id);
 		if (!profile || !profile.enabled) {
 			return undefined;
 		}
+		if (force) { this.invalidateBalance(id); }
+		const revision = this.balanceRevisions.get(id) ?? 0;
 		const cached = this.balances.get(id);
-		if (cached && Date.now() - cached.fetchedAt < 60_000) {
+		// Leave room for API latency so the 60-second view timer refreshes Cursor each tick.
+		const cacheTtl = isCursorCloudAgentBase(profile.baseUrl) ? 55_000 : 60_000;
+		if (cached && Date.now() - cached.fetchedAt < cacheTtl) {
 			return cached.info;
 		}
 		const inFlight = this.balanceInflight.get(id);
@@ -225,10 +303,12 @@ export class ApiProviderService implements vscode.Disposable {
 		}
 		const promise = (async () => {
 			const apiKey = await this.getApiKey(id);
-			if (!apiKey) {
+			const access = isCursorCloudAgentBase(profile.baseUrl) ? { adminApiKey: await this.secrets.get(cursorBudgetAdminSecretKey(id)), userEmail: this.getCursorBudgetUserEmail(id) } : {};
+			if (!apiKey && !access.adminApiKey) {
 				return undefined;
 			}
-			const info = await fetchApiProviderBalance(profile.baseUrl, apiKey);
+			const info = await fetchApiProviderBalance(profile.baseUrl, apiKey ?? "", access);
+			if ((this.balanceRevisions.get(id) ?? 0) !== revision) { return undefined; }
 			if (info) {
 				this.balances.set(id, { info, fetchedAt: Date.now() });
 			}
@@ -238,7 +318,7 @@ export class ApiProviderService implements vscode.Disposable {
 		try {
 			return await promise;
 		} finally {
-			this.balanceInflight.delete(id);
+			if (this.balanceInflight.get(id) === promise) { this.balanceInflight.delete(id); }
 		}
 	}
 
@@ -253,6 +333,7 @@ export class ApiProviderService implements vscode.Disposable {
 				baseUrl: profile.baseUrl,
 				protocol: profile.protocol,
 				contextLength: profile.contextLength,
+				...this.contextMaxima.get(profile.id),
 				llamaCppCompat: profile.llamaCppCompat,
 				enabled: profile.enabled,
 				hasApiKey: profile.hasApiKey,
@@ -279,6 +360,7 @@ export class ApiProviderService implements vscode.Disposable {
 		const profiles = this.list();
 		return Promise.all(profiles.map(async profile => ({
 			...profile,
+			...this.contextMaxima.get(profile.id),
 			hasApiKey: Boolean(await this.secrets.get(this.secretKey(profile.id))),
 		})));
 	}
@@ -291,7 +373,8 @@ export class ApiProviderService implements vscode.Disposable {
 			serverUrl: profile.baseUrl,
 			apiKey: await this.secrets.get(this.secretKey(profile.id)),
 			familyOverride: profile.family,
-			contextLengthOverride: profile.contextLength,
+			workingContextLength: profile.contextLength,
+			contextLengthFallback: DEFAULT_API_PROVIDER_CONTEXT,
 			protocol: profile.protocol,
 			llamaCppCompat: profile.llamaCppCompat,
 		})));
@@ -315,9 +398,9 @@ export class ApiProviderService implements vscode.Disposable {
 			id: existing?.id ?? randomUUID(),
 			name: normalizeName(draft.name),
 			baseUrl: normalizeBaseUrl(draft.baseUrl),
-			protocol: normalizeProtocol(draft.protocol),
+					protocol: normalizeProtocol(draft.protocol, draft.baseUrl),
 			family: normalizeFamily(draft.family),
-			contextLength: normalizeContextLength(draft.contextLength),
+			contextLength: draft.contextLength === undefined ? existing?.contextLength : normalizeContextLength(draft.contextLength),
 			llamaCppCompat: draft.llamaCppCompat === true,
 			enabled: draft.enabled !== false,
 			createdAt: existing?.createdAt ?? now,
@@ -345,7 +428,10 @@ export class ApiProviderService implements vscode.Disposable {
 		} else if (secretUpdate.clearApiKey) {
 			await this.secrets.delete(this.secretKey(profile.id));
 		}
-		this.balances.delete(profile.id);
+		this.invalidateBalance(profile.id);
+		if (!existing || existing.baseUrl !== profile.baseUrl || existing.family !== profile.family) {
+			this.contextMaxima.delete(profile.id);
+		}
 
 		this._onDidChange.fire();
 		return profile;
@@ -367,13 +453,19 @@ export class ApiProviderService implements vscode.Disposable {
 		}
 		await this.state.update(API_PROVIDER_STORAGE_KEY, next);
 		await this.secrets.delete(this.secretKey(id));
-		this.balances.delete(id);
+		await this.secrets.delete(cursorBudgetAdminSecretKey(id));
+		const budgetUsers = { ...this.state.get<Record<string, string>>(CURSOR_BUDGET_USERS_STORAGE_KEY, {}) };
+		delete budgetUsers[id]; await this.state.update(CURSOR_BUDGET_USERS_STORAGE_KEY, budgetUsers);
+		this.invalidateBalance(id);
+		this.contextMaxima.delete(id);
 		this._onDidChange.fire();
 		return true;
 	}
 
 	dispose(): void {
 		this._onDidChange.dispose();
+		this._onDidChangeContext.dispose();
+		this._onDidChangeBalance.dispose();
 	}
 
 	private secretKey(id: string): string {
@@ -384,4 +476,5 @@ export class ApiProviderService implements vscode.Disposable {
 	async getApiKey(id: string): Promise<string | undefined> {
 		return this.secrets.get(this.secretKey(id));
 	}
+
 }

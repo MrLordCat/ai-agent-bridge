@@ -255,12 +255,37 @@ They are shown in the next native tool segment. A remaining
 `detached-without-pending-turn` indicates an unrelated call with no valid
 Copilot result round to resume and is intentionally rejected.
 
+### Clarification questions appear as plain chat text
+
+The native VS Code question tool is advertised immediately, alongside file and
+terminal tools, and the provider instructs Codex to use its card for clarification
+and user choices. It does not require deferred tool discovery. If a contributed
+question tool is named `request_user_input`, it is exposed under `vscode_native`
+to avoid a collision with Codex's own collaboration-mode-dependent tool.
+The question tool still needs to be included by the active VS Code chat mode.
+
+### No visible thoughts during a long pause
+
+Codex's readable summaries (`item/reasoning/summaryTextDelta`) and raw reasoning
+text (`item/reasoning/textDelta`, when supported) stream into Chat's thinking
+block. When a reasoning item starts without readable content, the block shows
+**Codex is reasoning…**. This is an activity status, not generated model text.
+The runtime may supply no readable reasoning even with `codexReasoningSummary`
+set to `auto`. High reasoning effort can still take time before the next answer
+or tool call.
+
 ### Context display differs from the runtime
 
-The current runtime reports a 258400-token window. Before telemetry arrives the
-provider uses `codexContextLength` as a fallback; afterwards the server-reported
-window is authoritative. Actual usage from `thread/tokenUsage/updated` is
-returned after every completed turn.
+Before telemetry arrives the provider uses `codexContextLength` as a fallback;
+afterwards the server-reported window is authoritative and can vary by model.
+Measured usage from `thread/tokenUsage/updated` updates native Chat during the
+turn. The latest snapshot is replayed when native tools return, including a
+snapshot that arrived while Chat was executing a tool. Known context is also
+reported at the start of a subsequent turn in the same runtime thread.
+
+The indicator uses the last model request's tokens, not the thread's cumulative
+billing totals, and can decrease after compaction. Until the first measurement
+is available it may show zero; an activity status does not invent token counts.
 
 ### Input exceeds 1048576 characters
 

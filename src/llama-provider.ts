@@ -1,5 +1,6 @@
 
 import * as vscode from "vscode";
+import { CursorProfileTransport } from "./cursor/profile-transport";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -107,6 +108,8 @@ import {
 import {
     getChatCompletionsEndpoint,
     getModelsEndpoint,
+    getModelCatalogEntries,
+    isCursorCloudAgentBase,
     cloudflareSessionAffinity,
     isCloudflareWorkersAiBase,
     isDeepSeekEndpoint,
@@ -608,6 +611,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
      * @param secrets - VS Code secret storage for storing server URL and API key.
      * @param userAgent - User agent string to include in HTTP requests.
      */
+	private readonly cursorTransport = new CursorProfileTransport();
+
     constructor(
         secrets: vscode.SecretStorage,
         private readonly userAgent: string,
@@ -615,7 +620,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         private readonly sharedMemory?: SharedMemoryContextProvider,
         private readonly globalState?: vscode.Memento,
         private readonly storagePath?: string,
-        private readonly getApiModelSources?: () => Promise<readonly ChatModelSource[]>
+        private readonly getApiModelSources?: () => Promise<readonly ChatModelSource[]>,
+        private readonly onApiContextMaximum?: (sourceKey: string, maximum: number, reported: boolean) => void
     ) {
         super(secrets);
         this.chatRequestQueue = new SerialRequestQueue(event => {
@@ -627,12 +633,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     refreshLanguageModelChatInformation(): void {
+		this.cursorTransport.refresh();
         this.modelListCache.clear();
         this.runtimeContextCache.clear();
         this.serverTokenCounter.clear();
         this.log("models.refresh.requested");
         this._onDidChangeLanguageModelChatInformation.fire();
     }
+
+	disposeCursorTransport(): void { this.cursorTransport.dispose(); }
 
     /**
      * Arms one provider-owned manual compaction for a Copilot conversation.
@@ -1767,7 +1776,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         return undefined;
     }
 
-    private getServerReportedModelContextLength(model: LlamaCppModelInfo): number | undefined {
+    private getServerReportedModelContextLength(model: LlamaCppModelInfo, maximum = MAX_CONTEXT_LENGTH): number | undefined {
         const meta = model.meta;
         const candidates: unknown[] = [
             model.contextLength,
@@ -1782,14 +1791,27 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         for (const candidate of candidates) {
             const parsed = this.parsePositiveInt(candidate);
             if (parsed !== undefined) {
-                return this.clampInt(parsed, 4096, MAX_CONTEXT_LENGTH, DEFAULT_CONTEXT_LENGTH);
+                return this.clampInt(parsed, 4096, maximum, DEFAULT_CONTEXT_LENGTH);
             }
         }
 
         return undefined;
     }
 
-    private resolveModelContextLength(
+    private publishApiContextMaximum(models: readonly LlamaCppModelInfo[], source: ChatModelSource, runtime?: number): void {
+        if (!source.key.startsWith("api-") || models.length === 0) { return; }
+        const maximum = Math.max(...models.map(model => this.resolveMaximumModelContextLength(model, runtime, source)));
+        const reported = runtime !== undefined || models.every(model => this.getServerReportedModelContextLength(model) !== undefined);
+        this.onApiContextMaximum?.(source.key, maximum, reported);
+    }
+
+    private resolveModelContextLength(model: LlamaCppModelInfo, runtime?: number, source?: ChatModelSource): number {
+        const maximum = this.resolveMaximumModelContextLength(model, runtime, source);
+        return source?.workingContextLength === undefined ? maximum
+            : Math.min(maximum, this.clampInt(source.workingContextLength, 4096, maximum, maximum));
+    }
+
+    private resolveMaximumModelContextLength(
         model: LlamaCppModelInfo,
         runtimeContextLength?: number,
         source?: ChatModelSource
@@ -1806,6 +1828,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         }
 
         const family = this.resolveModelFamily(model.id, source?.familyOverride);
+
+        // Custom API metadata is authoritative even for a known model family.
+        if (source?.key.startsWith("api-")) {
+            const reported = runtimeContextLength ?? this.getServerReportedModelContextLength(model, Number.MAX_SAFE_INTEGER);
+            if (reported !== undefined) { return this.clampInt(reported, 4096, Number.MAX_SAFE_INTEGER, DEFAULT_CONTEXT_LENGTH); }
+        }
 
         if (family === "deepseek") {
             const deepseekCandidates: number[] = [];
@@ -1852,6 +1880,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         runtimeContextLength?: number,
         source?: ChatModelSource
     ): number {
+        if (source?.key.startsWith("api-")) {
+            const maximum = runtimeContextLength ?? this.parsePositiveInt(model.maxInputTokens + model.maxOutputTokens) ?? DEFAULT_CONTEXT_LENGTH;
+            return source.workingContextLength === undefined ? maximum
+                : this.clampInt(source.workingContextLength, 4096, maximum, maximum);
+        }
+        if (source?.workingContextLength !== undefined) {
+            const maximum = runtimeContextLength ?? this.parsePositiveInt(model.maxInputTokens + model.maxOutputTokens) ?? DEFAULT_CONTEXT_LENGTH;
+            return Math.min(maximum, this.clampInt(source.workingContextLength, 4096, MAX_CONTEXT_LENGTH, maximum));
+        }
         if (source?.contextLengthOverride !== undefined) {
             return this.clampInt(source.contextLengthOverride, 4096, MAX_CONTEXT_LENGTH, DEFAULT_CONTEXT_LENGTH);
         }
@@ -3779,6 +3816,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         if (source) {
             return { source, modelId: parsed.modelId };
         }
+		if (parsed.sourceKey?.startsWith("api-")) { throw new Error("This API profile is disabled or removed. Select a model from an enabled profile."); }
 
         const legacyServerUrl = await this.getServerUrl();
         return {
@@ -3880,6 +3918,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const allEntries: LanguageModelChatInformation[] = [];
 
         await Promise.all(sources.map(async source => {
+            if (source.protocol === "cursor" || isCursorCloudAgentBase(source.serverUrl)) {
+				try { allEntries.push(...await this.cursorTransport.models(source, token, this.userAgent, this.onApiContextMaximum)); }
+				catch (error) { this.logError("models.cursor.fetch_error", error, { source: source.key }); }
+                return;
+            }
             const apiKeyPresent = Boolean(source.apiKey);
             const runtimeContextLength = await this.getRuntimeContextLengthWithCache(
                 source,
@@ -3890,6 +3933,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
             const cachedModels = this.getFreshCachedModels(source, apiKeyPresent, modelListCacheTtlMs);
             if (cachedModels) {
+                this.publishApiContextMaximum(cachedModels, source, runtimeContextLength);
                 const entries = cachedModels.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                 allEntries.push(...entries);
                 this.log("models.request.cache_hit", {
@@ -3920,6 +3964,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             try {
                 const models = await this.fetchModelsWithInflightCache(source, source.apiKey, apiKeyPresent);
                 this.cacheModels(source, apiKeyPresent, models);
+                this.publishApiContextMaximum(models, source, runtimeContextLength);
                 const entries = models.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                 allEntries.push(...entries);
                 this.log("models.request.success", {
@@ -3943,6 +3988,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 });
                 const staleModels = this.getAnyCachedModels(source, apiKeyPresent);
                 if (staleModels) {
+                    this.publishApiContextMaximum(staleModels, source, runtimeContextLength);
                     const entries = staleModels.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                     allEntries.push(...entries);
                     this.log("models.request.stale_cache_fallback", {
@@ -4027,6 +4073,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         token: CancellationToken
     ): Promise<void> {
         const { source, modelId: requestModelId } = await this.resolveSourceForModel(model);
+        if (source.protocol === "cursor" || isCursorCloudAgentBase(source.serverUrl)) {
+            await this.cursorTransport.respond(source, requestModelId, model, messages, options, progress, token);
+            return;
+        }
         const serverUrl = source.serverUrl;
         const apiKey = source.apiKey;
         const apiKeyPresent = Boolean(apiKey);
@@ -6287,18 +6337,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             throw new Error(`Failed to fetch models: ${response.status} ${response.statusText}`);
         }
 
-        const data = (await response.json()) as { data?: unknown[]; models?: unknown[]; result?: unknown[] };
+        const data = (await response.json()) as { data?: unknown[]; models?: unknown[]; result?: unknown[]; items?: unknown[] };
         const descriptors = Array.isArray(data.models)
             ? data.models.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
             : [];
         const serverModalities = await this.fetchServerModalities(serverUrl, headers);
         // Cloudflare Workers AI returns its catalog under the REST envelope
         // key `result` (GET /ai/models/search), OpenAI and llama.cpp use `data`.
-        const rawModels = Array.isArray(data.data) && data.data.length > 0
-                ? data.data
-                : Array.isArray(data.result) && data.result.length > 0
-                        ? data.result
-                        : data.models ?? [];
+        const rawModels = getModelCatalogEntries(data);
 
         return rawModels.flatMap(item => {
             if (!item || typeof item !== "object") {
@@ -6334,12 +6380,20 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 obj["n_ctx"],
                 obj["num_ctx"],
                 obj["context_length"],
+                obj["context_window"],
+                obj["contextWindow"],
+                obj["contextLength"],
+                obj["max_context_window"],
+                obj["max_context_tokens"],
+                obj["top_provider"] && typeof obj["top_provider"] === "object"
+                    ? (obj["top_provider"] as Record<string, unknown>)["context_length"] : undefined,
                 obj["max_context_length"],
                 obj["n_ctx_train"],
                 modelMeta?.["n_ctx_runtime"],
                 modelMeta?.["n_ctx"],
                 modelMeta?.["num_ctx"],
                 modelMeta?.["context_length"],
+                modelMeta?.["context_window"],
                 modelMeta?.["max_context_length"],
                 modelMeta?.["n_ctx_train"],
             ];
@@ -6348,7 +6402,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             for (const candidate of contextLengthCandidates) {
                 const parsed = this.parsePositiveInt(candidate);
                 if (parsed !== undefined) {
-                    contextLength = this.clampInt(parsed, 4096, MAX_CONTEXT_LENGTH, DEFAULT_CONTEXT_LENGTH);
+                    contextLength = this.clampInt(parsed, 4096, Number.MAX_SAFE_INTEGER, DEFAULT_CONTEXT_LENGTH);
                     break;
                 }
             }

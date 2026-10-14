@@ -23,6 +23,7 @@ export type ProviderState =
 	| "unconfigured"
 	| "online"
 	| "offline"
+	| "unsupported"
 	| "paused";
 
 export interface ProviderStatusEntry {

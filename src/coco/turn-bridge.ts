@@ -208,7 +208,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 	}
 }
 
-export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart): JsonObject {
+export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart): { output: string } {
 	const output = result.content.map(part => {
 		if (part instanceof vscode.LanguageModelTextPart) { return part.value; }
 		if (part instanceof vscode.LanguageModelDataPart && (part.mimeType.startsWith("text/") || part.mimeType === "application/json")) {
@@ -217,7 +217,9 @@ export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart
 		return "[Non-text tool result: this Coco bridge accepts text only]";
 	}).join("\n");
 	const limit = 100_000;
-	return { output: output.length > limit ? `${output.slice(0, limit)}\n[Tool result truncated]` : output };
+	const marker = "\n[Tool result truncated]\n";
+	const keep = Math.floor((limit - marker.length) / 2);
+	return { output: output.length > limit ? output.slice(0, keep) + marker + output.slice(-keep) : output };
 }
 
 /** Only trailing tool-result messages can resume a suspended prompt, never historical results. */

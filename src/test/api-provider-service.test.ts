@@ -73,7 +73,8 @@ suite("API provider service", () => {
 			serverUrl: "https://openrouter.ai/api/v1",
 			apiKey: "secret-value",
 			familyOverride: "auto",
-			contextLengthOverride: 200_000,
+			workingContextLength: 200_000,
+			contextLengthFallback: 131_072,
 			protocol: "openai",
 			llamaCppCompat: false,
 		});

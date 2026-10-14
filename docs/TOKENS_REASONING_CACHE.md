@@ -166,6 +166,21 @@ tool registration still occur after reload; full-history prefill does not.
 logs report `compactDurationMs`. Exact `/apply-template` + `/tokenize` preflight
 latency is reported separately by `chat.tokens.count.durationMs`.
 
+## Cloudflare Workers AI Cache Behavior
+
+Cloudflare Workers AI prefix caching is **per model instance**: a cache hit
+requires the next request to land on the instance that computed the prefix.
+The extension sends the documented `x-session-affinity` header with a stable
+per-conversation id, but Cloudflare treats affinity as best-effort
+("increasing the likelihood" of a hit), so even with a byte-stable prompt and
+stable tools, hits alternate with full misses **on Cloudflare's side**.
+Observed on `@cf/deepseek-ai/deepseek-v4-pro-0813`: ~94% hit turns interleaved
+with 100% misses, plus a ~5–8K tail that stays uncached on hit turns. This is
+upstream behavior, not a client defect — the turn report labels it
+`upstream_cache_partial` with the `cloudflare` provider kind. DeepSeek-direct
+shows the same partial-miss class (CloudFront route changes) but far less
+frequently, so it remains the most cache-stable option for long agentic chats.
+
 ## Measuring Cache Reuse
 
 The Diagnostics group shows the last server-reported Prompt Cache value. Logs

@@ -7,6 +7,22 @@ export interface RequestCancellation {
 
 export type FetchImplementation = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
 
+
+export function isCursorCloudAgentBase(serverUrl: string): boolean {
+	try { return new URL(serverUrl).hostname.toLowerCase() === "api.cursor.com"; }
+	catch { return false; }
+}
+
+export function getModelCatalogEntries(value: unknown): unknown[] {
+	if (Array.isArray(value)) { return value; }
+	if (!value || typeof value !== "object") { return []; }
+	const body = value as Record<string, unknown>;
+	for (const key of ["data", "result", "models", "items"]) {
+		if (Array.isArray(body[key]) && body[key].length > 0) { return body[key]; }
+	}
+	return [];
+}
+
 export function isDeepSeekEndpoint(serverUrl: string): boolean {
 	try {
 		const url = new URL(serverUrl);
@@ -17,6 +33,7 @@ export function isDeepSeekEndpoint(serverUrl: string): boolean {
 }
 
 export function getChatCompletionsEndpoint(serverUrl: string): string {
+	if (isCursorCloudAgentBase(serverUrl)) { throw new Error("Cursor Cloud Agents requests must use the Cursor API format in Providers Manager."); }
 	return `${getOpenAiApiRoot(serverUrl)}/chat/completions`;
 }
 

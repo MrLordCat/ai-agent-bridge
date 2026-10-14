@@ -16,7 +16,7 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		private readonly defaultProvider: vscode.LanguageModelChatProvider,
 		private readonly codexProvider: vscode.LanguageModelChatProvider,
 		private readonly claudeProvider?: ClaudeChatModelProvider,
-		private readonly cocoProvider?: CocoChatModelProvider
+		private readonly cocoProvider?: CocoChatModelProvider,
 	) {
 		this.subscriptions = [
 			defaultProvider.onDidChangeLanguageModelChatInformation?.(() => this.modelChanges.fire()),

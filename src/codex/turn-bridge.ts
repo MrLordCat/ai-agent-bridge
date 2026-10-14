@@ -22,6 +22,16 @@ import type {
 	CodexTurnStartResponse,
 } from "./protocol";
 
+/** The last model request describes context occupancy; thread totals are billing counters. */
+export function createCodexNativeContextUsage(usage: CodexThreadTokenUsage) {
+	return {
+		prompt_tokens: usage.last.inputTokens,
+		completion_tokens: usage.last.outputTokens,
+		total_tokens: usage.last.totalTokens,
+		prompt_tokens_details: { cached_tokens: usage.last.cachedInputTokens },
+	};
+}
+
 export interface CodexDelegatedToolCall {
 	callId: string;
 	tool: string;
@@ -136,6 +146,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 	private readonly notificationDisposable: vscode.Disposable;
 	private readonly stopDisposable: vscode.Disposable;
 	private readonly itemPhases = new Map<string, string | null>();
+	private readonly startedReasoningItems = new Set<string>();
 	private readonly emittedItemChars = new Map<string, number>();
 	private readonly finalTextChunks: string[] = [];
 	private readonly delegatedToolMetrics = new Map<string, DelegatedToolMetric>();
@@ -502,6 +513,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 		this.segmentTextChunks = [];
 		this.segmentEstimatedOutputChars = 0;
 		this.progress = progress;
+		this.reportNativeContextUsage();
 		this.cancellation?.dispose();
 		this.cancellation = token.onCancellationRequested(() => {
 			void this.interrupt().catch(error => {
@@ -575,6 +587,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 					this.emittedItemChars.set(params.itemId, (this.emittedItemChars.get(params.itemId) ?? 0) + params.delta.length);
 					break;
 				}
+				case "item/reasoning/textDelta":
 				case "item/reasoning/summaryTextDelta": {
 					const params = notification.params as CodexReasoningDeltaParams;
 					this.recordModelEvent();
@@ -602,6 +615,7 @@ export class CodexTurnBridge implements vscode.Disposable {
 					this.tokenUsage = (notification.params as CodexTokenUsageParams).tokenUsage;
 					this.recordUsageSegment(this.tokenUsage);
 					this.onTokenUsage?.(this, this.tokenUsage);
+					this.reportNativeContextUsage();
 					this.logSink?.log("codex.chat.token_usage_updated", {
 						threadId: this.threadId,
 						turnId: this.turnId,
@@ -854,6 +868,11 @@ export class CodexTurnBridge implements vscode.Disposable {
 			return;
 		}
 		const id = typeof item.id === "string" ? item.id : undefined;
+		if (item.type === "reasoning" && id && !this.startedReasoningItems.has(id)) {
+			this.startedReasoningItems.add(id);
+			// Some runtimes report reasoning activity without a readable summary.
+			this.emitThinking("Codex is reasoning…\n", id);
+		}
 		if (item.type === "agentMessage" && id) {
 			this.itemPhases.set(id, typeof item.phase === "string" ? item.phase : null);
 			return;
@@ -873,6 +892,14 @@ export class CodexTurnBridge implements vscode.Disposable {
 		}
 		if (status) {
 			this.emitThinking(status, id);
+		}
+	}
+
+	private reportNativeContextUsage(): void {
+		if (this.progress && this.tokenUsage) {
+			this.progress.report(vscode.LanguageModelDataPart.text(
+				JSON.stringify(createCodexNativeContextUsage(this.tokenUsage)), "usage"
+			));
 		}
 	}
 
