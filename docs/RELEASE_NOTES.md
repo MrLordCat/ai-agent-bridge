@@ -1,76 +1,93 @@
-# AI Agent Bridge 1.17.3
+# AI Agent Bridge 1.18.0
 
-Snowflake Cortex Code (Coco) now works in native VS Code Chat with visible,
-controllable tools and terminals. Linux desktop installations can apply the
-required patches using a user-owned copy of VS Code, without root, or explicitly
-authorize patching the current system installation. This release replaces
-the withdrawn 1.17.0 release and includes its Coco features with Linux fixes.
+Cursor and Snowflake Coco now retain available Chat history across provider
+switches and window reloads, with native token/cache metrics in diagnostics.
+This stable release consolidates the work since 1.17.3, including a shared
+provider infrastructure, model navigation and a more responsive Quick Access.
 
-## Coco in native Chat
+## Cursor in native Agent Chat
 
-- Models and supported reasoning choices come from the active ACP session.
-  Thinking streams into Chat, and image input is enabled when ACP advertises it.
-- Native Chat owns tool execution and approvals. Commands use interactive VS
-  Code terminals that reuse idle shells and preserve state. Users can type,
-  interrupt commands or close the actual terminal.
-- Quick Access exposes Coco status, connection, refresh and reasoning controls.
-  Connection checks have a deadline and can be cancelled.
-- Context usage comes from ACP usage snapshots and the runtime context window,
-  including across tool-result continuations.
-- Azure OAuth uses the configured Snowflake CLI connection and its credential
-  cache; credentials are not copied from the Snowflake extension.
+- Configure Cursor through its existing Providers Manager profile and saved
+  chat key. Models advertise Tools and Vision; supported Thinking Effort
+  choices, model parameters and context limits come from Cursor's catalog.
+- The official local SDK delegates commands, file access, edits and questions
+  to native VS Code callback tools and approvals. Built-in Cursor execution,
+  external MCP servers and project/user SDK settings are excluded.
+- Reuse agents between messages and restore completed native checkpoints
+  after reload. If restoration fails, rebuild from the full available history.
+- Read input/output and cache read/write counters directly from SDK run usage.
+  Attribute metrics to the saved API profile and API usage history.
+- Remove Cursor balance/budget controls and Admin API requests. An Admin token
+  is not needed for chat or per-request token/cache metrics.
+
+## Coco and cross-provider context
+
+- Keep native ACP sessions warm and restore compatible completed sessions.
+  Returning after another provider adds its new visible messages and tool
+  results without replaying completed actions.
+- Keep a shared workspace-local journal of visible Chat messages. It can
+  recover earlier details that Chat has stopped including in later requests,
+  provided the extension received those details before.
+- Import large histories in bounded requests with tools disabled, preserving
+  all transferred text and image bytes. Archive large tool outputs in full;
+  expose the archive path so VS Code file/search tools can recover exact details.
+- Report native Coco prompt usage/cache counters independently of context
+  occupancy. Use a verified 1M initial window for the exact Opus 5.5 model ID;
+  observed runtime windows take precedence over configured baselines.
+- Isolate conversations, profiles and credentials; reject stale tool results
+  after cancellation and keep incomplete native runs out of durable checkpoints.
+
+## Models, Quick Access and diagnostics
+
+- Select a provider first in **Models by Provider**, then choose one of its
+  models. Existing native IDs, profile identities and model settings remain.
+- Discover API context maxima automatically and choose a separate working
+  context using the Providers Manager slider.
+- Render consistent provider snapshots and per-profile metrics. Supported
+  balances load in the background without blocking the Quick Access tree.
+- Distinguish Cursor/Coco sessions in Session Diagnostics and separate fresh
+  input, cache reads and cache creation. Missing native counters stay unreported.
+- Stream Codex reasoning and live context updates; keep the native VS Code
+  question tool immediately available for clarification.
+
+## Boundaries and verification
+
+- Model windows remain finite and native compaction still applies. Archived
+  history is recoverable through tools; it is not all simultaneously present
+  in model attention. Hidden reasoning and content never supplied to this
+  extension cannot be reconstructed. Server caches do not transfer providers.
+- Cold imports may consume additional model usage. The Coco and Cursor
+  `MaxHistoryImportParts` settings default to 16. Oversized transfers stop
+  explicitly with a complete local archive; Cursor's chat-only Cloud fallback
+  rejects overflow instead of silently discarding early history.
+- Journals, native stores and archives live in VS Code workspace storage,
+  not the repository. They contain local copies of visible chat content;
+  deleting workspace storage removes those copies. Archive cleanup is manual.
+- Windows regression suites passed 703 tests on VS Code 1.131 and 701 on
+  VS Code 1.141 before release preparation, with conditional/platform skips.
+  Metadata checks, lint and tests on Windows/Linux with both VS Code versions
+  gate the platform packages and GitHub publication.
+- Real Coco Opus 5.5 cold/warm/restored requests retained synthetic facts and
+  reported native cache counters. Installed Cursor SDK create/resume is
+  verified without inference; paid Cursor generation remains an opt-in test.
+  See [Coco continuity](https://github.com/MrLordCat/ai-agent-bridge/blob/v1.18.0/docs/COCO_CONTINUITY.md) and
+  [Cursor continuity](https://github.com/MrLordCat/ai-agent-bridge/blob/v1.18.0/docs/CURSOR_CONTINUITY.md)
+  for exact evidence and limits.
 
 ## Install from VSIX
 
-Download the package for your platform from this release:
+Download the package matching your platform from this release:
 
 ```sh
 # Windows x64
-code --install-extension llama-vscode-chat-v1.17.3-win32-x64.vsix
+code --install-extension llama-vscode-chat-v1.18.0-win32-x64.vsix --force
 # Linux x64
-code --install-extension llama-vscode-chat-v1.17.3-linux-x64.vsix
+code --install-extension llama-vscode-chat-v1.18.0-linux-x64.vsix --force
 ```
 
-Run **Developer: Reload Window**. Compatible Copilot Chat, terminal and agent-host
-patches apply on extension startup; reload again after a patch notification.
-External installer scripts and the repository patch wrapper have been removed.
-
-For Linux with a system-owned VS Code installation, run
-**AI Agent Bridge: Prepare User VS Code (Linux, no root)**. Open **AI Agent Bridge
-Code** from the application menu or use `~/.local/bin/code-ai-agent-bridge`.
-The copy lives under your home and uses a separate profile. Configure accounts
-and settings in that profile. System files remain unchanged; repeating the
-command for the same build preserves existing patches.
-
-Alternatively, choose **Apply patches with administrator rights** in the
-permission notification. The extension requests graphical authorization first.
-When it is unavailable, **Run sudo in Terminal** or **Run su in Terminal** uses
-the installed command. Enter your user's password for sudo or root's password
-for su directly in the visible terminal; Debian does not need sudo installed.
-
-After a failed password entry, **Apply Patch** in Quick Access reopens the retained
-terminal and offers **Retry in Terminal** or **Close Attempt** for a fresh
-workflow. Commands wait for shell integration, and an active password prompt
-does not receive duplicate commands. Backups and syntax checks also work when
-the application is read-only.
-
-Native capabilities are detected before patching. Unknown bundle layouts and
-read-only files remain visible in patch status. Remote SSH/WSL/container windows
-need the desktop application prepared locally.
-
-## Audit and verification
-
-- Hardened ACP parsing and request handling, including string IDs, fragmented
-  replies, malformed messages, process shutdown and synchronous handler errors.
-- Updated dependency fixes and the VSIX packager; npm audit reports zero known
-  vulnerabilities on 2026-10-10.
-- Platform-specific Windows/Linux builds and tests gate publication.
-- Debian verification covers ordinary VSIX installation, automatic patches,
-  root-owned files, migration without root, and real bash terminal control on
-  VS Code 1.131 and 1.141 as UID 1000. Administrator apply/restore is checked
-  through real su commands; failed-command retry is checked in the same real
-  bash shell on both versions.
-- Local suites passed 596 Windows tests and 601 Linux tests, with platform
-  skips. Interactive password entry was verified manually by the GUI tester.
-- Paid provider authentication and generation are not exercised in the Debian
-  fixture. See `docs/DEBIAN_VERIFICATION.md` for the tested scope.
+Run **Developer: Reload Window**. Existing profiles and chat keys are retained.
+Compatible Chat, terminal and agent-host patches apply on startup; reload again
+if a patch notification asks for it. Native capabilities are detected first.
+For a system-owned Linux installation, use **Prepare User VS Code (Linux,
+no root)** or the existing administrator-authorization flow. Remote
+SSH/WSL/container windows still need the desktop application prepared locally.

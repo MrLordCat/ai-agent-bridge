@@ -1,5 +1,38 @@
 # Changelog
 
+## 1.18.0 (stable release) - 2026-10-15
+
+Consolidates the development work since 1.17.3, including the final behavior
+of the 1.17.4–1.17.17 patches below.
+
+- Add Cursor SDK models through existing API profiles, with native VS Code
+  Tools, Vision, catalog-backed reasoning choices and discovered context limits.
+  Preserve profile IDs/keys and restrict actions to Copilot callback tools.
+- Keep Cursor and Coco sessions warm, restore completed sessions after reload,
+  and retain available cross-provider Chat history in a workspace journal.
+  Import oversized history in guarded requests with tools disabled; archive
+  complete transcripts, images and large tool outputs instead of silently
+  removing early messages or the middle of results.
+- Expose native Cursor/Coco input, output and cache read/write counters in
+  Quick Access, usage history and session diagnostics. Keep billed tokens
+  separate from context occupancy and leave missing counters unreported.
+  Use the verified 1M baseline for Coco's exact Opus 5.5 model ID.
+- Improve Codex live reasoning/context updates and keep the native question
+  tool immediately available. Add provider-first model selection and automatic
+  API context discovery with a separate working-context slider.
+- Unify provider registration, metadata, snapshots, resource caches, source
+  routing and delegated tool state. Simplify Quick Access dependencies and
+  load supported balances in the background without blocking the tree.
+- Remove Cursor Admin billing/budget controls and requests. Cursor chat keys
+  and native token/cache metrics work independently of Admin permissions.
+- Share CI/release checks across Windows/Linux and VS Code 1.131/1.141, validate
+  release metadata before publication, and publish platform-specific VSIXs.
+  Add continuity, cache, UI, lifecycle and native SDK create/resume coverage.
+
+Finite model windows and server compaction still apply. Cross-provider context
+transfer does not transfer server caches. Paid Cursor generation remains an
+opt-in check; see docs/RELEASE_NOTES.md for verification scope and installation.
+
 ## 1.17.17 (local development patch) - 2026-10-15
 
 - Keep Cursor SDK agents warm per workspace, saved profile, credentials, model
