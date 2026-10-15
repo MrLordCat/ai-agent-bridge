@@ -14,7 +14,7 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 	private readonly history?: ConversationHistory;
 	private historyWarningShown = false;
 	private warnHistory(): void {
-		if (!this.historyWarningShown) { console.warn("AI Agent Bridge: local handoff journal is unavailable; non-Coco providers continue with Chat-supplied messages."); this.historyWarningShown = true; }
+				if (!this.historyWarningShown) { console.warn("AI Agent Bridge: local handoff journal is unavailable; providers without native handoff continue with Chat-supplied messages."); this.historyWarningShown = true; }
 	}
 
 	constructor(
@@ -51,23 +51,24 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 	): Promise<void> {
 		const selected = this.registry.resolve(model.id);
 		this.registry.observeRequest(selected, token, options.modelOptions?._copilotConversationId);
+		const usesHistory = selected.id === "coco" || await selected.usesConversationHistory?.(model) === true;
 		let history: Awaited<ReturnType<ConversationHistory["begin"]>> | undefined;
 		try { history = await this.history?.begin(options.modelOptions?._copilotConversationId, messages); }
-		catch (error) { if (selected.id === "coco") { throw error; } this.warnHistory(); }
+		catch (error) { if (usesHistory) { throw error; } this.warnHistory(); }
 		const emitted: vscode.LanguageModelResponsePart[] = [];
 		let failed = false;
 		let providerError: unknown;
-		const responseOptions = selected.id === "coco" && history?.transcriptPath
-			? { ...options, modelOptions: { ...options.modelOptions, _aabCocoTranscriptPath: history.transcriptPath } } : options;
+		const responseOptions = usesHistory && history?.transcriptPath
+			? { ...options, modelOptions: { ...options.modelOptions, _aabCocoTranscriptPath: history.transcriptPath, _aabTranscriptPath: history.transcriptPath } } : options;
 		try { await selected.provider.provideLanguageModelChatResponse(
 			model,
-			selected.id === "coco" ? history?.messages ?? messages : messages,
+			usesHistory ? history?.messages ?? messages : messages,
 			responseOptions,
 			history ? { report: part => { emitted.push(part); progress.report(part); } } : progress,
 			token
 		); } catch (error) { failed = true; providerError = error; }
 		try { await history?.complete(emitted); }
-		catch (error) { if (selected.id === "coco" && !failed) { throw new Error("Cannot save the local Coco handoff transcript. Check workspace storage before reloading.", { cause: error }); } this.warnHistory(); }
+		catch (error) { if (usesHistory && !failed) { throw new Error("Cannot save the local handoff transcript. Check workspace storage before reloading.", { cause: error }); } this.warnHistory(); }
 		if (failed) { throw providerError; }
 	}
 

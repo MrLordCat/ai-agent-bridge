@@ -354,6 +354,13 @@ suite("session quality panel", () => {
 		assert.match(cacheHtml, /Safety stop/);
 		assert.match(cacheHtml, /Claude SDK context snapshot/);
 		assert.match(cacheHtml, /Claude.*live steps/);
+		const nativeCacheHtml = (sandbox.renderCacheTab as (value: unknown) => string)({ ...data, records: ["cursor", "coco"].map(providerKind => ({
+			...data.records[0], requestId: `${providerKind}-native`, providerKind, modelId: `${providerKind}::fixture`, sessionMode: "warm",
+			promptTokens: 1000, cachedPromptTokens: 900, cacheWriteInputTokens: 97, promptCacheHitPercent: 90,
+		})) });
+		assert.match(nativeCacheHtml, /Cursor session &amp; cache/); assert.match(nativeCacheHtml, /Coco session &amp; cache/);
+		assert.match(nativeCacheHtml, /cache write 97 \(9\.7%\)/); assert.match(nativeCacheHtml, /fresh 3/);
+		assert.ok(!nativeCacheHtml.includes("Claude session &amp; cache"));
 
 		// Performance tab (lazily rendered on switch).
 		const perfHtml = call("renderPerfTab");

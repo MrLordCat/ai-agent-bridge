@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
-import { normalizeSystemDate, normalizeVolatileHostContext } from "../context/cache-diagnostics";
+import { conversationUserAnchors } from "../providers/conversation-anchors";
 import type { CocoAcpClient, CocoAcpHandlers, CocoInitializeResult } from "./acp-client";
 
 const STORAGE_KEY = "llamacpp.coco.sessions.v1";
@@ -12,20 +12,7 @@ type Json = Record<string, unknown>;
 
 export interface CocoUserAnchor { key: string; index: number }
 export function cocoUserAnchors(messages: readonly vscode.LanguageModelChatRequestMessage[]): CocoUserAnchor[] {
-	return messages.flatMap((message, index) => {
-		if (message.role !== vscode.LanguageModelChatMessageRole.User) { return []; }
-		if (message.content.some(part => part instanceof vscode.LanguageModelToolResultPart)) { return []; }
-		const parts = message.content.flatMap(part => {
-			if (part instanceof vscode.LanguageModelTextPart && part.value.trim()) {
-				return [{ text: normalizeSystemDate(normalizeVolatileHostContext(part.value)) }];
-			}
-			if (part instanceof vscode.LanguageModelDataPart) {
-				return [{ text: `${part.mimeType}:${createHash("sha256").update(part.data).digest("hex")}` }];
-			}
-			return [];
-		});
-		return parts.length ? [{ key: digest(parts), index }] : [];
-	});
+	return conversationUserAnchors(messages);
 }
 
 interface SavedSession { key: string; identity: string; sessionId: string; users: string[]; updatedAt: number; contextWindow?: number }

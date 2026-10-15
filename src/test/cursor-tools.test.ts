@@ -99,18 +99,21 @@ suite("Cursor native tools", () => {
 		} finally { sdk.dispose(); }
 	});
 
-	test("initializes the installed SDK and callback-only tool configuration in the VS Code host without inference", async function () {
+	test("creates and restores the installed SDK with callback-only configuration without inference", async function () {
 		if (!cursorSdkRuntimeAvailable()) { this.skip(); }
 		const sdk = await import("@cursor/sdk");
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-sdk-host-test-"));
 		try {
 			const bridge = new CursorToolBridge([tool], () => undefined);
-			const agent = await sdk.Agent.create({
+			const config: AgentOptions = {
 				apiKey: "offline-test-key", tools: ["mcp"], mcpServers: {}, agents: {},
 				local: { cwd: root, store: new sdk.JsonlLocalAgentStore(root), settingSources: [], customTools: bridge.customTools, autoReview: false },
-			});
+			};
+			const agent = await sdk.Agent.create(config);
 			assert.ok(agent.agentId);
-			agent.close(); bridge.dispose();
+			agent.close();
+			const restored = await sdk.Agent.resume(agent.agentId, { ...config, local: { ...config.local, store: new sdk.JsonlLocalAgentStore(root) } });
+			assert.strictEqual(restored.agentId, agent.agentId); restored.close(); bridge.dispose();
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 

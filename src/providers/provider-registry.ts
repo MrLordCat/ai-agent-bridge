@@ -35,6 +35,7 @@ export interface ChatProviderRegistration {
 	source?: ProviderSourceDefinition;
 	provider: vscode.LanguageModelChatProvider;
 	ownsModel(modelId: string): boolean;
+	usesConversationHistory?: (model: vscode.LanguageModelChatInformation) => Promise<boolean>;
 	/** Optional background observation of requests to another adapter. */
 	onForeignRequest?: (conversationId?: unknown) => Promise<unknown>;
 }

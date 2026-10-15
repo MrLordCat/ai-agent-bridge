@@ -94,6 +94,16 @@ profile/key changes and stale tool results cannot resume another conversation.
 Compatible gateways remain ordinary OpenAI-compatible profiles. There is no
 separate Cursor enable setting or key store.
 
+Cursor SDK sessions stay warm between user messages and restore completed
+checkpoints after reload. The shared visible Chat journal supports switching
+from Codex/Coco/Claude and returning to Cursor with foreign turns retained.
+Large histories are imported in bounded requests with tools disabled; the
+`llamacpp.cursorMaxHistoryImportParts` guard defaults to 16. The Cloud fallback
+rejects oversized history explicitly instead of dropping early messages.
+Native SDK cache read/write counters feed profile metrics and diagnostics,
+independently of billing permissions. See [Cursor continuity](CURSOR_CONTINUITY.md)
+for storage, verification and finite-context limitations.
+
 The API format and model family are deliberately separate. For example, a
 DeepSeek model routed through OpenRouter normally uses:
 

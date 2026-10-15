@@ -2,10 +2,12 @@ import { createHash } from "node:crypto";
 import { AsyncResourceCache } from "../providers/async-resource-cache";
 import * as vscode from "vscode";
 import { encodeProviderModelId, type ChatModelSource } from "../model-sources/source-routing";
-import { CursorApiClient, CursorApiError, type CursorModel, type CursorParameter, type CursorPrompt, type CursorSelection } from "./api-client";
+import { CursorApiClient, CursorApiError, type CursorModel, type CursorParameter, type CursorSelection } from "./api-client";
 import { CursorSdkTransport } from "./sdk-transport";
 import { modelInformation } from "../providers/model-descriptor";
 import { cursorModelParameters, cursorReasoningOption, cursorReasoningParameter, cursorReasoningSchema } from "./model-configuration";
+import { cursorPrompt, cursorTranscript } from "./message-adapter";
+export { cursorPrompt } from "./message-adapter";
 
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const positive = (value: unknown): number | undefined => typeof value === "number" && Number.isFinite(value) && value >= 4096 ? Math.floor(value) : undefined;
@@ -39,6 +41,7 @@ export class CursorProfileTransport implements vscode.Disposable {
 		private readonly clientFactory = (source: ChatModelSource): CursorApiClient => new CursorApiClient(source.apiKey!, source.serverUrl),
 		private readonly sdk: CursorSdkTransport | null = new CursorSdkTransport(),
 	) {}
+	cancelConversation(conversationId: unknown): void { this.sdk?.cancelConversation(conversationId); }
 
 	refresh(): void {
 		this.sdk?.refresh();
@@ -124,7 +127,7 @@ export class CursorProfileTransport implements vscode.Disposable {
 		if (this.sdk?.available) {
 			const windows = selection.params!.filter(item => contextParameter(item.id)).flatMap(item => contextValue(item.value) ?? []);
 			const budget = Math.min(model.maxInputTokens, ...windows.map(window => Math.max(1024, window - model.maxOutputTokens)));
-			await this.sdk.respond(source, selection, () => cursorPrompt(messages, budget * 3), messages, options, progress, token);
+			await this.sdk.respond(source, selection, () => cursorTranscript(messages), messages, options, progress, token, budget * 3);
 			return;
 		}
 		if (options.toolMode === vscode.LanguageModelChatToolMode.Required || options.tools?.length) { throw new Error("Cursor tools require Node.js 22.13 or newer and a supported SDK platform in VS Code. Chat remains available in Ask mode."); }
@@ -184,30 +187,6 @@ export class CursorProfileTransport implements vscode.Disposable {
 			if (agentId && runId && !finished) { await client.cancelRun(agentId, runId).catch(() => { /* Best effort after a failed or cancelled stream. */ }); }
 		}
 	}
-}
-
-export function cursorPrompt(messages: readonly vscode.LanguageModelChatRequestMessage[], maximumChars: number): CursorPrompt {
-	const blocks: string[] = [], images: NonNullable<CursorPrompt["images"]> = [];
-	for (const message of messages) {
-		const parts: string[] = [];
-		for (const part of message.content) {
-			if (part instanceof vscode.LanguageModelTextPart) { parts.push(part.value); }
-			else if (part instanceof vscode.LanguageModelToolCallPart) { parts.push(`[Previous tool call: ${part.name}] ${JSON.stringify(part.input)}`); }
-			else if (part instanceof vscode.LanguageModelToolResultPart) { parts.push(`[Previous tool result: ${part.callId}] ` + part.content.filter(item => item instanceof vscode.LanguageModelTextPart).map(item => (item as vscode.LanguageModelTextPart).value).join("\n")); }
-			else if (part instanceof vscode.LanguageModelDataPart) {
-				if (!/^image\/(png|jpeg|gif|webp)$/.test(part.mimeType)) { throw new Error(`Cursor does not support attachment type ${part.mimeType}.`); }
-				if (part.data.byteLength > 15 * 1024 * 1024) { throw new Error("Cursor accepts images up to 15 MB each."); }
-				images.push({ data: Buffer.from(part.data).toString("base64"), mimeType: part.mimeType });
-			}
-		}
-		if (parts.length) { blocks.push(`${message.role === vscode.LanguageModelChatMessageRole.User ? "User" : "Assistant"}:\n${parts.join("\n")}`); }
-	}
-	if (images.length > 5) { throw new Error("Cursor accepts at most five images per prompt."); }
-	if (!blocks.length) { blocks.push("Please respond to the attached images."); }
-	const latest = blocks.at(-1)!;
-	if (latest.length > maximumChars) { throw new Error("The latest message exceeds the Cursor working context. Increase the profile's context slider or shorten the message."); }
-	while (blocks.length > 1 && blocks.join("\n\n").length > maximumChars) { blocks.shift(); }
-	return { text: blocks.join("\n\n"), ...(images.length ? { images } : {}) };
 }
 
 function cursorThinking(progress: vscode.Progress<vscode.LanguageModelResponsePart>, text: string, id: string): void {

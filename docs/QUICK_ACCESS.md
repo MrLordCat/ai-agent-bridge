@@ -18,6 +18,12 @@ history category. The context row uses the last measured window when available.
 Its input and cache counters come from ACP prompt results, including history
 imports; they are not inferred from context occupancy or session reuse.
 
+Cursor SDK usage appears on its saved API profile and in the aggregate API
+history category. Session Diagnostics distinguishes Cursor from Claude, shows
+new/warm/restored mode and separates fresh input, cache reads and cache writes.
+No SDK context-occupancy counter is inferred from cumulative billed tokens.
+Details and verification: [Cursor continuity](CURSOR_CONTINUITY.md).
+
 Supported account balances load in the background. The tree displays profile
 metadata and cached values immediately, then updates after the request finishes.
 Cached values carry a refresh hint. Provider cache TTL and the existing minute

@@ -621,7 +621,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		context.globalState,
 		context.globalStorageUri.fsPath,
 		() => apiProviderService.getModelSources(),
-		(sourceKey, maximum, reported) => apiProviderService.recordContextMaximum(sourceKey, maximum, reported)
+		(sourceKey, maximum, reported) => apiProviderService.recordContextMaximum(sourceKey, maximum, reported),
+		{ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "cursor-sdk") }
 	);
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
@@ -636,7 +637,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
 	const compositeProvider = new CompositeChatModelProvider({ providers: [
-		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel },
+		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel,
+			usesConversationHistory: model => llamaProvider.usesConversationHistory(model),
+			onForeignRequest: async id => llamaProvider.cancelCursorConversation(id) },
 		...subscriptionProviders.map(registration => ({ ...registration,
 			source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === registration.id),
 			ownsModel: (id: string) => providerSourceId(id) === registration.id,
@@ -755,6 +758,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}));
 	context.subscriptions.push(cocoProvider.onDidUpdateLiveTurn(update => {
 		if (update.context) { sessionQuality.recordContext(update.context); }
+		if (update.turn.lifecyclePhase === "running") { sessionQuality.updateTurn(update.turn); }
+		else { sessionQuality.recordTurn(update.turn); }
+		quickActionsProvider.refresh();
+	}));
+	context.subscriptions.push(llamaProvider.onDidRecordCursorUsage(usage => {
+		recordUsage({ provider: "api", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+			cachedInputTokens: usage.cachedInputTokens, cacheWriteInputTokens: usage.cacheWriteInputTokens,
+			modelTurns: usage.modelTurns, durationMs: usage.durationMs, estimated: usage.estimated }, usage.modelId);
+	}));
+	context.subscriptions.push(llamaProvider.onDidUpdateCursorTurn(update => {
+		runtimeMetrics.set(update.sourceKey, update.runtime);
 		if (update.turn.lifecyclePhase === "running") { sessionQuality.updateTurn(update.turn); }
 		else { sessionQuality.recordTurn(update.turn); }
 		quickActionsProvider.refresh();

@@ -33,8 +33,11 @@ uses an independent transport and lifecycle.
 - `src/claude/` owns Claude Code discovery, persistent Agent SDK queries,
   subscription limits, warm conversation reuse, a VS Code-only MCP allowlist,
   and live logical-turn usage/context/tool metrics.
-- `src/cursor/` owns saved-profile discovery, SDK callback tools and the
-  chat-only HTTP fallback. `src/coco/` owns Snowflake ACP sessions and tools.
+- `src/cursor/` owns saved-profile discovery, persistent SDK sessions, native
+  token/cache metrics, lossless handoffs, callback tools and the chat-only HTTP
+  fallback. `src/coco/` owns Snowflake ACP sessions and tools.
+- `src/providers/conversation-history.ts` journals visible Chat messages for
+  Coco/Cursor handoffs; `conversation-anchors.ts` shares stable user anchors.
 - `src/tools/delegated-turn-state.ts` shares response boundaries and bounded
   buffers for Cursor/Coco and pending-result delivery across all SDK adapters.
 - `src/provider-metrics.ts`, `src/token-usage-history.ts`, and

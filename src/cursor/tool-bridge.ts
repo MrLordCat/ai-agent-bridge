@@ -24,7 +24,8 @@ export class CursorToolBridge implements vscode.Disposable {
 	private usedTool = false;
 	private allowedTools = new Set<string>();
 	private readonly thinkingId = `cursor-thinking-${randomUUID()}`;
-	constructor(tools: readonly vscode.LanguageModelChatTool[], private readonly onStop: () => void, private readonly required = false) { this.updateTools(tools); }
+	constructor(tools: readonly vscode.LanguageModelChatTool[], private readonly onStop: (error?: Error) => void, private readonly required = false,
+		private readonly preserveResult?: (result: vscode.LanguageModelToolResultPart) => Promise<SDKCustomToolResult>) { this.updateTools(tools); }
 	get pendingCallIds(): ReadonlySet<string> { return new Set(this.pending.keys()); }
 	get isTerminal(): boolean { return this.terminal; }
 
@@ -63,8 +64,12 @@ export class CursorToolBridge implements vscode.Disposable {
 		if (this.terminal) { return completion; }
 		const returned = new Set(results.map(result => result.callId));
 		if (this.pending.missing(returned, call => call.reported).length) { this.finish(new Error("Cursor needs every tool result in the batch before continuing.")); return completion; }
-		this.pending.accept(results, result => result.callId, (call, result) => call.resolve(cursorToolResult(result)), call => call.reported);
-		this.scheduleCalls();
+		void Promise.all(results.filter(result => this.pending.get(result.callId)?.reported).map(async result => ({ callId: result.callId,
+			value: this.preserveResult ? await this.preserveResult(result) : cursorToolResult(result) }))).then(converted => {
+			if (this.terminal) { return; }
+			this.pending.accept(converted, result => result.callId, (call, result) => call.resolve(result.value), call => call.reported);
+			this.scheduleCalls();
+		}, error => this.finish(error instanceof Error ? error : new Error(String(error))));
 		return completion;
 	}
 
@@ -114,12 +119,12 @@ export class CursorToolBridge implements vscode.Disposable {
 		if (!this.state.finish(error, call => call.reject(error ?? new vscode.CancellationError()))) { return; }
 		clearTimeout(this.timer); this.cancellation?.dispose();
 		this.progress = undefined;
-		this.onStop();
+		this.onStop(error);
 	}
 	dispose(): void { this.finish(new vscode.CancellationError()); }
 }
 
-function cursorToolResult(result: vscode.LanguageModelToolResultPart): SDKCustomToolResult {
+export function cursorToolResult(result: vscode.LanguageModelToolResultPart): Extract<SDKCustomToolResult, { content: unknown }> {
 	const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> = [];
 	for (const part of result.content) {
 		if (part instanceof vscode.LanguageModelTextPart) { content.push({ type: "text", text: part.value }); }

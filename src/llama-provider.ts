@@ -1,6 +1,10 @@
 
 import * as vscode from "vscode";
 import { ApiSourceRouter } from "./providers/api-source-router";
+import { CursorSourceAdapter } from "./providers/api-source-router";
+import { CursorSdkTransport, type CursorSdkDependencies } from "./cursor/sdk-transport";
+import { CursorProfileTransport } from "./cursor/profile-transport";
+import type { CursorRecordedUsage, CursorLiveTurn } from "./cursor/turn-metrics";
 import { modelInformation } from "./providers/model-descriptor";
 import { AsyncResourceCache } from "./providers/async-resource-cache";
 import { createHash, randomUUID } from "node:crypto";
@@ -168,7 +172,7 @@ export interface LlamaChatTurnStepMetrics {
 export interface LlamaChatTurnMetrics {
     requestId: string;
     modelId: string;
-    providerKind?: "local" | "deepseek" | "codex" | "claude" | "coco" | "cloudflare" | "openrouter";
+    providerKind?: "local" | "deepseek" | "codex" | "claude" | "coco" | "cursor" | "cloudflare" | "openrouter";
     lifecyclePhase?: "running" | "completed" | "timed_out" | "interrupted" | "abandoned" | "failed";
     terminalDetail?: string;
     threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";
@@ -599,7 +603,12 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
      * @param secrets - VS Code secret storage for storing server URL and API key.
      * @param userAgent - User agent string to include in HTTP requests.
      */
-    private readonly sourceRouter = new ApiSourceRouter();
+    private readonly sourceRouter: ApiSourceRouter;
+    private readonly cursorSdk: CursorSdkTransport;
+    private readonly cursorUsage = new vscode.EventEmitter<CursorRecordedUsage>();
+    readonly onDidRecordCursorUsage = this.cursorUsage.event;
+    private readonly cursorLive = new vscode.EventEmitter<CursorLiveTurn>();
+    readonly onDidUpdateCursorTurn = this.cursorLive.event;
 
     constructor(
         secrets: vscode.SecretStorage,
@@ -609,9 +618,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         private readonly globalState?: vscode.Memento,
         private readonly storagePath?: string,
         private readonly getApiModelSources?: () => Promise<readonly ChatModelSource[]>,
-        private readonly onApiContextMaximum?: (sourceKey: string, maximum: number, reported: boolean) => void
+        private readonly onApiContextMaximum?: (sourceKey: string, maximum: number, reported: boolean) => void,
+        cursorDependencies: CursorSdkDependencies = {}
     ) {
         super(secrets);
+        this.cursorSdk = new CursorSdkTransport(cursorDependencies);
+        this.cursorSdk.onDidRecordUsage(usage => this.cursorUsage.fire(usage));
+        this.cursorSdk.onDidUpdateLiveTurn(update => this.cursorLive.fire(update));
+        this.sourceRouter = new ApiSourceRouter([new CursorSourceAdapter(new CursorProfileTransport(undefined, this.cursorSdk))]);
         this.chatRequestQueue = new SerialRequestQueue(event => {
             const { type, ...data } = event;
             this.log(`chat.queue.${type}`, data);
@@ -629,7 +643,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         this._onDidChangeLanguageModelChatInformation.fire();
     }
 
-    disposeCursorTransport(): void { this.sourceRouter.dispose(); }
+    disposeCursorTransport(): void { this.sourceRouter.dispose(); this.cursorUsage.dispose(); this.cursorLive.dispose(); }
+    cancelCursorConversation(conversationId: unknown): void { this.sourceRouter.cancelConversation(conversationId); }
+    async usesConversationHistory(model: vscode.LanguageModelChatInformation): Promise<boolean> {
+        return this.sourceRouter.usesConversationHistory((await this.resolveSourceForModel(model)).source);
+    }
 
     /**
      * Arms one provider-owned manual compaction for a Copilot conversation.

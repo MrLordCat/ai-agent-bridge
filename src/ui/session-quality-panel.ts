@@ -520,6 +520,7 @@ const REASON_LABEL = (r) => r ? r.replace(/_/g, " ") : "—";
 const MODEL_LABEL = (id) => String(id || "—").replace(/^.*::/, "");
 const IS_CODEX = (r) => r && (r.providerKind === "codex" || (!r.providerKind && typeof r.threadMode === "string"));
 const IS_CLAUDE = (r) => r && (r.providerKind === "claude" || (!r.providerKind && typeof r.sessionMode === "string"));
+const IS_NATIVE_CACHE = (r) => r && (IS_CLAUDE(r) || r.providerKind === "coco" || r.providerKind === "cursor");
 const IS_STATEFUL = (r) => IS_CODEX(r) || IS_CLAUDE(r);
 const EFFECTIVE_HIT = (r) => IS_STATEFUL(r) && typeof r.continuationCacheHitPercent === "number"
 	? r.continuationCacheHitPercent
@@ -852,7 +853,7 @@ function renderCacheTab(d) {
 				h += '</div><span class="cache-value ' + HIT_COLOR(hitPct) + '">' + PCT(hitPct) + '</span></div>';
 				if (IS_CODEX(r) && typeof r.promptCacheHitPercent === "number") {
 					h += '<div class="section-note">final segment · processed blend ' + PCT(r.promptCacheHitPercent) + '</div>';
-				} else if (IS_CLAUDE(r)) {
+				} else if (IS_NATIVE_CACHE(r)) {
 					h += '<div class="section-note">' + FMT_SHORT(cacheTokens) + ' read · ' + FMT_SHORT(r.cacheWriteInputTokens ?? 0) + ' written</div>';
 				} else {
 					h += '<div class="section-note">' + FMT_SHORT(cacheTokens) + ' cached</div>';
@@ -912,6 +913,14 @@ function renderCacheTab(d) {
 				h += '<div class="kv"><span class="k">Classification</span><span class="v"><span class="' + REASON_CLASS(r.cacheMissReason || 'unknown') + '">' + REASON_LABEL(r.cacheMissReason || 'unknown') + '</span></span></div>';
 				h += '<div class="kv"><span class="k">Detail</span><span class="v">' + esc(r.cacheMissDetail || "—") + '</span></div>';
 				if (r.terminalDetail) h += '<div class="kv"><span class="k">Terminal detail</span><span class="v">' + esc(r.terminalDetail) + '</span></div>';
+			} else if (IS_NATIVE_CACHE(r)) {
+				h += '<section class="detail-card"><h3>' + (r.providerKind === 'cursor' ? 'Cursor' : 'Coco') + ' session &amp; cache</h3>';
+				h += '<div class="kv"><span class="k">Session mode</span><span class="v">' + esc(r.sessionMode || 'unknown') + '</span></div>';
+				h += '<div class="kv"><span class="k">Cache read</span><span class="v">' + FMT(r.cachedPromptTokens) + ' · ' + PCT(r.promptCacheHitPercent) + '</span></div>';
+				h += '<div class="kv"><span class="k">Cache creation</span><span class="v">' + FMT(r.cacheWriteInputTokens) + '</span></div>';
+				h += '<div class="kv"><span class="k">Fresh input</span><span class="v">' + (typeof r.cachedPromptTokens === 'number' && typeof r.cacheWriteInputTokens === 'number' ? FMT(Math.max(0, r.promptTokens - r.cachedPromptTokens - r.cacheWriteInputTokens)) : 'not reported') + '</span></div>';
+				h += '<div class="kv"><span class="k">Detail</span><span class="v">' + esc(r.cacheMissDetail || '—') + '</span></div>';
+				if (r.terminalDetail) h += '<div class="kv"><span class="k">Terminal detail</span><span class="v">' + esc(r.terminalDetail) + '</span></div>';
 			} else {
 				h += '<section class="detail-card"><h3>Prefix &amp; cache</h3>';
 				h += '<div class="kv"><span class="k">Identical msgs</span><span class="v">' + (isColdStart ? 'cold start' : r.prefixIdenticalMessageCount !== undefined ? r.prefixIdenticalMessageCount + " of " + FMT(r.prefixPreviousMessageCount) : "n/a") + '</span></div>';
@@ -926,7 +935,7 @@ function renderCacheTab(d) {
 			// cache reads from cache creation, and stateless HTTP uses the prompt.
 			const detailInputTokens = IS_CODEX(r) && typeof r.finalSegmentInputTokens === "number" ? r.finalSegmentInputTokens : r.promptTokens;
 			const detailCachedTokens = IS_CODEX(r) && typeof r.finalSegmentCachedInputTokens === "number" ? r.finalSegmentCachedInputTokens : r.cachedPromptTokens;
-			const structMode = !IS_CODEX(r) && !IS_CLAUDE(r);
+			const structMode = !IS_CODEX(r) && !IS_NATIVE_CACHE(r);
 			if (typeof detailInputTokens === "number" && detailInputTokens > 0 && typeof detailCachedTokens === "number") {
 				const cached = detailCachedTokens;
 				const uncached = Math.max(0, detailInputTokens - cached);
@@ -935,7 +944,7 @@ function renderCacheTab(d) {
 				// instead of the generic cached/miss split — the structure bar
 				// already paints each block's cache coverage.
 				if (!structMode) {
-					const cacheWrite = IS_CLAUDE(r) ? Math.min(uncached, r.cacheWriteInputTokens ?? 0) : 0;
+					const cacheWrite = IS_NATIVE_CACHE(r) ? Math.min(uncached, r.cacheWriteInputTokens ?? 0) : 0;
 					const fresh = Math.max(0, uncached - cacheWrite);
 					const writePct = (cacheWrite / detailInputTokens) * 100;
 					const missPct = (fresh / detailInputTokens) * 100;
@@ -947,8 +956,8 @@ function renderCacheTab(d) {
 					h += '</div>';
 					h += '<div style="font-size:10px;color:var(--dim);margin-top:1px">';
 					h += '<span style="color:var(--good)">cached ' + FMT(cached) + ' (' + hitPct.toFixed(1) + '%)</span>';
-					if (IS_CLAUDE(r)) h += ' &middot; <span style="color:var(--warn)">cache write ' + FMT(cacheWrite) + ' (' + writePct.toFixed(1) + '%)</span>';
-					h += ' &middot; <span style="color:var(--bad)">' + (IS_CLAUDE(r) ? 'fresh ' + FMT(fresh) : 'uncached ' + FMT(uncached)) + ' (' + missPct.toFixed(1) + '%)</span>';
+					if (IS_NATIVE_CACHE(r)) h += ' &middot; <span style="color:var(--warn)">cache write ' + FMT(cacheWrite) + ' (' + writePct.toFixed(1) + '%)</span>';
+					h += ' &middot; <span style="color:var(--bad)">' + (IS_NATIVE_CACHE(r) ? 'fresh ' + FMT(fresh) : 'uncached ' + FMT(uncached)) + ' (' + missPct.toFixed(1) + '%)</span>';
 					h += '</div>';
 				}
 
@@ -1843,11 +1852,11 @@ function formatTurnText(r) {
 	lines.push("── Cache ──");
 	lines.push("Reason: " + (r.cacheMissReason || "n/a"));
 	lines.push("Detail: " + (r.cacheMissDetail || "—"));
-	if (typeof r.promptTokens === "number" && r.promptTokens > 0) {
+	if (typeof r.promptTokens === "number" && r.promptTokens > 0 && typeof r.cachedPromptTokens === "number") {
 		var cached = r.cachedPromptTokens || 0;
-		var written = IS_CLAUDE(r) ? (r.cacheWriteInputTokens || 0) : 0;
+		var written = IS_NATIVE_CACHE(r) ? (r.cacheWriteInputTokens || 0) : 0;
 		var uncached = Math.max(0, r.promptTokens - cached - written);
-		lines.push("processed cached/read " + fmt(cached) + " (" + (r.promptCacheHitPercent || 0).toFixed(1) + "%)" + (IS_CLAUDE(r) ? " · cache write " + fmt(written) + " · fresh " + fmt(uncached) : " · processed uncached " + fmt(uncached)));
+		lines.push("processed cached/read " + fmt(cached) + " (" + (r.promptCacheHitPercent || 0).toFixed(1) + "%)" + (IS_NATIVE_CACHE(r) ? " · cache write " + fmt(written) + " · fresh " + fmt(uncached) : " · processed uncached " + fmt(uncached)));
 	}
 
 	// Context

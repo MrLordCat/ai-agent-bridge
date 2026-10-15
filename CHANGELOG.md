@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.17.17 (local development patch) - 2026-10-15
+
+- Keep Cursor SDK agents warm per workspace, saved profile, credentials, model
+  configuration and conversation; restore completed native checkpoints after
+  reload, or replay the full visible history when restore fails.
+- Extend the workspace Chat journal to Cursor handoffs and foreign-provider
+  continuation. Import large histories with bounded requests and disabled
+  callbacks; archive large tool outputs instead of losing their middle.
+- Remove silent history dropping in Cursor's Cloud fallback. Oversized requests
+  now stop explicitly. Keep stale tool results and cancelled branches isolated.
+- Record native SDK input/output and cache read/write usage in API profile
+  metrics, API usage history and session diagnostics. Separate these counts
+  from context occupancy; render missing cache counters as unreported.
+- Show native Cursor/Coco session details and separate fresh input from cache
+  writes in the diagnostics dashboard. Add continuity, archive, native SDK
+  create/resume and opt-in real-inference checks.
+
 ## 1.17.16 (local development patch) - 2026-10-15
 
 - Keep Coco sessions per workspace, conversation, model and connection, append

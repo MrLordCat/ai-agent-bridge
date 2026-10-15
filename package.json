@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.17.16",
+	"version": "1.17.17",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -128,6 +128,13 @@
 					"minimum": 1,
 					"maximum": 128,
 					"description": "Maximum automatic Coco history-import requests for a cold handoff. Each request can incur model usage. Oversized transfers stop with a full local transcript instead of silently dropping history."
+				},
+				"llamacpp.cursorMaxHistoryImportParts": {
+					"type": "integer",
+					"default": 16,
+					"minimum": 1,
+					"maximum": 128,
+					"description": "Maximum automatic Cursor SDK history-import requests for a cold handoff or large foreign-provider delta. Each request can incur model usage. Overflow keeps a full local transcript and stops explicitly."
 				},
 				"llamacpp.enableCodexSubscription": {
 					"type": "boolean",

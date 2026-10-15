@@ -23,6 +23,7 @@ export interface ApiSourceAdapter extends vscode.Disposable {
 	respond(source: ChatModelSource, request: SourceResponse, fallback: () => Promise<void>): Promise<void>;
 	countTokens(model: vscode.LanguageModelChatInformation, fallback: () => Promise<number>): Promise<number>;
 	refresh(): void;
+	cancelConversation?(conversationId: unknown): void;
 }
 
 /** Runtime selection is independent of the source's saved identity and HTTP policies. */
@@ -43,8 +44,11 @@ export class ApiSourceRouter implements vscode.Disposable {
 	}
 	async respond(source: ChatModelSource, request: SourceResponse, http: () => Promise<void>): Promise<void> {
 		const adapter = this.adapter(source);
+		if (!adapter) { this.cancelConversation(request.options.modelOptions?._copilotConversationId); }
 		if (adapter) { await adapter.respond(source, request, http); } else { await http(); }
 	}
+	usesConversationHistory(source: ChatModelSource): boolean { return this.adapter(source)?.id === "cursor"; }
+	cancelConversation(conversationId: unknown): void { for (const adapter of this.adapters) { adapter.cancelConversation?.(conversationId); } }
 	countTokens(model: vscode.LanguageModelChatInformation, fallback: () => Promise<number>): Promise<number> {
 		const adapter = this.modelOwners.get(model.id);
 		return adapter ? adapter.countTokens(model, fallback) : fallback();
@@ -65,5 +69,6 @@ export class CursorSourceAdapter implements ApiSourceAdapter {
 	}
 	countTokens(_model: vscode.LanguageModelChatInformation, fallback: () => Promise<number>): Promise<number> { return fallback(); }
 	refresh(): void { this.transport.refresh(); }
+	cancelConversation(conversationId: unknown): void { this.transport.cancelConversation(conversationId); }
 	dispose(): void { this.transport.dispose(); }
 }
