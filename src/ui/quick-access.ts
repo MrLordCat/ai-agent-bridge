@@ -1,9 +1,13 @@
 import * as vscode from "vscode";
+import { QuickAccessItem, command, toggleIcon, runtimeMetricItems } from "./quick-access-items";
+export { QuickAccessItem } from "./quick-access-items";
 
 import type { QuickAccessApiProvider } from "../api-providers/api-provider-service";
 import type { ProviderState } from "../providers/provider-directory";
+import { providerUsageSummary, type ProviderSnapshot } from "../providers/provider-snapshot";
 import type { CocoProviderStatus } from "../coco/coco-provider";
-import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL } from "../constants";
+import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
+import { isDeepSeekEndpoint } from "../transport/openai-http";
 import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
 	normalizeCompactionTargetRatio,
@@ -13,9 +17,7 @@ import {
 	findCopilotBundle,
 } from "../copilot-patch";
 import {
-	formatProviderCache,
 	formatCompactTokenCount,
-	formatProviderContext,
 	formatProviderTokens,
 	type ProviderRuntimeMetrics,
 } from "../provider-metrics";
@@ -59,86 +61,67 @@ export interface QuickAccessCocoStatus extends CocoProviderStatus {
 	thinkingLevels?: readonly string[];
 }
 
-interface QuickAccessItemOptions {
-	description?: string;
-	command?: vscode.Command;
-	icon?: vscode.ThemeIcon;
-	tooltip?: string;
-	children?: QuickAccessItem[];
-	expanded?: boolean;
+export interface QuickAccessDependencies {
+	getLastThroughput?: () => string | undefined;
+	getLastContextUsage?: () => QuickAccessContextUsage | undefined;
+	getMemoryCount?: () => number;
+	getLastPromptCache?: () => string | undefined;
+	getSessionSummary?: () => string | undefined;
+	getExpiredMemoryCount?: () => number;
+	getCodexStatus?: () => string | undefined;
+	getClaudeStatus?: () => string | undefined;
+	getClaudeUsage?: () => string | undefined;
+	getClaudeLastRequest?: () => string | undefined;
+	getClaudeUsageLimits?: () => readonly QuickAccessUsageLimit[];
+	getLocalMetrics?: () => ProviderRuntimeMetrics | undefined;
+	getDeepSeekMetrics?: () => ProviderRuntimeMetrics | undefined;
+	getCodexMetrics?: () => ProviderRuntimeMetrics | undefined;
+	getClaudeMetrics?: () => ProviderRuntimeMetrics | undefined;
+	getCodexSubscriptionUsage?: () => string | undefined;
+	getSubagentProfiles?: () => readonly SubagentModelProfile[];
+	getTokenUsageHistory?: () => TokenUsageHistorySummary;
+	getUsageExperiments?: () => ExperimentSummary;
+	getDeepSeekBalance?: () => string | undefined;
+	getCodexUsageLimitPercent?: () => number | undefined;
+	getCodexUsageLimitReset?: () => string | undefined;
+	getCodexUsageLimitWindow?: () => string | undefined;
+	getClaudeUsageLimitPercent?: () => number | undefined;
+	getClaudeUsageLimitReset?: () => string | undefined;
+	getMemoryContextTokens?: () => number;
+	getApiProviderSummary?: () => QuickAccessApiProviderSummary;
+	getProviderState?: (key: string) => ProviderState | undefined;
+	getTotalMemoryCount?: () => number | undefined;
+	getApiProviders?: () => Promise<readonly QuickAccessApiProvider[]>;
+	getCodexUsageLimits?: () => readonly { label: string; description: string }[];
+	getCocoStatus?: () => QuickAccessCocoStatus | undefined;
+	getProviderSnapshots?: () => ReadonlyMap<string, ProviderSnapshot>;
 }
 
-export class QuickAccessItem extends vscode.TreeItem {
-	readonly children?: QuickAccessItem[];
-
-	constructor(id: string, label: string, options: QuickAccessItemOptions = {}) {
-		super(
-			label,
-			options.children
-				? options.expanded
-					? vscode.TreeItemCollapsibleState.Expanded
-					: vscode.TreeItemCollapsibleState.Collapsed
-				: vscode.TreeItemCollapsibleState.None
-		);
-		this.id = `llamacpp.quickAccess.${id}`;
-		this.description = options.description;
-		this.command = options.command;
-		this.iconPath = options.icon;
-		this.tooltip = options.tooltip;
-		this.children = options.children;
-		this.contextValue = options.children ? "llamacpp.quickAccessGroup" : "llamacpp.quickAction";
-	}
+/** Capture source data once so asynchronous profile rendering cannot mix snapshots. */
+function captureProviderView(dependencies: QuickAccessDependencies) {
+	const snapshots = new Map(dependencies.getProviderSnapshots?.() ?? []);
+	const metrics = new Map([...snapshots].map(([id, snapshot]) => [id, snapshot.metrics]));
+	const accounts = new Map([...snapshots].map(([id, snapshot]) => [id, snapshot.accountSummary]));
+	const legacyMetrics = { local: dependencies.getLocalMetrics, deepseek: dependencies.getDeepSeekMetrics, codex: dependencies.getCodexMetrics, claude: dependencies.getClaudeMetrics };
+	for (const [id, getMetrics] of Object.entries(legacyMetrics)) { if (getMetrics) { metrics.set(id, getMetrics()); } }
+	if (dependencies.getCodexStatus) { accounts.set("codex", dependencies.getCodexStatus()); }
+	if (dependencies.getClaudeStatus) { accounts.set("claude", dependencies.getClaudeStatus()); }
+	const states = new Map<string, ProviderState | undefined>([...snapshots].map(([id, snapshot]) => [id, snapshot.state]));
+	return { snapshots, metrics, accounts, state: (id: string) => {
+		if (!states.has(id) && dependencies.getProviderState) { states.set(id, dependencies.getProviderState(id)); }
+		return states.get(id);
+	} };
 }
 
-function command(command: string, title: string): vscode.Command {
-	return { command, title };
-}
-
-function toggleIcon(enabled: boolean): vscode.ThemeIcon {
-	return new vscode.ThemeIcon(
-		enabled ? "pass-filled" : "circle-slash",
-		new vscode.ThemeColor(enabled ? "testing.iconPassed" : "disabledForeground")
-	);
-}
-
-function runtimeMetricItems(
-	id: string,
-	metrics: ProviderRuntimeMetrics | undefined,
-	openCommand: vscode.Command
-): QuickAccessItem[] {
-	const running = metrics?.phase === "running";
-	const precision = metrics?.estimated ? "Estimated live values; replaced by exact app-server usage at the next segment boundary" : "Exact provider-reported values";
-	const items = [
-		new QuickAccessItem(`${id}.tokens`, running ? "Tokens (live)" : "Tokens (last)", {
-			description: formatProviderTokens(metrics),
-			tooltip: running ? `Input and output tokens for the active request. ${precision}` : "Input and output tokens for the last completed request",
-			icon: new vscode.ThemeIcon("symbol-numeric"),
-			command: openCommand,
-		}),
-		new QuickAccessItem(`${id}.cache`, "Prompt Cache", {
-			description: formatProviderCache(metrics),
-			tooltip: running ? `Cache-read tokens for the active request. ${precision}` : "Cache-read tokens divided by input tokens for the last completed request",
-			icon: new vscode.ThemeIcon("database"),
-			command: openCommand,
-		}),
-		new QuickAccessItem(`${id}.context`, "Context", {
-			description: formatProviderContext(metrics),
-			tooltip: [metrics?.contextDetail, running ? precision : undefined]
-				.filter((value): value is string => Boolean(value))
-				.join(". ") || "Current context usage and the provider-reported model window",
-			icon: new vscode.ThemeIcon("pie-chart"),
-			command: openCommand,
-		}),
-	];
-	if (metrics?.throughputTokensPerSecond !== undefined) {
-		items.push(new QuickAccessItem(`${id}.throughput`, "Throughput", {
-			description: `${metrics.throughputTokensPerSecond.toFixed(1)} tok/s`,
-			icon: new vscode.ThemeIcon("dashboard"),
-			command: openCommand,
-		}));
-	}
-	return items;
-}
+// Compatibility for existing consumers; production wiring uses named dependencies.
+const LEGACY_QUICK_ACCESS_KEYS: readonly (keyof QuickAccessDependencies)[] = [
+	"getLastThroughput", "getLastContextUsage", "getMemoryCount", "getLastPromptCache", "getSessionSummary",
+	"getExpiredMemoryCount", "getCodexStatus", "getClaudeStatus", "getClaudeUsage", "getClaudeLastRequest", "getClaudeUsageLimits",
+	"getLocalMetrics", "getDeepSeekMetrics", "getCodexMetrics", "getClaudeMetrics", "getCodexSubscriptionUsage", "getSubagentProfiles",
+	"getTokenUsageHistory", "getUsageExperiments", "getDeepSeekBalance", "getCodexUsageLimitPercent", "getCodexUsageLimitReset", "getCodexUsageLimitWindow",
+	"getClaudeUsageLimitPercent", "getClaudeUsageLimitReset", "getMemoryContextTokens", "getApiProviderSummary", "getProviderState",
+	"getTotalMemoryCount", "getApiProviders", "getCodexUsageLimits", "getCocoStatus",
+];
 
 function formatUsageDuration(durationMs: number): string {
 	if (durationMs < 1_000) {
@@ -240,11 +223,11 @@ function usageProviderItem(
 	const children = [
 		usagePeriodItem(`usage.${provider}.today`, "Today", usage.today.providers[provider]),
 		usagePeriodItem(`usage.${provider}.week`, "Last 7 Days", usage.week.providers[provider]),
-		new QuickAccessItem(`usage.${provider}.current`, metrics?.phase === "running" ? "Current Request" : "Last Request", {
+		...(provider === "api" ? [] : [new QuickAccessItem(`usage.${provider}.current`, metrics?.phase === "running" ? "Current Request" : "Last Request", {
 			description: formatProviderTokens(metrics),
 			icon: new vscode.ThemeIcon("pulse"),
 			children: runtimeMetricItems(`usage.${provider}.current`, metrics, openCommand),
-		}),
+		})]),
 	];
 	if (sessionSummary) {
 		children.push(new QuickAccessItem(`usage.${provider}.session`, "Current VS Code Session", {
@@ -265,6 +248,7 @@ const usageProviderLabels: Record<TokenUsageProvider, string> = {
 	deepseek: "DeepSeek",
 	codex: "Codex",
 	claude: "Claude",
+	api: "API profiles",
 };
 
 function formatExperimentSavings(value: number | undefined): string {
@@ -368,51 +352,48 @@ function codexUsageLimitItem(id: string, label: string, description: string): Qu
  */
 export function buildApiProfileItem(
 	profile: QuickAccessApiProvider,
-	state: ProviderState | undefined
+	state: ProviderState | undefined,
+	metrics?: ProviderRuntimeMetrics
 ): QuickAccessItem {
+	const id = `api.${profile.id}`;
 	const budgetCommand: vscode.Command = { command: "llamacpp.cursorBudget", title: "Cursor Budget", arguments: [profile.id] };
-	return new QuickAccessItem(`api.${profile.id}`, profile.name, {
+	return new QuickAccessItem(id, profile.name, {
 		description: state === "unsupported" ? "Unsupported API" : state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
-		icon: new vscode.ThemeIcon("cloud"),
-		tooltip: profile.baseUrl,
+		icon: new vscode.ThemeIcon("cloud"), tooltip: profile.baseUrl,
 		children: [
-			new QuickAccessItem(`api.${profile.id}.source`, "Source", {
-				description: "On",
-				tooltip: "Enabled API provider; disable it in the Providers Manager.",
-				icon: toggleIcon(true),
-				command: command("llamacpp.openApiProviders", "Manage API Providers"),
-			}),
-			...(profile.balance
-				? [new QuickAccessItem(`api.${profile.id}.balance`, profile.balance.label ?? "Balance", {
-					description: profile.balance.summary,
-					tooltip: profile.balance.tooltip,
-					icon: new vscode.ThemeIcon("credit-card"),
-					command: profile.balance.label === "Budget" ? budgetCommand : command("llamacpp.openApiProviders", "Manage API Providers"),
-					expanded: true,
-					children: profile.balance.rows?.length ? profile.balance.rows.map(row => new QuickAccessItem(`api.${profile.id}.balance.${row.id}`, row.label, { description: row.summary, tooltip: row.tooltip, icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })) : undefined,
-				})]
-				: []),
-			new QuickAccessItem(`api.${profile.id}.context`, "Maximum Context", {
+			new QuickAccessItem(`${id}.source`, "Source", { description: "On", tooltip: "Enabled API provider; disable it in the Providers Manager.", icon: toggleIcon(true), command: command("llamacpp.openApiProviders", "Manage API Providers") }),
+			...providerRuntimeItems(id, metrics),
+			...(profile.balance ? [new QuickAccessItem(`${id}.balance`, profile.balance.label ?? "Balance", {
+				description: profile.balance.usage ? providerUsageSummary(profile.balance.usage) : profile.balance.summary,
+				tooltip: profile.balance.tooltip + (profile.balanceUpdating ? "\nRefreshing cached values…" : ""), icon: new vscode.ThemeIcon("credit-card"), expanded: true,
+				command: profile.balance.label === "Budget" ? budgetCommand : command("llamacpp.openApiProviders", "Manage API Providers"),
+				children: profile.balance.rows?.length ? profile.balance.rows.map(row => new QuickAccessItem(`${id}.balance.${row.id}`, row.label, { description: row.summary, tooltip: row.tooltip, icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })) : undefined,
+			})] : []),
+			...(!profile.balance && profile.balanceUpdating && profile.protocol === "cursor" ? [new QuickAccessItem(`${id}.balance`, "Budget", { description: "Checking…", tooltip: "Reading Cursor usage in the background.", icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })] : []),
+			new QuickAccessItem(`${id}.context`, "Maximum Context", {
 				description: profile.maximumContextLength === undefined ? "Detecting" : formatCompactTokenCount(profile.maximumContextLength),
 				tooltip: profile.contextMaximumReported ? "Maximum context discovered from the provider's models." : "The API has not reported a maximum; discovery may use a fallback.",
-				icon: new vscode.ThemeIcon("symbol-numeric"),
-				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+				icon: new vscode.ThemeIcon("symbol-numeric"), command: command("llamacpp.openApiProviders", "Manage API Providers"),
 			}),
-			new QuickAccessItem(`api.${profile.id}.workingContext`, "Working Context", {
-				description: profile.contextLength === undefined ? "Automatic" : formatCompactTokenCount(profile.contextLength),
-				tooltip: "Choose a smaller working context with the slider in the Providers Manager.",
-				icon: new vscode.ThemeIcon("settings"),
-				command: command("llamacpp.openApiProviders", "Adjust Working Context"),
-			}),
-			new QuickAccessItem(`api.${profile.id}.manage`, "Providers Manager", {
-				description: "Edit, disable or delete",
-				icon: new vscode.ThemeIcon("server-process"),
-				command: command("llamacpp.openApiProviders", "Manage API Providers"),
-			}),
+			new QuickAccessItem(`${id}.workingContext`, "Working Context", { description: profile.contextLength === undefined ? "Automatic" : formatCompactTokenCount(profile.contextLength), tooltip: "Choose a smaller working context with the slider in the Providers Manager.", icon: new vscode.ThemeIcon("settings"), command: command("llamacpp.openApiProviders", "Adjust Working Context") }),
+			new QuickAccessItem(`${id}.manage`, "Providers Manager", { description: "Edit, disable or delete", icon: new vscode.ThemeIcon("server-process"), command: command("llamacpp.openApiProviders", "Manage API Providers") }),
 		],
 	});
 }
 
+export function providerRuntimeItems(id: string, metrics?: ProviderRuntimeMetrics): QuickAccessItem[] {
+	if (!metrics) { return []; }
+	return runtimeMetricItems(id, metrics, undefined, "runtimeContext");
+}
+
+export function buildProviderSnapshotItem(snapshot: ProviderSnapshot): QuickAccessItem {
+	return new QuickAccessItem(`provider.${snapshot.sourceId}`, snapshot.label, {
+		description: snapshot.accountSummary ?? snapshot.state, tooltip: snapshot.summary, icon: new vscode.ThemeIcon("cloud"),
+		children: [...providerRuntimeItems(`provider.${snapshot.sourceId}`, snapshot.metrics),
+			...(snapshot.usage ? [new QuickAccessItem(`provider.${snapshot.sourceId}.usage`, "Usage", { description: providerUsageSummary(snapshot.usage), tooltip: snapshot.usage.origin })] : []),
+		],
+	});
+}
 export function buildCocoItem(
 	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number
 ): QuickAccessItem {
@@ -472,41 +453,37 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
 
-	constructor(
-		private readonly getLastThroughput: () => string | undefined,
-		private readonly getLastContextUsage: () => QuickAccessContextUsage | undefined,
-		private readonly getMemoryCount: () => number,
-		private readonly getLastPromptCache: () => string | undefined = () => undefined,
-		private readonly getSessionSummary: () => string | undefined = () => undefined,
-
-		private readonly getExpiredMemoryCount: () => number = () => 0,
-		private readonly getCodexStatus: () => string | undefined = () => undefined,
-		private readonly getClaudeStatus: () => string | undefined = () => undefined,
-		private readonly getClaudeUsage: () => string | undefined = () => undefined,
-		private readonly getClaudeLastRequest: () => string | undefined = () => undefined,
-		private readonly getClaudeUsageLimits: () => readonly QuickAccessUsageLimit[] = () => [],
-		private readonly getLocalMetrics: () => ProviderRuntimeMetrics | undefined = () => undefined,
-		private readonly getDeepSeekMetrics: () => ProviderRuntimeMetrics | undefined = () => undefined,
-		private readonly getCodexMetrics: () => ProviderRuntimeMetrics | undefined = () => undefined,
-		private readonly getClaudeMetrics: () => ProviderRuntimeMetrics | undefined = () => undefined,
-		private readonly getCodexSubscriptionUsage: () => string | undefined = () => undefined,
-		private readonly getSubagentProfiles: () => readonly SubagentModelProfile[] = () => [],
-		private readonly getTokenUsageHistory: () => TokenUsageHistorySummary = emptyTokenUsageHistorySummary,
-		private readonly getUsageExperiments: () => ExperimentSummary = emptyUsageExperimentSummary,
-		private readonly getDeepSeekBalance: () => string | undefined = () => undefined,
-		private readonly getCodexUsageLimitPercent: () => number | undefined = () => undefined,
-		private readonly getCodexUsageLimitReset: () => string | undefined = () => undefined,
-		private readonly getCodexUsageLimitWindow: () => string | undefined = () => undefined,
-		private readonly getClaudeUsageLimitPercent: () => number | undefined = () => undefined,
-		private readonly getClaudeUsageLimitReset: () => string | undefined = () => undefined,
-		private readonly getMemoryContextTokens: () => number = () => 0,
-		private readonly getApiProviderSummary: () => QuickAccessApiProviderSummary = () => ({ total: 0, enabled: 0 }),
-		private readonly getProviderState: (key: string) => ProviderState | undefined = () => undefined,
-		private readonly getTotalMemoryCount: () => number | undefined = () => undefined,
-	private readonly getApiProviders: () => Promise<readonly QuickAccessApiProvider[]> = async () => [],
-		private readonly getCodexUsageLimits: () => readonly { label: string; description: string }[] = () => [],
-		private readonly getCocoStatus: () => QuickAccessCocoStatus | undefined = () => undefined,
-	) {}
+	private readonly dependencies: QuickAccessDependencies;
+	constructor(dependencies: QuickAccessDependencies | (() => string | undefined) = {}, ...legacy: unknown[]) {
+		this.dependencies = typeof dependencies === "function"
+			? Object.fromEntries(LEGACY_QUICK_ACCESS_KEYS.map((key, index) => [key, [dependencies, ...legacy][index]]).filter(([, value]) => value !== undefined)) as QuickAccessDependencies
+			: dependencies;
+	}
+	private get getLastThroughput() { return this.dependencies.getLastThroughput ?? (() => undefined); }
+	private get getLastContextUsage() { return this.dependencies.getLastContextUsage ?? (() => undefined); }
+	private get getMemoryCount() { return this.dependencies.getMemoryCount ?? (() => 0); }
+	private get getLastPromptCache() { return this.dependencies.getLastPromptCache ?? (() => undefined); }
+	private get getSessionSummary() { return this.dependencies.getSessionSummary ?? (() => undefined); }
+	private get getExpiredMemoryCount() { return this.dependencies.getExpiredMemoryCount ?? (() => 0); }
+	private get getClaudeUsage() { return this.dependencies.getClaudeUsage ?? (() => undefined); }
+	private get getClaudeLastRequest() { return this.dependencies.getClaudeLastRequest ?? (() => undefined); }
+	private get getClaudeUsageLimits() { return this.dependencies.getClaudeUsageLimits ?? (() => []); }
+	private get getCodexSubscriptionUsage() { return this.dependencies.getCodexSubscriptionUsage ?? (() => undefined); }
+	private get getSubagentProfiles() { return this.dependencies.getSubagentProfiles ?? (() => []); }
+	private get getTokenUsageHistory() { return this.dependencies.getTokenUsageHistory ?? emptyTokenUsageHistorySummary; }
+	private get getUsageExperiments() { return this.dependencies.getUsageExperiments ?? emptyUsageExperimentSummary; }
+	private get getDeepSeekBalance() { return this.dependencies.getDeepSeekBalance ?? (() => undefined); }
+	private get getCodexUsageLimitPercent() { return this.dependencies.getCodexUsageLimitPercent ?? (() => undefined); }
+	private get getCodexUsageLimitReset() { return this.dependencies.getCodexUsageLimitReset ?? (() => undefined); }
+	private get getCodexUsageLimitWindow() { return this.dependencies.getCodexUsageLimitWindow ?? (() => undefined); }
+	private get getClaudeUsageLimitPercent() { return this.dependencies.getClaudeUsageLimitPercent ?? (() => undefined); }
+	private get getClaudeUsageLimitReset() { return this.dependencies.getClaudeUsageLimitReset ?? (() => undefined); }
+	private get getMemoryContextTokens() { return this.dependencies.getMemoryContextTokens ?? (() => 0); }
+	private get getApiProviderSummary() { return this.dependencies.getApiProviderSummary ?? (() => ({ total: 0, enabled: 0 })); }
+	private get getTotalMemoryCount() { return this.dependencies.getTotalMemoryCount ?? (() => undefined); }
+	private get getApiProviders() { return this.dependencies.getApiProviders ?? (async () => []); }
+	private get getCodexUsageLimits() { return this.dependencies.getCodexUsageLimits ?? (() => []); }
+	private get getCocoStatus() { return this.dependencies.getCocoStatus ?? (() => undefined); }
 
 	refresh(): void {
 		this._onDidChangeTreeData.fire();
@@ -524,8 +501,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 	}
 
 	private async buildRootItems(): Promise<QuickAccessItem[]> {
+		const view = captureProviderView(this.dependencies);
 		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 		const serverUrl = String(config.get("serverUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
+		const deepSeekServerUrl = isDeepSeekEndpoint(serverUrl) ? serverUrl : DEEPSEEK_SERVER_URL;
 		const localServerUrl = String(config.get("localServerUrl", DEFAULT_SERVER_URL) || DEFAULT_SERVER_URL);
 		const localServerEnabled = config.get<boolean>("enableLocalServer", true) !== false;
 		const configuredLocalOutput = Number(config.get("localDefaultMaxOutputTokens", 32768));
@@ -582,8 +561,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const lastContextUsage = this.getLastContextUsage();
 		const lastPromptCache = this.getLastPromptCache();
 		const sessionSummary = this.getSessionSummary();
-		const codexStatus = this.getCodexStatus();
-		const claudeStatus = this.getClaudeStatus();
+		const codexStatus = view.accounts.get("codex");
+		const claudeStatus = view.accounts.get("claude");
 		const codexUsageLimitPercent = this.getCodexUsageLimitPercent();
 		const codexUsageLimitReset = this.getCodexUsageLimitReset();
 		const claudeUsageLimitPercent = this.getClaudeUsageLimitPercent();
@@ -596,10 +575,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const claudeUsage = this.getClaudeUsage();
 		const claudeLastRequest = this.getClaudeLastRequest();
 		const claudeUsageLimits = this.getClaudeUsageLimits();
-		const localMetrics = this.getLocalMetrics();
-		const deepSeekMetrics = this.getDeepSeekMetrics();
-		const codexMetrics = this.getCodexMetrics();
-		const claudeMetrics = this.getClaudeMetrics();
+		const localMetrics = view.metrics.get("local");
+		const deepSeekMetrics = view.metrics.get("deepseek");
+		const codexMetrics = view.metrics.get("codex");
+		const claudeMetrics = view.metrics.get("claude");
 		const subagentProfiles = this.getSubagentProfiles();
 		const tokenUsageHistory = this.getTokenUsageHistory();
 		const usageExperiments = this.getUsageExperiments();
@@ -712,14 +691,14 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					command: command("llamacpp.toggleDeepSeekCompactionSummary", "Toggle DeepSeek Compaction Summaries"),
 				}),
 				new QuickAccessItem("deepseek.settings", "Connection", {
-					description: formatEndpointLabel(serverUrl),
+					description: formatEndpointLabel(deepSeekServerUrl),
 					icon: new vscode.ThemeIcon("settings-gear"),
 					children: [
-						new QuickAccessItem("deepseek.endpoint", "Primary Endpoint", {
-							description: formatEndpointLabel(serverUrl),
-							tooltip: serverUrl,
+						new QuickAccessItem("deepseek.endpoint", "Endpoint", {
+							description: formatEndpointLabel(deepSeekServerUrl),
+							tooltip: deepSeekServerUrl,
 							icon: new vscode.ThemeIcon("link"),
-							command: command("llamacpp.manage", "Manage Primary Server"),
+							command: command("llamacpp.configureDeepSeek", "Configure DeepSeek"),
 						}),
 						new QuickAccessItem("deepseek.setup", "API Key & Profile", {
 							icon: new vscode.ThemeIcon("key"),
@@ -890,10 +869,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			].filter((value): value is string => Boolean(value)).join("\n"),
 			icon: new vscode.ThemeIcon("graph-line"),
 			children: [
-				usageProviderItem("local", "Local / Qwen", tokenUsageHistory, localMetrics, command("llamacpp.openLatestLog", "Open Latest Log")),
-				usageProviderItem("deepseek", "DeepSeek", tokenUsageHistory, deepSeekMetrics, command("llamacpp.openLatestLog", "Open Latest Log")),
-				usageProviderItem("codex", "Codex", tokenUsageHistory, codexMetrics, command("llamacpp.codexShowStatus", "Show Codex Subscription Status")),
-				usageProviderItem("claude", "Claude", tokenUsageHistory, claudeMetrics, command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"), claudeUsage, claudeLastRequest),
+				...TOKEN_USAGE_PROVIDERS.map(provider => usageProviderItem(provider, usageProviderLabels[provider], tokenUsageHistory,
+					({ local: localMetrics, deepseek: deepSeekMetrics, codex: codexMetrics, claude: claudeMetrics, api: undefined })[provider],
+					provider === "codex" ? command("llamacpp.codexShowStatus", "Show Codex Subscription Status") : provider === "claude" ? command("llamacpp.claudeShowStatus", "Show Claude Subscription Status") : command("llamacpp.openLatestLog", "Open Latest Log"),
+					provider === "claude" ? claudeUsage : undefined, provider === "claude" ? claudeLastRequest : undefined)),
 				new QuickAccessItem("usage.clear", "Clear Usage History", {
 					tooltip: "Delete the locally recorded daily token statistics",
 					icon: new vscode.ThemeIcon("trash"),
@@ -1186,12 +1165,21 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		];
 		const visibleProviders = providerRoots
 			// Keep Coco's reconnect and setup controls visible when its runtime is unavailable.
-			.filter(({ key }) => key === "coco" || this.getProviderState(key) !== "offline")
+			.filter(({ key }) => key === "coco" || view.state(key) !== "offline")
 			.map(({ item }) => item);
 
-		const apiProfileItems = (await this.getApiProviders()).map(profile =>
-			buildApiProfileItem(profile, this.getProviderState(`api-${profile.id}`))
+		let apiProfiles: readonly QuickAccessApiProvider[] = [];
+		try { apiProfiles = await this.getApiProviders(); }
+		catch {
+			apiProviders.description = "Profiles unavailable";
+			apiProviders.tooltip = "Unable to read API profiles. Open Providers Manager to check their configuration.";
+		}
+		const apiProfileItems = apiProfiles.map(profile =>
+			buildApiProfileItem(profile, view.state(`api-${profile.id}`), view.metrics.get(`api-${profile.id}`))
 		);
-		return [apiProviders, ...apiProfileItems, ...visibleProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
+		const genericProviders = [...view.snapshots.values()]
+			.filter(snapshot => !["primary", "local", "deepseek", "codex", "claude", "coco"].includes(snapshot.sourceId) && !snapshot.sourceId.startsWith("api-") && snapshot.state !== "offline")
+			.map(buildProviderSnapshotItem);
+		return [apiProviders, ...apiProfileItems, ...visibleProviders, ...genericProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
 	}
 }

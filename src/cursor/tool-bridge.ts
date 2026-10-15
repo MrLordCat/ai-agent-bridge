@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { DelegatedTurnState } from "../tools/delegated-turn-state";
 import type { SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
 
@@ -13,14 +14,12 @@ interface PendingTool {
 /** Callbacks wait here; Copilot, rather than the SDK, executes each advertised tool. */
 export class CursorToolBridge implements vscode.Disposable {
 	readonly customTools: Record<string, SDKCustomTool> = {};
-	private readonly pending = new Map<string, PendingTool>();
-	private boundary?: { resolve(): void; reject(error: Error): void };
+	private readonly state = new DelegatedTurnState<PendingTool, vscode.LanguageModelResponsePart>();
+	private get pending() { return this.state.pending; }
 	private progress?: vscode.Progress<vscode.LanguageModelResponsePart>;
 	private cancellation?: vscode.Disposable;
 	private timer?: ReturnType<typeof setTimeout>;
-	private queued: vscode.LanguageModelResponsePart[] = [];
-	private queuedChars = 0;
-	private terminal = false;
+	private get terminal() { return this.state.terminal; }
 	private scheduled = false;
 	private usedTool = false;
 	private allowedTools = new Set<string>();
@@ -63,13 +62,8 @@ export class CursorToolBridge implements vscode.Disposable {
 		const completion = this.attach(progress, token);
 		if (this.terminal) { return completion; }
 		const returned = new Set(results.map(result => result.callId));
-		if ([...this.pending.values()].some(call => call.reported && !returned.has(call.part.callId))) { this.finish(new Error("Cursor needs every tool result in the batch before continuing.")); return completion; }
-		for (const result of results) {
-			const call = this.pending.get(result.callId);
-			if (!call?.reported) { continue; }
-			this.pending.delete(result.callId);
-			call.resolve(cursorToolResult(result));
-		}
+		if (this.pending.missing(returned, call => call.reported).length) { this.finish(new Error("Cursor needs every tool result in the batch before continuing.")); return completion; }
+		this.pending.accept(results, result => result.callId, (call, result) => call.resolve(cursorToolResult(result)), call => call.reported);
 		this.scheduleCalls();
 		return completion;
 	}
@@ -84,22 +78,20 @@ export class CursorToolBridge implements vscode.Disposable {
 		} else { part = new vscode.LanguageModelTextPart(text); }
 		if (this.progress) { this.progress.report(part); }
 		else {
-			this.queuedChars += text.length;
-			if (this.queuedChars > 500_000) { this.finish(new Error("Cursor produced too much output while waiting for a tool result.")); return; }
-			this.queued.push(part);
+			try { this.state.enqueue(part, text.length); }
+			catch (error) { this.finish(error instanceof Error ? error : new Error(String(error))); }
 		}
 	}
 
 	private attach(progress: vscode.Progress<vscode.LanguageModelResponsePart>, token: vscode.CancellationToken): Promise<void> {
 		if (this.terminal) { return Promise.reject(new Error("Cursor tool session is no longer active.")); }
+		const completion = this.state.attach();
 		this.cancellation?.dispose(); clearTimeout(this.timer);
 		this.progress = progress;
-		const completion = new Promise<void>((resolve, reject) => { this.boundary = { resolve, reject }; });
 		this.cancellation = token.onCancellationRequested(() => this.finish(new vscode.CancellationError()));
 		this.timer = setTimeout(() => this.finish(new Error("Cursor tool session timed out.")), 30 * 60_000);
 		if (token.isCancellationRequested) { this.finish(new vscode.CancellationError()); return completion; }
-		for (const part of this.queued) { progress.report(part); }
-		this.queued = []; this.queuedChars = 0;
+		for (const part of this.state.takeOutput()) { progress.report(part); }
 		this.scheduleCalls();
 		return completion;
 	}
@@ -109,23 +101,19 @@ export class CursorToolBridge implements vscode.Disposable {
 		this.scheduled = true;
 		queueMicrotask(() => {
 			this.scheduled = false;
-			if (!this.progress || !this.boundary || this.terminal) { return; }
+			if (!this.progress || !this.state.attached || this.terminal) { return; }
 			const calls = [...this.pending.values()].filter(call => !call.reported);
 			if (!calls.length) { return; }
 			for (const call of calls) { call.reported = true; this.progress.report(call.part); }
-			const boundary = this.boundary; this.boundary = undefined; this.progress = undefined;
-			boundary.resolve();
+			this.progress = undefined;
+			this.state.release();
 		});
 	}
 
 	finish(error?: Error): void {
-		if (this.terminal) { return; }
-		this.terminal = true;
+		if (!this.state.finish(error, call => call.reject(error ?? new vscode.CancellationError()))) { return; }
 		clearTimeout(this.timer); this.cancellation?.dispose();
-		for (const call of this.pending.values()) { call.reject(error ?? new vscode.CancellationError()); }
-		this.pending.clear(); this.queued = [];
-		const boundary = this.boundary; this.boundary = undefined; this.progress = undefined;
-		if (error) { boundary?.reject(error); } else { boundary?.resolve(); }
+		this.progress = undefined;
 		this.onStop();
 	}
 	dispose(): void { this.finish(new vscode.CancellationError()); }

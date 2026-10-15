@@ -1,5 +1,35 @@
 # Changelog
 
+## 1.17.14 (local development patch) - 2026-10-15
+
+- Share CI and release verification across Windows/Linux and VS Code
+  1.131.0/1.141.0. Gate packaging on all tests and publication on matching
+  manifest, lockfile, tag and release-notes metadata.
+- Refresh architecture and maintenance documentation and record a Quick Access
+  audit. Extract common tree items and metric rows with consistent live/last
+  labels, precision hints and optional throughput.
+- Capture provider snapshots once per tree render, show API token history,
+  display the actual DeepSeek endpoint and remove empty expansion arrows.
+- Load account balances in the background so slow budget requests cannot block
+  the control tree; avoid repeated requests on unsupported balance endpoints.
+  Keep other sections usable when profile metadata cannot be read.
+
+## 1.17.13 (local development patch) - 2026-10-15
+
+- Register transport ownership, source labels and subscription status through
+  shared provider definitions. Preserve saved model IDs and profile credentials.
+- Build model metadata through a common descriptor and token-limit projection;
+  use provider snapshots and named Quick Access dependencies. Attribute custom
+  API metrics to their source instead of Local or DeepSeek model-family guesses.
+- Share TTL, concurrent request joining and generation invalidation across
+  balances and catalogs. Cancelling one reader leaves other readers active.
+- Move Cursor/HTTP source selection behind an API transport router covering
+  discovery, responses, token counting and resource disposal.
+- Share delegated tool response boundaries and bounded buffers for Cursor/Coco
+  and pending result delivery across Cursor, Coco, Claude and Codex. Preserve
+  protocol-specific result codecs, cancellation and session recovery.
+- Add provider, descriptor, cache, transport and tool-controller contract tests.
+
 ## 1.17.12 (local development patch) - 2026-10-14
 
 - Show Cursor's remaining team spending budget, current-cycle on-demand

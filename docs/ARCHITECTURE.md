@@ -2,8 +2,8 @@
 
 ## Scope
 
-This extension exposes OpenAI-compatible local models, DeepSeek, Codex, and
-Claude subscriptions through one VS Code language model provider. Stable
+This extension exposes OpenAI-compatible local models, DeepSeek, Cursor,
+Codex, Claude and Snowflake Coco through one VS Code language model provider. Stable
 compatibility ids remain under the `llamacpp` namespace even though each source
 uses an independent transport and lifecycle.
 
@@ -11,12 +11,17 @@ uses an independent transport and lifecycle.
 
 - `src/extension.ts` is the composition root. It creates services and registers
   the provider, commands, status items, UI providers, and memory tools.
-- `src/composite-provider.ts` combines the Local/DeepSeek, Codex, and Claude
-  catalogs and routes source-prefixed model ids without blocking one provider
-  on another provider's health probes.
+- `src/composite-provider.ts` consumes `ProviderRegistry` to combine catalogs
+  and route each model to its registered owner, isolating discovery failures.
+- `src/providers/model-descriptor.ts` projects shared model metadata to VS Code;
+  `provider-snapshot.ts` keeps source metrics and distinct usage kinds.
+- `src/providers/api-source-router.ts` dispatches API-profile transports,
+  including Cursor SDK, while preserving profile identity and credentials.
+- `src/providers/async-resource-cache.ts` owns shared loads, TTL and generation
+  invalidation for catalogs and balances, with independent reader cancellation.
 - `src/llama-provider.ts` coordinates model discovery, request attempts,
   compatibility retries, streaming, and metrics.
-- `src/base-provider.ts` owns provider-independent token estimation and SSE
+- `src/base-provider.ts` owns OpenAI-compatible token estimation and SSE
   streaming/tool-call parsing.
 - `src/utils.ts` converts VS Code messages and tools to OpenAI-compatible
   payloads and validates tool-call history.
@@ -28,6 +33,10 @@ uses an independent transport and lifecycle.
 - `src/claude/` owns Claude Code discovery, persistent Agent SDK queries,
   subscription limits, warm conversation reuse, a VS Code-only MCP allowlist,
   and live logical-turn usage/context/tool metrics.
+- `src/cursor/` owns saved-profile discovery, SDK callback tools and the
+  chat-only HTTP fallback. `src/coco/` owns Snowflake ACP sessions and tools.
+- `src/tools/delegated-turn-state.ts` shares response boundaries and bounded
+  buffers for Cursor/Coco and pending-result delivery across all SDK adapters.
 - `src/provider-metrics.ts`, `src/token-usage-history.ts`, and
   `src/usage-experiment.ts` normalize provider telemetry and persist bounded
   comparison data without prompt bodies.
@@ -64,8 +73,9 @@ uses an independent transport and lifecycle.
   cancellation, and serialized HTTP requests.
 - `src/transport/request-queue.ts` owns serial request admission, FIFO waiting,
   cancellation, queue timeouts, and idempotent slot release.
-- `src/ui/quick-access.ts` owns the grouped Quick Access tree, compact endpoint
-  labels, native icons, and live state summaries.
+- `src/ui/quick-access.ts` composes Quick Access sections from a captured provider
+  snapshot. `quick-access-items.ts` owns tree identity and shared metric rows;
+  balance requests refresh independently in the background.
 - `src/ui/session-quality-panel.ts` owns the live, state-preserving diagnostics
   webview with filters, issue highlighting, expandable turn details, usage
   segments, and Codex model/tool step timelines.
@@ -78,6 +88,9 @@ uses an independent transport and lifecycle.
 
 `src/vscode.d.ts` is a checked-in VS Code API declaration used for the language
 model provider surface. Update it explicitly with `npm run update-vscode-api`.
+
+See [provider contracts](PROVIDER_ARCHITECTURE.md) for extension points and
+[the development workflow](DEVELOPMENT_WORKFLOW.md) for verification and releases.
 
 ## Request Flow
 

@@ -1,9 +1,6 @@
 import * as vscode from "vscode";
 import { PROVIDER_VENDOR } from "../constants";
-import { decodeCodexModelId } from "../codex/model-adapter";
-import { decodeCocoModelId } from "../coco/model-adapter";
-import { decodeClaudeModelId } from "../claude/message-adapter";
-import { parseProviderModelId } from "../model-sources/source-routing";
+import { BUILTIN_PROVIDER_SOURCES, providerSourceId, type ProviderSourceDefinition } from "../providers/provider-registry";
 
 export interface ModelPickerProfile { id: string; name: string; baseUrl: string; enabled: boolean }
 export interface ProviderModelGroup { key: string; label: string; description: string; models: vscode.LanguageModelChatInformation[] }
@@ -22,7 +19,7 @@ const defaultUI: ProviderModelPickerUI = {
 };
 
 /** Group by source identity, so identical names and models never merge API profiles. */
-export function groupProviderModels(models: readonly vscode.LanguageModelChatInformation[], profiles: readonly ModelPickerProfile[]): ProviderModelGroup[] {
+export function groupProviderModels(models: readonly vscode.LanguageModelChatInformation[], profiles: readonly ModelPickerProfile[], sources: readonly ProviderSourceDefinition[] = BUILTIN_PROVIDER_SOURCES): ProviderModelGroup[] {
 	const groups = new Map<string, ProviderModelGroup>();
 	const apiProfiles = new Map(profiles.map(profile => [`api-${profile.id}`, profile]));
 	const ensure = (key: string, label: string, description: string): ProviderModelGroup => {
@@ -33,19 +30,11 @@ export function groupProviderModels(models: readonly vscode.LanguageModelChatInf
 	// Keep an enabled profile visible even if its catalog is empty or unavailable.
 	for (const [key, profile] of apiProfiles) { if (profile.enabled) { ensure(key, profile.name, profile.baseUrl); } }
 	for (const model of models) {
-		let group: ProviderModelGroup;
-		if (decodeCodexModelId(model.id) !== undefined) { group = ensure("codex", "Codex", "ChatGPT subscription"); }
-		else if (decodeCocoModelId(model.id) !== undefined) { group = ensure("coco", "Coco", "Snowflake Cortex Code"); }
-		else if (decodeClaudeModelId(model.id) !== undefined) { group = ensure("claude", "Claude", "Claude subscription"); }
-		else {
-			const { sourceKey } = parseProviderModelId(model.id);
-			if (sourceKey?.startsWith("api-")) {
-				const profile = apiProfiles.get(sourceKey);
-				if (!profile?.enabled) { continue; }
-				group = ensure(sourceKey, profile.name, profile.baseUrl);
-			} else if (sourceKey === "deepseek") { group = ensure("deepseek", "DeepSeek", "DeepSeek API"); }
-			else { group = ensure(sourceKey ?? "primary", "Local LLM", "Local model server"); }
-		}
+		const sourceKey = providerSourceId(model.id);
+		const profile = apiProfiles.get(sourceKey);
+		if (sourceKey.startsWith("api-") && !profile?.enabled) { continue; }
+		const source = sources.find(item => item.id === sourceKey);
+		const group = ensure(sourceKey, profile?.name ?? source?.label ?? sourceKey, profile?.baseUrl ?? source?.description ?? "Registered model source");
 		if (!group.models.some(existing => existing.id === model.id)) { group.models.push(model); }
 	}
 	for (const group of groups.values()) { group.models.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)); }
@@ -53,8 +42,8 @@ export function groupProviderModels(models: readonly vscode.LanguageModelChatInf
 }
 
 /** Use the current chat's modelSelector; no prompt is sent and no new chat is requested. */
-export async function showProviderModelPicker(models: readonly vscode.LanguageModelChatInformation[], profiles: readonly ModelPickerProfile[], ui = defaultUI): Promise<void> {
-	const groups = groupProviderModels(models, profiles);
+export async function showProviderModelPicker(models: readonly vscode.LanguageModelChatInformation[], profiles: readonly ModelPickerProfile[], ui = defaultUI, sources: readonly ProviderSourceDefinition[] = BUILTIN_PROVIDER_SOURCES): Promise<void> {
+	const groups = groupProviderModels(models, profiles, sources);
 	const manage: ProviderModelItem = { label: "$(settings-gear) Manage providers", action: "manage", alwaysShow: true };
 	while (true) {
 		const providerItems: ProviderModelItem[] = groups.map(group => ({

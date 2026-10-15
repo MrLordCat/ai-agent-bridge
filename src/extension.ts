@@ -37,14 +37,16 @@ import { applyAgentHostThinkingPatch, findAgentHostBundle, getAgentHostThinkingP
 import { applyWorkbenchTerminalPatch, findWorkbenchBundle, getWorkbenchTerminalPatchStatus, restoreWorkbenchTerminalPatch } from "./byok/workbench-terminal-patch";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
-import { CocoChatModelProvider, type CocoProviderStatus } from "./coco/coco-provider";
+import { CocoChatModelProvider } from "./coco/coco-provider";
 import { showProviderModelPicker } from "./ui/provider-model-picker";
+import { BUILTIN_PROVIDER_SOURCES, ownsHttpModel, providerSourceId } from "./providers/provider-registry";
+import { providerSnapshots } from "./providers/provider-snapshot";
+import { usageProviderForSource } from "./token-usage-history";
 import { registerCursorBudgetCommand } from "./api-providers/cursor-budget-commands";
 import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
-import { parseProviderModelId } from "./model-sources/source-routing";
 import { getSubagentModelProfiles } from "./subagent-guidance";
 import { TokenUsageHistory, type TokenUsageSample } from "./token-usage-history";
 import {
@@ -62,13 +64,11 @@ interface ContextUsageDisplay {
 	tooltipLines: string[];
 }
 
-type RuntimeSource = "local" | "deepseek";
+type RuntimeSource = string;
 
 function runtimeSourceForModel(modelId: string): RuntimeSource {
-	const parsed = parseProviderModelId(modelId);
-	return parsed.sourceKey === "deepseek" || parsed.modelId.toLowerCase().includes("deepseek")
-		? "deepseek"
-		: "local";
+	const source = providerSourceId(modelId);
+	return source === "primary" ? "local" : source;
 }
 
 function formatNumber(value: number): string {
@@ -602,17 +602,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(apiProviderService);
 
 	// Unified provider directory: one status model for every source.
-	let lastCodexStatus: { state: string; summary: string } | undefined;
-	let lastClaudeStatus: { state: string; summary: string } | undefined;
-	let lastCocoStatus: CocoProviderStatus | undefined;
+	const subscriptionStatuses = new Map<string, { state: string; summary: string }>();
 	const providerDirectory = new ProviderDirectory({
 		getSecret: key => Promise.resolve(context.secrets.get(key)),
 		getConfigValue: (key, fallback) => vscode.workspace.getConfiguration(CONFIG_SECTION).get(key, fallback),
 		getApiProfiles: async () => apiProviderService.listSummaries(),
 		getApiProfileKey: id => apiProviderService.getApiKey(id),
-		getCodexStatus: () => lastCodexStatus,
-		getClaudeStatus: () => lastClaudeStatus,
-		getCocoStatus: () => lastCocoStatus,
+		getSubscriptionStatuses: () => subscriptionStatuses,
+		getProviderSources: () => compositeProvider.registry.sources,
 	});
 	context.subscriptions.push(providerDirectory);
 
@@ -634,7 +631,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
 	context.subscriptions.push(cocoProvider);
-	const compositeProvider = new CompositeChatModelProvider(llamaProvider, codexProvider, claudeProvider, cocoProvider);
+	const subscriptionProviders = [
+		{ id: "codex", provider: codexProvider },
+		{ id: "claude", provider: claudeProvider, onForeignRequest: () => claudeProvider.refreshSubscriptionUsage() },
+		{ id: "coco", provider: cocoProvider },
+	];
+	const compositeProvider = new CompositeChatModelProvider([
+		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel },
+		...subscriptionProviders.map(registration => ({ ...registration,
+			source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === registration.id),
+			ownsModel: (id: string) => providerSourceId(id) === registration.id,
+		})),
+	]);
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
 
@@ -644,43 +652,36 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	let lastHealthStatus: string | undefined;
 	let lastHealthEnriched: unknown | undefined;
 	const runtimeMetrics = new Map<RuntimeSource, ProviderRuntimeMetrics>();
-	const quickActionsProvider = new LlamaQuickActionsProvider(
-		() => lastThroughput,
-		() => lastContextUsage,
-		() => filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId()).length,
-		() => lastPromptCache,
-		() => sessionQuality.count === 0 ? "No turns" : `${sessionQuality.count} turns / cache ${sessionQuality.summary.cacheHitPercent ?? "n/a"}%`,
-		() => memoryService.expiredCount,
-		() => codexProvider.accountSummary,
-		() => claudeProvider.accountSummary,
-		() => claudeProvider.usageSummary,
-		() => claudeProvider.lastRequestUsage,
-		() => claudeProvider.subscriptionUsageLimits,
-		() => runtimeMetrics.get("local"),
-		() => runtimeMetrics.get("deepseek"),
-		() => codexProvider.runtimeMetrics,
-		() => claudeProvider.runtimeMetrics,
-		() => codexProvider.subscriptionUsageSummary,
-		() => getSubagentModelProfiles(),
-		() => tokenUsageHistory.summary,
-		() => usageExperiments.summary,
-		() => llamaProvider.deepSeekBalanceSummary,
-		() => codexProvider.codexUsageLimitPercent,
-		() => codexProvider.codexUsageLimitResetLabel,
-		() => codexProvider.codexUsageLimitWindowLabel,
-		() => claudeProvider.claudeUsageLimitPercent,
-		() => claudeProvider.claudeUsageLimitResetLabel,
-		() => estimateMemoryTokens(filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId())),
-		() => ({
-			total: apiProviderService.count,
-			enabled: apiProviderService.enabledCount,
-		}),
-		key => providerDirectory.stateOf(key),
-		() => memoryService.count,
-		() => apiProviderService.quickAccessApiProviders(),
-		() => codexProvider.codexUsageLimitSummaries,
-		() => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels })
-	);
+	const quickActionsProvider = new LlamaQuickActionsProvider({
+		getLastThroughput: () => lastThroughput,
+		getLastContextUsage: () => lastContextUsage,
+		getMemoryCount: () => filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId()).length,
+		getLastPromptCache: () => lastPromptCache,
+		getSessionSummary: () => sessionQuality.count === 0 ? "No turns" : `${sessionQuality.count} turns / cache ${sessionQuality.summary.cacheHitPercent ?? "n/a"}%`,
+		getExpiredMemoryCount: () => memoryService.expiredCount,
+		getClaudeUsage: () => claudeProvider.usageSummary,
+		getClaudeLastRequest: () => claudeProvider.lastRequestUsage,
+		getClaudeUsageLimits: () => claudeProvider.subscriptionUsageLimits,
+		getCodexSubscriptionUsage: () => codexProvider.subscriptionUsageSummary,
+		getSubagentProfiles: () => getSubagentModelProfiles(),
+		getTokenUsageHistory: () => tokenUsageHistory.summary,
+		getUsageExperiments: () => usageExperiments.summary,
+		getDeepSeekBalance: () => llamaProvider.deepSeekBalanceSummary,
+		getCodexUsageLimitPercent: () => codexProvider.codexUsageLimitPercent,
+		getCodexUsageLimitReset: () => codexProvider.codexUsageLimitResetLabel,
+		getCodexUsageLimitWindow: () => codexProvider.codexUsageLimitWindowLabel,
+		getClaudeUsageLimitPercent: () => claudeProvider.claudeUsageLimitPercent,
+		getClaudeUsageLimitReset: () => claudeProvider.claudeUsageLimitResetLabel,
+		getMemoryContextTokens: () => estimateMemoryTokens(filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId())),
+		getApiProviderSummary: () => ({ total: apiProviderService.count, enabled: apiProviderService.enabledCount }),
+		getTotalMemoryCount: () => memoryService.count,
+		getApiProviders: () => apiProviderService.quickAccessApiProviders(false),
+		getCodexUsageLimits: () => codexProvider.codexUsageLimitSummaries,
+		getCocoStatus: () => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels }),
+		getProviderSnapshots: () => providerSnapshots(providerDirectory.list(),
+			new Map([...runtimeMetrics, ["codex", codexProvider.runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}]]),
+			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
+	});
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(apiProviderService.onDidChangeContext(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(apiProviderService.onDidChangeBalance(() => quickActionsProvider.refresh()));
@@ -689,24 +690,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(usageExperiments.onDidChange(() => quickActionsProvider.refresh()));
-	context.subscriptions.push(codexProvider.onDidChangeStatus(status => {
-		lastCodexStatus = { state: status.state, summary: status.summary };
-		void providerDirectory.refresh();
-		quickActionsProvider.refresh();
-		ApiProviderManagerPanel.refreshIfOpen();
-	}));
-	context.subscriptions.push(claudeProvider.onDidChangeStatus(status => {
-		lastClaudeStatus = { state: status.state, summary: status.summary };
-		void providerDirectory.refresh();
-		quickActionsProvider.refresh();
-		ApiProviderManagerPanel.refreshIfOpen();
-	}));
-	context.subscriptions.push(cocoProvider.onDidChangeStatus(status => {
-		lastCocoStatus = status;
-		void providerDirectory.refresh();
-		quickActionsProvider.refresh();
-		ApiProviderManagerPanel.refreshIfOpen();
-	}));
+	for (const { id, provider } of subscriptionProviders) {
+		const onStatus = provider.onDidChangeStatus as vscode.Event<{ state: string; summary: string }>;
+		context.subscriptions.push(onStatus(status => {
+			subscriptionStatuses.set(id, { state: status.state, summary: status.summary });
+			void providerDirectory.refresh(); quickActionsProvider.refresh(); ApiProviderManagerPanel.refreshIfOpen();
+		}));
+	}
 	context.subscriptions.push(cocoProvider.onDidChangeLanguageModelChatInformation(() => quickActionsProvider.refresh()));
 	registerCocoCommands(context, cocoProvider, () => quickActionsProvider.refresh());
 	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
@@ -771,10 +761,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	cocoProvider.refreshLanguageModelChatInformation();
 	void cocoProvider.refreshStatus();
 	void codexProvider.refreshStatus().then(status => {
-		lastCodexStatus = { state: status.state, summary: status.summary };
+		subscriptionStatuses.set("codex", { state: status.state, summary: status.summary });
 	}).catch(error => logService.logError("codex.initial_status.failed", error));
 	void claudeProvider.refreshStatus().then(status => {
-		lastClaudeStatus = { state: status.state, summary: status.summary };
+		subscriptionStatuses.set("claude", { state: status.state, summary: status.summary });
 	}).catch(error => logService.logError("claude.initial_status.failed", error));
 	void providerDirectory.recheck().catch(error => logService.logError("providers.initial_recheck.failed", error));
 	void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.balance.initial_failed", error));
@@ -942,7 +932,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			sessionQuality.recordContext(usage);
 			lastContextUsage = formatContextUsage(usage);
 			const source = runtimeSourceForModel(usage.modelId);
-			const sourceLabel = source === "deepseek" ? "DeepSeek" : "Local";
+			const sourceLabel = providerDirectory.list().find(entry => entry.key === source)?.label ?? source;
 			runtimeMetrics.set(source, {
 				...runtimeMetrics.get(source),
 				modelId: usage.modelId,
@@ -984,9 +974,9 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			lastThroughput = tpsText;
 			lastPromptCache = cacheText;
 			const source = runtimeSourceForModel(metrics.modelId);
-			const sourceLabel = source === "deepseek" ? "DeepSeek" : "Local";
+						const sourceLabel = providerDirectory.list().find(entry => entry.key === source)?.label ?? source;
 			recordUsage({
-				provider: source,
+				provider: usageProviderForSource(source),
 				inputTokens: metrics.promptTokens,
 				outputTokens: metrics.outputTokens ?? metrics.estimatedOutputTokens,
 				cachedInputTokens: metrics.cachedPromptTokens,
@@ -1238,12 +1228,12 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				() => ({
 					deepSeek: { balance: llamaProvider.deepSeekBalanceSummary },
 					codex: {
-						summary: lastCodexStatus?.summary ?? codexProvider.accountSummary,
+						   summary: subscriptionStatuses.get("codex")?.summary ?? codexProvider.accountSummary,
 						usagePercent: codexProvider.codexUsageLimitPercent,
 						usageReset: codexProvider.codexUsageLimitResetLabel,
 					},
 					claude: {
-						summary: lastClaudeStatus?.summary ?? claudeProvider.accountSummary,
+						   summary: subscriptionStatuses.get("claude")?.summary ?? claudeProvider.accountSummary,
 						limits: claudeProvider.subscriptionUsageLimits.map(limit => ({
 							label: limit.label,
 							description: limit.description,
@@ -1770,7 +1760,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				cancelled = token.isCancellationRequested;
 				return result;
 			});
-			if (!cancelled) { await showProviderModelPicker(models, apiProviderService.list()); }
+			if (!cancelled) { await showProviderModelPicker(models, apiProviderService.list(), undefined, compositeProvider.registry.sources); }
 		} catch (error) {
 			if (error instanceof vscode.CancellationError) { return; }
 			logService.logError("models.grouped_picker.failed", error);

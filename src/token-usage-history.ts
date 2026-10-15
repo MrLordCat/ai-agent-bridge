@@ -1,7 +1,7 @@
 import * as vscode from "vscode";
 import { nonNegativeInteger } from "./utils";
 
-export type TokenUsageProvider = "local" | "deepseek" | "codex" | "claude";
+export type TokenUsageProvider = "local" | "deepseek" | "codex" | "claude" | "api";
 
 export interface TokenUsageSample {
 	provider: TokenUsageProvider;
@@ -54,7 +54,13 @@ export const TOKEN_USAGE_PROVIDERS: readonly TokenUsageProvider[] = [
 	"deepseek",
 	"codex",
 	"claude",
+	"api",
 ];
+
+export function usageProviderForSource(sourceId: string): TokenUsageProvider {
+	if (sourceId === "primary" || sourceId === "local") { return "local"; }
+	return TOKEN_USAGE_PROVIDERS.includes(sourceId as TokenUsageProvider) ? sourceId as TokenUsageProvider : "api";
+}
 
 export function emptyTokenUsageAggregate(): TokenUsageAggregate {
 	return {

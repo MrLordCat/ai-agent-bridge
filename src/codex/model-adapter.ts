@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { modelInformation } from "../providers/model-descriptor";
 
 import type { CodexModel, CodexRateLimitSnapshot, CodexRateLimitWindow } from "./protocol";
 
@@ -61,20 +62,20 @@ export function mapCodexModelInformation(
 	maxOutputTokens: number
 ): vscode.LanguageModelChatInformation {
 	const outputTokens = Math.max(1024, Math.min(contextLength - 1, Math.floor(maxOutputTokens)));
-	const info: vscode.LanguageModelChatInformation & Record<string, unknown> = {
+	const info = modelInformation({
 		id: encodeCodexModelId(model.id),
 		name: `${model.displayName} (Codex)` ,
 		family: "codex",
 		version: model.model || model.id,
-		maxInputTokens: Math.max(1, Math.floor(contextLength) - outputTokens),
-		maxOutputTokens: outputTokens,
+		contextWindowTokens: contextLength,
+		outputTokens,
 		capabilities: {
 			toolCalling: true,
 			imageInput: model.inputModalities.includes("image"),
 		},
 		tooltip: `${model.description}\nOpenAI Codex through your ChatGPT subscription`,
 		detail: `${model.isDefault ? "Default / " : ""}ChatGPT subscription`,
-	};
+	});
 	info.isUserSelectable = true;
 	info.multiplierNumeric = 0;
 	info.model_picker_enabled = true;

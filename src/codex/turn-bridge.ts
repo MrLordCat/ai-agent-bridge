@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { PendingToolRegistry } from "../tools/delegated-turn-state";
 
 import { asRecord, truncate } from "../utils";
 import type { LlamaLogSink } from "../logger";
@@ -137,7 +138,7 @@ export function isCodexInternalActionItem(item: Record<string, unknown>): boolea
 /** Keeps one app-server turn alive while Copilot executes native tool cards. */
 export class CodexTurnBridge implements vscode.Disposable {
 	private boundary = deferred<CodexTurnBoundary>();
-	private readonly pendingTools = new Map<string, PendingToolResponse>();
+	private readonly pendingTools = new PendingToolRegistry<PendingToolResponse>();
 	private readonly reportedToolCallIds = new Set<string>();
 	private pendingToolTimer: NodeJS.Timeout | undefined;
 	private delegationScheduled = false;
@@ -190,14 +191,13 @@ export class CodexTurnBridge implements vscode.Disposable {
 		this.notificationDisposable = client.onNotification(notification => this.handleNotification(notification));
 		this.stopDisposable = client.onDidStop(error => {
 			this.rejectBoundary(error);
-			for (const pending of this.pendingTools.values()) {
+			this.pendingTools.settleAll(pending => {
 				this.finishToolMetric(pending.call.callId, "failed");
 				pending.resolve({
 					contentItems: [{ type: "inputText", text: "Codex app-server stopped before the tool completed." }],
 					success: false,
 				});
-			}
-			this.pendingTools.clear();
+			});
 			this.reportedToolCallIds.clear();
 			this.onMetricsChanged?.(this);
 			this.onToolTimeout?.(this, "client-stopped");
@@ -323,20 +323,15 @@ export class CodexTurnBridge implements vscode.Disposable {
 		this.reconcilePollCount = 0;
 		this.lastReconcileStatus = undefined;
 		this.attach(progress, token);
-		for (const callId of [...this.reportedToolCallIds]) {
-			const pending = this.pendingTools.get(callId);
-			const response = responses.get(callId);
-			if (pending && response) {
+		this.pendingTools.accept([...responses], ([callId]) => callId, (pending, [callId, response]) => {
 				const metric = this.delegatedToolMetrics.get(callId);
 				if (metric && metric.completedAt === undefined) {
 					metric.completedAt = Date.now();
 					metric.status = response.success ? "completed" : "failed";
 				}
 				pending.resolve(response);
-				this.pendingTools.delete(callId);
-			}
-			this.reportedToolCallIds.delete(callId);
-		}
+		}, pending => this.reportedToolCallIds.has(pending.call.callId));
+		this.reportedToolCallIds.clear();
 		this.onMetricsChanged?.(this);
 		if (this.pendingTools.size > 0) {
 			this.reportPendingToolCalls();

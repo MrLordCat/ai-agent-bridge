@@ -677,7 +677,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => undefined,
 			() => 0,
 			() => ({ total: 0, enabled: 0 }),
-			key => (stateMap[key] as "offline" | "online" | undefined)
+			(key: string) => (stateMap[key] as "offline" | "online" | undefined)
 		);
 
 		const labels = (await getItems(provider)).map(labelOf);

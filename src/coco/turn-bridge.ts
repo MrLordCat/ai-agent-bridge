@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { DelegatedTurnState } from "../tools/delegated-turn-state";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
 import { CocoResponseStream } from "./response-stream";
 import { selectCocoChatTools } from "./terminal-tools";
@@ -25,18 +26,16 @@ export const COCO_CHAT_TOOL_POLICY = [
 /** Keep native Chat call IDs and their ACP promises alive across model-provider requests. */
 export class CocoTurnBridge implements vscode.Disposable {
 	private readonly tools = new Map<string, vscode.LanguageModelChatTool>();
-	private readonly pending = new Map<string, PendingCall>();
-	private readonly queuedUpdates: JsonObject[] = [];
-	private queuedChars = 0;
+	private readonly state = new DelegatedTurnState<PendingCall, JsonObject>();
+	private get pending() { return this.state.pending; }
 	private stream?: CocoResponseStream;
 	private latestUsage?: JsonObject;
 	private progress?: vscode.Progress<vscode.LanguageModelResponsePart>;
 	private cancellation?: vscode.Disposable;
-	private boundary?: { resolve: () => void; reject: (error: Error) => void };
 	private idleTimer?: NodeJS.Timeout;
 	private delegationScheduled = false;
-	private terminal = false;
-	private error?: Error;
+	private get terminal() { return this.state.terminal; }
+	private get error() { return this.state.error; }
 
 	constructor(
 		advertisedTools: readonly vscode.LanguageModelChatTool[],
@@ -84,16 +83,11 @@ export class CocoTurnBridge implements vscode.Disposable {
 	): Promise<void> {
 		const completion = this.attach(progress, token);
 		const returnedIds = new Set(results.map(result => result.callId));
-		if ([...this.pending].some(([id, call]) => call.reported && !returnedIds.has(id))) {
+		if (this.pending.missing(returnedIds, call => call.reported).length) {
 			this.finish(new Error("Coco needs the results of every Chat tool call in the batch before continuing."));
 			return completion;
 		}
-		for (const result of results) {
-			const call = this.pending.get(result.callId);
-			if (!call?.reported) { continue; }
-			this.pending.delete(result.callId);
-			call.resolve(convertCocoToolResult(result));
-		}
+		this.pending.accept(results, result => result.callId, (call, result) => call.resolve(convertCocoToolResult(result)), call => call.reported);
 		this.reportCalls();
 		return completion;
 	}
@@ -117,12 +111,8 @@ export class CocoTurnBridge implements vscode.Disposable {
 		}
 		if (update.sessionUpdate !== "agent_message_chunk" && update.sessionUpdate !== "agent_thought_chunk") { return; }
 		if (this.stream) { this.stream.accept(update); return; }
-		this.queuedChars += JSON.stringify(update).length;
-		if (this.queuedChars > 500_000) {
-			this.finish(new Error("Coco produced too much output while waiting for a Chat tool result."));
-			return;
-		}
-		this.queuedUpdates.push(update);
+		try { this.state.enqueue(update, JSON.stringify(update).length); }
+		catch (error) { this.finish(error instanceof Error ? error : new Error(String(error))); }
 	}
 
 	delegate(alias: string, input: unknown): Promise<JsonObject> {
@@ -149,18 +139,17 @@ export class CocoTurnBridge implements vscode.Disposable {
 	dispose(): void { this.finish(new vscode.CancellationError()); }
 
 	private attach(progress: vscode.Progress<vscode.LanguageModelResponsePart>, token: vscode.CancellationToken): Promise<void> {
-		if (this.boundary) { return Promise.reject(new Error("Coco already has an active Chat response.")); }
+		if (this.state.attached) { return Promise.reject(new Error("Coco already has an active Chat response.")); }
 		if (this.terminal) { return this.error ? Promise.reject(this.error) : Promise.resolve(); }
 		clearTimeout(this.idleTimer);
 		this.idleTimer = undefined;
 		this.progress = progress;
 		this.stream = new CocoResponseStream(progress, token);
 		if (this.latestUsage) { this.stream.accept(this.latestUsage); }
-		const completion = new Promise<void>((resolve, reject) => { this.boundary = { resolve, reject }; });
+		const completion = this.state.attach();
 		this.cancellation = token.onCancellationRequested(() => this.finish(new vscode.CancellationError()));
 		if (token.isCancellationRequested) { this.finish(new vscode.CancellationError()); return completion; }
-		for (const update of this.queuedUpdates.splice(0)) { this.stream.accept(update); }
-		this.queuedChars = 0;
+		for (const update of this.state.takeOutput()) { this.stream.accept(update); }
 		return completion;
 	}
 
@@ -177,7 +166,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		this.delegationScheduled = true;
 		setImmediate(() => {
 			this.delegationScheduled = false;
-			if (!this.boundary || this.terminal) { return; }
+			if (!this.state.attached || this.terminal) { return; }
 			this.detach();
 			// A stopped chat may never return results. Retire that CLI rather than leak it.
 			this.idleTimer = setTimeout(() => this.finish(new Error("Coco Chat tool continuation expired.")), this.idleTimeoutMs);
@@ -186,23 +175,16 @@ export class CocoTurnBridge implements vscode.Disposable {
 	}
 
 	private detach(error?: Error): void {
-		const boundary = this.boundary;
-		this.boundary = undefined;
 		this.progress = undefined;
 		this.stream = undefined;
 		this.cancellation?.dispose();
 		this.cancellation = undefined;
-		if (error) { boundary?.reject(error); } else { boundary?.resolve(); }
+		this.state.release(error);
 	}
 
 	private finish(error?: Error): void {
-		if (this.terminal) { return; }
-		this.terminal = true;
-		this.error = error;
+		if (!this.state.finish(error, call => call.resolve({ error: "Chat tool delegation stopped." }))) { return; }
 		clearTimeout(this.idleTimer);
-		for (const call of this.pending.values()) { call.resolve({ error: "Chat tool delegation stopped." }); }
-		this.pending.clear();
-		this.queuedUpdates.length = 0;
 		this.detach(error);
 		this.onStop(error);
 	}

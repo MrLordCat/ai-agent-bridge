@@ -1,6 +1,8 @@
 
 import * as vscode from "vscode";
-import { CursorProfileTransport } from "./cursor/profile-transport";
+import { ApiSourceRouter } from "./providers/api-source-router";
+import { modelInformation } from "./providers/model-descriptor";
+import { AsyncResourceCache } from "./providers/async-resource-cache";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -109,7 +111,6 @@ import {
     getChatCompletionsEndpoint,
     getModelsEndpoint,
     getModelCatalogEntries,
-    isCursorCloudAgentBase,
     cloudflareSessionAffinity,
     isCloudflareWorkersAiBase,
     isDeepSeekEndpoint,
@@ -125,19 +126,6 @@ type ToolResultModeConfig = "auto" | "tool" | "user";
 type ToolCallingModeConfig = "classic" | "apiDirect";
 
 const MAX_CONTEXT_LENGTH = 1048576;
-interface ModelListCacheEntry {
-    serverUrl: string;
-    apiKeyPresent: boolean;
-    fetchedAt: number;
-    models: LlamaCppModelInfo[];
-}
-
-interface ModelListInflightEntry {
-    serverUrl: string;
-    apiKeyPresent: boolean;
-    promise: Promise<LlamaCppModelInfo[]>;
-}
-
 interface RuntimeContextCacheEntry {
     serverUrl: string;
     apiKeyPresent: boolean;
@@ -532,8 +520,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     readonly onDidUpdateContextUsage = this._onDidUpdateContextUsage.event;
     private readonly _onDidCompleteChatTurn = new vscode.EventEmitter<LlamaChatTurnMetrics>();
     readonly onDidCompleteChatTurn = this._onDidCompleteChatTurn.event;
-    private readonly modelListCache = new Map<string, ModelListCacheEntry>();
-    private readonly modelListInflight = new Map<string, ModelListInflightEntry>();
+    private readonly modelListCache = new AsyncResourceCache<LlamaCppModelInfo[]>();
+    private readonly catalogCredentials = new Map<string, { key?: string; revision: number }>();
     private readonly runtimeContextCache = new Map<string, RuntimeContextCacheEntry>();
     private readonly cachePrefixSnapshots = new BoundedMap<string, CachePrefixSnapshot>(32);
     private readonly stableToolCatalogs = new BoundedMap<string, StableToolCatalogSnapshot>(32);
@@ -611,7 +599,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
      * @param secrets - VS Code secret storage for storing server URL and API key.
      * @param userAgent - User agent string to include in HTTP requests.
      */
-	private readonly cursorTransport = new CursorProfileTransport();
+    private readonly sourceRouter = new ApiSourceRouter();
 
     constructor(
         secrets: vscode.SecretStorage,
@@ -633,7 +621,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     refreshLanguageModelChatInformation(): void {
-		this.cursorTransport.refresh();
+    this.sourceRouter.refresh();
         this.modelListCache.clear();
         this.runtimeContextCache.clear();
         this.serverTokenCounter.clear();
@@ -641,7 +629,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         this._onDidChangeLanguageModelChatInformation.fire();
     }
 
-	disposeCursorTransport(): void { this.cursorTransport.dispose(); }
+    disposeCursorTransport(): void { this.sourceRouter.dispose(); }
 
     /**
      * Arms one provider-owned manual compaction for a Copilot conversation.
@@ -1761,6 +1749,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
     private getSourceCacheKey(sourceKey: string, serverUrl: string, apiKeyPresent: boolean): string {
         return `${sourceKey}|${this.normalizeServerUrl(serverUrl)}|key=${apiKeyPresent ? "1" : "0"}`;
+    }
+
+    private getCatalogCacheKey(source: ChatModelSource): string {
+        const previous = this.catalogCredentials.get(source.key);
+        if (!previous || previous.key !== source.apiKey) {
+            this.catalogCredentials.set(source.key, { key: source.apiKey, revision: (previous?.revision ?? 0) + 1 });
+        }
+        return `${source.key}|${this.normalizeServerUrl(source.serverUrl)}|revision=${this.catalogCredentials.get(source.key)!.revision}`;
     }
 
     private parsePositiveInt(value: unknown): number | undefined {
@@ -3596,34 +3592,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     }
 
     private getFreshCachedModels(source: ChatModelSource, apiKeyPresent: boolean, ttlMs: number): LlamaCppModelInfo[] | undefined {
-        const cached = this.modelListCache.get(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent));
-        if (ttlMs <= 0 || !cached || !this.isCacheStillValid(cached, source.serverUrl, apiKeyPresent)) {
-            return undefined;
-        }
-
-        if (Date.now() - cached.fetchedAt > ttlMs) {
-            return undefined;
-        }
-
-        return cached.models;
+        void apiKeyPresent;
+        return this.modelListCache.peek(this.getCatalogCacheKey(source), ttlMs);
     }
 
     private getAnyCachedModels(source: ChatModelSource, apiKeyPresent: boolean): LlamaCppModelInfo[] | undefined {
-        const cached = this.modelListCache.get(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent));
-        if (!cached || !this.isCacheStillValid(cached, source.serverUrl, apiKeyPresent)) {
-            return undefined;
-        }
-
-        return cached.models;
-    }
-
-    private cacheModels(source: ChatModelSource, apiKeyPresent: boolean, models: LlamaCppModelInfo[]): void {
-        this.modelListCache.set(this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent), {
-            serverUrl: source.serverUrl,
-            apiKeyPresent,
-            fetchedAt: Date.now(),
-            models,
-        });
+        void apiKeyPresent;
+        return this.modelListCache.peek(this.getCatalogCacheKey(source));
     }
 
     private getFreshCachedRuntimeContextLength(
@@ -3763,25 +3738,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         apiKey: string | undefined,
         apiKeyPresent: boolean
     ): Promise<LlamaCppModelInfo[]> {
-        const serverUrl = source.serverUrl;
-        const cacheKey = this.getSourceCacheKey(source.key, serverUrl, apiKeyPresent);
-        const currentInflight = this.modelListInflight.get(cacheKey);
-        if (currentInflight && currentInflight.serverUrl === serverUrl && currentInflight.apiKeyPresent === apiKeyPresent) {
-            this.log("models.request.inflight_join", { serverUrl, apiKeyPresent });
-            return currentInflight.promise;
-        }
-
-        const fetchPromise = this.fetchModels(serverUrl, apiKey).finally(() => {
-            if (this.modelListInflight.get(cacheKey)?.promise === fetchPromise) {
-                this.modelListInflight.delete(cacheKey);
-            }
-        });
-        this.modelListInflight.set(cacheKey, {
-            serverUrl,
-            apiKeyPresent,
-            promise: fetchPromise,
-        });
-        return fetchPromise;
+        void apiKeyPresent;
+        const models = await this.modelListCache.get(this.getCatalogCacheKey(source), () => this.fetchModels(source.serverUrl, apiKey), { ttlMs: 0 });
+        if (!models) { throw new vscode.CancellationError(); }
+        return models;
     }
 
     private async getModelSources(): Promise<ChatModelSource[]> {
@@ -3850,7 +3810,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             contextLength,
             configuredOutputCap
         );
-        const maxInputTokens = Math.max(1, contextLength - maxOutputTokens);
         const maxTools = this.clampInt(this.getConfig().get("maxToolsPerRequest", 128), 0, 128, 128);
 
         // DeepSeek's /models endpoint returns only {id, object, owned_by}, so
@@ -3877,20 +3836,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             capabilities.includes("multimodal") ||
             (family === "deepseek" && isDeepSeekVisionModel(model.id));
 
-        const info: LanguageModelChatInformation & Record<string, unknown> = {
+        const info = modelInformation({
             id: encodeProviderModelId(source.key, model.id),
             name: `${model.id} (${source.label})`,
             tooltip: `Model: ${model.id}\nSource: ${source.label}\nServer: ${source.serverUrl}\nContext: ${contextLength} tokens`,
             detail: `${source.label} / ${family} / ctx ${contextLength}`,
             family,
             version: "1.0.0",
-            maxInputTokens,
-            maxOutputTokens,
+            contextWindowTokens: contextLength,
+            outputTokens: maxOutputTokens,
+            contextOrigin: runtimeContextLength !== undefined ? "observed" : this.getServerReportedModelContextLength(model) === undefined ? "fallback" : "reported",
             capabilities: {
                 toolCalling: maxTools > 0,
                 imageInput,
             },
-        };
+        });
 
         // Some model pickers (for example Copilot's BYOK picker pipeline) check these non-typed flags.
         info.isUserSelectable = true;
@@ -3917,12 +3877,10 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const modelListCacheTtlMs = this.getModelListCacheTtlMs();
         const allEntries: LanguageModelChatInformation[] = [];
 
-        await Promise.all(sources.map(async source => {
-            if (source.protocol === "cursor" || isCursorCloudAgentBase(source.serverUrl)) {
-				try { allEntries.push(...await this.cursorTransport.models(source, token, this.userAgent, this.onApiContextMaximum)); }
-				catch (error) { this.logError("models.cursor.fetch_error", error, { source: source.key }); }
-                return;
-            }
+        await Promise.all(sources.map(async source => this.sourceRouter.discover(source, {
+            token, version: this.userAgent, recordMaximum: this.onApiContextMaximum,
+            report: entries => { allEntries.push(...entries); },
+        }, async () => {
             const apiKeyPresent = Boolean(source.apiKey);
             const runtimeContextLength = await this.getRuntimeContextLengthWithCache(
                 source,
@@ -3963,7 +3921,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
 
             try {
                 const models = await this.fetchModelsWithInflightCache(source, source.apiKey, apiKeyPresent);
-                this.cacheModels(source, apiKeyPresent, models);
                 this.publishApiContextMaximum(models, source, runtimeContextLength);
                 const entries = models.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                 allEntries.push(...entries);
@@ -4002,7 +3959,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     console.error(`[Llama.cpp Provider] Failed to fetch models from ${source.label}`, err);
                 }
             }
-        }));
+        }).catch(error => { this.logError("models.source.fetch_error", error, { source: source.key }); })));
 
         const sortedEntries = allEntries.sort((a, b) => a.name.localeCompare(b.name));
         const localProfiles = sortedEntries
@@ -4046,7 +4003,7 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     ): Promise<number> {
         const startedAt = Date.now();
         try {
-            return await super.provideTokenCount(model, text, token);
+            return await this.sourceRouter.countTokens(model, () => super.provideTokenCount(model, text, token));
         } finally {
             this.tokenCountCalls += 1;
             this.tokenCountMs += Date.now() - startedAt;
@@ -4073,10 +4030,13 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         token: CancellationToken
     ): Promise<void> {
         const { source, modelId: requestModelId } = await this.resolveSourceForModel(model);
-        if (source.protocol === "cursor" || isCursorCloudAgentBase(source.serverUrl)) {
-            await this.cursorTransport.respond(source, requestModelId, model, messages, options, progress, token);
-            return;
-        }
+        return this.sourceRouter.respond(source, { modelId: requestModelId, model, messages, options, progress, token },
+            () => this.respondHttp(source, requestModelId, model, messages, options, progress, token));
+    }
+
+    private async respondHttp(source: ChatModelSource, requestModelId: string, model: LanguageModelChatInformation,
+        messages: readonly LanguageModelChatMessage[], options: ProvideLanguageModelChatResponseOptions,
+        progress: Progress<LanguageModelResponsePart>, token: CancellationToken): Promise<void> {
         const serverUrl = source.serverUrl;
         const apiKey = source.apiKey;
         const apiKeyPresent = Boolean(apiKey);

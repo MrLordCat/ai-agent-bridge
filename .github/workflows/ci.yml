@@ -4,37 +4,15 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: win32-x64
-          - os: ubuntu-latest
-            target: linux-x64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - name: Test Windows
-        if: runner.os == 'Windows'
-        run: npm test
-      - name: Test Linux
-        if: runner.os == 'Linux'
-        run: xvfb-run -a npm test
-      - run: npm run package -- --target ${{ matrix.target }} --out llama-vscode-chat-${{ matrix.target }}.vsix
-      - uses: actions/upload-artifact@v7
-        with:
-          name: llama-vscode-chat-${{ matrix.target }}
-          path: llama-vscode-chat-${{ matrix.target }}.vsix
+    uses: ./.github/workflows/verify.yml

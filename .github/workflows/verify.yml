@@ -1,0 +1,69 @@
+name: Verify and package
+
+on:
+  workflow_call:
+    inputs:
+      package-prefix:
+        type: string
+        default: llama-vscode-chat
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        vscode: ["1.131.0", "1.141.0"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check:metadata
+      - run: npm run lint
+      - name: Validate release tag and notes
+        if: github.ref_type == 'tag'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/check-repository.mjs --release
+      - name: Test Windows
+        if: runner.os == 'Windows'
+        run: npm test -- --code-version ${{ matrix.vscode }}
+      - name: Test Linux
+        if: runner.os == 'Linux'
+        run: xvfb-run -a npm test -- --code-version ${{ matrix.vscode }}
+
+  package:
+    needs: test
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: win32-x64
+          - os: ubuntu-latest
+            target: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run compile
+      - run: npm run package -- --target ${{ matrix.target }} --out ${{ inputs.package-prefix }}-${{ matrix.target }}.vsix
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vsix-${{ matrix.target }}
+          path: ${{ inputs.package-prefix }}-${{ matrix.target }}.vsix
+          if-no-files-found: error
+          retention-days: 7

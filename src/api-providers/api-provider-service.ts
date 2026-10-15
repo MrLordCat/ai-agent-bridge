@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { AsyncResourceCache } from "../providers/async-resource-cache";
 import * as vscode from "vscode";
 
 import {
@@ -91,6 +92,7 @@ export interface QuickAccessApiProvider {
 	enabled: boolean;
 	hasApiKey: boolean;
 	balance?: ApiProviderBalanceInfo;
+	balanceUpdating?: boolean;
 }
 
 const PROTOCOLS = new Set<ApiRequestProtocol>(["openai", "deepseek", "llamacpp", "cursor"]);
@@ -245,13 +247,27 @@ export class ApiProviderService implements vscode.Disposable {
 		return this.list().filter(profile => profile.enabled).length;
 	}
 
-	private readonly balances = new Map<string, { info: ApiProviderBalanceInfo; fetchedAt: number }>();
-	private readonly balanceInflight = new Map<string, Promise<ApiProviderBalanceInfo | undefined>>();
-	private readonly balanceRevisions = new Map<string, number>();
+	private readonly balances = new AsyncResourceCache<ApiProviderBalanceInfo>(() => Date.now());
+	private readonly backgroundBalances = new Map<string, Promise<void>>();
+	private readonly backgroundBalanceChecks = new Map<string, number>();
 
 	private invalidateBalance(id: string): void {
-		this.balances.delete(id); this.balanceInflight.delete(id);
-		this.balanceRevisions.set(id, (this.balanceRevisions.get(id) ?? 0) + 1);
+		this.balances.invalidate(id);
+		this.backgroundBalances.delete(id);
+		this.backgroundBalanceChecks.delete(id);
+	}
+
+	private refreshBalanceInBackground(id: string, ttlMs: number): void {
+		if (this.balances.peek(id, ttlMs) || this.backgroundBalances.has(id)) { return; }
+		const checkedAt = this.backgroundBalanceChecks.get(id);
+		if (checkedAt !== undefined && Date.now() - checkedAt < ttlMs) { return; }
+		this.backgroundBalanceChecks.set(id, Date.now());
+		const pending = this.getBalanceInfo(id).then(() => undefined, () => undefined).finally(() => {
+			if (this.backgroundBalances.get(id) !== pending) { return; }
+			this.backgroundBalances.delete(id);
+			this._onDidChangeBalance.fire();
+		});
+		this.backgroundBalances.set(id, pending);
 	}
 
 	getCursorBudgetUserEmail(id: string): string | undefined {
@@ -289,45 +305,26 @@ export class ApiProviderService implements vscode.Disposable {
 		if (!profile || !profile.enabled) {
 			return undefined;
 		}
-		if (force) { this.invalidateBalance(id); }
-		const revision = this.balanceRevisions.get(id) ?? 0;
-		const cached = this.balances.get(id);
 		// Leave room for API latency so the 60-second view timer refreshes Cursor each tick.
 		const cacheTtl = isCursorCloudAgentBase(profile.baseUrl) ? 55_000 : 60_000;
-		if (cached && Date.now() - cached.fetchedAt < cacheTtl) {
-			return cached.info;
-		}
-		const inFlight = this.balanceInflight.get(id);
-		if (inFlight) {
-			return inFlight;
-		}
-		const promise = (async () => {
+		return this.balances.get(id, async () => {
 			const apiKey = await this.getApiKey(id);
 			const access = isCursorCloudAgentBase(profile.baseUrl) ? { adminApiKey: await this.secrets.get(cursorBudgetAdminSecretKey(id)), userEmail: this.getCursorBudgetUserEmail(id) } : {};
 			if (!apiKey && !access.adminApiKey) {
 				return undefined;
 			}
-			const info = await fetchApiProviderBalance(profile.baseUrl, apiKey ?? "", access);
-			if ((this.balanceRevisions.get(id) ?? 0) !== revision) { return undefined; }
-			if (info) {
-				this.balances.set(id, { info, fetchedAt: Date.now() });
-			}
-			return info;
-		})();
-		this.balanceInflight.set(id, promise);
-		try {
-			return await promise;
-		} finally {
-			if (this.balanceInflight.get(id) === promise) { this.balanceInflight.delete(id); }
-		}
+			return fetchApiProviderBalance(profile.baseUrl, apiKey ?? "", access);
+		}, { ttlMs: cacheTtl, force });
 	}
 
-	/** Enabled profiles enriched with their (cached) balance info, for Quick Access. */
-	async quickAccessApiProviders(): Promise<QuickAccessApiProvider[]> {
+	/** Tree rendering uses cached balances; background loads publish a separate update. */
+	async quickAccessApiProviders(refreshBalances = true): Promise<QuickAccessApiProvider[]> {
 		const summaries = await this.listSummaries();
 		return Promise.all(summaries
 			.filter(profile => profile.enabled)
-			.map(async profile => ({
+			.map(async profile => {
+				if (!refreshBalances) { this.refreshBalanceInBackground(profile.id, isCursorCloudAgentBase(profile.baseUrl) ? 55_000 : 60_000); }
+				return {
 				id: profile.id,
 				name: profile.name,
 				baseUrl: profile.baseUrl,
@@ -337,8 +334,10 @@ export class ApiProviderService implements vscode.Disposable {
 				llamaCppCompat: profile.llamaCppCompat,
 				enabled: profile.enabled,
 				hasApiKey: profile.hasApiKey,
-				balance: await this.getBalanceInfo(profile.id),
-			})));
+				balance: refreshBalances ? await this.getBalanceInfo(profile.id) : this.balances.peek(profile.id),
+				balanceUpdating: !refreshBalances && this.backgroundBalances.has(profile.id),
+			};
+			}));
 	}
 
 	list(): ApiProviderProfile[] {
@@ -463,6 +462,8 @@ export class ApiProviderService implements vscode.Disposable {
 	}
 
 	dispose(): void {
+		this.backgroundBalances.clear(); this.backgroundBalanceChecks.clear();
+		this.balances.clear();
 		this._onDidChange.dispose();
 		this._onDidChangeContext.dispose();
 		this._onDidChangeBalance.dispose();

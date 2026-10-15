@@ -4,6 +4,7 @@ import {
         isCursorCloudAgentBase,
 } from "../transport/openai-http";
 import { fetchCursorBudget, type CursorBudgetAccess } from "./cursor-budget";
+import type { ProviderUsage } from "../providers/provider-snapshot";
 
 /**
  * Human-readable balance/usage info for a custom API provider, fetched from
@@ -19,6 +20,7 @@ import { fetchCursorBudget, type CursorBudgetAccess } from "./cursor-budget";
  *    (the row is hidden).
  */
 export interface ApiProviderBalanceInfo {
+        usage?: ProviderUsage;
         label?: string;
         summary: string;
         tooltip: string;

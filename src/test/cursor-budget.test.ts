@@ -27,6 +27,40 @@ function serviceFixture() {
 }
 
 suite("Cursor team budget", () => {
+	test("renders cached profile metadata while the budget request is still pending", async () => {
+		const originalFetch = globalThis.fetch, f = serviceFixture();
+		let release!: (value: Response) => void, signalStarted!: () => void, calls = 0;
+		const started = new Promise<void>(resolve => { signalStarted = resolve; });
+		globalThis.fetch = async () => { calls++; signalStarted(); return new Promise<Response>(resolve => { release = resolve; }); };
+		try {
+			const profile = await f.service.upsert({ name: "Cursor", baseUrl: "https://api.cursor.com/v1" }, { apiKey: "key" });
+			await f.service.setCursorBudgetAccess(profile.id, { userEmail: "developer@company.com" });
+			const refreshed = new Promise<void>(resolve => { f.service.onDidChangeBalance(() => resolve()); });
+			const first = await f.service.quickAccessApiProviders(false);
+			assert.strictEqual(first.length, 1); assert.strictEqual(first[0].balance, undefined);
+			assert.strictEqual(first[0].balanceUpdating, true);
+			await started; assert.strictEqual(calls, 1);
+			await f.service.quickAccessApiProviders(false); assert.strictEqual(calls, 1);
+			release(response({ teamMemberSpend: [member()] })); await refreshed;
+			const updated = await f.service.quickAccessApiProviders(false);
+			assert.strictEqual(updated[0].balance?.summary, "$75.50 left");
+			assert.strictEqual(updated[0].balanceUpdating, false); assert.strictEqual(calls, 1);
+		} finally { release?.(response({})); globalThis.fetch = originalFetch; f.dispose(); }
+	});
+
+	test("does not repeatedly refresh providers without a supported balance endpoint", async () => {
+		const f = serviceFixture(); let loads = 0;
+		const load = f.service.getBalanceInfo.bind(f.service);
+		f.service.getBalanceInfo = async (...args) => { loads++; return load(...args); };
+		try {
+			await f.service.upsert({ name: "Plain API", baseUrl: "https://example.test/v1" }, { apiKey: "key" });
+			const refreshed = new Promise<void>(resolve => { f.service.onDidChangeBalance(() => resolve()); });
+			await f.service.quickAccessApiProviders(false); await refreshed;
+			await f.service.quickAccessApiProviders(false); await f.service.quickAccessApiProviders(false);
+			assert.strictEqual(loads, 1);
+		} finally { f.dispose(); }
+	});
+
 	test("reads the exact user and enforced limit with cents converted separately from included usage", async () => {
 		const b = backend({ teamMemberSpend: [member({ email: "other@company.com", effectivePerUserLimitDollars: 5000 }), member()] });
 		const info = await fetchCursorBudget("chat-key", {}, b.fetchImpl);

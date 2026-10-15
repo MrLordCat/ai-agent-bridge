@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { PendingToolRegistry } from "../tools/delegated-turn-state";
 import { z, type ZodType } from "zod";
 
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
@@ -480,7 +481,7 @@ export function resolveClaudeCodeBinary(): string | undefined {
 
 export class ClaudeAgentSession implements vscode.Disposable {
 	private readonly input = new AsyncMessageQueue();
-	private readonly pendingTools = new Map<string, PendingToolCall>();
+	private readonly pendingTools = new PendingToolRegistry<PendingToolCall>();
 	private readonly queuedToolCalls: PendingToolCall[] = [];
 	private query: Query | undefined;
 	private pump: Promise<void> | undefined;
@@ -591,17 +592,10 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		}
 		await this.ensureStarted();
 		const completion = this.attachTurn(progress, token);
-		let resolved = 0;
-		for (const result of results) {
-			const pending = this.pendingTools.get(result.callId);
-			if (!pending) {
-				continue;
-			}
-			this.pendingTools.delete(result.callId);
+		const resolved = this.pendingTools.accept(results, result => result.callId, (pending, result) => {
 			this.finishToolStep(pending, "completed");
 			pending.resolve(convertToolResult(result));
-			resolved++;
-		}
+		});
 		if (resolved === 0) {
 			this.failActiveTurn(new Error("Claude tool continuation no longer exists"), "failed");
 		} else {
@@ -712,11 +706,10 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		this.streamClosed = true;
 		this.input.close();
 		this.query?.close();
-		for (const pending of this.pendingTools.values()) {
+		this.pendingTools.settleAll(pending => {
 			this.finishToolStep(pending, "cancelled");
 			pending.reject(new Error("Claude session closed before the VS Code tool returned"));
-		}
-		this.pendingTools.clear();
+		});
 		this.queuedToolCalls.length = 0;
 		this.failActiveTurn(new Error("Claude session closed"), "cancelled");
 	}
@@ -1377,11 +1370,10 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		const failure = error instanceof Error ? error : new Error(String(error));
 		this.options.logSink?.logError("claude.sdk.failed", failure);
 		this.streamClosed = true;
-		for (const pending of this.pendingTools.values()) {
+		this.pendingTools.settleAll(pending => {
 			this.finishToolStep(pending, "failed");
 			pending.reject(failure);
-		}
-		this.pendingTools.clear();
+		});
 		this.failActiveTurn(failure, "failed");
 	}
 }

@@ -57,7 +57,8 @@ reported, also includes subscription usage and is shown separately.
 If the API does not report a limit, the card shows usage without inventing
 a remaining balance.
 
-The budget refreshes every minute. Click **Budget** for a manual refresh,
+The budget refreshes in the background every minute; profile cards remain
+usable while the API responds. Click **Budget** for a manual refresh,
 access settings or the Cursor usage dashboard. The same settings are available
 through **Budget access** on the Cursor card in Providers Manager, or through
 **AI Agent Bridge: Cursor Budget** in the command palette.

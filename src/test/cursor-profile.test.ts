@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { ApiProviderService } from "../api-providers/api-provider-service";
 import { CursorApiClient, cursorApiRoot } from "../cursor/api-client";
 import { CursorProfileTransport } from "../cursor/profile-transport";
+import { ApiSourceRouter, CursorSourceAdapter } from "../providers/api-source-router";
 import { LlamaCppChatModelProvider } from "../llama-provider";
 import type { ChatModelSource } from "../model-sources/source-routing";
 import type { FetchImplementation } from "../transport/openai-http";
@@ -39,7 +40,7 @@ suite("Cursor API profiles", () => {
 		const secrets: vscode.SecretStorage = { get: async key => keys.get(key), store: async (key, value) => { keys.set(key, value); }, delete: async key => { keys.delete(key); }, keys: async () => [...keys.keys()], onDidChange: changed.event };
 		const service = new ApiProviderService(state, secrets), b = backend();
 		const provider = new LlamaCppChatModelProvider(secrets, "test", undefined, undefined, undefined, undefined, () => service.getModelSources());
-		(provider as unknown as { cursorTransport: CursorProfileTransport }).cursorTransport = b.transport;
+		(provider as unknown as { sourceRouter: ApiSourceRouter }).sourceRouter = new ApiSourceRouter([new CursorSourceAdapter(b.transport)]);
 		(provider as unknown as { getModelSources: () => Promise<readonly ChatModelSource[]> }).getModelSources = () => service.getModelSources();
 		try {
 			const profile = await service.upsert({ name: "Cursor", baseUrl: source.serverUrl, protocol: "openai" }, { apiKey: "saved-key" });

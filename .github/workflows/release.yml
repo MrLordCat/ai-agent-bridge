@@ -6,43 +6,23 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            target: win32-x64
-          - os: ubuntu-latest
-            target: linux-x64
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      - run: npm run lint
-      - name: Test Windows
-        if: runner.os == 'Windows'
-        run: npm test
-      - name: Test Linux
-        if: runner.os == 'Linux'
-        run: xvfb-run -a npm test
-      - run: npm run package -- --target ${{ matrix.target }} --out llama-vscode-chat-${{ github.ref_name }}-${{ matrix.target }}.vsix
-      - uses: actions/upload-artifact@v7
-        with:
-          name: vsix-${{ matrix.target }}
-          path: llama-vscode-chat-${{ github.ref_name }}-${{ matrix.target }}.vsix
-          if-no-files-found: error
+    uses: ./.github/workflows/verify.yml
+    with:
+      package-prefix: llama-vscode-chat-${{ github.ref_name }}
 
   release:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
       - uses: actions/download-artifact@v8

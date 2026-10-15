@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
+import { modelInformation } from "../providers/model-descriptor";
 
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
@@ -2438,13 +2439,14 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			const availability = this.getModelAvailability(model.id);
 			const actualContextLength = resolveClaudeContextLength(contextLength, observed?.rawMaxTokens);
 			const actualOutputTokens = Math.min(maxOutputTokens, Math.max(1_024, actualContextLength - 1));
-			const info: vscode.LanguageModelChatInformation & Record<string, unknown> = {
+			const info = modelInformation({
 				id: encodeClaudeModelId(model.id),
 				name: model.name,
 				family: "claude",
 				version: model.id,
-				maxInputTokens: Math.max(1, actualContextLength - actualOutputTokens),
-				maxOutputTokens: actualOutputTokens,
+				contextWindowTokens: actualContextLength,
+				outputTokens: actualOutputTokens,
+				contextOrigin: observed ? "observed" : "fallback",
 				capabilities: {
 					toolCalling: true,
 					imageInput: model.id.includes("opus"),
@@ -2453,7 +2455,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				detail: availability.state === "unavailable"
 					? "Claude subscription quota exhausted"
 					: "Claude subscription / native VS Code tools",
-			};
+			});
 			info.isUserSelectable = true;
 			info.multiplierNumeric = 0;
 			info.model_picker_enabled = true;

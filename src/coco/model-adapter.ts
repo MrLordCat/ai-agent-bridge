@@ -1,4 +1,5 @@
 import type * as vscode from "vscode";
+import { modelInformation } from "../providers/model-descriptor";
 
 export const COCO_MODEL_ID_PREFIX = "coco::";
 
@@ -112,17 +113,17 @@ export function mapCocoModel(
 	imageInput = false
 ): vscode.LanguageModelChatInformation {
 	const output = Math.min(16_384, Math.floor(contextLength / 4));
-	const info: vscode.LanguageModelChatInformation & Record<string, unknown> = {
+	const info = modelInformation({
 		id: `${COCO_MODEL_ID_PREFIX}${model.id}`,
 		name: `${model.name} (Coco)`,
 		family: "coco",
 		version: model.id,
-		maxInputTokens: contextLength - output,
-		maxOutputTokens: output,
+		contextWindowTokens: contextLength,
+		outputTokens: output,
 		capabilities: { toolCalling: true, imageInput },
 		tooltip: model.description ?? "Snowflake Cortex Code via your Snowflake connection",
 		detail: "Snowflake Cortex Code",
-	};
+	});
 	info.isUserSelectable = true;
 	info.model_picker_enabled = true;
 	if (thinking) {

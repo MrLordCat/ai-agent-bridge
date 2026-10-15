@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
 import { apiProviderSecretKey } from "../api-providers/api-provider-service";
 import { getModelsEndpoint, isCloudflareWorkersAiBase, isDeepSeekEndpoint } from "../transport/openai-http";
+import { BUILTIN_PROVIDER_SOURCES, type ProviderSourceDefinition } from "./provider-registry";
 
 /**
  * Unified provider directory: one place that knows every model source
@@ -46,6 +47,7 @@ export interface ApiProviderSource {
 export interface SubscriptionProviderStatus {
 	state: string;
 	summary: string;
+	paused?: boolean;
 }
 
 export interface HttpProbeResult {
@@ -69,6 +71,8 @@ export interface ProviderDirectoryOptions {
 	getCodexStatus?: () => SubscriptionProviderStatus | undefined;
 	getClaudeStatus?: () => SubscriptionProviderStatus | undefined;
 	getCocoStatus?: () => SubscriptionProviderStatus | undefined;
+	getSubscriptionStatuses?: () => ReadonlyMap<string, SubscriptionProviderStatus>;
+	getProviderSources?: () => readonly ProviderSourceDefinition[];
 	probeHttp?: HttpProbeFn;
 	probeIntervalMs?: number;
 	probeTimeoutMs?: number;
@@ -120,7 +124,7 @@ export function resolveSubscriptionState(status: SubscriptionProviderStatus | un
 	if (!status) {
 		return { state: "checking", detail: "Waiting for provider status." };
 	}
-	if (status.summary.startsWith("Paused")) {
+	if (status.state === "paused" || status.paused === true || status.paused === undefined && status.summary.startsWith("Paused")) {
 		return { state: "paused", detail: status.summary };
 	}
 	switch (status.state) {
@@ -194,9 +198,6 @@ export class ProviderDirectory implements vscode.Disposable {
 		const localEnabled = config.getConfigValue("enableLocalServer", true) !== false;
 		const localServerUrl = String(config.getConfigValue("localServerUrl", DEFAULT_SERVER_URL) ?? DEFAULT_SERVER_URL);
 		const deepSeekEnabled = config.getConfigValue("enableDeepSeek", true) !== false;
-		const codexEnabled = config.getConfigValue("enableCodexSubscription", true) !== false;
-		const claudeEnabled = config.getConfigValue("enableClaudeSubscription", true) !== false;
-		const cocoEnabled = config.getConfigValue("enableCoco", true) !== false;
 
 		const deepSeekKey = await secrets("llamacpp.deepSeekApiKey").catch(() => undefined);
 		const deepSeekEndpoint = getModelsEndpoint(this.deepSeekServerUrl());
@@ -210,12 +211,14 @@ export class ProviderDirectory implements vscode.Disposable {
 			endpoint: deepSeekEndpoint,
 		});
 
-		const codex = resolveSubscriptionState(config.getCodexStatus?.());
-		this.setMapped("codex", "Codex", "codex", codexEnabled, codex.state, codex.detail);
-		const claude = resolveSubscriptionState(config.getClaudeStatus?.());
-		this.setMapped("claude", "Claude", "claude", claudeEnabled, claude.state, claude.detail);
-		const coco = resolveSubscriptionState(config.getCocoStatus?.());
-		this.setMapped("coco", "Coco", "coco", cocoEnabled, coco.state, coco.detail);
+		const legacyStatuses = new Map<string, SubscriptionProviderStatus | undefined>([
+			["codex", config.getCodexStatus?.()], ["claude", config.getClaudeStatus?.()], ["coco", config.getCocoStatus?.()],
+		]);
+		const statuses = config.getSubscriptionStatuses?.() ?? legacyStatuses;
+		for (const source of (config.getProviderSources?.() ?? BUILTIN_PROVIDER_SOURCES).filter(item => item.mode === "subscription")) {
+			const status = resolveSubscriptionState(statuses.get(source.id));
+			this.setMapped(source.id, source.label, source.kind, config.getConfigValue(source.enabledSetting, true) !== false, status.state, status.detail);
+		}
 
 		for (const profile of profiles) {
 			const key = `api-${profile.id}`;

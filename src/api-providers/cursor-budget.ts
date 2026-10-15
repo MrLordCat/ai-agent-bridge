@@ -60,6 +60,7 @@ export async function fetchCursorBudget(apiKey: string, access: CursorBudgetAcce
 			"Updates every minute. Click for budget access and refresh actions.",
 		].filter(Boolean).join("\n");
 		return {
+			usage: { kind: "spendingCap", currency: "USD", used, limit, totalUsage: overall === undefined ? undefined : overall / 100, periodStart: period && Number.isFinite(period.getTime()) ? period.getTime() : undefined, origin: "Cursor Admin API" },
 			label: "Budget", summary: remaining === undefined ? `${dollars(used)} used · limit not reported` : `${dollars(remaining)} left`, tooltip,
 			rows: [
 				{ id: "used", label: "Used", summary: dollars(used), tooltip: "On-demand charges in the current Cursor billing cycle." },

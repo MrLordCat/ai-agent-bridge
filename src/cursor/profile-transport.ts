@@ -1,8 +1,10 @@
 import { createHash } from "node:crypto";
+import { AsyncResourceCache } from "../providers/async-resource-cache";
 import * as vscode from "vscode";
 import { encodeProviderModelId, type ChatModelSource } from "../model-sources/source-routing";
 import { CursorApiClient, CursorApiError, type CursorModel, type CursorParameter, type CursorPrompt, type CursorSelection } from "./api-client";
 import { CursorSdkTransport } from "./sdk-transport";
+import { modelInformation } from "../providers/model-descriptor";
 import { cursorModelParameters, cursorReasoningOption, cursorReasoningParameter, cursorReasoningSchema } from "./model-configuration";
 
 const digest = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -25,12 +27,11 @@ export function cursorContextMaximum(model: CursorModel): number | undefined {
 	return candidates.length ? Math.max(...candidates) : undefined;
 }
 
-interface Catalog { identity: string; fetchedAt: number; models: CursorModel[] }
 interface Session { agentId: string; identity: string; hashes: string[] }
 
 /** Per-profile Cloud Agents transport; registration stays in the API provider. */
 export class CursorProfileTransport implements vscode.Disposable {
-	private readonly catalogs = new Map<string, Catalog>();
+	private readonly catalogs = new AsyncResourceCache<CursorModel[]>();
 	private readonly sessions = new Map<string, Session>();
 	private readonly busy = new Set<string>();
 	private readonly requests = new Set<AbortController>();
@@ -56,17 +57,19 @@ export class CursorProfileTransport implements vscode.Disposable {
 	}
 
 	private async catalog(source: ChatModelSource, token: vscode.CancellationToken): Promise<CursorModel[]> {
-		const identity = this.identity(source), cached = this.catalogs.get(source.key);
-		if (cached?.identity === identity && Date.now() - cached.fetchedAt < 300_000) { return cached.models; }
-		const controller = new AbortController(); this.requests.add(controller);
+		const identity = this.identity(source);
+		const controller = new AbortController();
 		const cancellation = token.onCancellationRequested(() => controller.abort());
 		try {
 			if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
-			const models = await this.clientFactory(source).listModels(AbortSignal.any([controller.signal, AbortSignal.timeout(15_000)]));
-			if (!models.length) { throw new Error("Cursor returned no models for this API key."); }
-			this.catalogs.set(source.key, { identity, models, fetchedAt: Date.now() });
+			const models = await this.catalogs.get(identity, async signal => {
+				const result = await this.clientFactory(source).listModels(AbortSignal.any([signal, AbortSignal.timeout(15_000)]));
+				if (!result.length) { throw new Error("Cursor returned no models for this API key."); }
+				return result;
+			}, { ttlMs: 300_000, signal: controller.signal });
+			if (!models) { throw new vscode.CancellationError(); }
 			return models;
-		} finally { cancellation.dispose(); this.requests.delete(controller); }
+		} finally { cancellation.dispose(); }
 	}
 
 	async models(source: ChatModelSource, token: vscode.CancellationToken, version: string, recordMaximum?: (key: string, maximum: number, reported: boolean) => void): Promise<vscode.LanguageModelChatInformation[]> {
@@ -85,12 +88,14 @@ export class CursorProfileTransport implements vscode.Disposable {
 				enum: parameter.values.map(item => item.value),
 				default: (contextParameter(parameter.id) ? contextSelection(parameter, context) : undefined) ?? defaults.find(item => item.id === parameter.id)?.value ?? parameter.values[0]?.value,
 			}]));
-			const info: vscode.LanguageModelChatInformation & { configurationSchema?: unknown; isUserSelectable?: boolean } = {
+			const info = modelInformation({
 				id: encodeProviderModelId(source.key, model.id), name: `${model.displayName ?? model.id} (${source.label})`,
-				family: "cursor", version, maxInputTokens: context - output, maxOutputTokens: output,
-				capabilities: { toolCalling: this.sdk?.available ?? false, imageInput: true }, isUserSelectable: true,
+				family: "cursor", version, contextWindowTokens: context, outputTokens: output,
+				contextOrigin: cursorContextMaximum(model) === undefined ? "fallback" : "reported",
+				capabilities: { toolCalling: this.sdk?.available ?? false, imageInput: true },
 				tooltip: this.sdk?.available ? "Cursor with native VS Code tools through the local SDK bridge. Models run on Cursor's servers." : "Cursor chat. Tools require a supported platform and Node.js 22.13 or newer in VS Code.",
-			};
+			});
+			info.isUserSelectable = true;
 			if (reasoning) { properties.reasoningEffort = cursorReasoningSchema(reasoning, model); }
 			if (Object.keys(properties).length) { info.configurationSchema = { type: "object", properties }; }
 			return info;
