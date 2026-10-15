@@ -518,8 +518,8 @@ const HIT_TONE = (v) => v >= 90 ? "tone-good" : v >= 50 ? "tone-warn" : "tone-ba
 const REASON_CLASS = (r) => r ? "reason-badge reason-" + r : "";
 const REASON_LABEL = (r) => r ? r.replace(/_/g, " ") : "—";
 const MODEL_LABEL = (id) => String(id || "—").replace(/^.*::/, "");
-const IS_CODEX = (r) => r && (r.providerKind === "codex" || typeof r.threadMode === "string");
-const IS_CLAUDE = (r) => r && (r.providerKind === "claude" || typeof r.sessionMode === "string");
+const IS_CODEX = (r) => r && (r.providerKind === "codex" || (!r.providerKind && typeof r.threadMode === "string"));
+const IS_CLAUDE = (r) => r && (r.providerKind === "claude" || (!r.providerKind && typeof r.sessionMode === "string"));
 const IS_STATEFUL = (r) => IS_CODEX(r) || IS_CLAUDE(r);
 const EFFECTIVE_HIT = (r) => IS_STATEFUL(r) && typeof r.continuationCacheHitPercent === "number"
 	? r.continuationCacheHitPercent

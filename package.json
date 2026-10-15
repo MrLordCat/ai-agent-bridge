@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.17.14",
+	"version": "1.17.16",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -115,6 +115,19 @@
 					"minimum": 4096,
 					"maximum": 1048576,
 					"description": "Fallback context window advertised for Coco models. The server still enforces the selected model limit."
+				},
+				"llamacpp.cocoModelContextLengths": {
+					"type": "object",
+					"default": { "claude-opus-5-5": 1000000 },
+					"additionalProperties": { "type": "integer", "minimum": 4096, "maximum": 1048576 },
+					"description": "Initial Coco windows by exact model ID before live telemetry. Opus 5.5's 1M baseline was verified with Cortex Code; measured runtime windows take precedence. Other models use cocoContextLength."
+				},
+				"llamacpp.cocoMaxHistoryImportParts": {
+					"type": "integer",
+					"default": 16,
+					"minimum": 1,
+					"maximum": 128,
+					"description": "Maximum automatic Coco history-import requests for a cold handoff. Each request can incur model usage. Oversized transfers stop with a full local transcript instead of silently dropping history."
 				},
 				"llamacpp.enableCodexSubscription": {
 					"type": "boolean",
@@ -1280,11 +1293,6 @@
 				"command": "llamacpp.chooseModelByProvider",
 				"title": "AI Agent Bridge: Models by Provider",
 				"icon": "$(list-tree)"
-			},
-			{
-				"command": "llamacpp.cursorBudget",
-				"title": "AI Agent Bridge: Cursor Budget",
-								"icon": "$(credit-card)"
 			},
 			{
 				"command": "llamacpp.applyCopilotPatch",

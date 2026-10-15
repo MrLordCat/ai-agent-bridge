@@ -40,7 +40,8 @@ export class CocoTurnBridge implements vscode.Disposable {
 	constructor(
 		advertisedTools: readonly vscode.LanguageModelChatTool[],
 		private readonly onStop: (error?: Error) => void,
-		private readonly idleTimeoutMs = 30 * 60_000
+		private readonly idleTimeoutMs = 30 * 60_000,
+		private readonly preserveResult?: (result: vscode.LanguageModelToolResultPart) => Promise<{ output: string }>
 	) {
 		const seen = new Set<string>();
 		for (const original of selectCocoChatTools(advertisedTools).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -87,8 +88,12 @@ export class CocoTurnBridge implements vscode.Disposable {
 			this.finish(new Error("Coco needs the results of every Chat tool call in the batch before continuing."));
 			return completion;
 		}
-		this.pending.accept(results, result => result.callId, (call, result) => call.resolve(convertCocoToolResult(result)), call => call.reported);
-		this.reportCalls();
+		void Promise.all(results.map(async result => ({ result, converted: this.preserveResult ? await this.preserveResult(result) : convertCocoToolResult(result) })))
+			.then(converted => {
+				if (this.terminal) { return; }
+				this.pending.accept(converted, item => item.result.callId, (call, item) => call.resolve(item.converted), call => call.reported);
+				this.reportCalls();
+			}, error => this.finish(error instanceof Error ? error : new Error(String(error))));
 		return completion;
 	}
 
@@ -190,7 +195,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 	}
 }
 
-export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart): { output: string } {
+export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart, limit = 100_000): { output: string } {
 	const output = result.content.map(part => {
 		if (part instanceof vscode.LanguageModelTextPart) { return part.value; }
 		if (part instanceof vscode.LanguageModelDataPart && (part.mimeType.startsWith("text/") || part.mimeType === "application/json")) {
@@ -198,7 +203,6 @@ export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart
 		}
 		return "[Non-text tool result: this Coco bridge accepts text only]";
 	}).join("\n");
-	const limit = 100_000;
 	const marker = "\n[Tool result truncated]\n";
 	const keep = Math.floor((limit - marker.length) / 2);
 	return { output: output.length > limit ? output.slice(0, keep) + marker + output.slice(-keep) : output };

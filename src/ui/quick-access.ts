@@ -248,6 +248,7 @@ const usageProviderLabels: Record<TokenUsageProvider, string> = {
 	deepseek: "DeepSeek",
 	codex: "Codex",
 	claude: "Claude",
+	coco: "Coco",
 	api: "API profiles",
 };
 
@@ -356,20 +357,19 @@ export function buildApiProfileItem(
 	metrics?: ProviderRuntimeMetrics
 ): QuickAccessItem {
 	const id = `api.${profile.id}`;
-	const budgetCommand: vscode.Command = { command: "llamacpp.cursorBudget", title: "Cursor Budget", arguments: [profile.id] };
+	const balance = profile.protocol === "cursor" ? undefined : profile.balance;
 	return new QuickAccessItem(id, profile.name, {
 		description: state === "unsupported" ? "Unsupported API" : state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
 		icon: new vscode.ThemeIcon("cloud"), tooltip: profile.baseUrl,
 		children: [
 			new QuickAccessItem(`${id}.source`, "Source", { description: "On", tooltip: "Enabled API provider; disable it in the Providers Manager.", icon: toggleIcon(true), command: command("llamacpp.openApiProviders", "Manage API Providers") }),
 			...providerRuntimeItems(id, metrics),
-			...(profile.balance ? [new QuickAccessItem(`${id}.balance`, profile.balance.label ?? "Balance", {
-				description: profile.balance.usage ? providerUsageSummary(profile.balance.usage) : profile.balance.summary,
-				tooltip: profile.balance.tooltip + (profile.balanceUpdating ? "\nRefreshing cached values…" : ""), icon: new vscode.ThemeIcon("credit-card"), expanded: true,
-				command: profile.balance.label === "Budget" ? budgetCommand : command("llamacpp.openApiProviders", "Manage API Providers"),
-				children: profile.balance.rows?.length ? profile.balance.rows.map(row => new QuickAccessItem(`${id}.balance.${row.id}`, row.label, { description: row.summary, tooltip: row.tooltip, icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })) : undefined,
+			...(balance ? [new QuickAccessItem(`${id}.balance`, balance.label ?? "Balance", {
+				description: balance.usage ? providerUsageSummary(balance.usage) : balance.summary,
+				tooltip: balance.tooltip + (profile.balanceUpdating ? "\nRefreshing cached values…" : ""), icon: new vscode.ThemeIcon("credit-card"), expanded: true,
+				command: command("llamacpp.openApiProviders", "Manage API Providers"),
+				children: balance.rows?.length ? balance.rows.map(row => new QuickAccessItem(`${id}.balance.${row.id}`, row.label, { description: row.summary, tooltip: row.tooltip, icon: new vscode.ThemeIcon("credit-card"), command: command("llamacpp.openApiProviders", "Manage API Providers") })) : undefined,
 			})] : []),
-			...(!profile.balance && profile.balanceUpdating && profile.protocol === "cursor" ? [new QuickAccessItem(`${id}.balance`, "Budget", { description: "Checking…", tooltip: "Reading Cursor usage in the background.", icon: new vscode.ThemeIcon("credit-card"), command: budgetCommand })] : []),
 			new QuickAccessItem(`${id}.context`, "Maximum Context", {
 				description: profile.maximumContextLength === undefined ? "Detecting" : formatCompactTokenCount(profile.maximumContextLength),
 				tooltip: profile.contextMaximumReported ? "Maximum context discovered from the provider's models." : "The API has not reported a maximum; discovery may use a fallback.",
@@ -395,7 +395,7 @@ export function buildProviderSnapshotItem(snapshot: ProviderSnapshot): QuickAcce
 	});
 }
 export function buildCocoItem(
-	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number
+	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number, metrics?: ProviderRuntimeMetrics
 ): QuickAccessItem {
 	const summary = enabled ? status?.summary ?? "Checking..." : "Off";
 	const tooltip = [
@@ -412,6 +412,7 @@ export function buildCocoItem(
 				icon: new vscode.ThemeIcon(status?.state === "connected" && enabled ? "pass-filled" : "info"),
 				command: command("llamacpp.cocoShowStatus", "Check Coco Connection Status"),
 			}),
+			...providerRuntimeItems("coco", metrics),
 			new QuickAccessItem("coco.source", "Source", {
 				description: enabled ? "On" : "Off", icon: toggleIcon(enabled),
 				command: command("llamacpp.toggleCoco", "Toggle Coco Source"),
@@ -431,9 +432,9 @@ export function buildCocoItem(
 				icon: new vscode.ThemeIcon("lightbulb"),
 				command: command("llamacpp.openCopilotModelPicker", "Open Model Picker"),
 			}),
-			new QuickAccessItem("coco.context", "Maximum Context", {
-				description: formatCompactTokenCount(contextLength), icon: new vscode.ThemeIcon("symbol-numeric"),
-				tooltip: "Configured fallback context window; the selected model still enforces its server limit.",
+			new QuickAccessItem("coco.context", metrics?.contextWindowTokens ? "Maximum Context" : "Fallback Context", {
+				description: formatCompactTokenCount(metrics?.contextWindowTokens ?? contextLength), icon: new vscode.ThemeIcon("symbol-numeric"),
+				tooltip: "The last measured model window, when available; otherwise the global fallback. Exact model baselines and live windows are used in the model picker.",
 				command: command("llamacpp.cocoOpenSettings", "Open Coco Settings"),
 			}),
 			new QuickAccessItem("coco.settings", "Coco Settings", {
@@ -870,7 +871,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			icon: new vscode.ThemeIcon("graph-line"),
 			children: [
 				...TOKEN_USAGE_PROVIDERS.map(provider => usageProviderItem(provider, usageProviderLabels[provider], tokenUsageHistory,
-					({ local: localMetrics, deepseek: deepSeekMetrics, codex: codexMetrics, claude: claudeMetrics, api: undefined })[provider],
+					({ local: localMetrics, deepseek: deepSeekMetrics, codex: codexMetrics, claude: claudeMetrics, coco: view.metrics.get("coco"), api: undefined })[provider],
 					provider === "codex" ? command("llamacpp.codexShowStatus", "Show Codex Subscription Status") : provider === "claude" ? command("llamacpp.claudeShowStatus", "Show Claude Subscription Status") : command("llamacpp.openLatestLog", "Open Latest Log"),
 					provider === "claude" ? claudeUsage : undefined, provider === "claude" ? claudeLastRequest : undefined)),
 				new QuickAccessItem("usage.clear", "Clear Usage History", {
@@ -1160,7 +1161,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			{ key: "claude", item: claude },
 			{ key: "coco", item: buildCocoItem(
 				config.get<boolean>("enableCoco", true), this.getCocoStatus(),
-				config.get<number>("cocoContextLength", 128_000)
+				config.get<number>("cocoContextLength", 128_000), view.metrics.get("coco")
 			) },
 		];
 		const visibleProviders = providerRoots

@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.17.16 (local development patch) - 2026-10-15
+
+- Keep Coco sessions per workspace, conversation, model and connection, append
+  new entries on warm turns, and restore compatible sessions after reload.
+  A workspace-local visible Chat journal supports Codex → Coco handoffs and
+  returning to Coco after another provider has continued the conversation.
+- Import large histories in bounded requests with tools disabled during import;
+  preserve full transcripts, image bytes and oversized tool outputs locally.
+  Guard automatic import counts instead of silently discarding older messages.
+- Record ACP prompt input/output and cache read/write tokens in Coco's own
+  usage history, Quick Access and session diagnostics. Keep context occupancy
+  separate from billed tokens and leave missing cache counters unreported.
+- Use a verified 1M initial window for the exact Opus 5.5 model ID, with
+  per-model overrides and live runtime telemetry taking precedence.
+- Verify cold/warm/restored Opus 5.5 requests and an actual provider handoff
+  with facts retained from the beginning and middle of the conversation.
+
+## 1.17.15 (local development patch) - 2026-10-15
+
+- Remove Cursor balance cards, budget-access settings, the Cursor Budget command
+  and Admin API requests. Keep chat credentials and model configuration intact;
+  deleting a profile still cleans up its legacy budget credentials.
+- Preserve background balance loading and cache-invalidation checks for
+  OpenRouter. Document verified Coco long-chat limits, fresh-session behavior,
+  and information lost by history/tool-result shortening, including Opus 5.5.
+  This patch does not change Coco's context management.
+
 ## 1.17.14 (local development patch) - 2026-10-15
 
 - Share CI and release verification across Windows/Linux and VS Code

@@ -21,7 +21,8 @@ export function apiProviderSecretKey(id: string): string {
 	return `${API_PROVIDER_SECRET_PREFIX}${id}.apiKey`;
 }
 
-export function cursorBudgetAdminSecretKey(id: string): string { return `${API_PROVIDER_SECRET_PREFIX}${id}.cursorAdminApiKey`; }
+// Legacy credentials are only removed when their profile is deleted.
+function cursorBudgetAdminSecretKey(id: string): string { return `${API_PROVIDER_SECRET_PREFIX}${id}.cursorAdminApiKey`; }
 
 export const API_PROVIDER_CONTEXT_MIN = 4_096;
 export const API_PROVIDER_CONTEXT_MAX = 1_048_576;
@@ -270,26 +271,6 @@ export class ApiProviderService implements vscode.Disposable {
 		this.backgroundBalances.set(id, pending);
 	}
 
-	getCursorBudgetUserEmail(id: string): string | undefined {
-		const value = this.state.get<Record<string, string>>(CURSOR_BUDGET_USERS_STORAGE_KEY, {})[id];
-		return typeof value === "string" && value ? value : undefined;
-	}
-
-	async setCursorBudgetAccess(id: string, update: { adminApiKey?: string; clearAdminApiKey?: boolean; userEmail?: string }): Promise<void> {
-		const profile = this.get(id);
-		if (!profile || !isCursorCloudAgentBase(profile.baseUrl)) { throw new Error("Select an existing Cursor API profile."); }
-		const userEmail = update.userEmail?.trim().toLowerCase();
-		if (userEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(userEmail)) { throw new Error("Enter a valid team member email."); }
-		if (update.adminApiKey?.trim()) { await this.secrets.store(cursorBudgetAdminSecretKey(id), update.adminApiKey.trim()); }
-		else if (update.clearAdminApiKey) { await this.secrets.delete(cursorBudgetAdminSecretKey(id)); }
-		if (update.userEmail !== undefined) {
-			const users = { ...this.state.get<Record<string, string>>(CURSOR_BUDGET_USERS_STORAGE_KEY, {}) };
-			if (userEmail) { users[id] = userEmail; } else { delete users[id]; }
-			await this.state.update(CURSOR_BUDGET_USERS_STORAGE_KEY, users);
-		}
-		this.invalidateBalance(id); this._onDidChangeBalance.fire();
-	}
-
 	async refreshBalance(id: string): Promise<ApiProviderBalanceInfo | undefined> {
 		const info = await this.getBalanceInfo(id, true);
 		this._onDidChangeBalance.fire();
@@ -302,19 +283,16 @@ export class ApiProviderService implements vscode.Disposable {
 	 */
 	async getBalanceInfo(id: string, force = false): Promise<ApiProviderBalanceInfo | undefined> {
 		const profile = this.get(id);
-		if (!profile || !profile.enabled) {
+		if (!profile || !profile.enabled || profile.protocol === "cursor" || isCursorCloudAgentBase(profile.baseUrl)) {
 			return undefined;
 		}
-		// Leave room for API latency so the 60-second view timer refreshes Cursor each tick.
-		const cacheTtl = isCursorCloudAgentBase(profile.baseUrl) ? 55_000 : 60_000;
 		return this.balances.get(id, async () => {
 			const apiKey = await this.getApiKey(id);
-			const access = isCursorCloudAgentBase(profile.baseUrl) ? { adminApiKey: await this.secrets.get(cursorBudgetAdminSecretKey(id)), userEmail: this.getCursorBudgetUserEmail(id) } : {};
-			if (!apiKey && !access.adminApiKey) {
+			if (!apiKey) {
 				return undefined;
 			}
-			return fetchApiProviderBalance(profile.baseUrl, apiKey ?? "", access);
-		}, { ttlMs: cacheTtl, force });
+			return fetchApiProviderBalance(profile.baseUrl, apiKey);
+		}, { ttlMs: 60_000, force });
 	}
 
 	/** Tree rendering uses cached balances; background loads publish a separate update. */
@@ -323,7 +301,8 @@ export class ApiProviderService implements vscode.Disposable {
 		return Promise.all(summaries
 			.filter(profile => profile.enabled)
 			.map(async profile => {
-				if (!refreshBalances) { this.refreshBalanceInBackground(profile.id, isCursorCloudAgentBase(profile.baseUrl) ? 55_000 : 60_000); }
+								const supportsBalance = profile.protocol !== "cursor" && !isCursorCloudAgentBase(profile.baseUrl);
+								if (!refreshBalances && supportsBalance) { this.refreshBalanceInBackground(profile.id, 60_000); }
 				return {
 				id: profile.id,
 				name: profile.name,
@@ -334,8 +313,8 @@ export class ApiProviderService implements vscode.Disposable {
 				llamaCppCompat: profile.llamaCppCompat,
 				enabled: profile.enabled,
 				hasApiKey: profile.hasApiKey,
-				balance: refreshBalances ? await this.getBalanceInfo(profile.id) : this.balances.peek(profile.id),
-				balanceUpdating: !refreshBalances && this.backgroundBalances.has(profile.id),
+								balance: supportsBalance ? (refreshBalances ? await this.getBalanceInfo(profile.id) : this.balances.peek(profile.id)) : undefined,
+								balanceUpdating: supportsBalance && !refreshBalances && this.backgroundBalances.has(profile.id),
 			};
 			}));
 	}

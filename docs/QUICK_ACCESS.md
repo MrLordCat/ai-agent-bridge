@@ -13,11 +13,17 @@ The common metrics renderer uses Tokens (live/last), Prompt Cache, Context and
 Throughput when available. Estimated counters keep their estimate marker.
 A missing counter remains unreported instead of being displayed as zero.
 
-Account balances and Cursor budgets load in the background. The tree displays
-profile metadata and cached values immediately, then updates after the request
-finishes. A new Cursor budget displays Checking while loading; cached values
-carry a refresh hint. Provider cache TTL and the existing minute timer control
-refreshes. Missing balance endpoints are briefly cached to avoid render loops.
+Coco has its own Tokens, Prompt Cache and Context usage rows and Token Usage
+history category. The context row uses the last measured window when available.
+Its input and cache counters come from ACP prompt results, including history
+imports; they are not inferred from context occupancy or session reuse.
+
+Supported account balances load in the background. The tree displays profile
+metadata and cached values immediately, then updates after the request finishes.
+Cached values carry a refresh hint. Provider cache TTL and the existing minute
+timer control refreshes. Missing balance endpoints are briefly cached to avoid
+render loops. Cursor has no balance or budget row and makes no billing requests;
+its chat credentials do not grant the required Admin API access.
 
 Each render captures provider snapshots once. Child expansion reads the
 already-built tree and does not fetch accounts again. Empty child arrays are

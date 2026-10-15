@@ -36,7 +36,7 @@ export interface ChatProviderRegistration {
 	provider: vscode.LanguageModelChatProvider;
 	ownsModel(modelId: string): boolean;
 	/** Optional background observation of requests to another adapter. */
-	onForeignRequest?: () => Promise<unknown>;
+	onForeignRequest?: (conversationId?: unknown) => Promise<unknown>;
 }
 
 /** Routing, catalog ownership and change propagation share one registration list. */
@@ -99,10 +99,10 @@ export class ProviderRegistry implements vscode.Disposable {
 		return matches[0];
 	}
 
-	observeRequest(selected: ChatProviderRegistration, token: vscode.CancellationToken): void {
+	observeRequest(selected: ChatProviderRegistration, token: vscode.CancellationToken, conversationId?: unknown): void {
 		if (token.isCancellationRequested) { return; }
 		for (const registration of this.registrations) {
-			if (registration !== selected) { void registration.onForeignRequest?.().catch(() => undefined); }
+			if (registration !== selected) { void registration.onForeignRequest?.(conversationId).catch(() => undefined); }
 		}
 	}
 

@@ -1,4 +1,3 @@
-
 import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
@@ -42,10 +41,10 @@ import { showProviderModelPicker } from "./ui/provider-model-picker";
 import { BUILTIN_PROVIDER_SOURCES, ownsHttpModel, providerSourceId } from "./providers/provider-registry";
 import { providerSnapshots } from "./providers/provider-snapshot";
 import { usageProviderForSource } from "./token-usage-history";
-import { registerCursorBudgetCommand } from "./api-providers/cursor-budget-commands";
 import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
+import { ConversationHistory } from "./providers/conversation-history";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
 import { getSubagentModelProfiles } from "./subagent-guidance";
 import { TokenUsageHistory, type TokenUsageSample } from "./token-usage-history";
@@ -627,22 +626,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
-	const cocoProvider = new CocoChatModelProvider();
+	const cocoProvider = new CocoChatModelProvider({ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "coco-history") });
 	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
 	context.subscriptions.push(cocoProvider);
 	const subscriptionProviders = [
 		{ id: "codex", provider: codexProvider },
 		{ id: "claude", provider: claudeProvider, onForeignRequest: () => claudeProvider.refreshSubscriptionUsage() },
-		{ id: "coco", provider: cocoProvider },
+		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
-	const compositeProvider = new CompositeChatModelProvider([
+	const compositeProvider = new CompositeChatModelProvider({ providers: [
 		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel },
 		...subscriptionProviders.map(registration => ({ ...registration,
 			source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === registration.id),
 			ownsModel: (id: string) => providerSourceId(id) === registration.id,
 		})),
-	]);
+	], history: new ConversationHistory(path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history")) });
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
 
@@ -679,13 +678,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getCodexUsageLimits: () => codexProvider.codexUsageLimitSummaries,
 		getCocoStatus: () => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels }),
 		getProviderSnapshots: () => providerSnapshots(providerDirectory.list(),
-			new Map([...runtimeMetrics, ["codex", codexProvider.runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}]]),
+			new Map([...runtimeMetrics, ["codex", codexProvider.runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}], ["coco", cocoProvider.runtimeMetrics ?? {}]]),
 			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
 	});
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(apiProviderService.onDidChangeContext(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(apiProviderService.onDidChangeBalance(() => quickActionsProvider.refresh()));
-	context.subscriptions.push(registerCursorBudgetCommand(apiProviderService));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
@@ -749,6 +747,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}));
 	context.subscriptions.push(claudeProvider.onDidUpdateLiveTurn(update => {
 		updateClaudeSessionQuality(sessionQuality, update);
+	}));
+	context.subscriptions.push(cocoProvider.onDidRecordUsage(usage => {
+		recordUsage({ provider: "coco", inputTokens: usage.inputTokens, outputTokens: usage.outputTokens,
+			cachedInputTokens: usage.cachedInputTokens, cacheWriteInputTokens: usage.cacheWriteInputTokens,
+			modelTurns: usage.modelTurns, durationMs: usage.durationMs, estimated: usage.estimated }, usage.modelId);
+	}));
+	context.subscriptions.push(cocoProvider.onDidUpdateLiveTurn(update => {
+		if (update.context) { sessionQuality.recordContext(update.context); }
+		if (update.turn.lifecyclePhase === "running") { sessionQuality.updateTurn(update.turn); }
+		else { sessionQuality.recordTurn(update.turn); }
+		quickActionsProvider.refresh();
 	}));
 	context.subscriptions.push(registerContextControlCommand(
 		() => codexProvider.runtimeMetrics,

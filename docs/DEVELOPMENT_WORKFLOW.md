@@ -11,6 +11,10 @@ For local verification run `npm run check:metadata`, `npm run lint` and
 `npm test -- --code-version 1.141.0`. Provider, cache, transport and delegated
 tool contract suites are part of the full extension-host test suite.
 
+After deleting or renaming TypeScript sources, run `npm run clean` before
+testing. Compilation does not remove old JavaScript files from `out/`, so a
+stale compiled test can otherwise exercise a feature that has been removed.
+
 Local development changes increment only the patch version in package.json
 and both root entries in package-lock.json. Update README's Current build and
 CHANGELOG. Compile, package and install through `code --install-extension`;

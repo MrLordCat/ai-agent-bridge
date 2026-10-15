@@ -46,29 +46,14 @@ without local tool calling use Ask mode. Cursor SDK models with Tools remain
 available in Agent mode.
 The regular VS Code model dropdown remains available for model configuration.
 
-### Cursor team budget in Quick Access
+### Cursor billing
 
-Expand **Quick Access → Cursor → Budget** to see the remaining budget, **Used**
-and **Limit** for the current billing cycle. These values come from the
-[Cursor Admin API](https://cursor.com/docs/account/teams/admin-api) and apply
-to the exact team member identified by the saved chat key or selected email.
-The budget is an enforced cap on on-demand charges. **Total usage**, when
-reported, also includes subscription usage and is shown separately.
-If the API does not report a limit, the card shows usage without inventing
-a remaining balance.
-
-The budget refreshes in the background every minute; profile cards remain
-usable while the API responds. Click **Budget** for a manual refresh,
-access settings or the Cursor usage dashboard. The same settings are available
-through **Budget access** on the Cursor card in Providers Manager, or through
-**AI Agent Bridge: Cursor Budget** in the command palette.
-
-If **Admin access required** appears, choose **Configure Admin API key** and
-enter a team key with Admin API access in the password field. This optional
-key is stored in VS Code SecretStorage separately from the chat key. For a
-service-account key, choose **Select budget user** and enter the team member's
-email. Clear the email to detect the owner of the chat key again. Budget access
-changes refresh Quick Access without interrupting an active Cursor chat.
+Cursor balance and budget integration was removed in 1.17.15. The Admin API
+requires additional administrative access that ordinary chat credentials do not
+provide. Quick Access and Providers Manager do not display a Cursor balance or
+request an Admin token, and no background budget requests are made.
+Check billing in the Cursor dashboard. Chat keys, models, context settings and
+per-request token metrics continue to work independently of billing access.
 
 ### Cursor official API
 

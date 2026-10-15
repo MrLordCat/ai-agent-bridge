@@ -168,7 +168,7 @@ export interface LlamaChatTurnStepMetrics {
 export interface LlamaChatTurnMetrics {
     requestId: string;
     modelId: string;
-    providerKind?: "local" | "deepseek" | "codex" | "claude" | "cloudflare" | "openrouter";
+    providerKind?: "local" | "deepseek" | "codex" | "claude" | "coco" | "cloudflare" | "openrouter";
     lifecyclePhase?: "running" | "completed" | "timed_out" | "interrupted" | "abandoned" | "failed";
     terminalDetail?: string;
     threadMode?: "new" | "reused" | "tool-resume" | "interrupted-resume" | "rollover";

@@ -12,7 +12,7 @@ function shorten(text: string, maximum: number): string {
 	return text.slice(0, head) + marker + (available > head ? text.slice(-(available - head)) : "");
 }
 
-function serializeMessage(message: vscode.LanguageModelChatRequestMessage, toolResultLimit = COCO_MAX_PROMPT_CHARS): CocoPromptContent[] {
+function serializeMessage(message: vscode.LanguageModelChatRequestMessage, toolResultLimit = COCO_MAX_PROMPT_CHARS, lossless = false): CocoPromptContent[] {
 	const blocks: CocoPromptContent[] = [];
 	const appendText = (text: string) => {
 		if (!text) { return; }
@@ -39,10 +39,11 @@ function serializeMessage(message: vscode.LanguageModelChatRequestMessage, toolR
 				else if (part.mimeType.startsWith("text/") || part.mimeType === "application/json") {
 					begin(); appendText(`${Buffer.from(part.data).toString("utf8")}\n`);
 				}
+				else if (lossless) { throw new Error(`Coco ACP cannot import ${part.mimeType} attachments directly. Supply extracted text or use VS Code file tools; the original attachment remains in the Chat journal.`); }
 			} else if (part instanceof vscode.LanguageModelToolCallPart) {
 				begin(); appendText(`[VS Code tool call: ${part.name}, call id: ${part.callId}]\n${JSON.stringify(part.input)}\n`);
 			} else if (part instanceof vscode.LanguageModelToolResultPart) {
-								begin(); appendText(`[VS Code tool result, call id: ${part.callId}]\n${shorten(convertCocoToolResult(part).output, toolResultLimit)}\n`);
+								begin(); appendText(`[VS Code tool result, call id: ${part.callId}]\n${lossless ? convertCocoToolResult(part, Infinity).output : shorten(convertCocoToolResult(part).output, toolResultLimit)}\n`);
 				for (const item of part.content) {
 					if (item instanceof vscode.LanguageModelDataPart && item.mimeType.startsWith("image/")) { appendImage(item); }
 				}
@@ -67,7 +68,7 @@ function joinBlocks(groups: readonly (readonly CocoPromptContent[])[]): CocoProm
 	return result;
 }
 
-/** Keep current images intact; shorten old history instead of rejecting a large chat. */
+/** @deprecated Bounded preview only. Executable requests use serializeCocoTranscript and history-transfer. */
 export function serializeCocoMessages(
 	messages: readonly vscode.LanguageModelChatRequestMessage[], maximumTextChars = COCO_MAX_PROMPT_CHARS
 ): CocoPromptContent[] {
@@ -123,4 +124,9 @@ export function estimateCocoTokens(value: string | vscode.LanguageModelChatReque
 		}
 	}
 	return Math.max(1, Math.ceil(characters / 4) + images);
+}
+
+/** Import all available history; bounded transfers split it, never delete its middle. */
+export function serializeCocoTranscript(messages: readonly vscode.LanguageModelChatRequestMessage[]): CocoPromptContent[] {
+	return joinBlocks(messages.map(message => serializeMessage(message, Infinity, true)));
 }

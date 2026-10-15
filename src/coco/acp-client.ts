@@ -8,7 +8,7 @@ export type CocoPromptContent =
 	| { type: "image"; data: string; mimeType: string };
 
 export interface CocoInitializeResult {
-	agentCapabilities?: { promptCapabilities?: { image?: boolean } };
+	agentCapabilities?: { loadSession?: boolean; promptCapabilities?: { image?: boolean } };
 }
 
 export interface CocoPermissionOption {
@@ -92,6 +92,10 @@ export class CocoAcpClient {
 		return this.request("session/prompt", {
 			sessionId, prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
 		});
+	}
+
+	loadSession(sessionId: string, cwd: string, clientTools: JsonObject[] = []): Promise<JsonObject> {
+		return this.request("session/load", { sessionId, cwd, mcpServers: [], _meta: { clientTools } }, 120_000);
 	}
 
 	setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<JsonObject> {

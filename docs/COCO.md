@@ -1,12 +1,24 @@
 # Snowflake Coco
 
-Large conversations are shortened before sending a new ACP prompt. The bridge
-keeps the latest user request and its image bytes, initial instructions, and
-recent history; older long text and tool outputs are bounded. The text budget
-reserves space for tool definitions and agent instructions. Token counting does
-not reject a large historical message. If the latest request itself cannot fit,
-reduce its current text or attachments instead of starting over merely because
-the old chat is long.
+Coco keeps a native session for each workspace, conversation, model and
+Snowflake connection. Follow-ups append new entries, including entries from
+another provider that continued the same Chat. Compatible completed sessions
+resume after a VS Code reload. Rewinding/editing history creates a fresh native
+branch; interrupted tool cycles are cancelled rather than reused.
+
+Large cold handoffs import the complete available history in bounded parts.
+Import answers stay hidden and tools are disabled until the actual continuation.
+Full transcripts and oversized tool outputs remain in workspace-local storage
+for targeted rereading after native compaction. Nothing is silently removed
+from the middle of the execution transcript. Image bytes are retained.
+Each import consumes model usage. `llamacpp.cocoMaxHistoryImportParts` defaults
+to 16; exceeding it stops with the complete transcript path before inference.
+
+The exact `claude-opus-5-5` ID starts with a verified 1,000,000-token window.
+`llamacpp.cocoModelContextLengths` overrides per-model baselines; unknown models
+use `llamacpp.cocoContextLength` (128,000 by default). Measured runtime windows
+take precedence. A model's finite window and native compaction still apply.
+See [continuity, storage and cache verification](COCO_CONTINUITY.md).
 
 Install the Snowflake VS Code extension. AI Agent Bridge uses its bundled
 `cortex` CLI through the Agent Client Protocol (ACP). If your Snowflake CLI has
@@ -45,10 +57,9 @@ be enabled with a supported default shell (PowerShell 7, bash or zsh). If it
 cannot activate, the bridge reports the problem before sending the command.
 After updating the extension, reload VS Code and start a new request so Coco
 receives the updated tool catalog. Existing Background Shells remain separate.
-The bridge sends text and image attachments and starts a fresh ACP session for
-each new user request. The picker enables vision after the active ACP runtime
+The bridge sends text and image attachments. The picker enables vision after the active ACP runtime
 advertises image input. Images retain their original bytes and MIME types in
-separate ACP content blocks. Warm reuse between user turns is not yet supported.
+separate ACP content blocks. Warm turns reuse the same session and stable prefix.
 
 The model picker exposes **Thinking Effort** using the levels advertised by
 Coco (currently Auto, Minimal, Low, Medium, High, and Max). The chosen value is
@@ -62,6 +73,14 @@ runtime's `used` and `size` fields; the snapshot persists across tool-result
 continuations and can decrease after compaction. Observed windows replace the
 configured fallback for that model. The bridge does not treat cumulative billing
 tokens as context or invent a measured count when the runtime sends none.
+
+ACP prompt results also provide measured usage: uncached input, cache reads,
+cache writes and output. These populate Coco's own Token Usage category,
+Quick Access metrics and session diagnostics. Input totals include cache reads
+and writes exactly once. Handoff totals include its import requests; current
+context remains a separate snapshot. Cache availability depends on the backend;
+a warm or restored session does not promise a hit. Missing counters show as
+unreported. Statistics start with new requests after this update.
 
 Quick Access has a **Coco** section with live ACP connection status, the
 discovered model count, an on/off source toggle, Snowflake connection selection,

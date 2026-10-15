@@ -188,7 +188,7 @@ Cursor SDK и ACP не должны наследовать его SSE-парсе
   и [turn metrics](../src/extension.ts#L962). Обычная API-модель попадает
   в local; DeepSeek-модель другого API-профиля попадает в deepseek.
 - [ApiProviderBalanceInfo](../src/api-providers/balance.ts#L21) отдаёт в UI
-  текстовые summary/rows. [Cursor budget](../src/api-providers/cursor-budget.ts#L34)
+  текстовые summary/rows. Историческая реализация Cursor budget (удалена в 1.17.15)
   представляет лимит допрасходов, а не то же самое, что monthly usage плана.
 
 Предложение: `ProviderSnapshot` со стабильным source ID, типизированным

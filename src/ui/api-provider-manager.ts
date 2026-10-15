@@ -307,7 +307,6 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 			<div class="actions">
 				<button class="toggle-btn" data-id="${escAttr(profile.id)}" data-enabled="${profile.enabled}" type="button">${profile.enabled ? "Disable" : "Enable"}</button>
 				<button class="edit-btn" data-id="${escAttr(profile.id)}" type="button">Edit</button>
-				${profile.protocol === "cursor" ? `<button class="budget-btn" data-id="${escAttr(profile.id)}" type="button">Budget access</button>` : ""}
 				<button class="delete-btn danger" data-id="${escAttr(profile.id)}" type="button">Delete</button>
 			</div>
 		</article>`;
@@ -410,7 +409,6 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 		document.getElementById('refresh-models-btn').addEventListener('click', () => vscode.postMessage({ type: 'refreshModels' }));
 		document.getElementById('recheck-btn').addEventListener('click', () => vscode.postMessage({ type: 'recheck' }));
 		document.querySelectorAll('.edit-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'edit', id: button.dataset.id })));
-		document.querySelectorAll('.budget-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'budget', id: button.dataset.id })));
 		document.querySelectorAll('.delete-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({ type: 'delete', id: button.dataset.id })));
 		document.querySelectorAll('.toggle-btn').forEach(button => button.addEventListener('click', () => vscode.postMessage({
 			type: 'toggle',
@@ -631,9 +629,6 @@ export class ApiProviderManagerPanel {
 					await this.service.setWorkingContextLength(String(data.id ?? ""), data.contextLength);
 					this.status = data.contextLength === null ? "Working context is automatic." : "Working context updated.";
 					this.refreshModels();
-					break;
-				case "budget":
-					await vscode.commands.executeCommand("llamacpp.cursorBudget", String(data.id ?? ""));
 					break;
 				case "delete": {
 					const profile = this.service.get(String(data.id ?? ""));
