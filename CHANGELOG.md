@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.18.12 (local development patch) - 2026-10-19
+
+- Fix the reproduced Coco backend error: tool names must fit 64 characters
+  including the `mcp__vscode_chat__` namespace. Twenty of 72 names in the failing
+  catalog exceeded the limit (maximum 93). Bound aliases while preserving their
+  hash suffix and native Chat routing; validate names/uniqueness before inference.
+- Log request correlation, transport, catalog size and maximum wire-name length,
+  prompt size, image count and sanitized failures without recording prompt text.
+- Add an opt-in request reproducer. The original recorded names fail even with
+  a short prompt; fixed names pass with a short prompt, the recorded 1,015,904-
+  character input, and resume of a failed diagnostic session. These probes use
+  inert schemas because original tool schemas were not recorded; action callbacks
+  are disabled. See docs/COCO_TOOL_NAME_INCIDENT.md for evidence and limits.
+
 ## 1.18.11 (local development patch) - 2026-10-19
 
 - Prepare large Coco handoffs locally before the first native prompt. Preserve

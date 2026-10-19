@@ -627,7 +627,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
 	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
-	const cocoProvider = new CocoChatModelProvider({ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "coco-history") });
+	const cocoProvider = new CocoChatModelProvider({ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "coco-history"), log: (event,data) => logService.log(event,data) });
 	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
 	context.subscriptions.push(cocoProvider);

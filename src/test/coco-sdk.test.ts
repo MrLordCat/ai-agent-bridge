@@ -44,6 +44,28 @@ function fixture(handlers: CocoAcpHandlers = {}) {
 const tool = { name: "vscode_chat_read_test", description: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } };
 
 suite("Coco native SDK", () => {
+	test("logs request bounds without the private prompt",async () => {
+		const f = fixture(), events: unknown[] = [];
+		const provider = new CocoChatModelProvider({isEnabled:() => true,resolveCli:() => "fixture-cli",log:(event,data) => events.push({event,data}),
+			createSessionClient:(exe,cwd,connection,model,handlers) => new CocoSdkClient(exe,cwd,connection,model,handlers,f.dependencies)});
+		const source = new vscode.CancellationTokenSource();
+		try {
+			await provider.provideLanguageModelChatResponse(mapCocoModel({id:"claude-opus-5-5",name:"Opus"},1_000_000),[vscode.LanguageModelChatMessage.User("PRIVATE_DIAGNOSTIC_PROMPT")],
+				{toolMode:vscode.LanguageModelChatToolMode.Auto,tools:[{name:"configure_python_environment",description:"Python",inputSchema:{type:"object"}}]}, {report:() => undefined},source.token);
+			const recorded = events as Array<{event:string;data:Record<string,unknown>}>;
+			assert.strictEqual(recorded[0].event,"coco.request.prepared"); assert.strictEqual(recorded[0].data.maxSdkWireToolNameLength,64);
+			assert.strictEqual(recorded[0].data.toolCount,1); assert.ok(!JSON.stringify(events).includes("PRIVATE_DIAGNOSTIC_PROMPT"));
+		} finally {source.cancel();provider.dispose();source.dispose();}
+	});
+	test("invalid fully qualified names fail locally without starting a process",async () => {
+		const f = fixture(), client = f.make();
+		try {
+			const tools = [{name:"vscode_chat_configure_python_environment_cdfb233021",inputSchema:{type:"object"}}];
+			await assert.rejects(client.newSession("/workspace",tools),/Invalid Coco SDK tool catalog/);
+			await assert.rejects(client.loadSession("saved-session","/workspace",tools),/Invalid Coco SDK tool catalog/);
+			assert.strictEqual(f.starts.length,0); assert.strictEqual(f.inputs.length,0);
+		} finally {client.dispose();}
+	});
 	test("live large handoff retains user facts and resumes after process restart", async function () {
 		const archive = process.env.AAB_COCO_LIVE_ARCHIVE;
 		if (!archive) { this.skip(); return; }

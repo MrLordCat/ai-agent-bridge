@@ -1,5 +1,11 @@
 # Snowflake Coco
 
+For the reproduced full-tool-name failure and the 1.18.12 fix, see
+[the tool-name incident diagnosis](COCO_TOOL_NAME_INCIDENT.md). SDK aliases
+include the MCP namespace in the 64-character backend limit and are checked
+before inference. Request bounds and sanitized failures are recorded as
+`coco.request.prepared` / `coco.request.failed` without prompt text.
+
 Coco keeps a native session for each workspace, conversation, model and
 Snowflake connection. Follow-ups append new entries, including entries from
 another provider that continued the same Chat. Compatible completed sessions

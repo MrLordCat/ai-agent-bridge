@@ -5,6 +5,7 @@ import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../su
 import { CocoResponseStream } from "./response-stream";
 import { selectCocoChatTools } from "./terminal-tools";
 import { parseCocoContextUsage } from "./usage-adapter";
+import { cocoClientToolName } from "./tool-names";
 
 type JsonObject = Record<string, unknown>;
 interface PendingCall {
@@ -43,8 +44,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 			if (seen.has(original.name)) { continue; }
 			seen.add(original.name);
 			const tool = withRequiredSubagentModel(original);
-			const hash = createHash("sha256").update(tool.name).digest("hex").slice(0, 10);
-			const alias = `vscode_chat_${tool.name.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 80)}_${hash}`;
+			const alias = cocoClientToolName(tool.name);
 			this.tools.set(alias, tool);
 		}
 	}

@@ -4,7 +4,8 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 
 import { CocoAcpClient, type CocoSessionClient, type CocoAcpHandlers } from "./acp-client";
-import { CocoSdkClient, cocoSdkAvailable } from "./sdk-client";
+import { CocoSdkClient, cocoSdkAvailable, cocoSdkError } from "./sdk-client";
+import { COCO_SDK_TOOL_PREFIX } from "./tool-names";
 import {
 	decodeCocoModelId, mapCocoModel, parseCocoModels, parseCocoThinkingConfiguration,
 	resolveCocoReasoningEffort, type CocoModel, type CocoThinkingConfiguration,
@@ -38,6 +39,7 @@ export interface CocoProviderDependencies {
 	discoveryTimeoutMs?: number;
 	state?: vscode.Memento;
 	storageRoot?: string;
+	log?: (event: string, data: Record<string,unknown>) => void;
 }
 
 interface CocoActiveTurn {
@@ -165,6 +167,9 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 
 	private createClient(...args: ConstructorParameters<typeof CocoAcpClient>): CocoAcpClient {
 		return this.dependencies.createClient?.(...args) ?? new CocoAcpClient(...args);
+	}
+	private diagnostic(event: string, data: Record<string,unknown>): void {
+		try { this.dependencies.log?.(event,data); } catch { /* Diagnostic storage must not fail a native turn. */ }
 	}
 	private nativeClient(executable: string, cwd: string, connection: string | undefined, model: string, handlers: CocoAcpHandlers): CocoSessionClient {
 		if (this.dependencies.createSessionClient) { return this.dependencies.createSessionClient(executable, cwd, connection, model, handlers); }
@@ -364,6 +369,12 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 					throw new Error("This Coco ACP runtime does not support image input. Update the Snowflake extension and refresh Coco models.");
 				}
 				metrics.setSession(slot.mode, slot.key, slot.reason, client.transport === "sdk" && transfer.prompt.some(part => part.type === "image") ? "acp (same native session)" : client.transport ?? "acp");
+				this.diagnostic("coco.request.prepared",{
+					requestId:metrics.requestId,modelId,transport:client.transport ?? "acp",sessionMode:slot.mode,reason:slot.reason,
+					toolCount:bridge.clientTools.length,maxSdkWireToolNameLength:Math.max(0,...bridge.clientTools.map(tool => (COCO_SDK_TOOL_PREFIX + tool.name).length)),
+					promptChars:transfer.prompt.reduce((n,part) => n + (part.type === "text" ? part.text.length : 0),0),
+					imageCount:transfer.prompt.filter(part => part.type === "image").length,compacted:Boolean(transfer.compacted),
+				});
 				const send = async (content: typeof transfer.prompt) => {
 					if (bridge.isTerminal || token.isCancellationRequested) { throw new vscode.CancellationError(); }
 					await this.sessions.startPrompt(slot, anchors);
@@ -380,6 +391,7 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				await this.sessions.checkpoint(slot, anchors);
 			}, progress, token);
 		} catch (error) {
+			this.diagnostic("coco.request.failed",{requestId:metrics.requestId,modelId,transport:client.transport ?? "acp",promptSent:slot.promptSent,error:cocoSdkError(error).message});
 			if ((!sessionReady || slot.promptSent && client.lastPromptSent === false) && !token.isCancellationRequested && generation === this.discoveryGeneration) {
 				this.setStatus("unavailable", "Connection failed — check Snowflake / Azure sign-in", connection);
 			}

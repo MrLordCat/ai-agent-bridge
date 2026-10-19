@@ -4,6 +4,7 @@ import * as path from "node:path";
 import type { SessionOptions, SDKUserMessage } from "@snowflake/cortex-agent-sdk/code" with { "resolution-mode": "import" };
 import { CocoAcpClient, type CocoAcpHandlers, type CocoPromptContent, type CocoSessionClient } from "./acp-client";
 import { COCO_CHAT_TOOL_POLICY } from "./tool-policy";
+import { COCO_SDK_SERVER_NAME,COCO_SDK_TOOL_PREFIX,validateCocoSdkTools } from "./tool-names";
 
 type Json = Record<string, unknown>;
 export function cocoSdkError(error: unknown): Error {
@@ -60,10 +61,12 @@ export class CocoSdkClient implements CocoSessionClient {
 	async initialize() { return { agentCapabilities: { loadSession: true, promptCapabilities: { image: true } } }; }
 	async newSession(cwd: string, tools: Json[] = []): Promise<Json> {
 		if (cwd !== this.cwd || this.closed) { throw new Error("Invalid Coco workspace or closed session."); }
+		validateCocoSdkTools(tools);
 		const id = randomUUID(); this.sessionId = id; this.tools = tools; this.resume = false; return { sessionId: id };
 	}
 	async loadSession(id: string, cwd: string, tools: Json[] = []): Promise<Json> {
 		if (cwd !== this.cwd || this.closed) { throw new Error("Invalid Coco workspace or closed session."); }
+		validateCocoSdkTools(tools);
 		this.sessionId = id; this.tools = tools; this.resume = true;
 		if (this.session) { await this.open(id, cwd, tools, true); }
 		return { sessionId: id };
@@ -86,7 +89,7 @@ export class CocoSdkClient implements CocoSessionClient {
 				const result = await this.handlers.onClientTool?.(String(tool.name), input, nativeId);
 				return { content: [{ type: "text", text: JSON.stringify(result ?? { error: "VS Code callback unavailable" }) }] };
 			} }));
-		const alias = (name: string) => name.startsWith("mcp__vscode_chat__") ? name.slice("mcp__vscode_chat__".length) : name;
+		const alias = (name: string) => name.startsWith(COCO_SDK_TOOL_PREFIX) ? name.slice(COCO_SDK_TOOL_PREFIX.length) : name;
 		const options: SessionOptions = {
 			cliPath: this.executable, cwd, connection: this.connection, model: this.model === "auto" ? undefined : this.model,
 			...(resume ? { resume: id } : { sessionId: id }), includePartialMessages: true,
@@ -94,7 +97,7 @@ export class CocoSdkClient implements CocoSessionClient {
 			onlyExplicitMcpServers: true,
 			// Avoid ambient profile/plugin MCP servers; project instructions remain enabled.
 			extraArgs: { "only-explicit-profiles": null, "only-explicit-plugins": null },
-			mcpServers: { vscode_chat: { type: "sdk", name: "vscode_chat", _toolDefinitions: configs } as NonNullable<SessionOptions["mcpServers"]>[string] },
+			mcpServers: { [COCO_SDK_SERVER_NAME]: { type: "sdk", name: COCO_SDK_SERVER_NAME, _toolDefinitions: configs } as NonNullable<SessionOptions["mcpServers"]>[string] },
 			canUseTool: async (name, input) => {
 				// 0.YY.MMDD CLI sends a permission category plus a resource, not the tool's raw arguments.
 				const target = name === "MCP" && input.action === "execute_command" && typeof input.resource === "string"
