@@ -25,7 +25,20 @@ export interface CocoPermissionRequest {
 export interface CocoAcpHandlers {
 	onUpdate?: (update: JsonObject) => void;
 	onPermission?: (request: CocoPermissionRequest) => Promise<string | undefined>;
-	onClientTool?: (name: string, input: unknown) => Promise<JsonObject>;
+	onClientTool?: (name: string, input: unknown, nativeCallId?: string) => Promise<JsonObject>;
+}
+
+/** A native session transport; discovery can continue to use ACP independently. */
+export interface CocoSessionClient {
+	readonly transport?: "acp" | "sdk";
+	readonly lastPromptSent?: boolean;
+	initialize(): Promise<CocoInitializeResult>;
+	newSession(cwd: string, tools?: JsonObject[]): Promise<JsonObject>;
+	loadSession(sessionId: string, cwd: string, tools?: JsonObject[]): Promise<JsonObject>;
+	setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<JsonObject>;
+	prompt(sessionId: string, prompt: string | readonly CocoPromptContent[]): Promise<JsonObject>;
+	cancel(sessionId: string): void;
+	dispose(): void;
 }
 
 /** A small newline-delimited JSON-RPC client for `cortex acp serve`. */
@@ -39,6 +52,9 @@ export class CocoAcpClient {
 	private nextId = 1;
 	private buffer = "";
 	private closed = false;
+	private readonly exit: Promise<void>;
+	private promptFailure?: string;
+	private promptActive = false;
 
 	constructor(
 		executable: string,
@@ -63,6 +79,7 @@ export class CocoAcpClient {
 			env[pathKey] = `${path.dirname(executable)}${path.delimiter}${env[pathKey] ?? ""}`;
 		}
 		this.child = spawnProcess(executable, args, { cwd, env, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+		this.exit = new Promise(resolve => { this.child.once("close", () => resolve()); });
 		this.child.stdout.setEncoding("utf8");
 		this.child.stdout.on("data", (chunk: string) => this.accept(chunk));
 		this.child.stderr.resume();
@@ -80,18 +97,24 @@ export class CocoAcpClient {
 		}, 20_000);
 	}
 
-	newSession(cwd: string, clientTools: JsonObject[] = []): Promise<JsonObject> {
+	newSession(cwd: string, clientTools: JsonObject[] = [], sessionId?: string): Promise<JsonObject> {
 		return this.request("session/new", {
 			cwd,
 			mcpServers: [],
-			...(clientTools.length > 0 ? { _meta: { clientTools } } : {}),
+			...(clientTools.length > 0 || sessionId ? { _meta: { clientTools, ...(sessionId ? { sessionId } : {}) } } : {}),
 		}, 120_000);
 	}
 
-	prompt(sessionId: string, prompt: string | readonly CocoPromptContent[]): Promise<JsonObject> {
-		return this.request("session/prompt", {
+	async prompt(sessionId: string, prompt: string | readonly CocoPromptContent[]): Promise<JsonObject> {
+		if (this.promptActive) { throw new Error("A Coco ACP prompt is already active."); }
+		this.promptActive = true; this.promptFailure = undefined;
+		try {
+		const result = await this.request("session/prompt", {
 			sessionId, prompt: typeof prompt === "string" ? [{ type: "text", text: prompt }] : prompt,
 		});
+		if (this.promptFailure) { throw new Error(`Coco server failed (${this.promptFailure}). The native session was preserved; no automatic replay was started.`); }
+		return result;
+		} finally { this.promptActive = false; }
 	}
 
 	loadSession(sessionId: string, cwd: string, clientTools: JsonObject[] = []): Promise<JsonObject> {
@@ -105,6 +128,7 @@ export class CocoAcpClient {
 	cancel(sessionId: string): void {
 		this.send({ jsonrpc: "2.0", method: "session/cancel", params: { sessionId } });
 	}
+	async waitForExit(): Promise<void> { await this.exit; }
 
 	dispose(): void {
 		if (this.closed) {
@@ -189,6 +213,12 @@ export class CocoAcpClient {
 		if (message.method === "session/update") {
 			const update = (message.params as JsonObject | undefined)?.update;
 			if (update && typeof update === "object" && !Array.isArray(update)) {
+				const value = update as {sessionUpdate?: unknown; content?: {type?: unknown; text?: unknown}};
+				// Current Cortex ACP catches backend exceptions and emits this exact
+				// error frame followed by end_turn. It must not create a successful checkpoint.
+				const failure = this.promptActive && value.sessionUpdate === "agent_message_chunk" && typeof value.content?.text === "string"
+					? /^\s*Error: internal error \(request_id: ([a-f0-9-]{36})\)\s*$/i.exec(value.content.text) : null;
+				if (failure) { this.promptFailure = failure[1]; return; }
 				try {
 					this.handlers.onUpdate?.(update as JsonObject);
 				} catch {

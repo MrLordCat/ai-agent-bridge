@@ -58,7 +58,9 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		}
 		const selected = this.registry.resolve(model.id);
 		this.registry.observeRequest(selected, token, options.modelOptions?._copilotConversationId);
-		const usesHistory = selected.id === "coco" || await selected.usesConversationHistory?.(model) === true;
+		const usesHistory = selected.id === "coco"
+			? await (selected.provider as CocoChatModelProvider).needsConversationHistory?.(model, messages, options) ?? true
+			: await selected.usesConversationHistory?.(model) === true;
 		let history: Awaited<ReturnType<ConversationHistory["begin"]>> | undefined;
 		try { history = await this.history?.begin(options.modelOptions?._copilotConversationId, messages); }
 		catch (error) { if (usesHistory) { throw error; } this.warnHistory(); }

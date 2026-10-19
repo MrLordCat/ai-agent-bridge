@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.18.7",
+	"version": "1.18.11",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -116,6 +116,12 @@
 					"maximum": 1048576,
 					"description": "Fallback context window advertised for Coco models. The server still enforces the selected model limit."
 				},
+				"llamacpp.cocoTransport": {
+					"type": "string",
+					"enum": ["auto", "sdk", "acp"],
+					"default": "auto",
+					"description": "Coco native session transport. Auto uses Snowflake SDK on Node 22.22+ and ACP on older hosts. A failed native resume never silently starts a new history import."
+				},
 				"llamacpp.cocoModelContextLengths": {
 					"type": "object",
 					"default": {
@@ -133,7 +139,8 @@
 					"default": 16,
 					"minimum": 1,
 					"maximum": 128,
-					"description": "Maximum automatic Coco history-import requests for a cold handoff. Each request can incur model usage. Oversized transfers stop with a full local transcript instead of silently dropping history."
+					"description": "Legacy setting. Coco now sends fitting history in one prompt and never runs automatic ACK imports.",
+					"deprecationMessage": "Coco no longer performs automatic multi-prompt history imports. Compact history that exceeds the selected model window."
 				},
 				"llamacpp.cursorMaxHistoryImportParts": {
 					"type": "integer",
@@ -1462,6 +1469,7 @@
 	"dependencies": {
 		"@anthropic-ai/claude-agent-sdk": "0.3.240",
 		"@cursor/sdk": "1.0.37",
+		"@snowflake/cortex-agent-sdk": "0.0.2",
 		"stream-json": "3.7.0",
 		"zod": "^4.4.3"
 	}

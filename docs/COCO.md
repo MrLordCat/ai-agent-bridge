@@ -6,13 +6,44 @@ another provider that continued the same Chat. Compatible completed sessions
 resume after a VS Code reload. Rewinding/editing history creates a fresh native
 branch; interrupted tool cycles are cancelled rather than reused.
 
-Large cold handoffs import the complete available history in bounded parts.
-Import answers stay hidden and tools are disabled until the actual continuation.
-Full transcripts and oversized tool outputs remain in workspace-local storage
-for targeted rereading after native compaction. Nothing is silently removed
-from the middle of the execution transcript. Image bytes are retained.
-Each import consumes model usage. `llamacpp.cocoMaxHistoryImportParts` defaults
-to 16; exceeding it stops with the complete transcript path before inference.
+Since 1.18.8, `llamacpp.cocoTransport=auto` uses the Snowflake `/code` SDK on
+Node 22.22+ and ACP on older hosts. Explicit `sdk` and `acp` choices are available.
+The CLI owns conversation history; the bridge preserves its native session ID.
+Bindings are stored atomically on disk and mirrored in workspace state.
+Failed load or preflight checks preserve the previous binding without silently
+starting a fresh session. A confirmed native continuation can proceed even if
+the optional handoff journal is unavailable.
+
+A cold handoff uses one native prompt without hidden ACK imports. Since 1.18.11,
+large handoffs are prepared locally: retain the complete latest request, prefer
+user requirements and recent context, and put older tool output/images and
+omitted text in an exact archive. Chat shows the reduction and archive path.
+The model can read that archive through VS Code tools when a detail is missing;
+an archive is not proof that every detail is in the active model context.
+Historical @ references are quoted to avoid automatic attachment loading.
+The working target is at most 1,000,000 text characters, reduced for smaller
+configured windows. It is not a measured token limit: SDK 0.0.2 exposes no exact
+model tokenizer. A current request that alone exceeds the target is rejected
+before inference. The CLI owns its actual finite window and subsequent native
+compaction. There is no automatic multi-request replay after a failure.
+A separate 64 MiB limit on encoded content
+protects bridge memory/transport and includes JSON escaping, UTF-8 and image data.
+Exceeding that safety limit archives the payload and stops before inference;
+it is not a token count or model window. `llamacpp.cocoMaxHistoryImportParts`
+is obsolete. Full transcripts, image bytes and oversized tool outputs remain
+available locally for rereading.
+
+An interrupted native turn requires a new explicit user message. The bridge
+resumes the stored session and skips the already-sent request. Repeated native
+callback IDs reuse completed results visible in Chat. Missing acknowledgements
+across process loss still require reconciliation; arbitrary new tool IDs are
+not treated as proof that an earlier action did or did not execute.
+
+Current Cortex ACP can emit `Error: internal error (request_id: ...)` and still
+report `end_turn`. The bridge recognizes that exact error frame as a failed
+request. Older checkpoints whose associated answer was this frame are rebuilt
+from visible context on the next explicit user turn; original native histories
+are preserved. It does not automatically replay an unsuccessful action.
 
 The exact `claude-opus-5-5` ID starts with a verified 1,000,000-token window.
 `llamacpp.cocoModelContextLengths` overrides per-model baselines; unknown models
@@ -20,8 +51,12 @@ use `llamacpp.cocoContextLength` (128,000 by default). Measured runtime windows
 take precedence. A model's finite window and native compaction still apply.
 See [continuity, storage and cache verification](COCO_CONTINUITY.md).
 
+For the investigation behind SDK-managed native sessions, see the
+[Coco native integration research](COCO_NATIVE_INTEGRATION_RESEARCH.md).
+Current implementation and runtime checks are described here and in the changelog.
+
 Install the Snowflake VS Code extension. AI Agent Bridge uses its bundled
-`cortex` CLI through the Agent Client Protocol (ACP). If your Snowflake CLI has
+`cortex` CLI through the Snowflake SDK and ACP. If your Snowflake CLI has
 one connection, its name is selected automatically; otherwise set
 `llamacpp.cocoConnection`. The `Auto (Coco)` entry is available immediately.
 The models granted to your Snowflake role appear after an ACP connection
@@ -57,13 +92,15 @@ be enabled with a supported default shell (PowerShell 7, bash or zsh). If it
 cannot activate, the bridge reports the problem before sending the command.
 After updating the extension, reload VS Code and start a new request so Coco
 receives the updated tool catalog. Existing Background Shells remain separate.
-The bridge sends text and image attachments. The picker enables vision after the active ACP runtime
-advertises image input. Images retain their original bytes and MIME types in
-separate ACP content blocks. Warm turns reuse the same session and stable prefix.
+The bridge sends text and image attachments. The picker enables vision after
+ACP advertises image input. SDK 0.0.2 ignores image blocks on its stdin API,
+so image turns use ACP with the same native session ID. Replay stays hidden;
+images retain their original bytes and MIME types. The next text turn resumes
+that same history through SDK. This capability choice happens before inference.
 
 The model picker exposes **Thinking Effort** using the levels advertised by
 Coco (currently Auto, Minimal, Low, Medium, High, and Max). The chosen value is
-sent to the session before the prompt. ACP thought deltas appear in the native
+sent to the session before the prompt. Native thought deltas appear in the
 thinking block, separately from the answer. A model or endpoint that does not
 return thought deltas will only show its answer.
 
@@ -74,23 +111,44 @@ continuations and can decrease after compaction. Observed windows replace the
 configured fallback for that model. The bridge does not treat cumulative billing
 tokens as context or invent a measured count when the runtime sends none.
 
-ACP prompt results also provide measured usage: uncached input, cache reads,
+SDK/ACP prompt results also provide measured usage: uncached input, cache reads,
 cache writes and output. These populate Coco's own Token Usage category,
 Quick Access metrics and session diagnostics. Input totals include cache reads
-and writes exactly once. Handoff totals include its import requests; current
+and writes exactly once. SDK cumulative counters are differenced per process; current
 context remains a separate snapshot. Cache availability depends on the backend;
 a warm or restored session does not promise a hit. Missing counters show as
-unreported. Statistics start with new requests after this update.
+unreported.
+
+`node scripts/coco-sdk-smoke.mjs --run --cli <cortex> --connection <name> --vision`
+verifies a callback, warm continuation, process restart, image and subsequent
+SDK continuation. It uses real model requests only with `--run`. On the verified
+Opus 5.5 run, the marker survived all stages and the tool ran once. Warm input
+was 82,664 tokens (82,596 cache reads); restored input was 82,924 (82,506 reads).
+These are measurements of that test, not a cache-hit guarantee.
+
+The opt-in test `live large handoff` in `coco-sdk.test.ts` uses
+`AAB_COCO_LIVE_ARCHIVE` and optionally `AAB_COCO_LIVE_CLI`. It sends two real
+diagnostic prompts with no callable project tools. On 2026-10-19, the reported
+3,045,868-character archive was prepared and both control facts survived the
+first prompt and native restart (34 seconds total). Normal tests skip it.
 
 Quick Access has a **Coco** section with live ACP connection status, the
 discovered model count, an on/off source toggle, Snowflake connection selection,
 catalog refresh, and links to the native thinking picker, Coco settings, and the
 Snowflake Coco panel. Status checks open an ACP session without running inference.
-Fresh status results are reused. **Refresh Models** forces one shared check,
-preserving the catalog and thinking levels while it runs. The notification shows
+Background discovery reuses fresh status results. Since 1.18.10, manual
+**Connection Status** and **Refresh Models** force one shared check, preserving
+the catalog and thinking levels while it runs. Selecting the existing
+**Snowflake Connection** also retries it without rewriting settings; cancelling
+the picker does nothing. The notification shows
 the current stage and supports **Cancel**. Startup and model discovery together
 have a 45-second deadline; a timeout or cancellation stops the owned CLI and
 reports an actionable status. Repeated refresh clicks share the same operation
 instead of restarting it or adding more notifications.
+**Open Snowflake Coco** selects Snowflake's secondary-sidebar view on current
+VS Code, falling back to the classic view when needed. It shows cancellable
+activation progress with a 45-second deadline and reports failures. Cancelling
+or timing out prevents a late panel opening from that attempt. Credentials are
+managed by Snowflake/CLI: a valid cached login does not require a new sign-in.
 The section stays visible when Coco is offline so reconnect and setup controls
 remain available.

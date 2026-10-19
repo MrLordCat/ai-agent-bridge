@@ -13,19 +13,14 @@ interface PendingCall {
 	reported: boolean;
 }
 
-export const COCO_CHAT_TOOL_POLICY = [
-	"You are handling a VS Code Chat request. All actions must use the supplied vscode_chat_ client tools.",
-	"Use those tools for commands, file access, edits, search, web access, questions, planning and subagents.",
-	"Do not use Cortex built-in tools, terminals, SQL, MCP servers or internal subagents; the bridge stops those actions.",
-	"VS Code Chat handles permissions, execution and displays results. Continue from each client-tool result.",
-	"For commands use cocoRunInTerminal (or llamacpp_coco_run_in_terminal), which automatically reuses an idle interactive VS Code terminal. Use the returned terminalId for reading, input and closing. Set newTerminal only when a separate shell is necessary. If the caller offers run_in_terminal instead, use that interactive tool.",
-	"Use sync mode for finite commands, async for servers/watchers. A running result means the command was started once; read its output instead of rerunning it. The user may type, interrupt or close the terminal at any time. Respect a closed terminal; do not restart the cancelled command automatically.",
-	"If the required client tool is unavailable, explain the limitation instead of performing the action internally.",
-].join("\n");
+export { COCO_CHAT_TOOL_POLICY } from "./tool-policy";
 
 /** Keep native Chat call IDs and their ACP promises alive across model-provider requests. */
 export class CocoTurnBridge implements vscode.Disposable {
 	private readonly tools = new Map<string, vscode.LanguageModelChatTool>();
+	private readonly completed = new Map<string, JsonObject>();
+	private readonly historicalResults = new Map<string, vscode.LanguageModelToolResultPart>();
+	private readonly historicalCalls = new Set<string>();
 	private readonly state = new DelegatedTurnState<PendingCall, JsonObject>();
 	private get pending() { return this.state.pending; }
 	private stream?: CocoResponseStream;
@@ -65,6 +60,12 @@ export class CocoTurnBridge implements vscode.Disposable {
 
 	get isTerminal(): boolean { return this.terminal; }
 	get pendingCallIds(): ReadonlySet<string> { return new Set(this.pending.keys()); }
+	rememberResults(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
+		for (const message of messages) { for (const part of message.content) {
+			if (part instanceof vscode.LanguageModelToolResultPart && part.callId.startsWith("coco-")) { this.historicalResults.set(part.callId, part); }
+			else if (part instanceof vscode.LanguageModelToolCallPart && part.callId.startsWith("coco-")) { this.historicalCalls.add(part.callId); }
+		} }
+	}
 
 	start(
 		operation: () => Promise<unknown>, progress: vscode.Progress<vscode.LanguageModelResponsePart>,
@@ -91,7 +92,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		void Promise.all(results.map(async result => ({ result, converted: this.preserveResult ? await this.preserveResult(result) : convertCocoToolResult(result) })))
 			.then(converted => {
 				if (this.terminal) { return; }
-				this.pending.accept(converted, item => item.result.callId, (call, item) => call.resolve(item.converted), call => call.reported);
+				this.pending.accept(converted, item => item.result.callId, (call, item) => { this.completed.set(item.result.callId,item.converted); call.resolve(item.converted); }, call => call.reported);
 				this.reportCalls();
 			}, error => this.finish(error instanceof Error ? error : new Error(String(error))));
 		return completion;
@@ -120,7 +121,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		catch (error) { this.finish(error instanceof Error ? error : new Error(String(error))); }
 	}
 
-	delegate(alias: string, input: unknown): Promise<JsonObject> {
+	delegate(alias: string, input: unknown, nativeCallId?: string): Promise<JsonObject> {
 		const tool = this.tools.get(alias);
 		if (this.terminal || !tool) {
 			return Promise.reject(new Error(`Unavailable Coco client tool: ${alias}`));
@@ -128,7 +129,12 @@ export class CocoTurnBridge implements vscode.Disposable {
 		if (!input || typeof input !== "object" || Array.isArray(input)) {
 			return Promise.reject(new Error("Coco client tool arguments must be a JSON object."));
 		}
-		const callId = `coco-${randomUUID()}`;
+		const callId = nativeCallId ? `coco-${createHash("sha256").update(nativeCallId).digest("hex")}` : `coco-${randomUUID()}`;
+		if (this.completed.has(callId)) { return Promise.resolve(this.completed.get(callId)!); }
+		const historical = this.historicalResults.get(callId);
+		if (historical) { return this.preserveResult ? this.preserveResult(historical) : Promise.resolve(convertCocoToolResult(historical)); }
+		if (this.historicalCalls.has(callId)) { return Promise.reject(new Error("The earlier Coco tool completion is unknown. Verify its outcome before retrying; no action was repeated.")); }
+		if (this.pending.has(callId)) { return Promise.reject(new Error("Duplicate pending Coco callback; no action was repeated.")); }
 		const response = new Promise<JsonObject>(resolve => this.pending.set(callId, {
 			part: new vscode.LanguageModelToolCallPart(callId, tool.name, input), resolve, reported: false,
 		}));

@@ -31,6 +31,17 @@ suite("Coco ACP transport", () => {
 		await new Promise<void>(resolve => setImmediate(resolve));
 	}
 	teardown(() => client?.dispose());
+	test("rejects the native internal-error frame even when ACP reports end_turn", async () => {
+		const updates: unknown[] = []; setup({onUpdate: update => updates.push(update)});
+		const response = client.prompt("native-session","Continue");
+		const rejected = assert.rejects(response,/Coco server failed.*8f87cfae-6b7f-496f-8881-7fafe57caf39/);
+		receive({jsonrpc:"2.0",method:"session/update",params:{sessionId:"native-session",update:{sessionUpdate:"agent_message_chunk",content:{type:"text",text:"\n\nError: internal error (request_id: 8f87cfae-6b7f-496f-8881-7fafe57caf39)"}}}});
+		receive({jsonrpc:"2.0",id:1,result:{stopReason:"end_turn"}});
+		await rejected; assert.deepStrictEqual(updates,[]);
+		const next = client.prompt("native-session","Retry after diagnosis");
+		receive({jsonrpc:"2.0",id:2,result:{stopReason:"end_turn"}});
+		assert.strictEqual((await next).stopReason,"end_turn");
+	});
 
 	test("ignores non-object messages and decodes a fragmented reply", async () => {
 		setup();

@@ -25,8 +25,10 @@ export class CocoTurnMetrics {
 	private conversationKey?: string;
 	private reason?: string;
 	constructor(readonly modelId: string, private readonly messageCount: number, private readonly publish: (value: CocoLiveTurn) => void) {}
-	setSession(mode: LlamaChatTurnMetrics["sessionMode"], conversationKey: string, reason?: string): void { this.mode = mode; this.conversationKey = conversationKey; this.reason = reason; this.emit(); }
+	private transport = "acp";
+	setSession(mode: LlamaChatTurnMetrics["sessionMode"], conversationKey: string, reason?: string, transport = "acp"): void { this.mode = mode; this.conversationKey = conversationKey; this.reason = reason; this.transport = transport; this.emit(); }
 	accept(update: Record<string, unknown>, importing = false): void {
+		if (update.sessionUpdate === "compaction") { this.compacted = true; this.emit(); return; }
 		const context = parseCocoContextUsage(update);
 		if (context) { this.compacted ||= this.context !== undefined && context.usedTokens < this.context.usedTokens; this.context = context; this.emit(); return; }
 		if (importing || (update.sessionUpdate !== "agent_message_chunk" && update.sessionUpdate !== "agent_thought_chunk")) { return; }
@@ -64,14 +66,14 @@ export class CocoTurnMetrics {
 		const durationMs = Date.now() - this.started;
 		const turn: LlamaChatTurnMetrics = {
 			requestId: this.requestId, modelId: this.modelId, providerKind: "coco", lifecyclePhase: this.phase,
-			sessionMode: this.mode, conversationKey: this.conversationKey, inputMode: this.mode === "warm" ? "user-turn" : "history-import",
+			sessionMode: this.mode, conversationKey: this.conversationKey, inputMode: this.mode === "new" || this.mode === "resume-fallback" ? "full" : "user-turn",
 			terminalDetail: this.terminalDetail, startedAtMs: this.started, durationMs, queueWaitMs: 0, messageCount: this.messageCount,
 			firstTokenLatencyMs: this.firstToken, emittedParts: this.emittedParts, outputChars: this.outputChars, thinkingChars: this.thinkingChars,
 			estimatedOutputTokens: usage?.outputTokens ?? Math.ceil((this.outputChars + this.thinkingChars) / 4), outputTokens: usage?.outputTokens,
 			promptTokens: usage?.inputTokens ?? 0, cachedPromptTokens: cached, cacheWriteInputTokens: written,
 			promptCacheHitPercent: percent, cacheMissReason: reason,
-			cacheMissDetail: cached === undefined ? "This Coco runtime has not reported complete ACP prompt cache counters. Context occupancy is a separate snapshot."
-				: `ACP prompt usage; session ${this.mode}${this.reason ? ` (${this.reason})` : ""}. Cache reads are server-reported; a low hit rate does not identify the server's eviction reason.`,
+			cacheMissDetail: cached === undefined ? `This Coco ${this.transport} runtime has not reported complete prompt cache counters. Context occupancy is a separate snapshot.`
+				: `Coco ${this.transport} native prompt usage; session ${this.mode}${this.reason ? ` (${this.reason})` : ""}. Cache reads are server-reported; a low hit rate does not identify the server's eviction reason.`,
 			compacted: this.compacted, modelTurns: this.usage.length, usageEstimated: !usage || this.missingUsage,
 			retriedAfterOverflow: false, toolCalls: this.toolCalls, repairedToolCalls: 0, rejectedToolCalls: 0,
 			schemaRejectedToolCalls: 0, toolCallRepairRetries: 0, toolLoopDetected: false, metricsSource: "live",

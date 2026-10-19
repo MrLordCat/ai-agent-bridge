@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.18.11 (local development patch) - 2026-10-19
+
+- Prepare large Coco handoffs locally before the first native prompt. Preserve
+  the complete latest request, prefer user requirements and recent context,
+  and archive the exact original text and image bytes. Show the reduction and
+  archive path in Chat. The working target is conservative, not an exact token
+  count; the finite backend window still applies. No hidden ACK requests.
+- Quote historical @ references so CLI attachment expansion does not reload
+  screenshots/logos from old messages. Keep current explicit attachments intact.
+- Reject Cortex ACP's explicit internal-error frame even when the runtime
+  reports end_turn. Do not checkpoint that failure as a successful answer;
+  recover legacy checkpoints whose saved answer was the known error frame.
+- Reject malformed SDK protocol events and clear stale rollback state between
+  requests. Review and audit the pinned SDK and accumulated native-session work.
+- Verify an isolated live handoff using the reported 3,045,868-character archive:
+  both control facts survived the prepared first prompt and native process restart.
+  The diagnostic allowed no project actions. This checks continuation, not
+  preservation of every historical detail in the model's active context.
+
+## 1.18.10 (local development patch) - 2026-10-19
+
+- Make manual Coco connection checks bypass cached startup failures. Selecting
+  the existing Snowflake connection now retries it without rewriting settings;
+  cancelling the picker leaves the connection and runtime untouched.
+- Open Snowflake's secondary-sidebar Coco view on current VS Code versions,
+  retaining the classic view for older Snowflake manifests/layouts. The previous
+  hardcoded `cortexChat.focus` targeted a hidden view on current VS Code.
+- Show cancellable progress while activating Snowflake and opening Coco. Join
+  repeated clicks, report activation failures/timeouts, and prevent a cancelled
+  or timed-out attempt from opening the panel later. No raw connection errors
+  or credentials are included in the notification.
+
+## 1.18.9 (local development patch) - 2026-10-19
+
+- Stop rejecting Coco handoffs using a character-to-token guess. The 1.18.8
+  preflight could reject a 3,045,543-character Chat before Coco received it;
+  no exact model tokenizer is exposed by the SDK. Send the complete history
+  in one native prompt and let Coco enforce its window and manage compaction.
+- Keep a separate 64 MiB encoded-payload guard for transport/memory, including
+  UTF-8, JSON escaping and image data. Archive oversized payloads before
+  inference and identify the guard as a transport limit rather than token usage.
+- Cover large cold handoffs, all 14 historical images, and SDK reload with only
+  the next turn sent. No ACK requests, automatic replay or middle excerpts.
+
+## 1.18.8 (local development patch) - 2026-10-19
+
+- Use Snowflake's pinned `/code` SDK for native Coco sessions on Node 22.22+;
+  retain ACP for older hosts and explicit selection. Discovery still uses ACP.
+- Send a fitting Codex/other-provider handoff in one prompt. Remove automatic
+  ACK imports and the fixed 500,000-character execution cap. Archive and reject
+  histories exceeding the selected window before inference.
+- Persist session bindings atomically on disk as well as in workspace state.
+  Preserve bindings through preflight/load errors, resume the same native ID
+  after reload, and keep confirmed continuations independent of the handoff journal.
+- Map native callback identities into Chat tool IDs and reuse completed visible
+  results on repeated IDs instead of executing tools twice. Interrupted turns
+  continue on a new explicit user message without replaying the old request.
+- Preserve images through ACP on the same native session: SDK 0.0.2's stdio user
+  input ignores images. Hide replay notifications and return to SDK after the
+  image turn without reconstructing history.
+- Verify native callback, warm and restored turns, image recognition and a
+  subsequent SDK turn on Cortex Code 0.26.1019 / Opus 5.5. Normalize the SDK's
+  cumulative process counters into per-request usage without counting cache twice.
+
 ## 1.18.7 (local development patch) - 2026-10-19
 
 - Merge the incoming stored-tool-result bounds and MCP tuple-schema fixes

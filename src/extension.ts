@@ -1902,6 +1902,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					event.affectsConfiguration("llamacpp.enableCoco") ||
 					event.affectsConfiguration("llamacpp.cocoCliPath") ||
 					event.affectsConfiguration("llamacpp.cocoConnection") ||
+					event.affectsConfiguration("llamacpp.cocoTransport") ||
 					event.affectsConfiguration("llamacpp.cocoContextLength")
 				) {
 					cocoProvider.refreshLanguageModelChatInformation();

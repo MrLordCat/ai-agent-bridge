@@ -43,6 +43,28 @@ suite("Snowflake Coco provider", () => {
 		} finally { subscription.dispose(); provider.dispose(); }
 	});
 
+	test("a manual connection check retries a cached startup failure immediately", async () => {
+		let probes = 0, notifications = 0, infos = 0;
+		const provider = new CocoChatModelProvider({
+			isEnabled: () => true, resolveCli: () => "mock-cli",
+			createClient: () => { if (++probes === 1) { throw new Error("Startup unavailable"); } return fakeClient(async () => sessionResult()); },
+		});
+		const source = new vscode.CancellationTokenSource();
+		const ui = {
+			withProgress: (_options: vscode.ProgressOptions, task: (progress: vscode.Progress<{ message?: string }>, token: vscode.CancellationToken) => Promise<CocoProviderStatus>) => {
+				notifications++; return task({ report: () => undefined }, source.token);
+			},
+			showWarningMessage: () => { assert.fail("The manual retry should recover"); },
+			showInformationMessage: () => { infos++; return Promise.resolve(undefined); },
+		} as unknown as NonNullable<Parameters<typeof createCocoStatusCheck>[2]>;
+		try {
+			assert.strictEqual((await provider.refreshStatus()).state, "unavailable");
+			await createCocoStatusCheck(provider, () => undefined, ui)();
+			assert.strictEqual(probes, 2); assert.strictEqual(provider.providerStatus.state, "connected");
+			assert.strictEqual(notifications, 1); assert.strictEqual(infos, 1);
+		} finally { provider.dispose(); source.dispose(); }
+	});
+
 	test("reports disabled and missing-runtime states without spawning a CLI", async () => {
 		let enabled = false;
 		const provider = new CocoChatModelProvider({
