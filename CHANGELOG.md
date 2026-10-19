@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.18.7 (local development patch) - 2026-10-19
+
+- Merge the incoming stored-tool-result bounds and MCP tuple-schema fixes
+  (Copilot patch v24) with the Cursor continuity and interrupted-run recovery
+  work from local builds 1.18.1 through 1.18.6.
+- Preserve both independently numbered 1.18.1/1.18.2 histories below; incoming
+  patch releases and earlier local Cursor builds used the same version numbers.
+- Stream oversized chat-session repairs and apply every snapshot, assignment
+  and array delta before bounding the output. Refuse unsafe paths, unsupported
+  input names and existing outputs; enforce the budget in UTF-8 bytes.
+- Cover chat repair with offline regression tests and use a patched streaming
+  JSON parser. Original session files remain untouched.
+
 ## 1.18.6 (local development patch) - 2026-10-19
 
 - Recover a Cursor stream interrupted after a VS Code callback finished but
@@ -94,6 +107,36 @@
   cache reads/writes, while its total can add them again. Distinguish first cold
   starts from failed session reuse and include the actual continuation reason.
   Existing aggregated usage is retained; server cache hits are not guaranteed.
+## 1.18.2 (patch release) - 2026-10-18
+
+- **MCP tools with tuple schemas no longer break the chat.** A JSON Schema
+  tuple is written as `prefixItems` without `items`; Copilot's validator
+  rejected that shape and failed the whole request with
+  `Failed to validate tool <name>: tool parameters array type must have
+  items`. Patch v24 fills in an empty `items` schema, so tools such as
+  `inspect_analysis_view` from the REA MCP server remain usable.
+- Patch v24 upgrades from v23 in place; the preserved original bundle
+  backup stays valid.
+
+## 1.18.1 (patch release) - 2026-10-18
+
+- **Saved chat sessions no longer grow past the V8 string limit.** Copilot
+  stores every tool result twice: a bounded copy for the prompt and a
+  verbatim copy in the saved session. A session with several `view_image`
+  calls reached 544 MB, after which VS Code failed every request with
+  `RangeError: Invalid string length` while serializing the agent
+  arguments. Patch v23 bounds the stored copy as well: binary payloads
+  above 200 KB become a compact marker and text above 12 KB is truncated.
+  The live tool card keeps its full result.
+- **Patch v23 upgrades from v22 in place.** The v22 marker is now a legacy
+  marker, so the preserved original bundle backup stays valid and is used
+  as the source for the new patch.
+- `scripts/repair-chat-sessions.cjs` repairs an already oversized session:
+  binary payloads are replaced, huge text is trimmed, the newest requests
+  are kept, and a new `*.repaired.jsonl` is written next to the original.
+  The original file is never modified.
+
+- Tests: 702 extension-host tests.
 
 ## 1.18.0 (stable release) - 2026-10-15
 

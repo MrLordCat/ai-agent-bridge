@@ -22,90 +22,103 @@ import {
 	VSCODE_CHAT_HISTORY_PATCH_MARKER,
 } from "../copilot-patch";
 
-	for (const name of ["t", "n"]) {
-		test(`guards the git repositories reactive chain with Array.isArray (${name})`, () => {
-			const source = `class X{async init(){let t=await P(this.a);let r=no(this,o=>t.onDidOpenRepository(o),()=>${name}.repositories??[]);await Q(r,o=>o.length>0,void 0),!this.s&&fp(this,r,(o,a)=>{a.add(L())},o=>o.rootUri.toString()).recomputeInitiallyAndOnChange(this.s)}}`;
-			const patched = patchCopilotGitRepositoriesGuard(source);
-			assert.ok(patched.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER), "guard marker must be present");
-			assert.ok(
-				patched.includes(`()=>Array.isArray(${name}.repositories)?${name}.repositories:[]`),
-				"Array.isArray guard must be present"
-			);
-			assert.ok(!patched.includes(`()=>${name}.repositories??[]`), "original unguarded expression must be gone");
-			new Function(patched);
-			// Idempotent.
-			assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
-			// Missing / non-unique pattern must throw with a distinct message.
-			assert.throws(
-				() => patchCopilotGitRepositoriesGuard("class X{}"),
-				/pattern not found/
-			);
-			assert.throws(
-				() => patchCopilotGitRepositoriesGuard(
-					"()=>t.repositories??[]()=>n.repositories??[]"
-				),
-				/pattern not unique/
-			);
-		});
-	}
+for (const name of ["t", "n"]) {
+	test(`guards the git repositories reactive chain with Array.isArray (${name})`, () => {
+		const source = `class X{async init(){let t=await P(this.a);let r=no(this,o=>t.onDidOpenRepository(o),()=>${name}.repositories??[]);await Q(r,o=>o.length>0,void 0),!this.s&&fp(this,r,(o,a)=>{a.add(L())},o=>o.rootUri.toString()).recomputeInitiallyAndOnChange(this.s)}}`;
+		const patched = patchCopilotGitRepositoriesGuard(source);
+		assert.ok(patched.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER), "guard marker must be present");
+		assert.ok(
+			patched.includes(`()=>Array.isArray(${name}.repositories)?${name}.repositories:[]`),
+			"Array.isArray guard must be present"
+		);
+		assert.ok(!patched.includes(`()=>${name}.repositories??[]`), "original unguarded expression must be gone");
+		new Function(patched);
+		// Idempotent.
+		assert.strictEqual(patchCopilotGitRepositoriesGuard(patched), patched);
+		// Missing / non-unique pattern must throw with a distinct message.
+		assert.throws(() => patchCopilotGitRepositoriesGuard("class X{}"), /pattern not found/);
+		assert.throws(
+			() => patchCopilotGitRepositoriesGuard("()=>t.repositories??[]()=>n.repositories??[]"),
+			/pattern not unique/
+		);
+	});
+}
 
-	suite("agent history cap shapes", () => {
-		const SHAPE_060 = `class X{render(t,r,o,a){_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
-		const SHAPE_061 = `class X{render(t,r,o,a){x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:E,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
-		const SHAPE_0641 = `class X{render(t,r,o,a){x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass;return this.props.enableSummarization?vscpp(vscppf,null,v,vscpp(C8,{flexGrow:1,triggerSummarize:this.props.triggerSummarize,forceSimpleSummary:this.props.forceSimpleSummary,priority:900,promptContext:this.props.promptContext,location:this.props.location,maxToolResultLength:_,endpoint:this.props.endpoint,tools:this.props.promptContext.tools})):y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:_,enableCacheBreakpoints:!1}}async render(n,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let s=this.instantiationService.createChild(new mf([pkt,this.props.promptContext])),c={remaining:NPn},l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+suite("agent history cap shapes", () => {
+	const SHAPE_060 = `class X{render(t,r,o,a){_=o.userQueryTagName,w=o.ReminderInstructionsClass,E=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:v,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+	const SHAPE_061 = `class X{render(t,r,o,a){x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass;return this.props.enableSummarization?x:y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:E,enableCacheBreakpoints:!1}}async render(t,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
+	const SHAPE_0641 = `class X{render(t,r,o,a){x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass;return this.props.enableSummarization?vscpp(vscppf,null,v,vscpp(C8,{flexGrow:1,triggerSummarize:this.props.triggerSummarize,forceSimpleSummary:this.props.forceSimpleSummary,priority:900,promptContext:this.props.promptContext,location:this.props.location,maxToolResultLength:_,endpoint:this.props.endpoint,tools:this.props.promptContext.tools})):y}build(){return{toolCallRounds:this.props.promptContext.toolCallRounds,toolCallResults:this.props.promptContext.toolCallResults,truncateAt:_,enableCacheBreakpoints:!1}}async render(n,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;let s=this.instantiationService.createChild(new mf([pkt,this.props.promptContext])),c={remaining:NPn},l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));}}`;
 
-		test("patches the 0.60.x variable names (_/w/E, truncateAt:v)", () => {
-			const patched = patchAgentHistoryCap(SHAPE_060);
-			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
-			assert.ok(patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "wiring must keep the original truncateAt variable");
-			assert.ok(patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:v"), "wiring must switch to the capped arrays");
-			assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
-			new Function(patched);
-		});
-
-		test("patches the 0.61.0 variable names (x/k/P, truncateAt:E)", () => {
-			const patched = patchAgentHistoryCap(SHAPE_061);
-			assert.ok(patched.includes("x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass"), "original names must be preserved");
-			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
-			assert.ok(patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:E"), "wiring must keep truncateAt:E");
-			assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
-			new Function(patched);
-		});
-
-		test("patches the 0.64.1 variable names (x/E/I, render(n,r,o,a), truncateAt:_)", () => {
-			const patched = patchAgentHistoryCap(SHAPE_0641);
-			assert.ok(
-				patched.includes("x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass"),
-				"0.64.1 original names must be preserved"
-			);
-			assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
-			assert.ok(
-				patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:_"),
-				"wiring must keep truncateAt:_"
-			);
-			assert.ok(patched.includes("let __llamaRounds=this.props.toolCallRounds"), "element cap header must be added to async render");
-			assert.ok(patched.includes("if(this.promptEndpoint.modelProvider===\"llamacpp\")"), "element cap must be provider-guarded");
-			assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
-			assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
-			assert.ok(!patched.includes("truncateAt:E,enableCacheBreakpoints:!1"), "no stale 0.61 wiring");
-			new Function(patched);
-			// Idempotent.
-			assert.strictEqual(patchAgentHistoryCap(patched), patched);
-		});
+	test("patches the 0.60.x variable names (_/w/E, truncateAt:v)", () => {
+		const patched = patchAgentHistoryCap(SHAPE_060);
+		assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+		assert.ok(
+			patched.includes("truncateAt:v,enableCacheBreakpoints:!1"),
+			"wiring must keep the original truncateAt variable"
+		);
+		assert.ok(
+			patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:v"),
+			"wiring must switch to the capped arrays"
+		);
+		assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
+		new Function(patched);
 	});
 
+	test("patches the 0.61.0 variable names (x/k/P, truncateAt:E)", () => {
+		const patched = patchAgentHistoryCap(SHAPE_061);
+		assert.ok(
+			patched.includes("x=o.userQueryTagName,k=o.ReminderInstructionsClass,P=o.ToolReferencesHintClass"),
+			"original names must be preserved"
+		);
+		assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+		assert.ok(
+			patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:E"),
+			"wiring must keep truncateAt:E"
+		);
+		assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
+		new Function(patched);
+	});
+
+	test("patches the 0.64.1 variable names (x/E/I, render(n,r,o,a), truncateAt:_)", () => {
+		const patched = patchAgentHistoryCap(SHAPE_0641);
+		assert.ok(
+			patched.includes("x=o.userQueryTagName,E=o.ReminderInstructionsClass,I=o.ToolReferencesHintClass"),
+			"0.64.1 original names must be preserved"
+		);
+		assert.ok(patched.includes("__llamaRounds=this.props.promptContext.toolCallRounds"), "header cap must be added");
+		assert.ok(
+			patched.includes("toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:_"),
+			"wiring must keep truncateAt:_"
+		);
+		assert.ok(
+			patched.includes("let __llamaRounds=this.props.toolCallRounds"),
+			"element cap header must be added to async render"
+		);
+		assert.ok(
+			patched.includes('if(this.promptEndpoint.modelProvider==="llamacpp")'),
+			"element cap must be provider-guarded"
+		);
+		assert.ok(patched.includes("l=__llamaRounds.flatMap"), "element cap wiring must be added");
+		assert.ok(!patched.includes("truncateAt:v,enableCacheBreakpoints:!1"), "no stale 0.60 wiring");
+		assert.ok(!patched.includes("truncateAt:E,enableCacheBreakpoints:!1"), "no stale 0.61 wiring");
+		new Function(patched);
+		// Idempotent.
+		assert.strictEqual(patchAgentHistoryCap(patched), patched);
+	});
+});
+
 suite("Copilot patch", () => {
-	for (const mimeType of [
-		'"text/plain"',
-		'a.text.trimStart().startsWith("{")?"application/json":sr.text',
-	]) {
+	for (const mimeType of ['"text/plain"', 'a.text.trimStart().startsWith("{")?"application/json":sr.text']) {
 		test(`bounds native tool results while preserving MIME detection: ${mimeType}`, () => {
-			const source = 'function terminal(e){return{text:e.replace(/\\r?\\n/g,`\\r' + '\n' + '`)}}' +
+			const source =
+				"function terminal(e){return{text:e.replace(/\\r?\\n/g,`\\r" +
+				"\n" +
+				"`)}}" +
 				`function native(s){let r=[],a;switch(a.type){case"text":r.push({type:"embed",value:a.text,isText:!0,mimeType:${mimeType}});break;case"embeddedResource":r.push({type:"embed",value:a.data,mimeType:a.contentType});break}}` +
 				'let item={terminalCommandOutput:typeof l.output?.text=="string"?{text:l.output.text}:void 0};';
 			const patched = patchVsCodeWorkbenchBundle(source);
 			assert.ok(patched.includes(`value:__llamaBoundToolText(a.text),isText:!0,mimeType:${mimeType}`));
-			assert.ok(patched.includes('value:__llamaBoundToolPayload(a.data,a.contentType)'));
+			assert.ok(patched.includes("value:__llamaBoundToolPayload(a.data,a.contentType)"));
 			assert.ok(patched.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER));
 			assert.strictEqual(patchVsCodeWorkbenchBundle(patched), patched);
 			new Script(patched);
@@ -137,14 +150,24 @@ suite("Copilot patch", () => {
 		const workbenchBackup = workbenchPath + ".llama-vscode-chat.backup";
 		const original = fs.readFileSync(fs.existsSync(bundleBackup) ? bundleBackup : target.bundlePath, "utf8");
 		const patched = patchCopilotBundle(original);
-		const originalWorkbench = fs.readFileSync(
-			fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath,
-			"utf8"
-		);
+		const originalWorkbench = fs.readFileSync(fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath, "utf8");
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v22"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v24"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
+		// Saved chat sessions keep tool results verbatim unless they are bounded
+		// at the two assignment sites; sessions with view_image calls otherwise
+		// grow past the V8 string limit and VS Code fails to serialize a request.
+		assert.ok(patched.includes("function __llamaBoundStoredToolResult(r)"));
+		// tuple schemas from MCP servers use prefixItems without items; the
+		// validator must add items instead of failing the whole chat.
+		assert.ok(!patched.includes('throw new Error("tool parameters array type must have items")'));
+		assert.match(patched, /&&!([A-Za-z_$][\w$]*)\.items\)\1\.items=\{\}/);
+		assert.strictEqual(
+			patched.split("=__llamaBoundStoredToolResult(").length - 1,
+			2,
+			"both stored tool-result assignment sites must be wrapped"
+		);
 		// The tokenizer memoisation cache lives on the class constructor
 		// (module-scoped, outlives instances), so it is referenced as
 		// `__llamaT.__llamaTokenCache` where __llamaT = this.constructor.
@@ -178,7 +201,10 @@ suite("Copilot patch", () => {
 		if (upstreamHasModelCapabilities) {
 			// Copilot 0.64.x passes modelCapabilities itself; preserve the binding.
 			assert.ok(patched.includes("modelCapabilities:d"), "upstream modelCapabilities binding must be preserved");
-			assert.ok(patched.includes("reasoningEffort:d.reasoningEffort"), "reasoningEffort must be injected from modelCapabilities");
+			assert.ok(
+				patched.includes("reasoningEffort:d.reasoningEffort"),
+				"reasoningEffort must be injected from modelCapabilities"
+			);
 		} else {
 			// Legacy bundles have no modelCapabilities slot; the patch adds one.
 			assert.ok(
@@ -191,34 +217,68 @@ suite("Copilot patch", () => {
 			);
 		}
 		if (upstreamHasConversationId) {
-			assert.ok(patched.includes("let __llamaConversationId=p??__llamaConversationMetadata(u)"), "0.64 conversation id binding must be wired");
+			assert.ok(
+				patched.includes("let __llamaConversationId=p??__llamaConversationMetadata(u)"),
+				"0.64 conversation id binding must be wired"
+			);
 		} else {
 			assert.ok(
 				patched.includes("let __llamaConversationId=__llamaConversationMetadata(u)"),
 				"legacy conversation id binding must be wired"
 			);
 		}
-		assert.ok(patched.includes("_copilotConversationId:__llamaConversationId"), "llama conversation id must be sent to the model");
+		assert.ok(
+			patched.includes("_copilotConversationId:__llamaConversationId"),
+			"llama conversation id must be sent to the model"
+		);
 		assert.match(
 			patched,
 			/async makeChatRequest2\(\{[^}]*telemetryProperties:u,modelCapabilities:[A-Za-z_$][\w$]*(?:,conversationId:[A-Za-z_$][\w$]*)?\}/,
 			"request signature must be kept intact for the installed Copilot shape"
 		);
-		assert.ok(patched.includes('executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId)'));
-		assert.ok(patched.includes('executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0})'));
-		assert.match(
-			patched,
-			/modelProvider==="llamacpp"\|\|[^?]{1,80}\?Number\.MAX_SAFE_INTEGER/
+		assert.ok(
+			patched.includes('executeCommand("llamacpp.forceCompactConversation",globalThis.__llamaLastConversationId)')
 		);
+		assert.ok(patched.includes('executeCommand("workbench.action.chat.open",{query:"/compact",preserveInput:!0})'));
+		assert.match(patched, /modelProvider==="llamacpp"\|\|[^?]{1,80}\?Number\.MAX_SAFE_INTEGER/);
 		assert.match(
 			patched,
 			/promptEndpoint\.modelProvider==="llamacpp"\?this\.promptEndpoint\.modelMaxPromptTokens:Math\.floor/
 		);
-		assert.ok(!patched.includes(
-			'this.endpoint.modelProvider==="llamacpp"?' +
-			'this.endpoint.cloneWithTokenOverride(Number.MAX_SAFE_INTEGER)'
-		));
+		assert.ok(
+			!patched.includes(
+				'this.endpoint.modelProvider==="llamacpp"?' + "this.endpoint.cloneWithTokenOverride(Number.MAX_SAFE_INTEGER)"
+			)
+		);
 		assert.doesNotThrow(() => new Script(patched));
+		const storedStart = patched.indexOf("function __llamaBoundStoredText(");
+		const storedEnd = patched.indexOf("function __llamaConversationMetadata(", storedStart);
+		assert.ok(storedStart > 0 && storedEnd > storedStart, "stored tool-result helper must be present");
+		const storedContext: Record<string, unknown> = {};
+		new Script(
+			`${patched.slice(storedStart, storedEnd)};globalThis.__test={__llamaBoundStoredToolResult};`
+		).runInNewContext(storedContext);
+		interface StoredContent {
+			data?: string;
+			value?: string;
+			text?: string;
+			mimeType?: string;
+		}
+		interface StoredResult {
+			content?: StoredContent[] | StoredContent;
+		}
+		const boundResult = (storedContext.__test as { __llamaBoundStoredToolResult: (result: unknown) => StoredResult })
+			.__llamaBoundStoredToolResult;
+		const imageResult = boundResult({ content: [{ mimeType: "image/png", data: "A".repeat(300_000) }] });
+		assert.ok((imageResult.content as StoredContent[])[0].data?.includes("payload omitted from stored chat history"));
+		assert.ok(((imageResult.content as StoredContent[])[0].data?.length ?? 0) < 200);
+		const smallImage = boundResult({ content: [{ mimeType: "image/png", data: "A".repeat(1000) }] });
+		assert.strictEqual((smallImage.content as StoredContent[])[0].data, "A".repeat(1000));
+		const textResult = boundResult({ content: [{ mimeType: "text/plain", value: "x".repeat(20_000) }] });
+		assert.ok((textResult.content as StoredContent[])[0].value?.includes("stored tool-output characters omitted"));
+		assert.ok(((textResult.content as StoredContent[])[0].value?.length ?? 0) <= 12_100);
+		const objectContent = boundResult({ content: { mimeType: "image/png", data: "B".repeat(300_000) } });
+		assert.ok((objectContent.content as StoredContent).data?.includes("payload omitted"));
 		assert.ok(patchedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER));
 		assert.ok(patchedWorkbench.includes("__llamaBoundToolText"));
 		assert.ok(patchedWorkbench.includes("__llamaBoundToolPayload"));
@@ -246,10 +306,12 @@ suite("Copilot patch", () => {
 		const context: Record<string, unknown> = { console };
 		context.globalThis = context;
 		new Script(patchExtensionTokenizerCache(synthetic)).runInNewContext(context);
-		const { Tokenizer } = context.__test as { Tokenizer: new (model: unknown) => {
-			_textTokenLength(text: string): Promise<number>;
-			countMessageTokens(message: unknown): Promise<number>;
-		} };
+		const { Tokenizer } = context.__test as {
+			Tokenizer: new (model: unknown) => {
+				_textTokenLength(text: string): Promise<number>;
+				countMessageTokens(message: unknown): Promise<number>;
+			};
+		};
 
 		let upstreamCalls = 0;
 		const languageModel = {
@@ -306,7 +368,7 @@ suite("Copilot patch", () => {
 			assert.strictEqual(result.changed, true);
 			assert.strictEqual(result.status.workbenchApplied, false);
 			assert.ok(
-				result.status.notices.some(notice => /workbench/i.test(notice)),
+				result.status.notices.some((notice) => /workbench/i.test(notice)),
 				"the skipped workbench must be reported as a notice"
 			);
 			assert.ok(fs.readFileSync(bundlePath, "utf8").includes(COPILOT_PATCH_MARKER));

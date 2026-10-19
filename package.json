@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.18.6",
+	"version": "1.18.7",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -118,8 +118,14 @@
 				},
 				"llamacpp.cocoModelContextLengths": {
 					"type": "object",
-					"default": { "claude-opus-5-5": 1000000 },
-					"additionalProperties": { "type": "integer", "minimum": 4096, "maximum": 1048576 },
+					"default": {
+						"claude-opus-5-5": 1000000
+					},
+					"additionalProperties": {
+						"type": "integer",
+						"minimum": 4096,
+						"maximum": 1048576
+					},
 					"description": "Initial Coco windows by exact model ID before live telemetry. Opus 5.5's 1M baseline was verified with Cortex Code; measured runtime windows take precedence. Other models use cocoContextLength."
 				},
 				"llamacpp.cocoMaxHistoryImportParts": {
@@ -1424,13 +1430,14 @@
 		"compile": "tsc -p ./",
 		"lint": "eslint",
 		"check": "npm run lint && npm test",
-				"check:metadata": "node --test scripts/check-repository.test.mjs && node scripts/check-repository.mjs",
+		"check:metadata": "node --test scripts/check-repository.test.mjs && node scripts/check-repository.mjs",
 		"test:claude-native": "node ./scripts/claude-native-sdk-smoke.mjs",
 		"test:codex-persistence": "node ./scripts/codex-thread-persistence-smoke.mjs",
 		"package": "vsce package",
 		"format": "prettier --write .",
 		"watch": "tsc -watch -p ./",
-		"test": "npm run compile && vscode-test"
+		"test:chat-repair": "node --test scripts/repair-chat-sessions.test.mjs",
+		"test": "npm run compile && npm run test:chat-repair && vscode-test"
 	},
 	"devDependencies": {
 		"@eslint/js": "^10.0.1",
@@ -1455,6 +1462,7 @@
 	"dependencies": {
 		"@anthropic-ai/claude-agent-sdk": "0.3.240",
 		"@cursor/sdk": "1.0.37",
+		"stream-json": "3.7.0",
 		"zod": "^4.4.3"
 	}
 }

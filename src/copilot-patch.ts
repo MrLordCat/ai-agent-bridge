@@ -5,9 +5,15 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
-import { collectAppRoots, collectExtensionRoots, findWorkbenchCandidates, workbenchPathFor, type SearchOptions } from "./vscode-app-root";
+import {
+	collectAppRoots,
+	collectExtensionRoots,
+	findWorkbenchCandidates,
+	workbenchPathFor,
+	type SearchOptions,
+} from "./vscode-app-root";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v22";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v24";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID = "llama-vscode-chat:copilot-git-repositories-guard:v1";
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER = `/* ${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID} */`;
@@ -16,6 +22,9 @@ export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_
 export const VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER = "/* llama-vscode-chat:vscode-chat-history-bounds:v1 */";
 
 const LEGACY_PATCH_MARKERS = [
+	"/* llama-vscode-chat:copilot-native-model-controls:v23 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v22 */",
+	"/* llama-vscode-chat:copilot-native-model-controls:v21 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v20 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v19 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v18 */",
@@ -111,7 +120,7 @@ export function findCopilotBundles(explicitRoot?: string, options?: SearchOption
 	const bundleCandidates: Array<{ bundlePath: string; source: string }> = [];
 	const pushBundleCandidate = (bundlePath: string, source: string): void => {
 		const resolved = path.resolve(bundlePath);
-		if (fs.existsSync(resolved) && !bundleCandidates.some(entry => entry.bundlePath === resolved)) {
+		if (fs.existsSync(resolved) && !bundleCandidates.some((entry) => entry.bundlePath === resolved)) {
 			bundleCandidates.push({ bundlePath: resolved, source });
 		}
 	};
@@ -194,12 +203,7 @@ function replaceOnce(source: string, search: string, replacement: string, descri
 	return source.slice(0, first) + replacement + source.slice(first + search.length);
 }
 
-function replacePatternOnce(
-	source: string,
-	pattern: RegExp,
-	replacement: string,
-	description: string
-): string {
+function replacePatternOnce(source: string, pattern: RegExp, replacement: string, description: string): string {
 	const flags = pattern.flags.replaceAll("g", "");
 	const matcher = new RegExp(pattern.source, flags);
 	const first = matcher.exec(source);
@@ -215,12 +219,7 @@ function replacePatternOnce(
 }
 
 /** Like replaceOnce but returns source unchanged when the search string is not found. */
-function replaceOnceOptional(
-	source: string,
-	search: string,
-	replacement: string,
-	description: string
-): string {
+function replaceOnceOptional(source: string, search: string, replacement: string, description: string): string {
 	const first = source.indexOf(search);
 	if (first < 0) {
 		return source;
@@ -250,6 +249,30 @@ function replacePatternOnceWith(
 	return source.slice(0, first.index) + replacement(first) + source.slice(first.index + first[0].length);
 }
 
+/** Replaces every match of a pattern and refuses an unexpected number of hits. */
+function replacePatternEvery(
+	source: string,
+	pattern: RegExp,
+	replacement: (match: string, ...groups: string[]) => string,
+	description: string,
+	expected: number
+): string {
+	const flags = pattern.flags.includes("g") ? pattern.flags : pattern.flags + "g";
+	const matcher = new RegExp(pattern.source, flags);
+	let count = 0;
+	const result = source.replace(matcher, (...args: unknown[]) => {
+		count++;
+		const [match, ...rest] = args;
+		// The last two arguments are the match offset and the input string.
+		const groups = rest.slice(0, -2) as string[];
+		return replacement(match as string, ...groups);
+	});
+	if (count !== expected) {
+		throw new Error(`Copilot bundle shape changed: ${description} matched ${count} times, expected ${expected}.`);
+	}
+	return result;
+}
+
 export function patchVsCodeWorkbenchBundle(source: string): string {
 	if (source.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER)) {
 		return source;
@@ -260,11 +283,11 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 	if (source.includes(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER)) {
 		const upgraded = replaceOnce(
 			source,
-			"function __llamaBoundToolText(e){if(typeof e!=\"string\"||e.length<=12000)return e;",
+			'function __llamaBoundToolText(e){if(typeof e!="string"||e.length<=12000)return e;',
 			`${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){` +
 				'if(typeof e!="string")return e;' +
 				'e=e.replace(/\\x1b\\[[\\d;]*R/g,"");' +
-				'if(e.length<=12000)return e;',
+				"if(e.length<=12000)return e;",
 			"terminal tool output CPR sanitizer upgrade"
 		);
 		return upgraded.replace(VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER, "");
@@ -274,23 +297,24 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 		`${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){` +
 		'if(typeof e!="string")return e;' +
 		'e=e.replace(/\\x1b\\[[\\d;]*R/g,"");' +
-		'if(e.length<=12000)return e;' +
+		"if(e.length<=12000)return e;" +
 		'let t="\\n...["+(e.length-12000)+" stored tool-output characters omitted]...\\n",' +
-		'o=Math.max(0,12000-t.length),n=Math.floor(o*.35);' +
-		'return e.slice(0,n)+t+e.slice(-(o-n))}' +
+		"o=Math.max(0,12000-t.length),n=Math.floor(o*.35);" +
+		"return e.slice(0,n)+t+e.slice(-(o-n))}" +
 		'function __llamaBoundToolPayload(e,t){return typeof t=="string"&&!t.startsWith("text/")?' +
-		'`[${t} payload omitted from stored chat history]`:__llamaBoundToolText(e)}';
+		"`[${t} payload omitted from stored chat history]`:__llamaBoundToolText(e)}";
 
 	let patched = replacePatternOnceWith(
 		source,
 		/(function [A-Za-z_$][\w$]*\([A-Za-z_$][\w$]*\)\{[\s\S]{0,700}?return\{text:)([A-Za-z_$][\w$]*\.replace\(\/\\r\?\\n\/g,`\\r\r?\n`\))/,
-		match => `${helper}${match[1]}__llamaBoundToolText(${match[2]})`,
+		(match) => `${helper}${match[1]}__llamaBoundToolText(${match[2]})`,
 		"terminal tool output serializer"
 	);
 	patched = replacePatternOnceWith(
 		patched,
 		/case"text":([A-Za-z_$][\w$]*)\.push\(\{type:"embed",value:([A-Za-z_$][\w$]*)\.text,isText:!0,mimeType:([^;]{1,160}?)\}\);break;case"embeddedResource":\1\.push\(\{type:"embed",value:\2\.data,mimeType:\2\.contentType\}\);break/,
-		match => `case"text":${match[1]}.push({type:"embed",value:__llamaBoundToolText(${match[2]}.text),isText:!0,mimeType:${match[3]}});break;` +
+		(match) =>
+			`case"text":${match[1]}.push({type:"embed",value:__llamaBoundToolText(${match[2]}.text),isText:!0,mimeType:${match[3]}});break;` +
 			`case"embeddedResource":${match[1]}.push({type:"embed",value:__llamaBoundToolPayload(${match[2]}.data,${match[2]}.contentType),mimeType:${match[2]}.contentType});break`,
 		"native tool result serializer"
 	);
@@ -298,7 +322,7 @@ export function patchVsCodeWorkbenchBundle(source: string): string {
 		patched,
 		/terminalCommandOutput:typeof ([A-Za-z_$][\w$]*)\.output\?\.text=="string"\?\{text:\1\.output\.text\}:void 0/,
 		'terminalCommandOutput:typeof $1.output?.text=="string"?{text:__llamaBoundToolText($1.output.text),' +
-			'truncated:$1.output.text.length>12000}:void 0',
+			"truncated:$1.output.text.length>12000}:void 0",
 		"extension terminal output serializer"
 	);
 	return patched;
@@ -341,53 +365,56 @@ export function patchCopilotGitRepositoriesGuard(source: string): string {
  */
 export function patchAgentHistoryCap(source: string): string {
 	if (
-		source.includes("__llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;") &&
+		source.includes(
+			"__llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;"
+		) &&
 		source.includes("l=__llamaRounds.flatMap")
 	) {
 		return source;
 	}
-        let patched = replacePatternOnce(
-                source,
-                /([A-Za-z_$][\w$]*)=o\.userQueryTagName,([A-Za-z_$][\w$]*)=o\.ReminderInstructionsClass,([A-Za-z_$][\w$]*)=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
-                '$1=o.userQueryTagName,$2=o.ReminderInstructionsClass,$3=o.ToolReferencesHintClass;' +
-                        'let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;' +
-                        'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-                        'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
-                        'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
-                        'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
-                        'let __llamaHead=Math.floor(__llamaCap*.2);' +
-                        '__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}' +
-                        'if(Array.isArray(__llamaResults)&&__llamaResults.length>__llamaCap)' +
-                        '__llamaResults=__llamaResults.slice(__llamaResults.length-__llamaCap)}' +
-                        'return this.props.enableSummarization?',
-                "extension model agent history cap"
-        );
-        patched = replacePatternOnceWith(
-                patched,
-                /(toolCallRounds:this\.props\.promptContext\.toolCallRounds,toolCallResults:this\.props\.promptContext\.toolCallResults,truncateAt:)([A-Za-z_$][\w$]*)(,enableCacheBreakpoints:!1)/,
-                match => `toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:${match[2]},enableCacheBreakpoints:!1`,
-                "extension model agent history cap wiring"
-        );
-        patched = replacePatternOnce(
-                patched,
-                /async render\(([A-Za-z_$][\w$]*),r,o,a\)\{if\(!this\.props\.promptContext\.tools\|\|!this\.props\.toolCallRounds\?\.length\)return;/,
-                'async render($1,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;' +
-                        'let __llamaRounds=this.props.toolCallRounds;' +
-                        'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-                        'let __llamaCap=globalThis.__llamaAgentHistoryRounds;' +
-                        'if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);' +
-                        'if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){' +
-                        'let __llamaHead=Math.floor(__llamaCap*.2);' +
-                        '__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}}',
-                "agent history element cap"
-        );
-        patched = replaceOnce(
-                patched,
-                'l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));',
-                'l=__llamaRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,__llamaRounds.length,s,c,a));',
-                "agent history element cap wiring"
-        );
-        return patched;
+	let patched = replacePatternOnce(
+		source,
+		/([A-Za-z_$][\w$]*)=o\.userQueryTagName,([A-Za-z_$][\w$]*)=o\.ReminderInstructionsClass,([A-Za-z_$][\w$]*)=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
+		"$1=o.userQueryTagName,$2=o.ReminderInstructionsClass,$3=o.ToolReferencesHintClass;" +
+			"let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;" +
+			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+			"let __llamaCap=globalThis.__llamaAgentHistoryRounds;" +
+			"if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);" +
+			"if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){" +
+			"let __llamaHead=Math.floor(__llamaCap*.2);" +
+			"__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}" +
+			"if(Array.isArray(__llamaResults)&&__llamaResults.length>__llamaCap)" +
+			"__llamaResults=__llamaResults.slice(__llamaResults.length-__llamaCap)}" +
+			"return this.props.enableSummarization?",
+		"extension model agent history cap"
+	);
+	patched = replacePatternOnceWith(
+		patched,
+		/(toolCallRounds:this\.props\.promptContext\.toolCallRounds,toolCallResults:this\.props\.promptContext\.toolCallResults,truncateAt:)([A-Za-z_$][\w$]*)(,enableCacheBreakpoints:!1)/,
+		(match) =>
+			`toolCallRounds:__llamaRounds,toolCallResults:__llamaResults,truncateAt:${match[2]},enableCacheBreakpoints:!1`,
+		"extension model agent history cap wiring"
+	);
+	patched = replacePatternOnce(
+		patched,
+		/async render\(([A-Za-z_$][\w$]*),r,o,a\)\{if\(!this\.props\.promptContext\.tools\|\|!this\.props\.toolCallRounds\?\.length\)return;/,
+		"async render($1,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;" +
+			"let __llamaRounds=this.props.toolCallRounds;" +
+			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
+			"let __llamaCap=globalThis.__llamaAgentHistoryRounds;" +
+			"if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);" +
+			"if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){" +
+			"let __llamaHead=Math.floor(__llamaCap*.2);" +
+			"__llamaRounds=__llamaRounds.slice(0,__llamaHead).concat(__llamaRounds.slice(__llamaRounds.length-(__llamaCap-__llamaHead)))}}",
+		"agent history element cap"
+	);
+	patched = replaceOnce(
+		patched,
+		"l=this.props.toolCallRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,this.props.toolCallRounds.length,s,c,a));",
+		"l=__llamaRounds.flatMap((d,p)=>this.renderOneToolCallRound(d,p,__llamaRounds.length,s,c,a));",
+		"agent history element cap wiring"
+	);
+	return patched;
 }
 
 export function patchCopilotBundle(source: string): string {
@@ -417,14 +444,14 @@ export function patchCopilotBundle(source: string): string {
 		classSource,
 		"get modelMaxPromptTokens(){return this._maxTokens}",
 		'get modelMaxPromptTokens(){return this.languageModel.vendor==="llamacpp"?' +
-			'this._maxTokens+(this.languageModel.maxOutputTokens??0):this._maxTokens}',
+			"this._maxTokens+(this.languageModel.maxOutputTokens??0):this._maxTokens}",
 		"extension endpoint full context budget"
 	);
 	classSource = replaceOnce(
 		classSource,
 		"get maxOutputTokens(){return 8192}",
 		'get maxOutputTokens(){return this.languageModel.vendor==="llamacpp"?' +
-			'this.languageModel.maxOutputTokens??8192:8192}',
+			"this.languageModel.maxOutputTokens??8192:8192}",
 		"extension endpoint output token limit"
 	);
 	classSource = replaceOnce(
@@ -438,7 +465,8 @@ export function patchCopilotBundle(source: string): string {
 		"extension endpoint capability getters"
 	);
 
-	const methodSignature = /async makeChatRequest2\(\{([^{}]*\btelemetryProperties:[A-Za-z_$][\w$]*)([^{}]*)\},([A-Za-z_$][\w$]*)\)\{/;
+	const methodSignature =
+		/async makeChatRequest2\(\{([^{}]*\btelemetryProperties:[A-Za-z_$][\w$]*)([^{}]*)\},([A-Za-z_$][\w$]*)\)\{/;
 	const signatureMatch = classSource.match(methodSignature);
 	if (!signatureMatch) {
 		throw new Error("Copilot extension endpoint request signature was not found.");
@@ -486,17 +514,61 @@ export function patchCopilotBundle(source: string): string {
 		classSource,
 		cloneAnchor,
 		'cloneWithTokenOverride(e){let t=this.languageModel.vendor==="llamacpp"?' +
-			'Math.max(1,e-(this.languageModel.maxOutputTokens??0)):e;return this._instantiationService.createInstance(' +
+			"Math.max(1,e-(this.languageModel.maxOutputTokens??0)):e;return this._instantiationService.createInstance(" +
 			`${className},{...this.languageModel,maxInputTokens:t})}`,
 		"extension endpoint token override"
 	);
 
 	let patched = source.slice(0, classStart) + classSource + source.slice(classEnd + 1);
+	// MCP servers may describe a tuple with `prefixItems` and no `items`. That is
+	// valid JSON Schema 2020-12, but Copilot's tool validator rejects it and
+	// fails the whole chat with "Failed to validate tool ...: tool parameters
+	// array type must have items". Normalise the schema instead of aborting.
+	patched = replacePatternOnce(
+		patched,
+		/([A-Za-z_$][\w$]*)&&"type"in \1&&\1\.type==="array"&&!\1\.items\)throw new Error\("tool parameters array type must have items"\)/,
+		'$1&&"type"in $1&&$1.type==="array"&&!$1.items)$1.items={}',
+		"MCP tuple tool schema items normalization"
+	);
 	patched = replacePatternOnce(
 		patched,
 		/(function [A-Za-z_$][\w$]*\(([A-Za-z_$][\w$]*)\)\{if\(typeof \2\?\.turnIndex!="string"\|\|!\/\^\\d\+\$\/\.test\(\2\.turnIndex\)\)return;let ([A-Za-z_$][\w$]*)=Number\.parseInt\(\2\.turnIndex,10\);return Number\.isSafeInteger\(\3\)\?\3:void 0\})(function [A-Za-z_$][\w$]*)/,
 		'$1function __llamaConversationMetadata(n){let e=n?.conversationId;return typeof e==="string"&&e.length>0&&e.length<=256?e:void 0}$4',
 		"extension endpoint Copilot conversation identity"
+	);
+	// Tool results are stored twice: bounded for the prompt (the workbench patch)
+	// and verbatim in the saved chat session. A session with a handful of
+	// view_image calls reached 544 MB, and VS Code then failed with
+	// "RangeError: Invalid string length" while serializing the agent request.
+	// Bound the stored copy as well: large binary payloads become a marker and
+	// long text is truncated, so the session stays loadable.
+	const storedResultHelper =
+		'function __llamaBoundStoredText(e){if(typeof e!="string"||e.length<=12000)return e;' +
+		'let t="\\n...["+(e.length-12000)+" stored tool-output characters omitted]...\\n",' +
+		"o=Math.max(0,12000-t.length),n=Math.floor(o*.35);return e.slice(0,n)+t+e.slice(-(o-n))}" +
+		'function __llamaBoundStoredToolResult(r){if(!r||typeof r!="object")return r;let a=r.content;' +
+		'if(Array.isArray(a)){for(let c of a){if(!c||typeof c!="object")continue;' +
+		'if(typeof c.data=="string"&&c.data.length>200000&&typeof c.mimeType=="string"&&c.mimeType.indexOf("text/")!==0){' +
+		'c.data="["+c.mimeType+" payload omitted from stored chat history: "+c.data.length+" chars]"}' +
+		'else if(typeof c.value=="string"&&c.value.length>12000){c.value=__llamaBoundStoredText(c.value)}' +
+		'else if(typeof c.text=="string"&&c.text.length>12000){c.text=__llamaBoundStoredText(c.text)}}}' +
+		'else if(a&&typeof a=="object"&&typeof a.data=="string"&&a.data.length>200000&&typeof a.mimeType=="string"&&a.mimeType.indexOf("text/")!==0){' +
+		'a.data="["+a.mimeType+" payload omitted from stored chat history: "+a.data.length+" chars]"}return r}';
+	patched = replaceOnce(
+		patched,
+		"function __llamaConversationMetadata(n){",
+		`${storedResultHelper}function __llamaConversationMetadata(n){`,
+		"stored tool result bounds helper"
+	);
+	patched = replacePatternEvery(
+		patched,
+		/([A-Za-z_$][\w$]*)\.toolCallResults\[([A-Za-z_$][\w$]*)\.toolCallId\]=\2\.result/g,
+		(match, owner, group) => {
+			void match;
+			return `${owner}.toolCallResults[${group}.toolCallId]=__llamaBoundStoredToolResult(${group}.result)`;
+		},
+		"stored tool result bounds",
+		2
 	);
 	patched = replacePatternOnce(
 		patched,
@@ -507,7 +579,7 @@ export function patchCopilotBundle(source: string): string {
 	patched = replacePatternOnce(
 		patched,
 		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\.tools\?\.availableTools,([A-Za-z_$][\w$]*)=!!this\.endpoint\.supportsToolSearch,([A-Za-z_$][\w$]*)=\1\?\.length\?await this\.endpoint\.acquireTokenizer\(\)\.countToolTokens\(\1\):0/,
-		'$1=$2.tools?.availableTools,$3=!!this.endpoint.supportsToolSearch,' +
+		"$1=$2.tools?.availableTools,$3=!!this.endpoint.supportsToolSearch," +
 			'$4=this.endpoint.modelProvider==="llamacpp"?0:$1?.length?await this.endpoint.acquireTokenizer().countToolTokens($1):0',
 		"extension endpoint host tool reservation"
 	);
@@ -575,7 +647,7 @@ export function patchCopilotBundle(source: string): string {
 		patched,
 		/([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\?Number\.MAX_SAFE_INTEGER:([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)>0\?this\.endpoint\.cloneWithTokenOverride\(\1\):this\.endpoint/,
 		'$1=this.endpoint.modelProvider==="llamacpp"||$2?Number.MAX_SAFE_INTEGER:$3,' +
-			'$4=$5>0?this.endpoint.cloneWithTokenOverride($1):this.endpoint',
+			"$4=$5>0?this.endpoint.cloneWithTokenOverride($1):this.endpoint",
 		"auto-compaction prevention for llama.cpp"
 	);
 	// Fix context window display — Copilot's WD()/jD() function sets max_prompt_tokens
@@ -585,7 +657,7 @@ export function patchCopilotBundle(source: string): string {
 	// Two alternative patterns for different Copilot bundle versions.
 	const ctxPatched = replaceOnceOptional(
 		patched,
-		'max_prompt_tokens:o?.maxInputTokens||1e5',
+		"max_prompt_tokens:o?.maxInputTokens||1e5",
 		'max_prompt_tokens:e==="llamacpp"&&o?o.maxInputTokens+o.maxOutputTokens:o?.maxInputTokens||1e5',
 		"context window display sync for llama.cpp"
 	);
@@ -595,7 +667,7 @@ export function patchCopilotBundle(source: string): string {
 		// Fallback: older Copilot bundles use a different variable naming (s.maxInputTokens).
 		patched = replaceOnce(
 			patched,
-			'max_prompt_tokens:s.maxInputTokens,max_output_tokens:s.maxOutputTokens',
+			"max_prompt_tokens:s.maxInputTokens,max_output_tokens:s.maxOutputTokens",
 			'max_prompt_tokens:e==="llamacpp"&&o?s.contextWindow:s.maxInputTokens,max_output_tokens:s.maxOutputTokens',
 			"context window display sync for llama.cpp (legacy bundle)"
 		);
@@ -620,7 +692,7 @@ export function patchCopilotBundle(source: string): string {
 	patched = replacePatternOnceWith(
 		patched,
 		/async getAvailableTools\(([A-Za-z_$][\w$]*),r\)\{let o=await this\.options\.invocation\.getAvailableTools\?\.\(\)\?\?\[\];if\(this\.options\.invocation\.endpoint\.supportsToolSearch\)return o;/,
-		match =>
+		(match) =>
 			`async getAvailableTools(${match[1]},r){let o=await this.options.invocation.getAvailableTools?.()??[],` +
 			"__llamaToolSignature=y=>JSON.stringify(y.map(v=>[v.name,v.description,v.inputSchema]).sort((v,w)=>v[0]<w[0]?-1:v[0]>w[0]?1:0))," +
 			"__llamaToolCurrent=__llamaToolSignature(o);" +
@@ -644,8 +716,8 @@ export function patchCopilotBundle(source: string): string {
 	// session), matching the tool signature cache above.
 	patched = replaceOnce(
 		patched,
-		'}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;',
-		'}this._llamaToolsSignature=__llamaToolCurrent}if(!this.options.request.subAgentInvocationId&&o.length>0)this._llamaFullTools=o;else if(this.options.request.subAgentInvocationId&&Array.isArray(this._llamaFullTools)&&this._llamaFullTools.length>o.length)o=this._llamaFullTools;if(this.options.invocation.endpoint.supportsToolSearch)return o;',
+		"}this._llamaToolsSignature=__llamaToolCurrent}if(this.options.invocation.endpoint.supportsToolSearch)return o;",
+		"}this._llamaToolsSignature=__llamaToolCurrent}if(!this.options.request.subAgentInvocationId&&o.length>0)this._llamaFullTools=o;else if(this.options.request.subAgentInvocationId&&Array.isArray(this._llamaFullTools)&&this._llamaFullTools.length>o.length)o=this._llamaFullTools;if(this.options.invocation.endpoint.supportsToolSearch)return o;",
 		"subagent tool parity with the calling agent"
 	);
 	patched = patchExtensionTokenizerCache(patched);
@@ -668,12 +740,12 @@ export function patchExtensionTokenizerCache(source: string): string {
 		"__llamaC=__llamaT.__llamaTokenCache||(__llamaT.__llamaTokenCache=new Map())," +
 		"__llamaH=__llamaT.__llamaTokenHash||(__llamaT.__llamaTokenHash=s=>{let a=2166136261;" +
 		"for(let i=0;i<s.length;i++){a^=s.charCodeAt(i);a=Math.imul(a,16777619)}" +
-		'return(a>>>0).toString(36)}),' +
+		"return(a>>>0).toString(36)})," +
 		'__llamaM=(this.languageModel.id||this.languageModel.family||"")+"|";';
 	return replacePatternOnceWith(
 		source,
 		/async _textTokenLength\(([A-Za-z_$][\w$]*)\)\{return \1\?this\.languageModel\.countTokens\(\1\):0\}async countMessageTokens\(([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=([A-Za-z_$][\w$]*)\(\[\2\],\{emitCacheBreakpoints:([A-Za-z_$][\w$]*)\(this\.languageModel\.vendor\)\}\);if\(\3\.length===0\)return 0;let ([A-Za-z_$][\w$]*)=await this\.languageModel\.countTokens\(\3\[0\]\);return ([A-Za-z_$][\w$]*)\+\6\}/,
-		match => {
+		(match) => {
 			const [, text, message, raw, toRaw, breakpoints, count, base] = match;
 			return (
 				`async _textTokenLength(${text}){` +
@@ -736,7 +808,7 @@ export function getCopilotPatchStatus(target: CopilotPatchTarget): CopilotPatchS
 		metadataPath,
 		applied: installed.includes(COPILOT_PATCH_MARKER),
 		workbenchApplied: installedWorkbench ? installedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER) : false,
-		legacyPatch: LEGACY_PATCH_MARKERS.some(marker => installed.includes(marker)),
+		legacyPatch: LEGACY_PATCH_MARKERS.some((marker) => installed.includes(marker)),
 		backupExists: fs.existsSync(backupPath),
 		workbenchBackupExists: Boolean(workbenchBackupPath && fs.existsSync(workbenchBackupPath)),
 		sha256: sha256(target.bundlePath),
@@ -763,7 +835,7 @@ export function formatCopilotPatchStatus(status: CopilotPatchStatus): string {
 	} else {
 		lines.push("VS Code workbench: not found (chat-history bounds patch skipped)");
 	}
-	lines.push(...status.notices.map(notice => `Notice: ${notice}`));
+	lines.push(...status.notices.map((notice) => `Notice: ${notice}`));
 	return lines.join("\n");
 }
 
@@ -773,9 +845,9 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	const workbenchPath = target.workbenchPath;
 	const hasWorkbench = Boolean(workbenchPath && initialStatus.workbenchPath);
 	if (
-		initialStatus.applied
-		&& (!hasWorkbench || initialStatus.workbenchApplied)
-		&& installed.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)
+		initialStatus.applied &&
+		(!hasWorkbench || initialStatus.workbenchApplied) &&
+		installed.includes(COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER)
 	) {
 		return {
 			changed: false,
@@ -791,8 +863,8 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	const original = initialStatus.applied
 		? installed
 		: initialStatus.legacyPatch
-		? fs.readFileSync(initialStatus.backupPath, "utf8")
-		: installed;
+			? fs.readFileSync(initialStatus.backupPath, "utf8")
+			: installed;
 	if (initialStatus.backupExists && !force && !initialStatus.legacyPatch && !initialStatus.applied) {
 		throw new Error(
 			`Backup already exists: ${initialStatus.backupPath}. Restore it first or explicitly force the patch after inspection.`
@@ -814,9 +886,7 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 	}
 
 	const patched = patchCopilotGitRepositoriesGuard(patchCopilotBundle(original));
-	const patchedWorkbench = installedWorkbenchBefore
-		? patchVsCodeWorkbenchBundle(installedWorkbenchBefore)
-		: undefined;
+	const patchedWorkbench = installedWorkbenchBefore ? patchVsCodeWorkbenchBundle(installedWorkbenchBefore) : undefined;
 	const validationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-agent-bridge-patch-check-"));
 	const validationPath = path.join(validationDirectory, "copilot.js");
 	const workbenchValidationPath = patchedWorkbench ? path.join(validationDirectory, "workbench.mjs") : undefined;
@@ -830,7 +900,10 @@ export function applyCopilotPatch(target: CopilotPatchTarget, force = false): Co
 			execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
 		}
 	} catch (error) {
-		throw new Error(`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+		throw new Error(
+			`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error }
+		);
 	} finally {
 		fs.rmSync(validationDirectory, { recursive: true, force: true });
 	}
@@ -898,8 +971,10 @@ export function restoreCopilotPatch(target: CopilotPatchTarget): CopilotPatchRes
 			fs.copyFileSync(initialStatus.workbenchBackupPath, initialStatus.workbenchPath);
 		} catch (error) {
 			// Keep both backups so a user can retry with administrator rights.
-			throw new Error("Could not restore the original VS Code workbench: " +
-				(error instanceof Error ? error.message : String(error)), { cause: error });
+			throw new Error(
+				"Could not restore the original VS Code workbench: " + (error instanceof Error ? error.message : String(error)),
+				{ cause: error }
+			);
 		}
 	}
 	fs.copyFileSync(initialStatus.backupPath, target.bundlePath);
@@ -912,6 +987,7 @@ export function restoreCopilotPatch(target: CopilotPatchTarget): CopilotPatchRes
 	return {
 		changed: true,
 		status,
-		message: "Restored the original Copilot Chat and VS Code workbench bundles. Reload all VS Code windows to activate them.",
+		message:
+			"Restored the original Copilot Chat and VS Code workbench bundles. Reload all VS Code windows to activate them.",
 	};
 }

@@ -2,11 +2,11 @@ import * as assert from "node:assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { COPILOT_PATCH_ID } from "../copilot-patch";
+
 suite("AI Agent Bridge branding", () => {
 	const root = path.resolve(__dirname, "..", "..");
-	const manifest = JSON.parse(
-		fs.readFileSync(path.join(root, "package.json"), "utf8")
-	) as {
+	const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8")) as {
 		name: string;
 		publisher: string;
 		displayName: string;
@@ -17,11 +17,14 @@ suite("AI Agent Bridge branding", () => {
 			viewsContainers: { activitybar: Array<{ title: string }> };
 			configuration: {
 				title: string;
-				properties: Record<string, {
-					default?: unknown;
-					minimum?: number;
-					description?: string;
-				}>;
+				properties: Record<
+					string,
+					{
+						default?: unknown;
+						minimum?: number;
+						description?: string;
+					}
+				>;
 			};
 			commands: Array<{ title: string; category?: string }>;
 		};
@@ -60,21 +63,30 @@ suite("AI Agent Bridge branding", () => {
 		assert.match(readme, /^# AI Agent Bridge for VS Code/m);
 		// Local dev builds have no release tag; the development install command
 		// must name the current package version.
-		assert.ok(readme.includes(`llama-vscode-chat-${manifest.version}.vsix`),
-			"the development install example names the current version");
-		assert.ok(readme.includes(`Current build: ${manifest.version}.`),
-			"the development block names the shipping version");
+		assert.ok(
+			readme.includes(`llama-vscode-chat-${manifest.version}.vsix`),
+			"the development install example names the current version"
+		);
+		assert.ok(
+			readme.includes(`Current build: ${manifest.version}.`),
+			"the development block names the shipping version"
+		);
 		assert.match(
 			readme,
 			new RegExp(`${manifest.version} build`),
 			"the test command in the development block names this build"
 		);
+		assert.match(readme, /\d+ extension-host tests/, "the README names the extension-host test count");
+		const patchVersion = COPILOT_PATCH_ID.split(":").pop();
+		assert.ok(patchVersion, "the Copilot patch id must end with a version");
 		assert.match(
 			readme,
-			/\d+ extension-host tests/,
-			"the README names the extension-host test count"
+			new RegExp(`Patch ${patchVersion.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+			"the README names the current Copilot patch version"
 		);
-		assert.match(readme, /Patch v22/);
-		assert.doesNotMatch(readme, /Local LLM Chat Provider|Local LLM:|Stable release: 1.9.0|283 extension-host tests|Patch v16/);
+		assert.doesNotMatch(
+			readme,
+			/Local LLM Chat Provider|Local LLM:|Stable release: 1.9.0|283 extension-host tests|Patch v16/
+		);
 	});
 });
