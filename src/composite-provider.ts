@@ -49,6 +49,13 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		progress: vscode.Progress<vscode.LanguageModelResponsePart>,
 		token: vscode.CancellationToken
 	): Promise<void> {
+		// Current hosts send the native _conversationId; older Copilot patches use
+		// _copilotConversationId. Normalize once before journaling and routing so
+		// all providers keep the same durable keys across a host update.
+		const usableId = (value: unknown): value is string => typeof value === "string" && Boolean(value.trim()) && value.length <= 512;
+		if (!usableId(options.modelOptions?._copilotConversationId) && usableId(options.modelOptions?._conversationId)) {
+			options = { ...options, modelOptions: { ...options.modelOptions, _copilotConversationId: options.modelOptions!._conversationId } };
+		}
 		const selected = this.registry.resolve(model.id);
 		this.registry.observeRequest(selected, token, options.modelOptions?._copilotConversationId);
 		const usesHistory = selected.id === "coco" || await selected.usesConversationHistory?.(model) === true;

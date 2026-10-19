@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.18.0",
+	"version": "1.18.6",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -131,10 +131,18 @@
 				},
 				"llamacpp.cursorMaxHistoryImportParts": {
 					"type": "integer",
-					"default": 16,
-					"minimum": 1,
+					"default": 0,
+					"minimum": 0,
 					"maximum": 128,
-					"description": "Maximum automatic Cursor SDK history-import requests for a cold handoff or large foreign-provider delta. Each request can incur model usage. Overflow keeps a full local transcript and stops explicitly."
+					"description": "Legacy setting. Cursor no longer performs automatic multi-prompt history imports.",
+					"deprecationMessage": "Automatic multi-prompt imports are disabled. This setting has no effect."
+				},
+				"llamacpp.cursorMaxColdHistoryChars": {
+					"type": "integer",
+					"default": 64000,
+					"minimum": 4096,
+					"maximum": 3000000,
+					"description": "Maximum history characters automatically replayed into a NEW Cursor native session. Larger cold starts stop before inference and preserve a full archive. Warm/restored sessions send only new turns. Raising this limit explicitly permits a larger, potentially costly prefill."
 				},
 				"llamacpp.enableCodexSubscription": {
 					"type": "boolean",

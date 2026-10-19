@@ -280,14 +280,15 @@ suite("Copilot patch", () => {
 		// no desktop workbench; the patch must still apply to the bundle instead
 		// of failing the whole operation.
 		const targets = findCopilotBundles(vscode.env.appRoot);
-		const target = targets.find(entry => fs.existsSync(entry.bundlePath + ".llama-vscode-chat.backup"))
-			?? targets.find(entry => !fs.readFileSync(entry.bundlePath, "utf8").includes(COPILOT_PATCH_MARKER));
-		if (!target) {
+		// A backup can itself contain the patch after a reinstall/upgrade. This
+		// apply/restore test needs an actual unpatched source, rather than an
+		// idempotent apply that correctly returns changed:false.
+		const sourcePath = targets.flatMap(entry => [entry.bundlePath + ".llama-vscode-chat.backup", entry.bundlePath])
+			.find(file => fs.existsSync(file) && !fs.readFileSync(file, "utf8").includes(COPILOT_PATCH_MARKER));
+		if (!sourcePath) {
 			this.skip();
 			return;
 		}
-		const backupPath = target.bundlePath + ".llama-vscode-chat.backup";
-		const sourcePath = fs.existsSync(backupPath) ? backupPath : target.bundlePath;
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "llama-copilot-no-workbench-"));
 		try {
 			const bundlePath = path.join(tempDir, "extension.js");

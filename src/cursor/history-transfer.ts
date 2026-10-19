@@ -30,16 +30,7 @@ export class CursorHistoryArchive {
 	}
 	async prepare(prompt: CursorPrompt, maximum: number, scope: string): Promise<{ imports: CursorPrompt[]; prompt: CursorPrompt; archivePath?: string }> {
 		if (prompt.text.length <= maximum && (prompt.images?.length ?? 0) <= 5) { return { imports: [], prompt }; }
-		const archivePath = await this.save(prompt, scope), imports: CursorPrompt[] = [];
-		const size = Math.max(1024, Math.floor(maximum));
-		for (let offset = 0; offset < prompt.text.length;) {
-			let end = Math.min(prompt.text.length, offset + size);
-			if (end < prompt.text.length && /[\uD800-\uDBFF]/.test(prompt.text[end - 1])) { end--; }
-			imports.push({ text: prompt.text.slice(offset, end) }); offset = end;
-		}
-		for (let index = 0; index < (prompt.images?.length ?? 0); index += 5) {
-			imports.push({ text: `Quoted history image attachments ${index + 1} through ${Math.min(index + 5, prompt.images!.length)}.`, images: prompt.images!.slice(index, index + 5) });
-		}
-		return { imports, archivePath, prompt: { text: `All history parts have been imported in order. Continue the latest user request normally with the supplied VS Code tools. The complete transcript remains at ${JSON.stringify(archivePath)}; reread exact details when compaction leaves them uncertain. Do not repeat historical actions.` } };
+		const archivePath = await this.save(prompt, scope);
+		throw new Error(`Cursor history exceeds one request's working budget or five images. No inference requests were sent. Full transcript: ${archivePath}. Compact the chat, choose a larger supported context, or start a new chat. Automatic multi-prompt imports are disabled.`);
 	}
 }

@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { DelegatedTurnState } from "../tools/delegated-turn-state";
 import type { SDKCustomTool, SDKCustomToolResult } from "@cursor/sdk";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
+import { cursorToolAlias } from "./tool-turn-recovery";
 
 interface PendingTool {
 	part: vscode.LanguageModelToolCallPart;
@@ -32,9 +33,9 @@ export class CursorToolBridge implements vscode.Disposable {
 	updateTools(tools: readonly vscode.LanguageModelChatTool[]): void {
 		this.allowedTools = new Set(tools.map(tool => tool.name));
 		for (const alias of Object.keys(this.customTools)) { delete this.customTools[alias]; }
-		for (const original of tools) {
+		for (const original of [...tools].sort((a, b) => a.name.localeCompare(b.name))) {
 			const tool = withRequiredSubagentModel(original);
-			const alias = `vscode_${tool.name.replace(/[^a-zA-Z0-9_]/g, "_").slice(0, 70)}_${createHash("sha256").update(tool.name).digest("hex").slice(0, 10)}`;
+			const alias = cursorToolAlias(tool.name);
 			this.customTools[alias] = {
 				description: enhanceSubagentToolDescription(tool.name, `VS Code tool ${tool.name}. ${tool.description}`).slice(0, 8000),
 				inputSchema: tool.inputSchema as SDKCustomTool["inputSchema"] ?? { type: "object", properties: {} },

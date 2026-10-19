@@ -44,7 +44,7 @@ export class CursorProfileTransport implements vscode.Disposable {
 	cancelConversation(conversationId: unknown): void { this.sdk?.cancelConversation(conversationId); }
 
 	refresh(): void {
-		this.sdk?.refresh();
+		// Catalog refresh is not a request to discard completed native sessions.
 		this.catalogs.clear();
 		for (const request of this.requests) { request.abort(); }
 	}

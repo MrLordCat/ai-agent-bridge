@@ -326,6 +326,11 @@ suite("session quality panel", () => {
 		};
 
 		// Cache tab (rendered by default on load).
+		const compact = sandbox.compactTurnRecord as (value: unknown) => { cache: Record<string, unknown> };
+		const aggregate = compact({ providerKind: "cursor", modelTurns: 1, cursorCacheDiagnostics: { usageScope: "native-run-aggregate" } }).cache;
+		assert.strictEqual(aggregate.modelSegments, undefined); assert.strictEqual(aggregate.sdkRuns, 1);
+		assert.strictEqual(aggregate.coldRewriteTokens, undefined);
+		assert.strictEqual((aggregate.cursor as { usageScope: string }).usageScope, "native-run-aggregate");
 		const cacheHtml = call("renderCacheTab");
 		assert.match(cacheHtml, /class="metric-grid"/);
 		assert.match(cacheHtml, /Claude cache keep-alive/);

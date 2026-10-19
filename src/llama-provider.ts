@@ -213,6 +213,21 @@ export interface LlamaChatTurnMetrics {
     cacheMissReason?: string;
     /** Human-readable explanation for the cache miss. */
     cacheMissDetail?: string;
+    /** Cursor exposes aggregate run usage, without per-model-call cache or compaction telemetry. */
+    cursorCacheDiagnostics?: {
+        usageScope: "native-run-aggregate";
+        modelCallBreakdown: "unreported";
+        compactionStatus: "unreported";
+        nativeRunId?: string;
+        sessionReason?: string;
+        sentTextChars?: number;
+        sentMessages?: number;
+        sentImages?: number;
+        toolCatalogHash?: string;
+        toolCatalogChanged?: boolean;
+        toolCatalogChangesDuringRun: number;
+        uncachedInputTokens?: number;
+    };
     /** Classified original error from a rejected Claude durable resume. */
     resumeFailureReason?: string;
     /** Lifecycle stage at which Claude durable resume failed. */

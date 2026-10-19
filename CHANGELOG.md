@@ -1,5 +1,100 @@
 # Changelog
 
+## 1.18.6 (local development patch) - 2026-10-19
+
+- Recover a Cursor stream interrupted after a VS Code callback finished but
+  before its result reached the native checkpoint. Match checkpointed calls,
+  SDK stream events and completed visible calls before retaining that snapshot.
+- Supply only the results absent from the snapshot as quoted history on the
+  next explicit user turn; never re-execute those callbacks or automatically
+  restart the model. Retain recovery IDs across reload and preflight errors,
+  and clear them after successful continuation.
+- Explain Premature close errors, including old saved failure receipts. Reject
+  missing results, conflicting event arguments and ambiguous callback matches.
+- Validate the affected 37+1 callback case and native resume offline on a copy
+  of its store, without network/model requests or changes to original data.
+
+## 1.18.5 (local development patch) - 2026-10-19
+
+- Accept the host's native _conversationId before provider routing, journaling
+  and foreign-session cancellation. Preserve valid legacy IDs and existing
+  durable keys so Cursor resumes its saved agent after a host update.
+- Explain when a large cold replay was blocked because no conversation ID was
+  supplied. Keep the 64,000-character automatic replay guard unchanged.
+- Verify large-history resume, tool continuation and a second reload through
+  the native ID. Offline validation on a copy of the affected store retained
+  the same agent and exact checkpoint bytes without any network/model request.
+- Select an actually unpatched source for the local Copilot apply/restore test
+  when an existing backup already contains the patch.
+
+## 1.18.4 (local development patch) - 2026-10-16
+
+- Report Cursor cache usage as a native-run aggregate; do not classify restored
+  sessions as the cause of a miss or assert that native compaction did not occur.
+  Leave unavailable model-call breakdown and cold-rewrite counters unreported.
+- Record the sent continuation size, native run ID, time since the previous
+  completed response, and changes to effective callback schemas across reload
+  and tool continuations. Persist only timestamps and catalog hashes.
+- Document the observed 70.04% case, checkpoint continuity, large cache writes
+  after pauses, and the limits of the SDK's aggregate usage telemetry.
+
+## 1.18.3 (local development patch) - 2026-10-15
+
+- Preserve the original Cursor backend error when Copilot retries a completed
+  tool-result batch. Retain bounded error receipts across reload, scoped to the
+  same conversation/profile/model identity; retries start no additional model run.
+- Keep an error-run native checkpoint only when all its native tool calls have
+  terminal results. The next explicit user message resumes that agent with new
+  entries instead of replaying the interrupted request's completed actions.
+- Repair existing 1.18.2 inflight bindings when the failed run starts from the
+  saved checkpoint and every native callback matches the visible completed calls,
+  including duplicates and reordered parallel batches. Reject incomplete matches.
+- Diagnose the reported failure as Cursor's `[resource_exhausted] Error`, which
+  retries previously masked with `tool session is no longer active`. The server
+  did not specify the exhausted resource; this patch does not increase its limits.
+- Verify repeated result delivery, reload, cross-chat isolation and continuation.
+  Local inspection matched all 84 completed callbacks in the affected run;
+  real SDK resume on a temporary copy retained its exact native checkpoint
+  with networking blocked and zero model prompts.
+
+## 1.18.2 (local development patch) - 2026-10-15
+
+- Persist Cursor conversation bindings atomically beside the SDK store as well
+  as in workspaceState. Save the exact completed native checkpoint and user
+  anchors; restore that same agent and send only new conversation entries.
+- Preserve the last completed checkpoint while a later request is active,
+  cancelled or interrupted by reload. Repair missing SDK agent checkpoint
+  pointers from native run records and retain new snapshots during status updates.
+- Recover lost 1.18.0 bindings only when this chat's original archive, ordered
+  user inputs, unique completed reply, model, workspace and run timing agree.
+  Reject ambiguous, failed and import-only agents. Keep native bytes unchanged.
+- Stop on native resume failure while retaining the checkpoint. Never silently
+  turn a failed resume into a costly full-history replay. Preserve the 1.18.1
+  cold-prefill guard and disabled multi-prompt imports.
+- Verify disk-only recovery, repeated reload of a 1.4M-character chat, reload
+  during tool execution, and real SDK JSONL behavior. Two real Agent.resume
+  calls on a temporary copy of the affected chat retained the same agent and
+  exact checkpoint bytes with networking blocked and zero model prompts.
+  Server cache retention remains controlled by Cursor.
+
+## 1.18.1 (local development patch) - 2026-10-15
+
+- Stop automatic multi-prompt Cursor history imports and remove the arbitrary
+  500,000-character split. A user request uses one SDK run; native model/tool
+  iterations can still occur within that run.
+- Reuse compatible Cursor sessions across host-context repacking, retained-tail
+  histories, model-catalog refreshes, callback-catalog changes and working-input
+  budget changes. Migrate completed 1.18.0 checkpoints without replaying history.
+- Reject unmatched history branches before inference while preserving the
+  completed session. New-session history above 64,000 characters stops before
+  inference and is archived in full. `cursorMaxColdHistoryChars` explicitly
+  controls that cold-prefill budget; warm/restored deltas are unaffected.
+  `cursorMaxHistoryImportParts` is deprecated and cannot enable paid imports.
+- Count native Cursor input once: observed SDK 1.0.37 input already includes
+  cache reads/writes, while its total can add them again. Distinguish first cold
+  starts from failed session reuse and include the actual continuation reason.
+  Existing aggregated usage is retained; server cache hits are not guaranteed.
+
 ## 1.18.0 (stable release) - 2026-10-15
 
 Consolidates the development work since 1.17.3, including the final behavior

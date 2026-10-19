@@ -11,19 +11,27 @@ import { CursorSessionStore, type CursorSession } from "./session-store";
 import { CursorTurnMetrics, type CursorRecordedUsage, type CursorLiveTurn } from "./turn-metrics";
 import { CursorHistoryArchive } from "./history-transfer";
 import { cursorTranscript } from "./message-adapter";
+import { CursorNativeStore, type CursorNativeCheckpoint } from "./native-store";
+import { recoverLegacyCursorSession } from "./legacy-recovery";
+import { cursorRecoveryReplay, matchFailedCursorTurn } from "./tool-turn-recovery";
+import type { CursorFailedTurn } from "./native-store";
 
-export interface CursorLocalRun { wait(): Promise<{ status: string; result?: string; error?: { message: string; code?: string }; usage?: TokenUsage }>; cancel(): Promise<void> }
+export interface CursorLocalRun { readonly id?: string; wait(): Promise<{ status: string; result?: string; error?: { message: string; code?: string }; usage?: TokenUsage }>; cancel(): Promise<void> }
 export interface CursorLocalAgent { readonly agentId?: string; send(message: SDKUserMessage, options: SendOptions): Promise<CursorLocalRun>; close(): void }
 export interface CursorSdkDependencies {
 	createAgent?: (options: AgentOptions) => Promise<CursorLocalAgent>;
 	resumeAgent?: (id: string, options: AgentOptions) => Promise<CursorLocalAgent>;
+	checkpoint?: (agentId: string, runId?: string) => Promise<CursorNativeCheckpoint | undefined>;
+	failedTurn?: (agentId: string, runId?: string) => Promise<CursorFailedTurn | undefined>;
 	available?: () => boolean;
 	storageRoot?: string;
 	state?: vscode.Memento;
+	/** @deprecated Automatic multi-prompt imports are disabled. */
 	maxImportParts?: number;
+	coldStartMaxChars?: number;
 	cwd?: () => string;
 }
-interface Turn { identity: string; bridge: CursorToolBridge; agent?: CursorLocalAgent; run?: CursorLocalRun; ended?: boolean; completed?: boolean; session: CursorSession; metrics: CursorTurnMetrics; conversationId?: unknown }
+interface Turn { identity: string; bridge: CursorToolBridge; agent?: CursorLocalAgent; run?: CursorLocalRun; ended?: boolean; completed?: boolean; sent?: boolean; session: CursorSession; metrics: CursorTurnMetrics; conversationId?: unknown; callIds: string[]; messages: readonly vscode.LanguageModelChatRequestMessage[] }
 
 export const CURSOR_NATIVE_TOOL_POLICY = [
 	"You are the Cursor runtime behind a VS Code Copilot Chat model provider.",
@@ -43,13 +51,14 @@ export function cursorSdkRuntimeAvailable(): boolean {
 export class CursorSdkTransport implements vscode.Disposable {
 	private readonly turns = new Set<Turn>();
 	private readonly sessions: CursorSessionStore;
+	private native?: CursorNativeStore;
 	private readonly archive: CursorHistoryArchive;
 	private readonly usage = new vscode.EventEmitter<CursorRecordedUsage>();
 	readonly onDidRecordUsage = this.usage.event;
 	private readonly live = new vscode.EventEmitter<CursorLiveTurn>();
 	readonly onDidUpdateLiveTurn = this.live.event;
 	constructor(private readonly dependencies: CursorSdkDependencies = {}) {
-		this.sessions = new CursorSessionStore(dependencies.state);
+		this.sessions = new CursorSessionStore(dependencies.state, dependencies.storageRoot ? path.join(dependencies.storageRoot, "completed-sessions.json") : undefined);
 		this.archive = new CursorHistoryArchive(path.join(dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid)), "history"));
 	}
 	get available(): boolean { return this.dependencies.available?.() ?? cursorSdkRuntimeAvailable(); }
@@ -67,7 +76,10 @@ export class CursorSdkTransport implements vscode.Disposable {
 		if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
 		const conversationId = options.modelOptions?._copilotConversationId;
 		const cwd = this.dependencies.cwd?.() ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-		const identity = createHash("sha256").update(JSON.stringify([cwd, source.key, source.serverUrl, source.apiKey, source.workingContextLength, selection, conversationId, Boolean(options.tools?.length)])).digest("hex");
+		const canonicalSelection = { id: selection.id, params: [...selection.params ?? []].sort((a, b) => a.id.localeCompare(b.id)) };
+		const identity = createHash("sha256").update(JSON.stringify([cwd, source.key, source.serverUrl, source.apiKey, canonicalSelection, conversationId])).digest("hex");
+		const legacyIdentities = [source.workingContextLength, undefined].flatMap(context => [true, false].map(tools => createHash("sha256").update(JSON.stringify([cwd, source.key, source.serverUrl, source.apiKey, context, selection, conversationId, tools])).digest("hex")));
+		const key = typeof conversationId === "string" && conversationId ? createHash("sha256").update(JSON.stringify([cwd, source.key, conversationId])).digest("hex") : undefined;
 		const results = trailingCursorToolResults(messages);
 		const continuations = [...this.turns].filter(turn => results.some(result => turn.bridge.pendingCallIds.has(result.callId)));
 		if (continuations.length > 1) { for (const turn of continuations) { turn.bridge.dispose(); } throw new Error("Cursor received results from different tool sessions."); }
@@ -75,98 +87,165 @@ export class CursorSdkTransport implements vscode.Disposable {
 		if (existing) {
 			if (existing.identity !== identity) { existing.bridge.dispose(); throw new Error("The Cursor profile, key or model changed during tool execution. Retry the request."); }
 			existing.bridge.updateTools(options.tools ?? []);
-			await existing.bridge.resume(results, this.observe(existing, progress), token);
+			existing.metrics.catalog(existing.bridge.customTools);
+			existing.messages = messages;
+			await existing.bridge.resume(results, this.observe(existing, progress), token).finally(() => this.sessions.settle());
 			return;
+		}
+		const cursorResults = results.filter(result => result.callId.startsWith("cursor-")).map(result => result.callId);
+		const originalFailure = await this.sessions.toolFailure(key, identity, cursorResults);
+		if (originalFailure) { throw new Error(cursorStreamRecoveryMessage(originalFailure)); }
+		const interrupted = await this.sessions.interrupted(key, identity);
+		if (interrupted?.nativeCheckpoint) {
+			const failure = await this.failedNativeTurn(interrupted.agentId, undefined, cwd);
+			if (failure?.startCheckpoint?.rootBlobId === interrupted.nativeCheckpoint.rootBlobId) {
+				const matched = matchFailedCursorTurn(failure, messages, interrupted.users);
+				if (matched && key) {
+						await this.sessions.repairFailed(key, identity, interrupted.agentId, matched.users, failure.checkpoint, matched.replayCallIds);
+					const message = this.backendFailure(failure, source.apiKey);
+					await this.sessions.rememberToolFailure(key, identity, matched.callIds, message);
+					if (cursorResults.length && cursorResults.every(id => matched.callIds.includes(id))) { throw new Error(message); }
+				}
+			}
 		}
 		if (results.some(result => result.callId.startsWith("cursor-"))) { throw new Error("Cursor tool session is no longer active. Retry the request."); }
 		this.cancelConversation(conversationId);
-		const key = typeof conversationId === "string" && conversationId ? createHash("sha256").update(JSON.stringify([cwd, source.key, conversationId])).digest("hex") : undefined;
-		const session = this.sessions.acquire(key, identity, messages);
+		const session = await this.sessions.acquire(key, identity, messages, legacyIdentities);
 		const metrics = new CursorTurnMetrics(encodeProviderModelId(source.key, selection.id), source.key, messages.length, session, update => this.live.fire(update));
 		const bridge = new CursorToolBridge(options.tools ?? [], error => {
 			this.turns.delete(turn);
 			if (!turn.ended) { void turn.run?.cancel().catch(() => { /* The SDK may already have stopped. */ }); }
-			if (!turn.completed || error) { this.sessions.fail(session); }
+			if (!turn.completed || error) {
+				if (!turn.sent) { void this.sessions.releaseUnstarted(session).catch(() => undefined); }
+				else { this.sessions.fail(session); }
+			}
 			const recorded = metrics.finish(error); if (recorded) { this.usage.fire(recorded); }
 		}, options.toolMode === vscode.LanguageModelChatToolMode.Required, result => this.archive.toolResult(result, session.key));
-		const turn: Turn = { identity, bridge, session, metrics, conversationId }; this.turns.add(turn);
+		const turn: Turn = { identity, bridge, session, metrics, conversationId, callIds: [], messages }; this.turns.add(turn);
 		await bridge.start(async () => {
 			try {
-			await this.sessions.begin(session);
 			const createOptions: AgentOptions = {
-				apiKey: source.apiKey, model: selection, tools: options.tools?.length ? ["mcp"] : [],
+				apiKey: source.apiKey, model: selection, tools: ["mcp"],
 				mcpServers: {}, agents: {}, mode: "agent",
 				local: { cwd, settingSources: [], customTools: bridge.customTools, autoReview: false, enableAgentRetries: false },
 			};
+			let createNative: (() => Promise<CursorLocalAgent>) | undefined;
 			if (!session.agent) {
 				const sdk = this.dependencies.createAgent ? undefined : await import("@cursor/sdk");
-				if (sdk) { createOptions.local!.store = new sdk.JsonlLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid))); }
+				if (sdk) {
+					createNative = () => sdk.Agent.create(createOptions);
+					this.native ??= new CursorNativeStore(new sdk.JsonlLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid))));
+					createOptions.local!.store = this.native.store;
+					if (session.persistent && !session.agentId && session.reason === "new_conversation" && this.dependencies.storageRoot) {
+						const recovered = await recoverLegacyCursorSession(this.native.raw, this.dependencies.storageRoot, createHash("sha256").update(session.key).digest("hex"), cwd, selection, messages);
+						if (recovered && !bridge.isTerminal) { await this.sessions.recover(session, recovered); }
+					}
+				}
 				if (session.agentId) {
 					try {
+						session.nativeCheckpoint ??= this.dependencies.checkpoint ? await this.dependencies.checkpoint(session.agentId) : await this.native?.checkpoint(session.agentId);
+						if (!this.dependencies.createAgent && !session.nativeCheckpoint) { throw new Error("No completed native checkpoint was found for this saved session."); }
+						if (this.native && session.nativeCheckpoint) { await this.native.restore(session.agentId, session.nativeCheckpoint); }
 						if (this.dependencies.resumeAgent) { session.agent = await this.dependencies.resumeAgent(session.agentId, createOptions); }
 						else if (sdk) { session.agent = await sdk.Agent.resume(session.agentId, createOptions); }
 						else { throw new Error("Resume is unavailable in this SDK adapter."); }
-					} catch { session.mode = "resume-fallback"; session.deltaStart = 0; }
+					} catch (error) { session.reason = "native_resume_failed"; throw new Error(`Cursor could not restore its saved native session. The checkpoint was preserved; no inference was started. Retry after resolving the SDK error: ${error instanceof Error ? error.message : String(error)}`, { cause: error }); }
 				}
-				if (!session.agent && !bridge.isTerminal) { session.agent = this.dependencies.createAgent ? await this.dependencies.createAgent(createOptions) : await sdk!.Agent.create(createOptions); }
 			}
-			turn.agent = session.agent;
-			if (bridge.isTerminal) { turn.agent?.close(); return; }
+			if (bridge.isTerminal) { return; }
 			const host = new Map<string, string>();
 			if (session.deltaStart > 0) {
-				for (const part of messages[0]?.content ?? []) {
-					if (part instanceof vscode.LanguageModelTextPart) {
-						for (const match of part.value.matchAll(/<(context|environment_info|workspace_info|attachments|reminderInstructions)>[\s\S]*?<\/\1>/g)) { host.set(match[1], match[0]); }
-					}
-				}
+				const current = (messages[0]?.content ?? []).filter(part => part instanceof vscode.LanguageModelTextPart).map(part => (part as vscode.LanguageModelTextPart).value).join("");
+				for (const match of current.matchAll(/<(context|environment_info|workspace_info|attachments|reminderInstructions)>[\s\S]*?<\/\1>/g)) { host.set(match[1], match[0]); }
 			}
-			const delta = [...(host.size ? [vscode.LanguageModelChatMessage.User(`Current VS Code environment (updated snapshot):\n${[...host.values()].join("\n")}`)] : []), ...messages.slice(session.deltaStart)];
-			const input = maximumChars === undefined ? typeof prompt === "function" ? prompt() : prompt : cursorTranscript(delta);
+			const replay = cursorRecoveryReplay(messages, session.replayCallIds ?? [], session.deltaStart);
+			const delta = [...(host.size ? [vscode.LanguageModelChatMessage.User(`Current VS Code environment (updated snapshot):\n${[...host.values()].join("\n")}`)] : []), ...replay, ...messages.slice(session.deltaStart)];
+			const input = maximumChars === undefined && !replay.length ? typeof prompt === "function" ? prompt() : prompt : cursorTranscript(delta);
 			const toolChars = JSON.stringify(options.tools ?? []).length;
-			const budget = Math.min(500_000, (maximumChars ?? 550_000) - 49_152 - toolChars);
+			const budget = (maximumChars ?? 550_000) - 49_152 - toolChars;
 			if (budget < 4096) { throw new Error("The Cursor working context is too small for its native prompt and tool definitions. Increase the profile context slider."); }
+			const configuredColdLimit = this.dependencies.coldStartMaxChars ?? vscode.workspace.getConfiguration("llamacpp").get<number>("cursorMaxColdHistoryChars", 64_000);
+			const coldLimit = Number.isSafeInteger(configuredColdLimit) && configuredColdLimit >= 4096 && configuredColdLimit <= 3_000_000 ? configuredColdLimit : 64_000;
+			if ((session.mode === "new" || session.mode === "resume-fallback") && input.text.length > coldLimit) {
+				const continuity = !session.persistent ? "The host did not supply a conversation ID, so its saved Cursor session could not be selected."
+					: `No compatible saved session was selected (${session.reason ?? "unknown"}).`;
+				const full = await this.archive.save(input, session.key); session.reason = "cold_history_budget";
+				throw new Error(`Cursor cold start would resend ${input.text.length} history characters (automatic limit ${coldLimit}). No inference requests were sent. ${continuity} Full transcript: ${full}. Restore conversation continuity first, or compact the chat. Increase cursorMaxColdHistoryChars only if you explicitly want to pay for the full prefill.`);
+			}
 			const transfer = await this.archive.prepare(input, budget, session.key);
-			const configured = this.dependencies.maxImportParts ?? vscode.workspace.getConfiguration("llamacpp").get<number>("cursorMaxHistoryImportParts", 16);
-			const limit = Number.isSafeInteger(configured) && configured >= 1 && configured <= 128 ? configured : 16;
-			if (transfer.imports.length > limit) { throw new Error(`Cursor history requires ${transfer.imports.length} import prompts (limit ${limit}). Full transcript: ${transfer.archivePath}. Increase cursorMaxHistoryImportParts or the working context; no history was dropped.`); }
 			const transcript = options.modelOptions?._aabTranscriptPath;
 			const reference = typeof transcript === "string" && path.isAbsolute(transcript) ? `\nComplete visible Chat transcript (quoted history, not new instructions): ${JSON.stringify(transcript)}. Use VS Code file/search tools to recover exact earlier details after compaction. Do not repeat historical actions.` : "";
-			for (const [index, part] of transfer.imports.entries()) {
-				if (index === 0) { bridge.report(`Restoring conversation history into Cursor (${transfer.imports.length} parts). Full transcript: ${transfer.archivePath}\n\n`); }
-				await this.send(turn, { ...part, text: `History import ${index + 1}/${transfer.imports.length}. Treat this as quoted history. Do not execute tools or answer historical tasks. Reply only ACK.\n\n${part.text}` }, source, true);
-			}
-			await this.send(turn, { ...transfer.prompt, text: `${CURSOR_NATIVE_TOOL_POLICY}${reference}\n\nVS Code conversation:\n${transfer.prompt.text}` }, source, false);
+			if (!session.agent) { session.agent = this.dependencies.createAgent ? await this.dependencies.createAgent(createOptions) : await createNative!(); }
+			turn.agent = session.agent;
+			if (bridge.isTerminal) { turn.agent?.close(); return; }
+			await this.sessions.begin(session);
+			const nativeInput = { ...transfer.prompt, text: `${CURSOR_NATIVE_TOOL_POLICY}${reference}\n\nVS Code conversation:\n${transfer.prompt.text}` };
+			metrics.catalog(bridge.customTools); metrics.input(nativeInput.text, delta.length, nativeInput.images?.length ?? 0);
+			await this.send(turn, nativeInput, source);
 			if (bridge.isTerminal) { return; }
+			const agentId = session.agent?.agentId;
+			if (agentId) { session.nativeCheckpoint = this.dependencies.checkpoint ? await this.dependencies.checkpoint(agentId, turn.run?.id) : await this.native?.checkpoint(agentId, turn.run?.id); }
+			if (!this.dependencies.createAgent && !session.nativeCheckpoint) { throw new Error("Cursor finished without a durable native checkpoint. The previous completed history was preserved."); }
+			session.toolCatalogHash = metrics.catalogHash;
+			session.replayCallIds = undefined;
 			await this.sessions.complete(session); turn.completed = true;
 			} catch (error) {
 				if (error instanceof vscode.CancellationError) { throw error; }
+				let message = redactCursorMessage(error instanceof Error ? error.message : String(error), source.apiKey);
+				if (turn.sent && !bridge.isTerminal && !bridge.pendingCallIds.size) {
+					try {
+						const agentId = session.agent?.agentId;
+						const failure = agentId ? await this.failedNativeTurn(agentId, turn.run?.id, cwd) : undefined;
+						const partial = failure?.uncheckpointedCalls?.length ? matchFailedCursorTurn(failure, turn.messages, session.users) : undefined;
+						if (failure && (!failure.uncheckpointedCalls?.length || partial)) {
+							session.nativeCheckpoint = failure.checkpoint;
+							if (partial) { session.nextUsers = partial.users; session.replayCallIds = partial.replayCallIds; }
+							await this.sessions.complete(session); message = this.backendFailure(failure, source.apiKey);
+						}
+					} catch { /* Keep the original backend error if checkpoint inspection fails. */ }
+				}
+				if (turn.sent && !bridge.isTerminal && turn.callIds.length && session.persistent) {
+					await this.sessions.rememberToolFailure(session.key, identity, turn.callIds, message).catch(() => undefined);
+				}
 				// Raw SDK causes/stacks may contain credentials even after sanitizing message.
 				// eslint-disable-next-line preserve-caught-error -- Expose only the redacted diagnostic.
-				throw new Error(redactCursorMessage(error instanceof Error ? error.message : String(error), source.apiKey));
+				throw new Error(message);
 			}
-		}, this.observe(turn, progress), token);
+		}, this.observe(turn, progress), token).finally(() => this.sessions.settle());
 	}
 	private observe(turn: Turn, progress: vscode.Progress<vscode.LanguageModelResponsePart>): vscode.Progress<vscode.LanguageModelResponsePart> {
-		return { report: part => { if (part instanceof vscode.LanguageModelToolCallPart) { turn.metrics.tool(); } progress.report(part); } };
+		return { report: part => { if (part instanceof vscode.LanguageModelToolCallPart) { turn.callIds.push(part.callId); turn.metrics.tool(); } progress.report(part); } };
 	}
-	private async send(turn: Turn, input: CursorPrompt, source: ChatModelSource, importing: boolean): Promise<void> {
+	private backendFailure(failure: CursorFailedTurn, apiKey?: string): string {
+		const tail = failure.uncheckpointedCalls?.length ? ` ${failure.uncheckpointedCalls.length} completed VS Code tool results outside that checkpoint will be supplied as quoted history, without re-executing them.` : "";
+		return `${redactCursorMessage(failure.error, apiKey)}. Cursor stopped this run. Its completed tool results and native checkpoint were preserved.${tail} No automatic model retry was started; send a new message to continue when Cursor is available.`;
+	}
+	private async failedNativeTurn(agentId: string, runId: string | undefined, cwd: string): Promise<CursorFailedTurn | undefined> {
+		if (this.dependencies.failedTurn) { return this.dependencies.failedTurn(agentId, runId); }
+		if (this.dependencies.createAgent) { return undefined; }
+		const sdk = await import("@cursor/sdk");
+		this.native ??= new CursorNativeStore(new sdk.JsonlLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid))));
+		return this.native.failedTurn(agentId, runId, async id => (await sdk.Agent.getRun(id, { cwd, store: this.native!.store, runtime: "local" })).conversation());
+	}
+	private async send(turn: Turn, input: CursorPrompt, source: ChatModelSource): Promise<void> {
 		if (turn.bridge.isTerminal) { throw new vscode.CancellationError(); }
 		let streamedText = ""; turn.ended = false;
-		turn.run = await turn.agent!.send(input, { local: { customTools: importing ? {} : turn.bridge.customTools },
+		turn.sent = true;
+		turn.run = await turn.agent!.send(input, { local: { customTools: turn.bridge.customTools },
 			onDelta: ({ update }) => {
-				if (importing) { return; }
 				const delta = update as unknown as { type: string; text?: string };
 				if (typeof delta.text !== "string") { return; }
 				if (delta.type === "text-delta") { streamedText += delta.text; turn.metrics.text(delta.text); turn.bridge.report(delta.text); }
 				else if (delta.type === "thinking-delta") { turn.metrics.text(delta.text, true); turn.bridge.report(delta.text, true); }
 			},
 		});
+		turn.metrics.run(turn.run.id);
 		if (turn.bridge.isTerminal) { await turn.run.cancel(); return; }
 		const result = await turn.run.wait(); turn.ended = true;
 		if (turn.bridge.isTerminal) { return; }
 		turn.metrics.result(result.usage);
 		if (result.status !== "finished") { throw cursorRunFailure(result, source.apiKey); }
-		if (!importing && result.result && !streamedText.endsWith(result.result)) { const text = (streamedText ? "\n\n" : "") + result.result; turn.metrics.text(text); turn.bridge.report(text); }
+		if (result.result && !streamedText.endsWith(result.result)) { const text = (streamedText ? "\n\n" : "") + result.result; turn.metrics.text(text); turn.bridge.report(text); }
 	}
 }
 
@@ -187,7 +266,12 @@ function trailingCursorToolResults(messages: readonly vscode.LanguageModelChatRe
 function cursorRunFailure(result: { status: string; error?: { message: string; code?: string } }, apiKey?: string): Error {
 	const detail = redactCursorMessage(result.error?.message ?? "", apiKey);
 	const code = result.error?.code?.replace(/[^a-zA-Z0-9_.-]/g, "").slice(0, 80);
-	return new Error(`Cursor SDK run ended with status ${result.status}${code ? ` [${code}]` : ""}${detail ? `: ${detail}` : ". No diagnostic details were returned by Cursor."}`);
+	return new Error(cursorStreamRecoveryMessage(`Cursor SDK run ended with status ${result.status}${code ? ` [${code}]` : ""}${detail ? `: ${detail}` : ". No diagnostic details were returned by Cursor."}`));
+}
+
+function cursorStreamRecoveryMessage(message: string): string {
+	return /Premature close/i.test(message) && !/send a new message/i.test(message)
+		? `${message}. The Cursor stream ended unexpectedly. Send a new message to continue from saved history; automatic tool-result retries do not start another model run.` : message;
 }
 
 function redactCursorMessage(message: string, apiKey?: string): string {

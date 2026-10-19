@@ -21,6 +21,10 @@ imports; they are not inferred from context occupancy or session reuse.
 Cursor SDK usage appears on its saved API profile and in the aggregate API
 history category. Session Diagnostics distinguishes Cursor from Claude, shows
 new/warm/restored mode and separates fresh input, cache reads and cache writes.
+Native Cursor input already includes cache reads/writes; the adapter counts
+them once and checks SDK totals for the known duplicate-cache representation.
+First cold starts are labelled separately from failed session reuse. A warm
+session does not itself prove a server cache hit. Older aggregates are retained.
 No SDK context-occupancy counter is inferred from cumulative billed tokens.
 Details and verification: [Cursor continuity](CURSOR_CONTINUITY.md).
 

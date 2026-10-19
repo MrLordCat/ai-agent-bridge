@@ -95,11 +95,19 @@ Compatible gateways remain ordinary OpenAI-compatible profiles. There is no
 separate Cursor enable setting or key store.
 
 Cursor SDK sessions stay warm between user messages and restore completed
-checkpoints after reload. The shared visible Chat journal supports switching
+native checkpoints after reload, using an atomic disk binding in addition to
+workspaceState. Interrupted follow-ups retain the prior completed checkpoint.
+Native resume failure preserves that checkpoint and sends no inference request;
+it never silently starts a full-history replay. The shared visible Chat journal supports switching
 from Codex/Coco/Claude and returning to Cursor with foreign turns retained.
-Large histories are imported in bounded requests with tools disabled; the
-`llamacpp.cursorMaxHistoryImportParts` guard defaults to 16. The Cloud fallback
-rejects oversized history explicitly instead of dropping early messages.
+Automatic multi-prompt history imports are disabled. Each user request starts
+one SDK run; native model/tool iterations can still occur within it. Unmatched
+history branches stop before inference and preserve the completed session.
+New sessions replay at most 64,000 history characters by default, controlled by
+`llamacpp.cursorMaxColdHistoryChars`; larger cold transfers stop before inference
+and retain a full archive. Warm/restored deltas do not use that cold budget.
+`llamacpp.cursorMaxHistoryImportParts` is deprecated and ignored. The Cloud
+fallback rejects oversized history explicitly instead of dropping early messages.
 Native SDK cache read/write counters feed profile metrics and diagnostics,
 independently of billing permissions. See [Cursor continuity](CURSOR_CONTINUITY.md)
 for storage, verification and finite-context limitations.
