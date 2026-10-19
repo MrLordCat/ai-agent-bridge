@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. The extension applies compatible patches on startup
 and exposes apply, status and restore commands; no installer or external patch
-script is required. Patch v22 makes the following changes:
+script is required. Patch v24 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -89,6 +89,19 @@ script is required. Patch v22 makes the following changes:
   serializes them into persisted chat history;
 - binary and other non-text tool payloads are replaced by a compact history
   placeholder. The live tool card is unaffected.
+- the persisted session bounds tool results where Copilot stores them
+  (`toolCallResults`): binary payloads above 200 KB are replaced by a
+  marker and text above 12 KB is truncated. Without this, a session with
+  several `view_image` calls grew to 544 MB, and VS Code then failed every
+  request with `RangeError: Invalid string length` while serializing the
+  agent arguments. The live tool card keeps its full result.
+- an oversized session that already exists can be repaired with
+  `node scripts/repair-chat-sessions.cjs <session.jsonl>`; it writes a
+  `*.repaired.jsonl` next to the original and leaves the original intact.
+- MCP tool schemas that describe a tuple with `prefixItems` and no `items`
+  (valid JSON Schema 2020-12) no longer fail the whole chat with
+  `Failed to validate tool ...: tool parameters array type must have
+  items`. The validator fills in an empty `items` schema instead.
 - the tokenizer for extension-contributed models memoises token counts by
   content. Copilot otherwise calls `LanguageModelChat.countTokens` once per
   message, text part and tool-schema key on every agent round — measured at
@@ -123,7 +136,7 @@ that chat request.
 `llamacpp.autoPatchCopilot` defaults to `true`. On extension startup, the
 runtime discovers installed Copilot bundles and associates them with the active
 desktop workbench. Read-only bundles from another Linux installation are
-skipped. If patch v22 is already present, startup is silent. If a bundle is changed, the extension asks
+skipped. If patch v24 is already present, startup is silent. If a bundle is changed, the extension asks
 for one window reload. A repeated compatibility failure is logged but shown at
 most once per VS Code build.
 
@@ -168,7 +181,7 @@ Before writing, the patcher:
 6. creates separate restorable backups beside both bundles;
 7. records original and patched SHA-256 hashes for both files.
 
-Applying patch v22 over an older supported patch marker uses the preserved
+Applying patch v24 over an older supported patch marker uses the preserved
 original backup rather than stacking edits on the already modified bundle.
 
 The patch is deliberately fail-closed. If a Copilot update changes the bundle

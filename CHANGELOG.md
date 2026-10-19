@@ -1,5 +1,36 @@
 # Changelog
 
+## 1.18.2 (patch release) - 2026-10-18
+
+- **MCP tools with tuple schemas no longer break the chat.** A JSON Schema
+  tuple is written as `prefixItems` without `items`; Copilot's validator
+  rejected that shape and failed the whole request with
+  `Failed to validate tool <name>: tool parameters array type must have
+  items`. Patch v24 fills in an empty `items` schema, so tools such as
+  `inspect_analysis_view` from the REA MCP server remain usable.
+- Patch v24 upgrades from v23 in place; the preserved original bundle
+  backup stays valid.
+
+## 1.18.1 (patch release) - 2026-10-18
+
+- **Saved chat sessions no longer grow past the V8 string limit.** Copilot
+  stores every tool result twice: a bounded copy for the prompt and a
+  verbatim copy in the saved session. A session with several `view_image`
+  calls reached 544 MB, after which VS Code failed every request with
+  `RangeError: Invalid string length` while serializing the agent
+  arguments. Patch v23 bounds the stored copy as well: binary payloads
+  above 200 KB become a compact marker and text above 12 KB is truncated.
+  The live tool card keeps its full result.
+- **Patch v23 upgrades from v22 in place.** The v22 marker is now a legacy
+  marker, so the preserved original bundle backup stays valid and is used
+  as the source for the new patch.
+- `scripts/repair-chat-sessions.cjs` repairs an already oversized session:
+  binary payloads are replaced, huge text is trimmed, the newest requests
+  are kept, and a new `*.repaired.jsonl` is written next to the original.
+  The original file is never modified.
+
+- Tests: 702 extension-host tests.
+
 ## 1.18.0 (stable release) - 2026-10-15
 
 Consolidates the development work since 1.17.3, including the final behavior
