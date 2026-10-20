@@ -4,6 +4,7 @@ import { modelInformation } from "../providers/model-descriptor";
 
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
+import { resolveSharedContextLimit } from "../context/provider-handoff";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_ACTIVE_SESSION_IDLE_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
@@ -960,8 +961,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (!usage && !context) {
 			return undefined;
 		}
-		const configuredContextLimit = vscode.workspace.getConfiguration("llamacpp")
-			.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH);
+		const configuredContextLimit = resolveSharedContextLimit();
 		const contextWindow = context
 			? resolveClaudeContextLength(configuredContextLimit, context.rawMaxTokens)
 			: undefined;
@@ -1156,9 +1156,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			return;
 		}
 		const config = vscode.workspace.getConfiguration("llamacpp");
-		const contextTarget = resolveClaudeContextLength(
-			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
-		);
+		const contextTarget = resolveClaudeContextLength(resolveSharedContextLimit(config));
 		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
 		const probe = new ClaudeAgentSession({
 			model: resolveClaudeRuntimeModel(CLAUDE_SUBSCRIPTION_MODELS[0].id),
@@ -1265,9 +1263,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			),
 		});
 		const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
-		const contextTarget = resolveClaudeContextLength(
-			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
-		);
+		const contextTarget = resolveClaudeContextLength(resolveSharedContextLimit(config));
 		const runtimeModelId = resolveClaudeRuntimeModel(modelId);
 		const effort = resolveEffort(
 			options.modelOptions?.reasoningEffort
@@ -1959,8 +1955,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		update: ClaudeAgentTurnUpdate,
 		contextUsage?: ClaudeContextUsageSnapshot
 	): ClaudeLiveTurnUpdate {
-		const configuredContextLimit = vscode.workspace.getConfiguration("llamacpp")
-			.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH);
+		const configuredContextLimit = resolveSharedContextLimit();
 		return {
 			...update,
 			modelId,
@@ -2422,9 +2417,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 
 	private mapKnownModels(): vscode.LanguageModelChatInformation[] {
 		const config = vscode.workspace.getConfiguration("llamacpp");
-		const contextLength = resolveClaudeContextLength(
-			config.get("claudeContextLength", DEFAULT_CLAUDE_CONTEXT_LENGTH)
-		);
+		const contextLength = resolveClaudeContextLength(resolveSharedContextLimit(config));
 		const maxOutputTokens = Math.max(
 			1_024,
 			Math.min(

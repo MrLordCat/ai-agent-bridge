@@ -658,6 +658,11 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         this._onDidChangeLanguageModelChatInformation.fire();
     }
 
+    /** Re-advertises limits (e.g. the shared context) without dropping catalogs or active runs. */
+    notifyModelLimitsChanged(): void {
+        this._onDidChangeLanguageModelChatInformation.fire();
+    }
+
     disposeCursorTransport(): void { this.sourceRouter.dispose(); this.cursorUsage.dispose(); this.cursorLive.dispose(); }
     cancelCursorConversation(conversationId: unknown): void { this.sourceRouter.cancelConversation(conversationId); }
     async usesConversationHistory(model: vscode.LanguageModelChatInformation): Promise<boolean> {

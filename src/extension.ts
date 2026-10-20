@@ -609,6 +609,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getApiProfileKey: id => apiProviderService.getApiKey(id),
 		getSubscriptionStatuses: () => subscriptionStatuses,
 		getProviderSources: () => compositeProvider.registry.sources,
+		getCatalogLoadedAt: key => apiProviderService.catalogLoadedAt(key),
 	});
 	context.subscriptions.push(providerDirectory);
 
@@ -685,7 +686,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
 	});
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
-	context.subscriptions.push(apiProviderService.onDidChangeContext(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(apiProviderService.onDidChangeContext(() => {
+		// A loaded catalog is also availability evidence (Cursor's probe can lag).
+		void providerDirectory.refresh().catch(error => logService.logError("providers.catalog_refresh.failed", error));
+		quickActionsProvider.refresh();
+	}));
 	context.subscriptions.push(apiProviderService.onDidChangeBalance(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(memoryService.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
@@ -1907,6 +1912,16 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				) {
 					cocoProvider.refreshLanguageModelChatInformation();
 					void cocoProvider.refreshStatus();
+				}
+				if (
+					event.affectsConfiguration("llamacpp.sharedContextLength") ||
+					event.affectsConfiguration("llamacpp.codexWorkingContextTarget")
+				) {
+					// One working context for Codex, Claude, Coco and Cursor.
+					llamaProvider.notifyModelLimitsChanged();
+					codexProvider.refreshLanguageModelChatInformation();
+					claudeProvider.refreshLanguageModelChatInformation();
+					cocoProvider.refreshLanguageModelChatInformation();
 				}
 				if (
 					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveEnabled") ||

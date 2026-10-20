@@ -1,0 +1,73 @@
+{
+  "node": "24.21.0",
+  "vscode": "1.142.0",
+  "reports": [
+    {
+      "historyChars": 100000,
+      "journalRounds": 5,
+      "journal": {
+        "wallMs": 49.71,
+        "cpuMs": 79,
+        "rssDeltaMiB": 0.47
+      },
+      "mergeRounds": 20,
+      "merge": {
+        "wallMs": 13.95,
+        "cpuMs": 0,
+        "rssDeltaMiB": 0.21
+      },
+      "savedBytes": 100732
+    },
+    {
+      "historyChars": 1000000,
+      "journalRounds": 5,
+      "journal": {
+        "wallMs": 120.16,
+        "cpuMs": 110,
+        "rssDeltaMiB": 28.84
+      },
+      "mergeRounds": 20,
+      "merge": {
+        "wallMs": 145.89,
+        "cpuMs": 124,
+        "rssDeltaMiB": -3.37
+      },
+      "savedBytes": 1000732
+    },
+    {
+      "historyChars": 3000000,
+      "journalRounds": 5,
+      "journal": {
+        "wallMs": 205.95,
+        "cpuMs": 188,
+        "rssDeltaMiB": 23.52
+      },
+      "mergeRounds": 20,
+      "merge": {
+        "wallMs": 356.31,
+        "cpuMs": 343,
+        "rssDeltaMiB": 12.16
+      },
+      "savedBytes": 3000732
+    },
+    {
+      "streamChunks": 10000,
+      "publishedUpdates": 1,
+      "stream": {
+        "wallMs": 1.48,
+        "cpuMs": 0,
+        "rssDeltaMiB": -0.01
+      }
+    },
+    {
+      "reportRecords": 500,
+      "serializationRounds": 100,
+      "reportBytes": 540371,
+      "reportCost": {
+        "wallMs": 101,
+        "cpuMs": 126,
+        "rssDeltaMiB": -38.14
+      }
+    }
+  ]
+}

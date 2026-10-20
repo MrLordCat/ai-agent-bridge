@@ -1,5 +1,16 @@
 # Snowflake Coco
 
+Since 1.18.14, all adapters receive the common conversation journal; Codex,
+Coco and Cursor prepare handoffs using one token-budget planner. The old
+million-character Coco cutoff is gone. See [shared context](SHARED_CONTEXT.md)
+for settings, native continuation, archive/image preservation and long-run errors.
+
+Since 1.18.13, requests with VS Code callback tools use native ACP even when
+SDK is selected: the bundled CLI expires SDK callbacks after 30 seconds,
+including time spent waiting for Chat approval and tool execution. ACP retains
+the native session and supports longer tool waits. Text-only requests can
+still use SDK. See [the live reproduction and measurements](PERFORMANCE_RESEARCH.md).
+
 For the reproduced full-tool-name failure and the 1.18.12 fix, see
 [the tool-name incident diagnosis](COCO_TOOL_NAME_INCIDENT.md). SDK aliases
 include the MCP namespace in the 64-character backend limit and are checked

@@ -3,12 +3,14 @@ import * as vscode from "vscode";
 
 import {
 	DEFAULT_API_PROVIDER_CONTEXT,
+	isCursorApiProfile,
 	type ApiProviderDraft,
 	type ApiProviderService,
 	type ApiProviderSummary,
 } from "../api-providers/api-provider-service";
 import { API_PROVIDER_PRESETS } from "../api-providers/presets";
 import { CONFIG_SECTION, DEFAULT_SERVER_URL } from "../constants";
+import { resolveSharedContextLimit } from "../context/provider-handoff";
 import {
 	formatDeepSeekPeakEffectiveLocal,
 	resolveDeepSeekPricingSnapshot,
@@ -298,12 +300,15 @@ export function renderApiProviderManagerHtml(state: ApiProviderManagerRenderStat
 				${profile.llamaCppCompat ? '<span title="Sends cache_prompt, enable_thinking and thinking_budget_tokens.">llama.cpp fields</span>' : ""}
 				<span class="${profile.hasApiKey ? "key-set" : ""}">${profile.hasApiKey ? "key saved" : "no key"}</span>
 			</div>
-			<div class="context-control">
+			${isCursorApiProfile(profile) ? `<div class="context-control">
+				<label>Working context: <output>Shared · ${Math.min(resolveSharedContextLimit(), maximum).toLocaleString("en-US")}</output></label>
+				<small>Cursor follows the shared working context of Codex, Claude and Coco. Change it in Provider Context (Quick Access → Providers → Shared Context).</small>
+			</div>` : `<div class="context-control">
 				<label>Working context: <output id="context-value-${escAttr(profile.id)}">${profile.contextLength === undefined ? "Auto · " : ""}${working.toLocaleString("en-US")}</output>
 				<input class="working-context" data-id="${escAttr(profile.id)}" type="range" min="4096" max="${maximum}" step="1" value="${working}" style="width:100%" /></label>
 				${profile.contextMaximumReported ? "" : '<small>The API has not reported its maximum; the slider uses a safe fallback.</small>'}
 				<button class="context-auto" data-id="${escAttr(profile.id)}" type="button">Use automatic context</button>
-			</div>
+			</div>`}
 			<div class="actions">
 				<button class="toggle-btn" data-id="${escAttr(profile.id)}" data-enabled="${profile.enabled}" type="button">${profile.enabled ? "Disable" : "Enable"}</button>
 				<button class="edit-btn" data-id="${escAttr(profile.id)}" type="button">Edit</button>

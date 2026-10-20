@@ -3,15 +3,19 @@ import { QuickAccessItem, command, toggleIcon, runtimeMetricItems } from "./quic
 export { QuickAccessItem } from "./quick-access-items";
 
 import type { QuickAccessApiProvider } from "../api-providers/api-provider-service";
+import { isCursorApiProfile } from "../api-providers/api-provider-service";
 import type { ProviderState } from "../providers/provider-directory";
 import { providerUsageSummary, type ProviderSnapshot } from "../providers/provider-snapshot";
 import type { CocoProviderStatus } from "../coco/coco-provider";
+import { cocoNativeCompactionTokens } from "../coco/model-adapter";
+import { resolveClaudeContextLength } from "../claude/claude-provider";
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
 import { isDeepSeekEndpoint } from "../transport/openai-http";
 import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
 	normalizeCompactionTargetRatio,
 } from "../context/context-budget";
+import { resolveSharedContextLimit } from "../context/provider-handoff";
 import {
 	getCopilotPatchStatus,
 	findCopilotBundle,
@@ -354,13 +358,18 @@ function codexUsageLimitItem(id: string, label: string, description: string): Qu
 export function buildApiProfileItem(
 	profile: QuickAccessApiProvider,
 	state: ProviderState | undefined,
-	metrics?: ProviderRuntimeMetrics
+	metrics?: ProviderRuntimeMetrics,
+	detail?: string,
+	sharedContext?: number
 ): QuickAccessItem {
 	const id = `api.${profile.id}`;
 	const balance = profile.protocol === "cursor" ? undefined : profile.balance;
+	// Cursor is a native agent: it follows the shared working context, not the profile slider.
+	const shared = sharedContext !== undefined && isCursorApiProfile(profile) ? sharedContext : undefined;
+	const sharedWorking = shared === undefined ? undefined : Math.min(shared, profile.maximumContextLength ?? shared);
 	return new QuickAccessItem(id, profile.name, {
 		description: state === "unsupported" ? "Unsupported API" : state === "offline" ? "Offline" : profile.hasApiKey ? "API provider" : "No API key",
-		icon: new vscode.ThemeIcon("cloud"), tooltip: profile.baseUrl,
+		icon: new vscode.ThemeIcon("cloud"), tooltip: [profile.baseUrl, detail].filter(Boolean).join("\n"),
 		children: [
 			new QuickAccessItem(`${id}.source`, "Source", { description: "On", tooltip: "Enabled API provider; disable it in the Providers Manager.", icon: toggleIcon(true), command: command("llamacpp.openApiProviders", "Manage API Providers") }),
 			...providerRuntimeItems(id, metrics),
@@ -375,7 +384,9 @@ export function buildApiProfileItem(
 				tooltip: profile.contextMaximumReported ? "Maximum context discovered from the provider's models." : "The API has not reported a maximum; discovery may use a fallback.",
 				icon: new vscode.ThemeIcon("symbol-numeric"), command: command("llamacpp.openApiProviders", "Manage API Providers"),
 			}),
-			new QuickAccessItem(`${id}.workingContext`, "Working Context", { description: profile.contextLength === undefined ? "Automatic" : formatCompactTokenCount(profile.contextLength), tooltip: "Choose a smaller working context with the slider in the Providers Manager.", icon: new vscode.ThemeIcon("settings"), command: command("llamacpp.openApiProviders", "Adjust Working Context") }),
+			new QuickAccessItem(`${id}.workingContext`, "Working Context", sharedWorking !== undefined
+				? { description: `${formatCompactTokenCount(sharedWorking)} shared`, tooltip: `Shared working context ${formatCompactTokenCount(shared!)} for Codex, Claude, Coco and Cursor, capped by the model window. Change it in Provider Context.`, icon: new vscode.ThemeIcon("settings"), command: command("llamacpp.openContextControl", "Open Provider Context Control") }
+				: { description: profile.contextLength === undefined ? "Automatic" : formatCompactTokenCount(profile.contextLength), tooltip: "Choose a smaller working context with the slider in the Providers Manager.", icon: new vscode.ThemeIcon("settings"), command: command("llamacpp.openApiProviders", "Adjust Working Context") }),
 			new QuickAccessItem(`${id}.manage`, "Providers Manager", { description: "Edit, disable or delete", icon: new vscode.ThemeIcon("server-process"), command: command("llamacpp.openApiProviders", "Manage API Providers") }),
 		],
 	});
@@ -395,9 +406,10 @@ export function buildProviderSnapshotItem(snapshot: ProviderSnapshot): QuickAcce
 	});
 }
 export function buildCocoItem(
-	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number, metrics?: ProviderRuntimeMetrics
+	enabled: boolean, status: QuickAccessCocoStatus | undefined, contextLength: number, metrics?: ProviderRuntimeMetrics, sharedContext?: number
 ): QuickAccessItem {
 	const summary = enabled ? status?.summary ?? "Checking..." : "Off";
+	const window = metrics?.contextWindowTokens ?? contextLength;
 	const tooltip = [
 		"Snowflake Cortex Code connection checked through ACP; no model request is sent.",
 		status?.checkedAt ? `Last check: ${new Date(status.checkedAt).toLocaleString()}` : undefined,
@@ -433,10 +445,19 @@ export function buildCocoItem(
 				command: command("llamacpp.openCopilotModelPicker", "Open Model Picker"),
 			}),
 			new QuickAccessItem("coco.context", metrics?.contextWindowTokens ? "Maximum Context" : "Fallback Context", {
-				description: formatCompactTokenCount(metrics?.contextWindowTokens ?? contextLength), icon: new vscode.ThemeIcon("symbol-numeric"),
+				description: formatCompactTokenCount(window), icon: new vscode.ThemeIcon("symbol-numeric"),
 				tooltip: "The last measured model window, when available; otherwise the global fallback. Exact model baselines and live windows are used in the model picker.",
 				command: command("llamacpp.cocoOpenSettings", "Open Coco Settings"),
 			}),
+			...(sharedContext !== undefined ? [new QuickAccessItem("coco.workingContext", "Working Context", {
+				description: `${formatCompactTokenCount(Math.min(sharedContext, window))} shared`,
+				tooltip: [
+					`Shared working context ${formatCompactTokenCount(sharedContext)} for Codex, Claude, Coco and Cursor, capped by the ${formatCompactTokenCount(window)} model window.`,
+					`Coco CLI auto-compacts natively at about ${formatCompactTokenCount(cocoNativeCompactionTokens(sharedContext, window))}: its threshold is 20-99% of the window, and the server caps it at 75% for 1M windows (90% below).`,
+				].join("\n"),
+				icon: new vscode.ThemeIcon("settings"),
+				command: command("llamacpp.openContextControl", "Open Provider Context Control"),
+			})] : []),
 			new QuickAccessItem("coco.settings", "Coco Settings", {
 				icon: new vscode.ThemeIcon("settings-gear"),
 				command: command("llamacpp.cocoOpenSettings", "Open Coco Settings"),
@@ -534,9 +555,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			60_000,
 			Math.min(3_600_000, Number(config.get("codexCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
 		);
-		const codexWorkingContextTarget = Number(config.get("codexWorkingContextTarget", 258_400)) || 258_400;
+		const sharedContext = resolveSharedContextLimit(config);
 		const claudeEnabled = config.get<boolean>("enableClaudeSubscription", true) !== false;
-		const claudeContextLength = Number(config.get("claudeContextLength", 258_400)) || 258_400;
+		const claudeContextLength = resolveClaudeContextLength(sharedContext);
 		const thinkingMode = String(config.get("thinkingMode", "auto"));
 		const reasoningBudget = Number(config.get("reasoningBudget", DEFAULT_LOCAL_REASONING_BUDGET));
 		const effectiveReasoningBudget = resolveReasoningBudget(
@@ -592,6 +613,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			icon: new vscode.ThemeIcon("server-environment"),
 			tooltip: "Manage multiple OpenAI-compatible API endpoints and credentials. API keys are stored in VS Code SecretStorage.",
 			children: [
+				new QuickAccessItem("apiProviders.sharedContext", "Shared Context", {
+					description: formatCompactTokenCount(sharedContext),
+					tooltip: "One working context for Codex, Claude, Coco and Cursor. Each provider caps it to its real model window and uses it as the native auto-compaction threshold.",
+					icon: new vscode.ThemeIcon("symbol-numeric"),
+					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
+				}),
 				new QuickAccessItem("apiProviders.manage", "Providers Manager", {
 					description: apiProviderSummary.total > 0 ? `${apiProviderSummary.total} configured` : "Add, edit or remove",
 					icon: new vscode.ThemeIcon("server-process"),
@@ -726,8 +753,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
 				}),
 				new QuickAccessItem("codex.contextTarget", "Working Context", {
-					description: `${formatCompactTokenCount(codexWorkingContextTarget)} target${codexMetrics?.contextWindowTokens ? ` / ${formatCompactTokenCount(codexMetrics.contextWindowTokens)} max` : ""}`,
-					tooltip: "Open the provider context sliders. Codex is capped to its server-reported model window and reserves output, tool-schema, instruction, and safety tokens.",
+					description: codexMetrics?.contextWindowTokens
+						? `${formatCompactTokenCount(Math.min(sharedContext, codexMetrics.contextWindowTokens))} shared / ${formatCompactTokenCount(codexMetrics.contextWindowTokens)} max`
+						: `${formatCompactTokenCount(sharedContext)} shared`,
+					tooltip: "Shared working context for Codex, Claude, Coco and Cursor, capped to Codex's server-reported model window. Below 90% of that window it is also Codex's native auto-compaction limit. Open Provider Context to change it.",
 					icon: new vscode.ThemeIcon("settings"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
@@ -838,9 +867,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 						}),
 						],
 				}),
-				new QuickAccessItem("claude.contextLimit", "Maximum Context", {
-					description: `${formatCompactTokenCount(claudeContextLength)} target / 1M max`,
-					tooltip: "Open the provider context sliders. Claude uses the real Opus 5 1M runtime and this value as its auto-compaction threshold.",
+				new QuickAccessItem("claude.contextLimit", "Working Context", {
+					description: `${formatCompactTokenCount(claudeContextLength)} shared / 1M max`,
+					tooltip: `Shared working context ${formatCompactTokenCount(sharedContext)} for Codex, Claude, Coco and Cursor. Claude uses the real Opus 5 1M runtime and this value as its auto-compaction threshold, bounded to 258.4K-967K.`,
 					icon: new vscode.ThemeIcon("settings"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
@@ -1161,7 +1190,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			{ key: "claude", item: claude },
 			{ key: "coco", item: buildCocoItem(
 				config.get<boolean>("enableCoco", true), this.getCocoStatus(),
-				config.get<number>("cocoContextLength", 128_000), view.metrics.get("coco")
+				config.get<number>("cocoContextLength", 128_000), view.metrics.get("coco"), sharedContext
 			) },
 		];
 		const visibleProviders = providerRoots
@@ -1175,9 +1204,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			apiProviders.description = "Profiles unavailable";
 			apiProviders.tooltip = "Unable to read API profiles. Open Providers Manager to check their configuration.";
 		}
-		const apiProfileItems = apiProfiles.map(profile =>
-			buildApiProfileItem(profile, view.state(`api-${profile.id}`), view.metrics.get(`api-${profile.id}`))
-		);
+		const apiProfileItems = apiProfiles.map(profile => {
+			const key = `api-${profile.id}`;
+			return buildApiProfileItem(profile, view.state(key), view.metrics.get(key), view.snapshots.get(key)?.summary, sharedContext);
+		});
 		const genericProviders = [...view.snapshots.values()]
 			.filter(snapshot => !["primary", "local", "deepseek", "codex", "claude", "coco"].includes(snapshot.sourceId) && !snapshot.sourceId.startsWith("api-") && snapshot.state !== "offline")
 			.map(buildProviderSnapshotItem);

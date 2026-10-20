@@ -27,7 +27,7 @@ function serializeMessage(message: vscode.LanguageModelChatRequestMessage, toolR
 		let roleWritten = false;
 		const begin = () => {
 			if (!roleWritten) {
-				appendText(`\n\n${message.role === vscode.LanguageModelChatMessageRole.User ? "User" : "Assistant"}:\n`);
+				appendText(`\n\n${message.role === vscode.LanguageModelChatMessageRole.User ? "User" : message.role === vscode.LanguageModelChatMessageRole.Assistant ? "Assistant" : "System"}:\n`);
 				roleWritten = true;
 			}
 		};

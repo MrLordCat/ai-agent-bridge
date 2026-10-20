@@ -205,7 +205,8 @@ shown or written to extension logs.
 | `llamacpp.persistProviderSessions` | `true` | Resume completed Codex and Claude sessions across reloads. |
 | `llamacpp.codexEphemeralThreads` | `false` | Force Codex threads to stay in-memory and disable cross-reload resume. |
 | `llamacpp.codexContextLength` | `258400` | Pre-telemetry fallback window; server-reported model context takes precedence. |
-| `llamacpp.codexWorkingContextTarget` | `258400` | Cold-start target capped to the server window before explicit reserves are deducted. |
+| `llamacpp.sharedContextLength` | `0` | Shared working context for Codex, Claude, Coco and Cursor, capped to the server window. Below 90% of that window it is also sent as `model_auto_compact_token_limit`. `0` inherits `codexWorkingContextTarget`. |
+| `llamacpp.codexWorkingContextTarget` | `258400` | Legacy value, used only while `sharedContextLength` is `0`. |
 | `llamacpp.codexMaxInputChars` | `900000` | Serialized conversation hard cap after token-aware compaction. |
 | `llamacpp.codexMaxToolResultChars` | `12000` | Per-result history cap that preserves more conversational turns. |
 | `llamacpp.codexDeferNonCoreTools` | `true` | Keep core coding tools eager and load uncommon schemas through Codex tool search. |

@@ -58,7 +58,7 @@ async function fixture(state = memory().state, coldStartMaxChars?: number) {
 		failBackend: () => { backendFailed = true; }, recoverBackend: () => { backendFailed = false; },
 		recoverOldFailure: (value?: CursorFailedTurn) => { oldFailure = value; },
 		respond: (messages: vscode.LanguageModelChatRequestMessage[], parts: vscode.LanguageModelResponsePart[] = [], config = options, profile = source, token = none, maximum = 1_000_000) =>
-			sdk.respond(profile, { id: "test-model" }, () => cursorTranscript(messages), messages, config, { report: part => parts.push(part) }, token, maximum),
+			sdk.respond(profile, { id: "test-model" }, () => cursorTranscript(messages), messages, config, { report: part => parts.push(part) }, token, maximum, Math.floor(maximum / 2)),
 		dispose: async () => { sdk.dispose(); await fs.rm(root, { recursive: true, force: true }); } };
 }
 
@@ -214,7 +214,7 @@ suite("Cursor conversation continuity", () => {
 		const f = await fixture();
 		try {
 			await f.respond([user("FIRST")]);
-			await assert.rejects(f.respond([user("FIRST"), assistant("Cursor continued."), user("x".repeat(80_000))], [], options, source, none, 60_000), /No inference requests were sent/);
+			await assert.rejects(f.respond([user("FIRST"), assistant("Cursor continued."), user("x".repeat(80_000))], [], options, source, none, 60_000), /current request.*shared context budget/);
 			assert.strictEqual(f.sent.length, 1); assert.strictEqual(f.closes(), 0);
 			await f.respond([user("FIRST"), assistant("Cursor continued."), user("SMALL_NEXT")]);
 			assert.strictEqual(f.created.length, 1); assert.strictEqual(f.sent.length, 2);
@@ -412,11 +412,42 @@ suite("Cursor conversation continuity", () => {
 			assert.ok(files.some(file => file.endsWith(".txt")));
 		} finally { limited.dispose(); await f.dispose(); }
 	});
-	test("explains a missing host conversation ID without creating an agent or replaying large history", async () => {
+	test("refuses an oversized current request without creating an agent or replaying large history", async () => {
 		const f = await fixture();
 		try {
-			await assert.rejects(f.respond([user("x".repeat(100_000))], [], { ...options, modelOptions: {} }), /host did not supply a conversation ID/);
+			await assert.rejects(f.respond([user("x".repeat(1_100_000))], [], { ...options, modelOptions: {} }), /current request.*shared context budget/);
 			assert.strictEqual(f.sent.length, 0); assert.strictEqual(f.created.length, 0);
+		} finally { await f.dispose(); }
+	});
+	test("compacts a multi-megabyte foreign history once and restores the resulting native session", async () => {
+		const f = await fixture(), parts: vscode.LanguageModelResponsePart[] = [];
+		const historical = "BEGIN_FINDING\n" + "private history\n".repeat(145000) + "\nMIDDLE_EXACT_DETAIL\nEND_FINDING";
+		const messages = [user("EARLY_USER_REQUIREMENT"), assistant(historical), user("LATEST_REQUEST_COMPLETE")];
+		try {
+			await f.respond(messages, parts);
+			assert.strictEqual(f.sent.length, 1); assert.ok(f.sent[0].input.text.length < 66000);
+			assert.match(f.sent[0].input.text, /EARLY_USER_REQUIREMENT/); assert.match(f.sent[0].input.text, /LATEST_REQUEST_COMPLETE/);
+			assert.ok(!f.sent[0].input.text.includes(historical));
+			const scopes = await fs.readdir(path.join(f.root, "history"));
+			const folder = path.join(f.root, "history", scopes[0]); const files = await fs.readdir(folder);
+			const archived = await fs.readFile(path.join(folder, files.find(file => file.endsWith(".txt"))!), "utf8");
+			assert.ok(archived.includes(historical)); assert.match(archived, /LATEST_REQUEST_COMPLETE/);
+			assert.ok(parts.some(part => part instanceof vscode.LanguageModelTextPart && /Full history:/.test(part.value)));
+			f.reload(); await f.respond([...messages, assistant("DONE"), user("NEXT_NATIVE_TURN")]);
+			assert.deepStrictEqual(f.restored, ["agent-1"]); assert.strictEqual(f.created.length, 1);
+			assert.ok(f.sent[1].input.text.length < 10000); assert.match(f.sent[1].input.text, /NEXT_NATIVE_TURN/);
+			assert.ok(!f.sent[1].input.text.includes("BEGIN_FINDING"));
+		} finally { await f.dispose(); }
+	});
+	test("archives old images during a cold handoff and preserves the complete current image", async () => {
+		const f = await fixture();
+		const old = Array.from({ length: 7 }, () => vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png"));
+		const current = vscode.LanguageModelDataPart.image(new Uint8Array([4, 5, 6]), "image/png");
+		try {
+			await f.respond([vscode.LanguageModelChatMessage.User([...old, new vscode.LanguageModelTextPart("OLD_IMAGES")]), assistant("history ".repeat(10000)), vscode.LanguageModelChatMessage.User([current, new vscode.LanguageModelTextPart("CURRENT_IMAGE_REQUEST")])]);
+			assert.strictEqual(f.sent.length, 1); assert.strictEqual(f.sent[0].input.images?.length, 1);
+			assert.ok(JSON.stringify(f.sent[0].input.images).includes(Buffer.from(current.data).toString("base64")));
+			assert.match(f.sent[0].input.text, /CURRENT_IMAGE_REQUEST/);
 		} finally { await f.dispose(); }
 	});
 	test("refuses inference if durable checkpoint invalidation fails", async () => {

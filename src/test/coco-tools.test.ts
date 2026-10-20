@@ -151,7 +151,7 @@ suite("Coco native Chat tools", () => {
 		} finally { provider.dispose(); token.dispose(); }
 	});
 
-	test("cancels an attached response and retires abandoned tool continuations", async () => {
+	test("cancels an attached response but never expires a pending Chat tool by elapsed time", async () => {
 		let stops = 0;
 		const token = new vscode.CancellationTokenSource();
 		const bridge = new CocoTurnBridge([tool], () => { stops++; });
@@ -165,11 +165,32 @@ suite("Coco native Chat tools", () => {
 				const abandonedSegment = abandoned.start(() => new Promise(() => undefined), { report: () => undefined }, nextToken.token);
 				const response = abandoned.delegate(String(abandoned.clientTools[0].name), { command: "abandoned" });
 				await abandonedSegment;
+				await new Promise<void>(resolve => setTimeout(resolve, 25));
+				assert.strictEqual(abandoned.isTerminal, false, "the legacy 10ms timeout must not discard an active callback");
+				abandoned.dispose();
 				assert.deepStrictEqual(await response, { error: "Chat tool delegation stopped." });
 				assert.ok(abandoned.isTerminal);
 				assert.strictEqual(stops, 2);
 			} finally { nextToken.dispose(); }
 		} finally { bridge.dispose(); abandoned.dispose(); token.dispose(); }
+	});
+	test("preserves the native network error when it arrives before Chat returns the delegated result", async () => {
+		let fail!: (error: Error) => void, callbacks = 0;
+		const provider = new CocoChatModelProvider({ isEnabled: () => true, resolveCli: () => "fixture-cli",
+			createClient: (_exe, _cwd, _connection, _model, handlers) => {
+				let alias = "";
+				return { initialize: async () => ({}), newSession: async (_cwd: string, tools: Array<Record<string, unknown>>) => { alias = String(tools[0].name); return { sessionId: "failed-native" }; },
+					prompt: async () => { callbacks++; void handlers?.onClientTool?.(alias, { command: "already completed" }); return new Promise((_, reject) => { fail = reject; }); },
+					cancel: () => undefined, dispose: () => undefined } as unknown as CocoAcpClient;
+			} });
+		const token = new vscode.CancellationTokenSource(), parts: vscode.LanguageModelResponsePart[] = [];
+		try {
+			await provider.provideLanguageModelChatResponse(model, [vscode.LanguageModelChatMessage.User("Work")], options, { report: part => parts.push(part) }, token.token);
+			const call = callFrom(parts); fail(new Error("Network connection was interrupted while streaming the response"));
+			await new Promise<void>(resolve => setImmediate(resolve));
+			await assert.rejects(provider.provideLanguageModelChatResponse(model, continuation(call, "completed result"), options, { report: () => undefined }, token.token), /native request was interrupted:.*Network connection/);
+			assert.strictEqual(callbacks, 1);
+		} finally { provider.dispose(); token.dispose(); }
 	});
 
 	test("matches trailing results only and bounds text without turning binary data into text", () => {

@@ -189,14 +189,14 @@ suite("Coco conversation continuity", () => {
 			assert.strictEqual(f.stats().sessions, 1); assert.strictEqual(f.prompts.length, 2); assert.ok(!f.prompts[1].includes("FIRST"));
 		} finally { await f.dispose(); }
 	});
-	test("a broken sidecar does not block a confirmed native continuation", async () => {
+	test("a broken common journal cannot silently omit history during a native continuation", async () => {
 		const f = await fixture();
 		try {
 			const native = f.make(); await f.send(native, [user("FIRST")]);
 			const blocked = path.join(f.root, "blocked-sidecar"); await fs.writeFile(blocked, "not a directory");
 			const composite = new CompositeChatModelProvider({ history: new ConversationHistory(blocked), providers: [{ id: "coco", provider: native, ownsModel: () => true }] });
-			await composite.provideLanguageModelChatResponse(model, [user("FIRST"), assistant("Done"), user("NEXT")], options(), { report: () => undefined }, none);
-			assert.strictEqual(f.stats().sessions, 1); assert.strictEqual(f.prompts.length, 2); composite.dispose();
+			await assert.rejects(composite.provideLanguageModelChatResponse(model, [user("FIRST"), assistant("Done"), user("NEXT")], options(), { report: () => undefined }, none), /Cannot save.*Chat transcript/);
+			assert.strictEqual(f.stats().sessions, 1); assert.strictEqual(f.prompts.length, 1); composite.dispose();
 		} finally { await f.dispose(); }
 	});
 	test("updates volatile editor context without replaying stable history", async () => {
@@ -212,9 +212,9 @@ suite("Coco conversation continuity", () => {
 		try {
 			const p = f.make(); const history = "a".repeat(550_000) + "MIDDLE_REQUIREMENT" + "b".repeat(550_000);
 			const parts = await f.send(p, [user("Initial rule"), assistant(history), user("Latest task")]);
-			assert.strictEqual(f.prompts.length, 1); assert.ok(f.prompts[0].length < 1_000_000); assert.match(f.prompts[0],/Historical excerpt/);
+			assert.strictEqual(f.prompts.length, 1); assert.ok(f.prompts[0].length < 1_000_000); assert.match(f.prompts[0],/Conversation summary \(shared provider context\)/);
 			assert.match(f.prompts[0], /Latest task/); assert.ok(!f.prompts[0].includes("History import"));
-			assert.match(text(parts),/Coco: prepared/); assert.ok(text(parts).endsWith("Visible answer"));
+			assert.match(text(parts),/Coco: shared context prepared/); assert.ok(text(parts).endsWith("Visible answer"));
 			assert.strictEqual(f.usage.length, 1); assert.strictEqual(f.usage[0].inputTokens, 105);
 		} finally { await f.dispose(); }
 	});
@@ -236,7 +236,7 @@ suite("Coco lossless handoff contracts", () => {
 				user([new vscode.LanguageModelToolResultPart("old",[new vscode.LanguageModelTextPart("log ".repeat(50_000))])]),
 				user([new vscode.LanguageModelTextPart("LATEST: fix the provider"),vscode.LanguageModelDataPart.image(new Uint8Array([1,2,3]),"image/png")])];
 			const transfer = await new CocoHistoryArchive(f.root).prepare(messages,"bounded",64_000);
-			const prompt = body(transfer.prompt); assert.ok(prompt.length <= 64_000); assert.deepStrictEqual(transfer.imports,[]);
+			const prompt = body(transfer.prompt); assert.ok(transfer.estimatedTokens! <= 64_000); assert.deepStrictEqual(transfer.imports,[]);
 			for (const label of ["FIRST:","MIDDLE:","LATEST:"]) { assert.ok(prompt.includes(label)); }
 			assert.ok(transfer.prompt.some(part => part.type === "image" && part.data === "AQID")); assert.ok(transfer.archivePath);
 			assert.match(await fs.readFile(transfer.archivePath!,"utf8"),/log log log/);
@@ -258,7 +258,7 @@ suite("Coco lossless handoff contracts", () => {
 			assert.ok(fitting.prompt.some(part => part.type === "image" && part.data === "AQID"));
 		} finally { await f.dispose(); }
 	});
-	test("a broken journal leaves Codex usable and explicitly prevents an unsafe Coco handoff", async () => {
+	test("a broken common journal prevents partial handoffs to every provider", async () => {
 		const f = await fixture();
 		try {
 			const blocked = path.join(f.root, "blocked"); await fs.writeFile(blocked, "not a directory");
@@ -267,10 +267,10 @@ suite("Coco lossless handoff contracts", () => {
 			const composite = new CompositeChatModelProvider({ history: new ConversationHistory(blocked), providers: [
 				{ id: "codex", provider, ownsModel: id => id.startsWith("codex::") }, { id: "coco", provider, ownsModel: id => id.startsWith("coco::") },
 			] });
-			await composite.provideLanguageModelChatResponse({ ...model, id: "codex::test" }, [user("Task")], options(), { report: () => undefined }, none);
-			assert.strictEqual(calls, 1);
+			await assert.rejects(composite.provideLanguageModelChatResponse({ ...model, id: "codex::test" }, [user("Task")], options(), { report: () => undefined }, none), /Cannot (restore|save).*Chat transcript/);
+			assert.strictEqual(calls, 0);
 			await assert.rejects(composite.provideLanguageModelChatResponse(model, [user("Task")], options(), { report: () => undefined }, none), /Cannot (restore|save).*Chat transcript/);
-			assert.strictEqual(calls, 1); composite.dispose();
+			assert.strictEqual(calls, 0); composite.dispose();
 		} finally { await f.dispose(); }
 	});
 	test("Coco measured cache appears as one diagnostic turn and on its Quick Access card", async () => {

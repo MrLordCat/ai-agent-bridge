@@ -104,12 +104,14 @@ function clip(value: string, maxChars: number): string {
 }
 
 function summarizeCodeAwareText(content: string): { text: string; priority: number } {
-	const normalized = content.replace(/\r/g, "").trim();
+	// Summaries inspect bounded excerpts; exact text remains in the journal.
+	// PATH_REGEX can otherwise backtrack quadratically over a multi-MB line.
+	const normalized = clipHeadAndTail(content, 32768).replace(/\r/g, "").trim();
 	if (!normalized) {
 		return { text: "", priority: 0 };
 	}
 
-	const lines = normalized.split("\n").map(line => line.trim()).filter(Boolean);
+	const lines = normalized.split("\n").map(line => clip(line.trim(), 2048)).filter(Boolean);
 
 	const details: string[] = [];
 	let priority = 1;
@@ -329,7 +331,7 @@ function selectSummaryLines(messages: OpenAIChatMessage[]): string[] {
 	return lines;
 }
 
-function buildSummaryContent(
+export function buildSummaryContent(
 	label: string,
 	previousSummaries: string[],
 	head: OpenAIChatMessage[],

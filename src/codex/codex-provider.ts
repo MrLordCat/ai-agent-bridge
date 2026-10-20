@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { prepareSharedHandoff, resolveSharedContextLimit, sharedContextBudget } from "../context/provider-handoff";
 
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
@@ -18,7 +19,6 @@ import {
 	type CodexDynamicToolRuntimeSignature,
 } from "./dynamic-tools";
 import {
-	compactCodexMessages,
 	estimateCodexInputTokens,
 	createCodexConversationAnchor,
 	convertCodexToolResult,
@@ -358,11 +358,22 @@ export interface CodexVsCodeOnlyPolicy {
 		mcp_servers: Record<string, never>;
 		tools: { web_search: false };
 		features: Record<string, boolean>;
+		model_auto_compact_token_limit?: number;
 	};
 }
 
+/**
+ * Codex's own auto-compaction threshold for the shared working context. It is
+ * only lowered: at or above 90% of the real window Codex keeps its default.
+ */
+export function resolveCodexAutoCompactTokenLimit(sharedLimit: number, modelContextWindow: number): number | undefined {
+	return Number.isFinite(sharedLimit) && sharedLimit > 0 && sharedLimit < Math.floor(modelContextWindow * 0.9)
+		? Math.floor(sharedLimit)
+		: undefined;
+}
+
 /** Hard runtime boundary: all actions must return through Copilot's native VS Code tool loop. */
-export function createCodexVsCodeOnlyPolicy(): CodexVsCodeOnlyPolicy {
+export function createCodexVsCodeOnlyPolicy(autoCompactTokenLimit?: number): CodexVsCodeOnlyPolicy {
 	return {
 		approvalPolicy: "on-request",
 		sandbox: "read-only",
@@ -371,6 +382,7 @@ export function createCodexVsCodeOnlyPolicy(): CodexVsCodeOnlyPolicy {
 			web_search: "disabled",
 			mcp_servers: {},
 			tools: { web_search: false },
+			...(autoCompactTokenLimit !== undefined ? { model_auto_compact_token_limit: autoCompactTokenLimit } : {}),
 			features: {
 				apps: false,
 				browser_use: false,
@@ -899,7 +911,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const cwd = normalizeCodexRuntimeCwd(
 			vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
 		);
-		const vsCodeOnlyPolicy = createCodexVsCodeOnlyPolicy();
+		const vsCodeOnlyPolicy = createCodexVsCodeOnlyPolicy(this.autoCompactTokenLimit(model.id, config));
 		const { approvalPolicy, sandbox } = vsCodeOnlyPolicy;
 		const effort = resolveCodexReasoningEffort(
 			config.get("codexReasoningEffort", "auto"),
@@ -1155,16 +1167,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 		const toolSchemaChars = JSON.stringify(dynamicToolSet.specs).length;
 		const toolSchemaTokens = Math.ceil(toolSchemaChars / 4);
-		const configuredContextWindow = this.clampNumber(
-			config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
-			32_768,
-			1_048_576,
-			DEFAULT_CODEX_CONTEXT_LENGTH
-		);
-		const modelContextWindow = this.observedContextWindows.get(model.id)
-			?? configuredContextWindow;
+		const modelContextWindow = this.resolveModelContextWindow(model.id, config);
 		const workingContextTarget = this.clampNumber(
-			config.get("codexWorkingContextTarget", modelContextWindow),
+			resolveSharedContextLimit(config),
 			CODEX_WORKING_CONTEXT_MIN,
 			1_048_576,
 			modelContextWindow
@@ -1187,26 +1192,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		// selected working target after real tool, output, instruction, and safety
 		// reserves. The former extra 0.45 multiplier discarded usable context.
 		let compactionResult: CodexCompactionResult | undefined;
-		const compactionTokenBudget = compactionBudget.messageTokenBudget;
-		if (inputMode === "full" && inputMessages.length > 12) {
-			const compactKeepLastTurns = this.clampInt(
-				config.get("codexCompactKeepLastTurns", 18),
-				2,
-				64,
-				18
-			);
-			compactionResult = compactCodexMessages(inputMessages, {
-				tokenBudget: compactionTokenBudget,
-				keepLastCount: compactKeepLastTurns,
-				label: "Conversation summary (Codex auto-compact)",
-			});
+		const compactionTokenBudget = Math.min(compactionBudget.messageTokenBudget, sharedContextBudget(compactionBudget.modelContextWindow, options.tools));
+		if (inputMode === "full") {
+			const archive = options.modelOptions?._aabTranscriptPath;
+			compactionResult = prepareSharedHandoff(inputMessages, compactionTokenBudget, typeof archive === "string" ? archive : undefined);
 		}
 
 		const serializedMessages = compactionResult?.compacted ?? inputMessages;
 		const maxInputChars = config.get("codexMaxInputChars", DEFAULT_CODEX_MAX_INPUT_CHARS);
 		const input = serializeCodexConversation(serializedMessages, {
-			maxTextChars: maxInputChars,
-			maxToolResultChars: config.get("codexMaxToolResultChars", 12_000),
+			maxTextChars: inputMode === "full" ? Math.max(maxInputChars, compactionTokenBudget * 2 + 65536) : maxInputChars,
+			maxToolResultChars: inputMode === "full" ? Number.MAX_SAFE_INTEGER : config.get("codexMaxToolResultChars", 12_000),
 		});
 		// VS Code does not deliver file attachments into subagent prompts (the
 		// child request carries only the parent agent's text). When the prompt
@@ -2414,7 +2410,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	private async reattachDurableThread(conversation: CodexConversationThread): Promise<boolean> {
 		try {
-			const policy = createCodexVsCodeOnlyPolicy();
+			const policy = createCodexVsCodeOnlyPolicy(this.autoCompactTokenLimit(conversation.modelId));
 			const cwd = normalizeCodexRuntimeCwd(
 				vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
 			);
@@ -2458,12 +2454,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	private mapKnownModels(): vscode.LanguageModelChatInformation[] {
 		const config = this.getConfig();
-		const contextLength = this.clampNumber(
-			config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
-			32_768,
-			1_048_576,
-			DEFAULT_CODEX_CONTEXT_LENGTH
-		);
+		const sharedLimit = Math.max(CODEX_WORKING_CONTEXT_MIN, resolveSharedContextLimit(config));
 		const maxOutputTokens = this.clampNumber(
 			config.get("codexMaxOutputTokens", DEFAULT_CODEX_MAX_OUTPUT_TOKENS),
 			1_024,
@@ -2489,9 +2480,26 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		})));
 		return models.map(model => mapCodexModelInformation(
 			model,
-			this.observedContextWindows.get(model.id) ?? contextLength,
+			Math.min(this.resolveModelContextWindow(model.id, config), sharedLimit),
 			maxOutputTokens
 		));
+	}
+
+	/** Real server-reported window, or the configured fallback before the first turn. */
+	private resolveModelContextWindow(modelId: string, config = this.getConfig()): number {
+		return this.observedContextWindows.get(modelId) ?? this.clampNumber(
+			config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
+			32_768,
+			1_048_576,
+			DEFAULT_CODEX_CONTEXT_LENGTH
+		);
+	}
+
+	private autoCompactTokenLimit(modelId: string, config = this.getConfig()): number | undefined {
+		return resolveCodexAutoCompactTokenLimit(
+			Math.max(CODEX_WORKING_CONTEXT_MIN, resolveSharedContextLimit(config)),
+			this.resolveModelContextWindow(modelId, config)
+		);
 	}
 
 	private async requireSubscriptionAccount(): Promise<CodexChatGptAccount> {

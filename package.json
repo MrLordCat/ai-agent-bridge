@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.18.12",
+	"version": "1.18.15",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -114,13 +114,17 @@
 					"default": 128000,
 					"minimum": 4096,
 					"maximum": 1048576,
-					"description": "Fallback context window advertised for Coco models. The server still enforces the selected model limit."
+					"description": "Fallback model window for Coco before the CLI reports the real one. The advertised window and native auto-compaction follow llamacpp.sharedContextLength, capped by this window."
 				},
 				"llamacpp.cocoTransport": {
 					"type": "string",
-					"enum": ["auto", "sdk", "acp"],
+					"enum": [
+						"auto",
+						"sdk",
+						"acp"
+					],
 					"default": "auto",
-					"description": "Coco native session transport. Auto uses Snowflake SDK on Node 22.22+ and ACP on older hosts. A failed native resume never silently starts a new history import."
+					"description": "Coco native session transport. Requests with VS Code callback tools use ACP to support approvals and tools longer than the CLI SDK's fixed 30-second timeout. Text-only Auto uses SDK on Node 22.22+. Both transports retain native session IDs; failed resume never silently replays history."
 				},
 				"llamacpp.cocoModelContextLengths": {
 					"type": "object",
@@ -151,11 +155,12 @@
 					"deprecationMessage": "Automatic multi-prompt imports are disabled. This setting has no effect."
 				},
 				"llamacpp.cursorMaxColdHistoryChars": {
+					"deprecationMessage": "Replaced by sharedContextLength (tokens). This separate character limit is no longer used.",
 					"type": "integer",
 					"default": 64000,
 					"minimum": 4096,
 					"maximum": 3000000,
-					"description": "Maximum history characters automatically replayed into a NEW Cursor native session. Larger cold starts stop before inference and preserve a full archive. Warm/restored sessions send only new turns. Raising this limit explicitly permits a larger, potentially costly prefill."
+					"description": "Legacy character limit, ignored by the shared handoff planner. Use sharedContextLength in tokens. Warm/restored native sessions send only new turns."
 				},
 				"llamacpp.enableCodexSubscription": {
 					"type": "boolean",
@@ -166,6 +171,13 @@
 					"type": "string",
 					"default": "",
 					"description": "Optional path to the Codex CLI executable. Empty uses the CLI bundled with the official OpenAI VS Code extension, then falls back to codex on PATH."
+				},
+				"llamacpp.sharedContextLength": {
+					"type": "integer",
+					"default": 0,
+					"minimum": 0,
+					"maximum": 1048576,
+					"description": "Shared working context in TOKENS for Codex, Claude, Coco and Cursor, so switching providers keeps the same history budget. Each provider uses min(this value, its real model window) as its advertised window and native auto-compaction threshold (Codex model_auto_compact_token_limit, Claude Code auto-compact window, Coco CLI threshold fraction). Zero inherits codexWorkingContextTarget. Claude is bounded to 258.4K-967K."
 				},
 				"llamacpp.codexContextLength": {
 					"type": "number",
@@ -179,9 +191,10 @@
 					"default": 258400,
 					"minimum": 131072,
 					"maximum": 1048576,
-					"description": "Total Codex working-context target used for cold-start compaction. It is capped to the server-reported model window, then output, tool-schema, developer-instruction, and safety reserves are subtracted."
+					"description": "Legacy shared working-context value, used only while llamacpp.sharedContextLength is 0. The Provider Context panel now saves llamacpp.sharedContextLength."
 				},
 				"llamacpp.codexCompactKeepLastTurns": {
+					"deprecationMessage": "Replaced by the shared handoff planner, which keeps typed recent history within sharedContextLength. This value is no longer used.",
 					"type": "number",
 					"default": 18,
 					"minimum": 2,
@@ -264,7 +277,8 @@
 					"default": 258400,
 					"minimum": 258400,
 					"maximum": 967000,
-					"description": "Claude Opus 5 working-context target. The provider selects the real 1M runtime and sets Claude Code auto-compaction to this value; 967k leaves provider headroom below the raw 1M window."
+					"description": "Deprecated: Claude now follows llamacpp.sharedContextLength (bounded to 258.4K-967K) as its Claude Code auto-compaction threshold. This value is no longer read.",
+					"markdownDeprecationMessage": "Claude uses `#llamacpp.sharedContextLength#`, the shared working context for Codex, Claude, Coco and Cursor."
 				},
 				"llamacpp.claudeMaxOutputTokens": {
 					"type": "number",
@@ -1255,7 +1269,7 @@
 			},
 			{
 				"command": "llamacpp.setClaudeContextLength",
-				"title": "AI Agent Bridge: Set Claude Working Context"
+				"title": "AI Agent Bridge: Set Shared Working Context"
 			},
 			{
 				"command": "llamacpp.openContextControl",

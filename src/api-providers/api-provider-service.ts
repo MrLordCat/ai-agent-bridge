@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { AsyncResourceCache } from "../providers/async-resource-cache";
 import * as vscode from "vscode";
 
+import { resolveSharedContextLimit } from "../context/provider-handoff";
 import {
 	normalizeServerUrl,
 	type ApiRequestProtocol,
@@ -19,6 +20,11 @@ const CURSOR_BUDGET_USERS_STORAGE_KEY = "llamacpp.cursorBudgetUsers.v1";
 
 export function apiProviderSecretKey(id: string): string {
 	return `${API_PROVIDER_SECRET_PREFIX}${id}.apiKey`;
+}
+
+/** Cursor runs as a native agent, so it shares the Codex/Claude/Coco working context. */
+export function isCursorApiProfile(profile: { protocol?: ApiRequestProtocol; baseUrl: string }): boolean {
+	return profile.protocol === "cursor" || isCursorCloudAgentBase(profile.baseUrl);
 }
 
 // Legacy credentials are only removed when their profile is deleted.
@@ -209,6 +215,12 @@ export class ApiProviderService implements vscode.Disposable {
 	private readonly _onDidChangeBalance = new vscode.EventEmitter<void>();
 	readonly onDidChangeBalance = this._onDidChangeBalance.event;
 	private readonly contextMaxima = new Map<string, { maximumContextLength: number; contextMaximumReported: boolean }>();
+	private readonly catalogLoads = new Map<string, number>();
+
+	/** Last time an authenticated model catalog loaded for `api-<id>`; proof the source is reachable. */
+	catalogLoadedAt(sourceKey: string): number | undefined {
+		return sourceKey.startsWith("api-") ? this.catalogLoads.get(sourceKey.slice(4)) : undefined;
+	}
 
 	recordContextMaximum(sourceKey: string, maximum: number, reported: boolean): void {
 		if (!sourceKey.startsWith("api-") || !Number.isFinite(maximum)) { return; }
@@ -216,7 +228,9 @@ export class ApiProviderService implements vscode.Disposable {
 		if (!this.get(id)) { return; }
 		const maximumContextLength = normalizeContextLength(maximum)!;
 		const previous = this.contextMaxima.get(id);
-		if (previous?.maximumContextLength === maximumContextLength && previous.contextMaximumReported === reported) { return; }
+		const firstLoad = !this.catalogLoads.has(id);
+		this.catalogLoads.set(id, Date.now());
+		if (!firstLoad && previous?.maximumContextLength === maximumContextLength && previous.contextMaximumReported === reported) { return; }
 		this.contextMaxima.set(id, { maximumContextLength, contextMaximumReported: reported });
 		this._onDidChangeContext.fire();
 	}
@@ -351,7 +365,7 @@ export class ApiProviderService implements vscode.Disposable {
 			serverUrl: profile.baseUrl,
 			apiKey: await this.secrets.get(this.secretKey(profile.id)),
 			familyOverride: profile.family,
-			workingContextLength: profile.contextLength,
+			workingContextLength: isCursorApiProfile(profile) ? resolveSharedContextLimit() : profile.contextLength,
 			contextLengthFallback: DEFAULT_API_PROVIDER_CONTEXT,
 			protocol: profile.protocol,
 			llamaCppCompat: profile.llamaCppCompat,

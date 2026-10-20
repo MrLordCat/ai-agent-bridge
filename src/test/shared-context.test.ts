@@ -1,0 +1,107 @@
+import * as assert from "node:assert";
+import * as fs from "node:fs/promises";
+import * as os from "node:os";
+import * as path from "node:path";
+import * as vscode from "vscode";
+import { CompositeChatModelProvider } from "../composite-provider";
+import { ConversationHistory, mergeConversationHistory } from "../providers/conversation-history";
+import { prepareSharedHandoff, sharedContextBudget, sharedImageName } from "../context/provider-handoff";
+import { cocoUserAnchors, CocoSessionStore } from "../coco/session-store";
+import { conversationUserAnchors } from "../providers/conversation-anchors";
+
+const user = vscode.LanguageModelChatMessage.User, assistant = vscode.LanguageModelChatMessage.Assistant;
+const none: vscode.CancellationToken = { isCancellationRequested: false, onCancellationRequested: () => new vscode.Disposable(() => undefined) };
+const text = (messages: readonly vscode.LanguageModelChatRequestMessage[]) => JSON.stringify(messages);
+
+suite("Shared provider context", () => {
+	test("migrates persisted legacy Coco fingerprints and loads the same native session after reload", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "coco-anchor-migration-"));
+		const file = path.join(root, "sessions.json"), loads: string[] = [];
+		const makeClient = () => ({ transport: "acp" as const, initialize: async () => ({ agentCapabilities: { loadSession: true } }),
+			newSession: async () => ({ sessionId: "existing-native-id" }), loadSession: async (id: string) => { loads.push(id); return { sessionId: id }; },
+			setSessionConfigOption: async () => ({}), prompt: async () => ({}), cancel: () => undefined, dispose: () => undefined });
+		const identity = CocoSessionStore.identity("cli", root, "connection", "model");
+		let store = new CocoSessionStore(undefined, file);
+		try {
+			const first = [user("FIRST_RULE")], legacy = conversationUserAnchors(first);
+			const old = await store.acquire(identity, "chat", legacy, makeClient, {}, first);
+			await store.prepare(old, root, []); await store.checkpoint(old, legacy); store.finish(old); store.dispose();
+			store = new CocoSessionStore(undefined, file);
+			const messages = [...first, assistant("DONE"), user("NEW_TASK")];
+			const restored = await store.acquire(identity, "chat", cocoUserAnchors(messages), makeClient, {}, messages);
+			await store.prepare(restored, root, []);
+			assert.deepStrictEqual(loads, ["existing-native-id"]); assert.strictEqual(restored.fresh, false); assert.strictEqual(restored.deltaStart, 2);
+		} finally { store.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+	});
+	test("Coco anchors ignore host-only updates and text-part boundaries", () => {
+		const a = [user("RULE <context>old terminal</context>"), assistant("DONE"), user("NEXT")];
+		const b = [user([new vscode.LanguageModelTextPart("RULE "), new vscode.LanguageModelTextPart("<context>new terminal</context>")]), assistant("DONE"), user("NEXT")];
+		assert.deepStrictEqual(cocoUserAnchors(a), cocoUserAnchors(b));
+	});
+	test("summarizes a multi-megabyte unbroken line using bounded excerpts", function () {
+		this.timeout(3000);
+		const plan = prepareSharedHandoff([user("EARLY_RULE"), assistant("BEGIN_FINDING\n" + "x".repeat(3000000) + "\nEND_FINDING"), user("CURRENT")], 12000);
+		assert.ok(plan.wasCompacted); assert.ok(plan.tokenEstimateAfter <= 12000); assert.match(text(plan.compacted), /CURRENT/);
+	});
+	test("every provider receives the complete common history after retained-window switches and reload", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "shared-context-"));
+		const captures = new Map<string, readonly vscode.LanguageModelChatRequestMessage[]>();
+		const ids = ["codex", "coco", "http", "claude", "local"];
+		const make = () => new CompositeChatModelProvider({ history: new ConversationHistory(root), providers: ids.map(id => ({ id, ownsModel: model => model === id,
+			provider: { provideLanguageModelChatInformation: async () => [], provideTokenCount: async () => 1,
+				provideLanguageModelChatResponse: async (_model, messages, _options, progress) => { captures.set(id, messages); progress.report(new vscode.LanguageModelTextPart(`${id}_FINDING`)); } } })) });
+		let composite = make();
+		const options = { toolMode: vscode.LanguageModelChatToolMode.Auto, modelOptions: { _conversationId: "same-chat" } };
+		const model = { name: "fixture", family: "fixture", version: "1", capabilities: {}, maxInputTokens: 100000, maxOutputTokens: 8192 };
+		try {
+			await composite.provideLanguageModelChatResponse({ ...model, id: ids[0] }, [user("EARLY_REQUIREMENT"), assistant("MIDDLE_DECISION"), user("FIRST_TASK")], options, { report: () => undefined }, none);
+			let previousTask = "FIRST_TASK";
+			for (let index = 1; index < ids.length; index++) {
+				composite.dispose(); composite = make();
+				const id = ids[index], task = `TASK_${id}`;
+				await composite.provideLanguageModelChatResponse({ ...model, id }, [user(previousTask), assistant(`${ids[index - 1]}_FINDING`), user(task)], options, { report: () => undefined }, none);
+				const received = text(captures.get(id)!);
+				assert.match(received, /EARLY_REQUIREMENT/); assert.match(received, /MIDDLE_DECISION/);
+				for (const prior of ids.slice(0, index)) { assert.ok(received.includes(`${prior}_FINDING`)); }
+				previousTask = task;
+			}
+		} finally { composite.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+	});
+	test("retained windows do not require the previous final anchor to preserve the omitted middle", () => {
+		const old = [user("FIRST"), assistant("EARLY"), user("SECOND"), assistant("SECOND_FINDING"), user("THIRD"), assistant("THIRD_FINDING")];
+		const result = mergeConversationHistory(old, [user("SECOND"), assistant("SECOND_FINDING"), user("FOURTH")]);
+		assert.match(text(result), /FIRST/); assert.match(text(result), /THIRD_FINDING/); assert.match(text(result), /FOURTH/);
+	});
+	test("replaces the current system snapshot instead of retaining duplicates from each provider", () => {
+		const system = (value: string) => new vscode.LanguageModelChatMessage(3 as vscode.LanguageModelChatMessageRole, [new vscode.LanguageModelTextPart(value)]);
+		const result = mergeConversationHistory([system("OLD_SYSTEM"), user("TASK"), assistant("FINDING")], [system("NEW_SYSTEM"), system("NEW_SYSTEM"), user("TASK"), assistant("FINDING"), user("NEXT")]);
+		assert.ok(!text(result).includes("OLD_SYSTEM")); assert.strictEqual(result.filter(message => Number(message.role) === 3).length, 1);
+	});
+	test("uses the same token budget in every larger window and respects a smaller native window", () => {
+		assert.strictEqual(sharedContextBudget(1000000, [], 475000), sharedContextBudget(500000, [], 475000));
+		assert.ok(sharedContextBudget(258400, [], 475000) < sharedContextBudget(500000, [], 475000));
+	});
+	test("one planner preserves typed current tools/images and does not mutate the original transcript", () => {
+		const oldResult = new vscode.LanguageModelToolResultPart("old-call", [new vscode.LanguageModelTextPart("result ".repeat(10000))]);
+		const image = vscode.LanguageModelDataPart.image(new Uint8Array([1, 2, 3]), "image/png");
+		const current = user([new vscode.LanguageModelTextPart("CURRENT_EXACT"), image]);
+		const source = [user("EARLY_RULE"), assistant("old history ".repeat(20000)), user([oldResult]), current];
+		const plan = prepareSharedHandoff(source, 12000, "/shared/context.json");
+		assert.ok(plan.wasCompacted); assert.ok(plan.tokenEstimateAfter <= 12000);
+		assert.strictEqual(plan.compacted.at(-1), current); assert.ok(text(plan.compacted).includes("CURRENT_EXACT"));
+		assert.strictEqual((oldResult.content[0] as vscode.LanguageModelTextPart).value.length, 70000);
+		assert.match(text(plan.compacted), /Conversation summary \(shared provider context\)/);
+		assert.throws(() => prepareSharedHandoff([user("x".repeat(10000))], 1024), /current request.*shared context budget/);
+	});
+	test("historical image references resolve to exact workspace files after journaling", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "shared-images-"));
+		try {
+			const image = vscode.LanguageModelDataPart.image(new Uint8Array([4, 5, 6]), "image/png");
+			const lease = await new ConversationHistory(root).begin("chat", [user([image, new vscode.LanguageModelTextPart("OLD_IMAGE")]), assistant("Answer"), user("CURRENT")]);
+			const plan = prepareSharedHandoff(lease.messages, 20000, lease.transcriptPath);
+			const file = path.join(root, "assets", sharedImageName(image.data, image.mimeType));
+			assert.ok(text(plan.compacted).includes(sharedImageName(image.data, image.mimeType)));
+			assert.deepStrictEqual(await fs.readFile(file), Buffer.from(image.data)); await lease.complete([]);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
+});

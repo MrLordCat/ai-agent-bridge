@@ -3,7 +3,8 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { normalizeSystemDate, normalizeVolatileHostContext } from "../context/cache-diagnostics";
-import { cocoUserAnchors } from "../coco/session-store";
+import { canonicalConversationUserAnchors as cocoUserAnchors } from "./conversation-anchors";
+import { sharedImageName } from "../context/provider-handoff";
 
 type Part = { type: "text"; text: string } | { type: "data"; data: string; mimeType: string }
 	| { type: "call"; callId: string; name: string; input: object } | { type: "result"; callId: string; content: Part[] };
@@ -37,6 +38,14 @@ function messageKey(message: vscode.LanguageModelChatRequestMessage): string {
 
 /** Match retained anchors, preserve missing middle entries, and cut branches before edited requests. */
 export function mergeConversationHistory(previous: readonly vscode.LanguageModelChatRequestMessage[], incoming: readonly vscode.LanguageModelChatRequestMessage[]): vscode.LanguageModelChatRequestMessage[] {
+	const system = (message: vscode.LanguageModelChatRequestMessage) => message.role !== vscode.LanguageModelChatMessageRole.User && message.role !== vscode.LanguageModelChatMessageRole.Assistant;
+	const latestSystems = incoming.filter(system);
+	const systems = latestSystems.length ? latestSystems : previous.filter(system);
+	const uniqueSystems = [...new Map(systems.map(message => [messageKey(message), message])).values()];
+	return [...uniqueSystems, ...mergeConversationBody(previous.filter(message => !system(message)), incoming.filter(message => !system(message)))];
+}
+
+function mergeConversationBody(previous: readonly vscode.LanguageModelChatRequestMessage[], incoming: readonly vscode.LanguageModelChatRequestMessage[]): vscode.LanguageModelChatRequestMessage[] {
 	if (!previous.length || !incoming.length) { return [...incoming]; }
 	const oldUsers = cocoUserAnchors(previous), newUsers = cocoUserAnchors(incoming);
 	const toolContinuation = incoming.at(-1)?.content.some(p => p instanceof vscode.LanguageModelToolResultPart) === true;
@@ -48,7 +57,8 @@ export function mergeConversationHistory(previous: readonly vscode.LanguageModel
 		if (common === newUsers.length && newUsers.length <= oldUsers.length) {
 			ceiling = oldUsers[Math.max(0, common - 1)].index;
 		}
-		if (!common && !newUsers.slice(0, -1).some(n => n.key === oldUsers.at(-1)?.key)) { return [...incoming]; }
+		const oldKeys = new Set(oldUsers.map(anchor => anchor.key));
+		if (!common && !newUsers.slice(0, -1).some(n => oldKeys.has(n.key))) { return [...incoming]; }
 	}
 	const keys = incoming.map(messageKey);
 	const positions = new Map<string, { first: number; last: number }>();
@@ -95,8 +105,20 @@ export interface ConversationHistoryLease {
 export class ConversationHistory {
 	private readonly entries = new Map<string, Entry>();
 	private readonly loading = new Map<string, Promise<Entry>>();
+	private readonly savedImages = new Set<string>();
 	constructor(private readonly root: string) {}
 	private async persist(owner: Entry, file: string, revision: number, messages: readonly vscode.LanguageModelChatRequestMessage[]): Promise<void> {
+		const assets = new Map<string, Uint8Array>();
+		const collect = (part: unknown): void => {
+			if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) {
+				const name = sharedImageName(part.data, part.mimeType); if (!this.savedImages.has(name)) { assets.set(name, part.data); }
+			} else if (part instanceof vscode.LanguageModelToolResultPart) { part.content.forEach(collect); }
+		};
+		messages.forEach(message => message.content.forEach(collect));
+		if (assets.size) {
+			await fs.mkdir(path.join(this.root, "assets"), { recursive: true, mode: 0o700 });
+			for (const [name, bytes] of assets) { await fs.writeFile(path.join(this.root, "assets", name), bytes, { mode: 0o600 }); this.savedImages.add(name); }
+		}
 		const payload = JSON.stringify({ version: 1, messages: messages.map(encode) });
 		if (Buffer.byteLength(payload) > 64 * 1024 * 1024) { throw new Error("The saved Chat transcript exceeds 64 MiB. Compact the source Chat before another cross-provider handoff."); }
 		const commit = async () => {
@@ -126,7 +148,7 @@ export class ConversationHistory {
 				if (document.version !== 1 || !Array.isArray(document.messages)) { throw new Error("Invalid conversation checkpoint."); }
 				stored = document.messages.map(message => decode(message as Message));
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw new Error("Cannot restore the local Chat transcript. Check workspace storage before continuing with Coco.", { cause: error }); }
+				if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw new Error("Cannot restore the common Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
 			}
 			const loaded = { messages: stored, revision: 0, active: 0 }; this.entries.set(key, loaded); return loaded;
 			};
@@ -139,7 +161,7 @@ export class ConversationHistory {
 		owner.messages = mergeConversationHistory(owner.messages, incoming);
 		const messages = [...owner.messages];
 		try { await this.persist(owner, file, revision, messages); }
-		catch (error) { owner.active--; throw new Error("Cannot save the incoming Chat transcript. Check workspace storage before continuing with Coco.", { cause: error }); }
+		catch (error) { owner.active--; throw new Error("Cannot save the incoming Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
 		let finished = false;
 		return { messages, transcriptPath: file, complete: async parts => {
 			if (finished) { return; } finished = true; owner.active--;

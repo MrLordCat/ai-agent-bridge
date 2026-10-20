@@ -1,5 +1,66 @@
 # Changelog
 
+## 1.18.15 (local development patch) - 2026-10-20
+
+- One working context for Codex, Claude, Coco and Cursor:
+  `sharedContextLength` now drives every native agent, so a switch after a rate
+  limit keeps the same history budget. Each provider advertises
+  min(limit, real model window), so Chat's context indicator matches.
+  `claudeContextLength` is deprecated and no longer read.
+- Pass the limit to each backend's own auto-compaction: Codex
+  `model_auto_compact_token_limit` (only below 90% of the real window), Claude
+  Code `CLAUDE_CODE_AUTO_COMPACT_WINDOW` (258.4K-967K), and the Coco CLI
+  threshold fraction (0.20-0.99; the server caps it at 75% for 1M windows).
+  Idle Coco processes started with another threshold are released and reload
+  their native session; active turns are not interrupted.
+- Provider Context panel: one shared slider replaces the Claude and Codex
+  sliders and shows each provider's effective value. Quick Access adds
+  Providers > Shared Context and working-context rows for Coco and Cursor;
+  the Providers Manager shows the shared value for Cursor instead of its slider.
+- Cursor status: a model catalog loaded with the API key in the last 15 minutes
+  keeps the profile online when the availability probe fails, and the probe now
+  uses the catalog's 15 s timeout instead of 5 s. The Offline reason is shown in
+  the profile tooltip.
+- Refresh every provider's model list when the limit changes, without aborting
+  active Cursor requests.
+- The `Set Shared Working Context` command (formerly `Set Claude Working
+  Context`, same command ID) now writes `sharedContextLength` instead of the
+  ignored `claudeContextLength`. `codexCompactKeepLastTurns` is marked
+  deprecated because the shared planner no longer reads it.
+
+## 1.18.14 (local development patch) - 2026-10-20
+
+- Restore the same workspace conversation journal before routing to every
+  provider. Recover retained windows using shared user anchors and replace
+  current system snapshots instead of accumulating duplicate policy messages.
+- Use one token-budget handoff planner for native Codex, Coco and Cursor:
+  deterministic Codex-style summary, typed recent messages, complete current
+  request and exact image files. Remove the separate 64k Cursor / 1M Coco
+  character cutoffs. `sharedContextLength` sets the common working target;
+  zero inherits `codexWorkingContextTarget`, subject to smaller native windows.
+- Migrate Coco user fingerprints without discarding compatible native sessions.
+  Never expire pending Chat tools because of elapsed time. Preserve the original
+  native/network error for late results and log terminal failures explicitly.
+- Bound summary text before path regexes to prevent quadratic work on giant
+  unbroken lines. Add cross-provider/reload, image, budget, cancellation,
+  legacy-session migration and network-failure regressions.
+
+## 1.18.13 (local development patch) - 2026-10-20
+
+- Route Coco callback tools through native ACP sessions. The bundled CLI SDK
+  expires MCP callbacks after 30 seconds, including approval/execution time;
+  ACP handles long waits. Rebind completed SDK sessions by their native ID
+  when tools become available, without replaying the conversation.
+- Add an opt-in live latency reproducer and a real VS Code provider test:
+  a 35-second inert callback loses its result on SDK and succeeds on ACP.
+- Compact oversized structured Cursor cold handoffs within the configured
+  character limit. Preserve the latest request and its images, archive the
+  complete original, and report the handoff. Oversized current requests and
+  unknown prompt formats still stop before inference.
+- Record Coco session/history preparation times and callback durations without
+  prompt contents or tool arguments. Add opt-in performance measurements and
+  a report covering journals, history merges, streaming metrics and Live Report.
+
 ## 1.18.12 (local development patch) - 2026-10-19
 
 - Fix the reproduced Coco backend error: tool names must fit 64 characters

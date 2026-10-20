@@ -45,14 +45,16 @@ returned to the SDK; Session Quality does not inspect or retain its body.
 ## Extended Context
 
 The provider ships the platform-specific Agent SDK runtime and starts Opus 5
-with the official `[1m]` model suffix. `llamacpp.claudeContextLength` is a real
-working-context target from 258,400 through 967,000 tokens, not only VS Code
+with the official `[1m]` model suffix. Claude follows
+`llamacpp.sharedContextLength`, the working context shared with Codex, Coco and
+Cursor, bounded to 258,400 through 967,000 tokens. It is not only VS Code
 metadata: it is also passed to Claude Code as
 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`. The upper bound leaves provider headroom
-below the raw one-million-token model window.
+below the raw one-million-token model window. The former
+`llamacpp.claudeContextLength` setting is deprecated and no longer read.
 
-Open **Quick Access > Claude > Maximum Context** to use the Provider Context
-range slider. A changed value applies to a new SDK session; durable transcripts
+Open **Quick Access > Claude > Working Context** to use the shared Provider
+Context slider. A changed value applies to a new SDK session; durable transcripts
 remain eligible for restore. The cold-start serializer scales up to the chosen
 target while retaining a provider/tool reserve. Live context details show both
 the selected target and the raw limit returned by `getContextUsage()`.
@@ -137,7 +139,7 @@ aggregate counters can sum multiple model/tool steps and are therefore retained
 for Live Report, usage history, and billing analysis instead of being sent as a
 single native context value. The native denominator comes from the model's
 advertised `maxInputTokens + maxOutputTokens`, capped by
-`llamacpp.claudeContextLength` and refreshed when `getContextUsage()` reports a
+the shared working context and refreshed when `getContextUsage()` reports a
 different raw provider limit.
 
 ## Cancellation And Failure

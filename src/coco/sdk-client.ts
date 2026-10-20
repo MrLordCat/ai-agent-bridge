@@ -56,7 +56,8 @@ export class CocoSdkClient implements CocoSessionClient {
 	private exit = Promise.resolve();
 	lastPromptSent = false;
 	constructor(private readonly executable: string, private readonly cwd: string, private readonly connection: string | undefined,
-		private readonly model: string | undefined, private readonly handlers: CocoAcpHandlers = {}, private readonly dependencies: CocoSdkDependencies = {}) {}
+		private readonly model: string | undefined, private readonly handlers: CocoAcpHandlers = {}, private readonly dependencies: CocoSdkDependencies = {},
+		private readonly environment: Readonly<Record<string, string>> = {}) {}
 
 	async initialize() { return { agentCapabilities: { loadSession: true, promptCapabilities: { image: true } } }; }
 	async newSession(cwd: string, tools: Json[] = []): Promise<Json> {
@@ -113,7 +114,7 @@ export class CocoSdkClient implements CocoSessionClient {
 				if (nativeId) { this.calls.set(nativeId, { alias: name, key: fingerprint(input.tool_input ?? {}) }); }
 				return { continue: true };
 			}] }] },
-			env: { NODE_OPTIONS: undefined, ...(this.connection ? { COCO_CLI_CONNECTION_OVERRIDES_INFERENCE: "1" } : {}),
+			env: { ...this.environment, NODE_OPTIONS: undefined, ...(this.connection ? { COCO_CLI_CONNECTION_OVERRIDES_INFERENCE: "1" } : {}),
 				PATH: `${path.dirname(this.executable)}${path.delimiter}${process.env.PATH ?? ""}` },
 		};
 		if (this.effort) { options.effort = this.effort; }
@@ -161,7 +162,7 @@ export class CocoSdkClient implements CocoSessionClient {
 		};
 		try {
 			if (old) { await old.close(); await this.pump; }
-			client = this.dependencies.createVisionClient?.(handlers) ?? new CocoAcpClient(this.executable,this.cwd,this.connection,this.model,handlers);
+			client = this.dependencies.createVisionClient?.(handlers) ?? new CocoAcpClient(this.executable,this.cwd,this.connection,this.model,handlers,undefined,this.environment);
 			this.visionClient = client;
 			const capabilities = await client.initialize();
 			if (!capabilities.agentCapabilities?.promptCapabilities?.image) { throw new Error("This Coco runtime cannot receive image input."); }

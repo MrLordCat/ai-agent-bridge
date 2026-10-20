@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { AsyncResourceCache } from "../providers/async-resource-cache";
 import * as vscode from "vscode";
+import { sharedContextBudget } from "../context/provider-handoff";
 import { encodeProviderModelId, type ChatModelSource } from "../model-sources/source-routing";
 import { CursorApiClient, CursorApiError, type CursorModel, type CursorParameter, type CursorSelection } from "./api-client";
 import { CursorSdkTransport } from "./sdk-transport";
@@ -127,7 +128,8 @@ export class CursorProfileTransport implements vscode.Disposable {
 		if (this.sdk?.available) {
 			const windows = selection.params!.filter(item => contextParameter(item.id)).flatMap(item => contextValue(item.value) ?? []);
 			const budget = Math.min(model.maxInputTokens, ...windows.map(window => Math.max(1024, window - model.maxOutputTokens)));
-			await this.sdk.respond(source, selection, () => cursorTranscript(messages), messages, options, progress, token, budget * 3);
+			await this.sdk.respond(source, selection, () => cursorTranscript(messages), messages, options, progress, token, budget * 3,
+				sharedContextBudget(Math.min(source.workingContextLength ?? Infinity, budget + model.maxOutputTokens), options.tools));
 			return;
 		}
 		if (options.toolMode === vscode.LanguageModelChatToolMode.Required || options.tools?.length) { throw new Error("Cursor tools require Node.js 22.13 or newer and a supported SDK platform in VS Code. Chat remains available in Ask mode."); }

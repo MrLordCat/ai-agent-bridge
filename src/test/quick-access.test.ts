@@ -296,7 +296,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 
 		const deepSeekLimit = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Maximum Context");
 		const deepSeekOutput = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "Max Output");
-		const claudeLimit = (await getItems(provider, claude)).find(item => labelOf(item) === "Maximum Context");
+		const claudeLimit = (await getItems(provider, claude)).find(item => labelOf(item) === "Working Context");
 		const localOutput = (await getItems(provider, local)).find(item => labelOf(item) === "Max Output");
 		assert.strictEqual(deepSeekLimit?.description, "258.4K");
 		assert.strictEqual(deepSeekLimit?.command?.command, "llamacpp.openContextControl");
@@ -305,10 +305,10 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const semanticCompaction = (await getItems(provider, deepSeek)).find(item => labelOf(item) === "AI Compaction Summaries");
 		assert.strictEqual(semanticCompaction?.description, "Off");
 		assert.strictEqual(semanticCompaction?.command?.command, "llamacpp.toggleDeepSeekCompactionSummary");
-		assert.strictEqual(claudeLimit?.description, "258.4K target / 1M max");
+		assert.strictEqual(claudeLimit?.description, "258.4K shared / 1M max");
 		assert.strictEqual(claudeLimit?.command?.command, "llamacpp.openContextControl");
 		const codexTarget = (await getItems(provider, codex)).find(item => labelOf(item) === "Working Context");
-		assert.strictEqual(codexTarget?.description, "258.4K target");
+		assert.strictEqual(codexTarget?.description, "258.4K shared");
 		assert.strictEqual(codexTarget?.command?.command, "llamacpp.openContextControl");
 		assert.strictEqual(localOutput?.description, "32.8K");
 		assert.strictEqual(localOutput?.command?.command, "llamacpp.openSettings");
@@ -424,19 +424,23 @@ test("opens centralized API provider management from Quick Access", async () => 
 			["deepSeekContextLength", 2_000_000],
 			["deepSeekDefaultMaxOutputTokens", 500_000],
 		]);
-		const state = resolveContextControlState({
-			get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback,
-		}, {
-			modelId: "gpt-5.6-sol",
-			contextWindowTokens: 258_400,
-			updatedAt: Date.now(),
-		});
-		assert.strictEqual(state.claudeTarget, 967_000);
+		const configuration = { get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback };
+		const codexMetrics = { modelId: "gpt-5.6-sol", contextWindowTokens: 258_400, updatedAt: Date.now() };
+		const state = resolveContextControlState(configuration, codexMetrics);
+		// The legacy Codex target is the shared limit while sharedContextLength is unset;
+		// the per-provider Claude value is no longer read.
+		assert.strictEqual(state.sharedTarget, 500_000);
+		assert.strictEqual(state.claudeTarget, 500_000);
 		assert.strictEqual(state.codexTarget, 258_400);
 		assert.strictEqual(state.codexMaximum, 258_400);
 		assert.strictEqual(state.codexMaximumObserved, true);
 		assert.strictEqual(state.deepSeekContextTarget, 1_048_576);
 		assert.strictEqual(state.deepSeekMaxOutputTarget, 393_216);
+		values.set("sharedContextLength", 2_000_000);
+		const capped = resolveContextControlState(configuration, codexMetrics);
+		assert.strictEqual(capped.sharedTarget, 1_048_576);
+		assert.strictEqual(capped.claudeTarget, 967_000);
+		assert.strictEqual(capped.codexTarget, 258_400);
 	});
 
 	test("moves the same last-request metrics into Token Usage for every provider", async () => {

@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import { CocoAcpClient } from "../coco/acp-client";
 import { CocoChatModelProvider } from "../coco/coco-provider";
 import { mapCocoModel } from "../coco/model-adapter";
+import { resolveSharedContextLimit } from "../context/provider-handoff";
 import { CocoResponseStream } from "../coco/response-stream";
 import { CocoTurnBridge } from "../coco/turn-bridge";
 import { createCocoNativeContextUsage, parseCocoContextUsage } from "../coco/usage-adapter";
@@ -73,14 +74,16 @@ suite("Coco context usage", () => {
 			await provider.provideLanguageModelChatResponse(mapCocoModel({ id: "auto", name: "Auto" }), [vscode.LanguageModelChatMessage.User("Hi")],
 				{ toolMode: vscode.LanguageModelChatToolMode.Auto }, { report: part => parts.push(part) }, token.token);
 			assert.deepStrictEqual(usageParts(parts), [{ prompt_tokens: 62_229, total_tokens: 62_229 }]);
+			// The measured 1M window is adopted, then capped by the shared working context.
+			const advertised = Math.min(1_000_000, resolveSharedContextLimit());
 			const model = (await provider.provideLanguageModelChatInformation({ silent: true }, token.token))[0];
-			assert.strictEqual(model.maxInputTokens + model.maxOutputTokens, 1_000_000);
+			assert.strictEqual(model.maxInputTokens + model.maxOutputTokens, advertised);
 			provider.refreshLanguageModelChatInformation();
 			const refreshed = (await provider.provideLanguageModelChatInformation({ silent: true }, token.token))[0];
-			assert.strictEqual(refreshed.maxInputTokens + refreshed.maxOutputTokens, 1_000_000);
+			assert.strictEqual(refreshed.maxInputTokens + refreshed.maxOutputTokens, advertised);
 			connection = "Second"; provider.refreshLanguageModelChatInformation();
 			const reset = (await provider.provideLanguageModelChatInformation({ silent: true }, token.token))[0];
-			assert.notStrictEqual(reset.maxInputTokens + reset.maxOutputTokens, 1_000_000);
+			assert.notStrictEqual(reset.maxInputTokens + reset.maxOutputTokens, advertised);
 		} finally { provider.dispose(); token.dispose(); }
 	});
 

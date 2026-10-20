@@ -37,12 +37,14 @@ export interface CocoSessionClient {
 	loadSession(sessionId: string, cwd: string, tools?: JsonObject[]): Promise<JsonObject>;
 	setSessionConfigOption(sessionId: string, configId: string, value: string): Promise<JsonObject>;
 	prompt(sessionId: string, prompt: string | readonly CocoPromptContent[]): Promise<JsonObject>;
+	waitForExit?(): Promise<void>;
 	cancel(sessionId: string): void;
 	dispose(): void;
 }
 
 /** A small newline-delimited JSON-RPC client for `cortex acp serve`. */
 export class CocoAcpClient {
+	readonly transport = "acp" as const;
 	private readonly child: ChildProcessWithoutNullStreams;
 	private readonly pending = new Map<number, {
 		resolve: (value: JsonObject) => void;
@@ -62,7 +64,8 @@ export class CocoAcpClient {
 		connection: string | undefined,
 		model: string | undefined,
 		private readonly handlers: CocoAcpHandlers = {},
-		spawnProcess: typeof spawn = spawn
+		spawnProcess: typeof spawn = spawn,
+		environment: Readonly<Record<string, string>> = {}
 	) {
 		const args = ["acp", "serve", "-w", cwd];
 		if (connection) {
@@ -72,7 +75,7 @@ export class CocoAcpClient {
 			args.push("-m", model);
 		}
 		// Match Snowflake's launch environment: VS Code's Node hooks must not reach CLI helpers.
-		const env = { ...process.env };
+		const env = { ...process.env, ...environment };
 		delete env.NODE_OPTIONS;
 		if (path.isAbsolute(executable)) {
 			const pathKey = Object.keys(env).find(key => key.toUpperCase() === "PATH") ?? "PATH";

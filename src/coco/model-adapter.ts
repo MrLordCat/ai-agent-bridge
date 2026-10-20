@@ -3,6 +3,27 @@ import { modelInformation } from "../providers/model-descriptor";
 
 export const COCO_MODEL_ID_PREFIX = "coco::";
 
+/** Coco CLI env override for autoCompactThreshold: a fraction of the model window. */
+export const COCO_COMPACTION_THRESHOLD_ENV = "CORTEX_AGENT_SUMMARIZATION_TRIGGER_THRESHOLD";
+// CLI bounds: the setting accepts 0.2..0.99, then the server caps it at 0.75
+// for windows of 1M tokens and above and at 0.9 below that.
+const COCO_COMPACTION_THRESHOLD_MIN = 0.2;
+const COCO_COMPACTION_THRESHOLD_MAX = 0.99;
+
+export function resolveCocoCompactionThreshold(sharedLimit: number, contextWindow: number): number | undefined {
+	if (!Number.isFinite(sharedLimit) || !Number.isFinite(contextWindow) || sharedLimit <= 0 || contextWindow <= 0 || sharedLimit >= contextWindow) {
+		return undefined;
+	}
+	const fraction = Math.floor(sharedLimit / contextWindow * 10_000) / 10_000;
+	return Math.min(COCO_COMPACTION_THRESHOLD_MAX, Math.max(COCO_COMPACTION_THRESHOLD_MIN, fraction));
+}
+
+/** Token count at which the CLI compacts natively, after its own server cap. */
+export function cocoNativeCompactionTokens(sharedLimit: number, contextWindow: number): number {
+	const serverCap = contextWindow >= 1_000_000 ? 0.75 : 0.9;
+	return Math.floor(contextWindow * Math.min(serverCap, resolveCocoCompactionThreshold(sharedLimit, contextWindow) ?? 0.9));
+}
+
 export function decodeCocoModelId(id: string): string | undefined {
 	return id.startsWith(COCO_MODEL_ID_PREFIX) ? id.slice(COCO_MODEL_ID_PREFIX.length) : undefined;
 }

@@ -5,6 +5,7 @@ import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
 	normalizeCompactionTargetRatio,
 } from "../context/context-budget";
+import { resolveSharedContextLimit, SHARED_CONTEXT_MAX, SHARED_CONTEXT_MIN } from "../context/provider-handoff";
 import { formatCompactTokenCount } from "../provider-metrics";
 import type { ThinkingMode } from "../reasoning";
 
@@ -63,11 +64,12 @@ function contextLimitCommand(
 	fallback: number,
 	minimum: number,
 	maximum: number,
-	refresh: () => void
+	refresh: () => void,
+	readCurrent: (config: vscode.WorkspaceConfiguration) => unknown = config => config.get(setting, fallback)
 ): vscode.Disposable {
 	return vscode.commands.registerCommand(commandId, async () => {
 		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
-		const configured = Number(config.get(setting, fallback));
+		const configured = Number(readCurrent(config));
 		const current = Number.isFinite(configured) ? configured : fallback;
 		const next = await pickContextLimit(title, current, minimum, maximum);
 		if (next === undefined) {
@@ -169,14 +171,16 @@ export function registerModelBehaviorCommands(refresh: () => void): vscode.Dispo
 			1_048_576,
 			refresh
 		),
+		// Claude follows the shared working context; the command ID is kept for keybindings.
 		contextLimitCommand(
 			"llamacpp.setClaudeContextLength",
-			"claudeContextLength",
-			"Claude Working Context",
+			"sharedContextLength",
+			"Shared Working Context (Codex, Claude, Coco, Cursor)",
 			258_400,
-			258_400,
-			967_000,
-			refresh
+			SHARED_CONTEXT_MIN,
+			SHARED_CONTEXT_MAX,
+			refresh,
+			config => resolveSharedContextLimit(config)
 		),
 		vscode.commands.registerCommand("llamacpp.setCompactionTargetRatio", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);

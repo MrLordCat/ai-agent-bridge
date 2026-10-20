@@ -2,13 +2,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
+import { resolveSharedContextLimit, sharedContextBudget } from "../context/provider-handoff";
 
 import { CocoAcpClient, type CocoSessionClient, type CocoAcpHandlers } from "./acp-client";
 import { CocoSdkClient, cocoSdkAvailable, cocoSdkError } from "./sdk-client";
 import { COCO_SDK_TOOL_PREFIX } from "./tool-names";
 import {
-	decodeCocoModelId, mapCocoModel, parseCocoModels, parseCocoThinkingConfiguration,
-	resolveCocoReasoningEffort, type CocoModel, type CocoThinkingConfiguration,
+	COCO_COMPACTION_THRESHOLD_ENV, decodeCocoModelId, mapCocoModel, parseCocoModels, parseCocoThinkingConfiguration,
+	resolveCocoCompactionThreshold, resolveCocoReasoningEffort, type CocoModel, type CocoThinkingConfiguration,
 } from "./model-adapter";
 import { CocoTurnBridge, collectCocoToolResults, COCO_CHAT_TOOL_POLICY } from "./turn-bridge";
 import { estimateCocoTokens } from "./message-adapter";
@@ -100,11 +101,14 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 	private thinking?: CocoThinkingConfiguration;
 	private imageInput = false;
 	private readonly observedContextWindows = new Map<string, number>();
+	/** Native compaction threshold each CLI process was started with. */
+	private readonly spawnedThresholds = new WeakMap<CocoSessionClient, { modelId: string; threshold?: number }>();
 	private discovery?: Promise<void>;
 	private discoveryGeneration = 0;
 	private lastDiscoveryAt = 0;
 	private readonly clients = new Set<CocoSessionClient>();
 	private readonly activeTurns = new Set<CocoActiveTurn>();
+	private readonly failedCallbacks = new Map<string, Error>();
 	private discoveryClient?: CocoAcpClient;
 	private stopDiscovery?: () => void;
 	private acceptDiscovery?: (modelCount: number) => void;
@@ -171,12 +175,38 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 	private diagnostic(event: string, data: Record<string,unknown>): void {
 		try { this.dependencies.log?.(event,data); } catch { /* Diagnostic storage must not fail a native turn. */ }
 	}
-	private nativeClient(executable: string, cwd: string, connection: string | undefined, model: string, handlers: CocoAcpHandlers): CocoSessionClient {
+	private nativeClient(executable: string, cwd: string, connection: string | undefined, model: string, handlers: CocoAcpHandlers, hasTools = false): CocoSessionClient {
 		if (this.dependencies.createSessionClient) { return this.dependencies.createSessionClient(executable, cwd, connection, model, handlers); }
 		if (this.dependencies.createClient) { return this.createClient(executable, cwd, connection, model, handlers); }
+		const threshold = this.compactionThreshold(model);
+		const environment: Record<string, string> = threshold === undefined ? {} : { [COCO_COMPACTION_THRESHOLD_ENV]: String(threshold) };
 		const transport = vscode.workspace.getConfiguration("llamacpp").get<string>("cocoTransport", "auto");
-		if (transport === "sdk" || transport === "auto" && cocoSdkAvailable()) { return new CocoSdkClient(executable, cwd, connection, model, handlers); }
-		return this.createClient(executable, cwd, connection, model, handlers);
+		// The bundled CLI's SDK MCP control requests expire after 30 seconds.
+		// ACP client tools can wait for Chat approvals and long commands while
+		// retaining the same native session ID, including SDK-created sessions.
+		const client = !hasTools && (transport === "sdk" || transport === "auto" && cocoSdkAvailable())
+			? new CocoSdkClient(executable, cwd, connection, model, handlers, undefined, environment)
+			: this.createClient(executable, cwd, connection, model, handlers, undefined, environment);
+		this.spawnedThresholds.set(client, { modelId: model, threshold });
+		return client;
+	}
+	/** Real model window when measured, then the saved, baseline or fallback window. */
+	private modelWindow(modelId: string): number {
+		const configured = vscode.workspace.getConfiguration("llamacpp");
+		const windows = configured.get<Record<string, number>>("cocoModelContextLengths", { "claude-opus-5-5": 1_000_000 });
+		const baseline = windows[modelId];
+		return this.observedContextWindows.get(modelId) ?? this.sessions.window(this.sessionIdentity(modelId))
+			?? (Number.isSafeInteger(baseline) && baseline >= 4096 && baseline <= 1048576 ? baseline : Math.max(4_096, configured.get<number>("cocoContextLength", 128_000)));
+	}
+	private compactionThreshold(modelId: string): number | undefined {
+		return resolveCocoCompactionThreshold(resolveSharedContextLimit(), this.modelWindow(modelId));
+	}
+	/** Idle processes started with another threshold restart; the native session reloads. */
+	private releaseStaleCompaction(): void {
+		this.sessions.releaseIdle(session => {
+			const spawned = this.spawnedThresholds.get(session.client);
+			return spawned !== undefined && spawned.threshold !== this.compactionThreshold(spawned.modelId);
+		});
 	}
 	async needsConversationHistory(model: vscode.LanguageModelChatInformation, messages: readonly vscode.LanguageModelChatRequestMessage[], options: vscode.ProvideLanguageModelChatResponseOptions): Promise<boolean> {
 		const id = decodeCocoModelId(model.id);
@@ -213,6 +243,7 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 			}
 		}
 		if (!this.discovery) { this.lastDiscoveryAt = 0; }
+		this.releaseStaleCompaction();
 		this.changes.fire();
 	}
 
@@ -227,11 +258,8 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 		if (!this.enabled || !this.resolveCli()) {
 			return [];
 		}
-		const context = vscode.workspace.getConfiguration("llamacpp").get<number>("cocoContextLength", 128_000);
-		const windows = vscode.workspace.getConfiguration("llamacpp").get<Record<string, number>>("cocoModelContextLengths", { "claude-opus-5-5": 1_000_000 });
-		return this.models.map(model => mapCocoModel(model,
-			this.observedContextWindows.get(model.id) ?? this.sessions.window(this.sessionIdentity(model.id))
-			?? (Number.isSafeInteger(windows[model.id]) && windows[model.id] >= 4096 && windows[model.id] <= 1048576 ? windows[model.id] : Math.max(4_096, context)), this.thinking, this.imageInput));
+		const shared = resolveSharedContextLimit();
+		return this.models.map(model => mapCocoModel(model, Math.min(this.modelWindow(model.id), shared), this.thinking, this.imageInput));
 	}
 
 	async provideLanguageModelChatResponse(
@@ -274,6 +302,8 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 			return;
 		}
 		if (results.some(result => result.callId.startsWith("coco-"))) {
+			const original = results.map(result => this.failedCallbacks.get(result.callId)).find(error => error !== undefined);
+			if (original) { throw new Error(`Coco's native request was interrupted: ${original.message} Send a new user message to continue its saved session. Completed tools were not repeated.`); }
 			throw new Error("The Coco tool session is no longer active. Retry the request in Chat.");
 		}
 		// An explicit new request supersedes an abandoned tool cycle in this chat.
@@ -287,15 +317,23 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 			this.liveEvents.fire(update);
 		});
 		const bridge = new CocoTurnBridge(options.tools ?? [], error => {
+			if (error && !(error instanceof vscode.CancellationError)) {
+				const safe = cocoSdkError(error);
+				for (const id of bridge.issuedCallIds) { this.failedCallbacks.set(id, safe); }
+				while (this.failedCallbacks.size > 256) { this.failedCallbacks.delete(this.failedCallbacks.keys().next().value!); }
+				this.diagnostic("coco.turn.failed", { requestId: metrics.requestId, sessionId: turn.sessionId, durationMs: Date.now() - metrics.started, error: safe.message });
+			}
 			if (error && turn.sessionId) { client.cancel(turn.sessionId); }
 			this.sessions.finish(slot, error);
+			// A fallback window may have been replaced by the measured one during this turn.
+			this.releaseStaleCompaction();
 			this.clients.delete(client);
 			this.activeTurns.delete(turn);
 			const usage = metrics.finish(error);
 			if (usage) { this.usageEvents.fire(usage); }
 		}, undefined, result => this.archive.toolResult(result, slot.key));
 		const slot = await this.sessions.acquire(this.sessionIdentity(modelId), conversationId, anchors,
-			handlers => this.nativeClient(executable, cwd, connection, modelId, handlers), {
+			handlers => this.nativeClient(executable, cwd, connection, modelId, handlers, Boolean(options.tools?.length)), {
 			onUpdate: update => {
 				const usage = parseCocoContextUsage(update);
 				if (usage) { slot.contextWindow = usage.contextWindowTokens; }
@@ -314,8 +352,13 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				bridge.blockInternalAction(request.toolCall?.title ?? "permission request");
 				return undefined;
 			},
-			onClientTool: (name, input, nativeCallId) => { metrics.tool(); return bridge.delegate(name, input, nativeCallId); },
-		}, messages);
+			onClientTool: async (name, input, nativeCallId) => {
+				const started = Date.now(); metrics.tool();
+				this.diagnostic("coco.tool.delegated", { requestId: metrics.requestId, name, transport: slot.client.transport ?? "acp" });
+				try { return await bridge.delegate(name, input, nativeCallId); }
+				finally { this.diagnostic("coco.tool.returned", { requestId: metrics.requestId, name, durationMs: Date.now() - started }); }
+			},
+		}, messages, !this.dependencies.createSessionClient && !this.dependencies.createClient && Boolean(options.tools?.length));
 		const client = slot.client;
 		const turn: CocoActiveTurn = { modelId: model.id, executable, connection, bridge, client, conversationId };
 		this.activeTurns.add(turn);
@@ -324,7 +367,9 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 		try {
 			bridge.rememberResults(messages);
 			await bridge.start(async () => {
+				const preparingSession = Date.now();
 				const session = await this.sessions.prepare(slot, cwd, bridge.clientTools);
+				const sessionPrepareMs = Date.now() - preparingSession;
 				const imageInput = slot.initialized?.agentCapabilities?.promptCapabilities?.image === true;
 				const sessionId = slot.sessionId;
 				if (!sessionId) {
@@ -358,11 +403,13 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				}
 				const host = [...hostBlocks.values()].join("\n");
 				const delta = slot.fresh ? messages : [...(host ? [vscode.LanguageModelChatMessage.User(`Current VS Code environment (updated snapshot):\n${host}`)] : []), ...messages.slice(slot.deltaStart)];
-				const targetChars = Math.min(1_000_000,Math.max(32_768,(model.maxInputTokens - 98_304) * 2));
-				const transfer = await this.archive.prepare(delta, slot.key,targetChars);
+				const tokenBudget = sharedContextBudget(model.maxInputTokens + model.maxOutputTokens, options.tools);
+				const preparingHistory = Date.now();
+				const transfer = await this.archive.prepare(delta, slot.key, tokenBudget);
+				const historyPrepareMs = Date.now() - preparingHistory;
 				if (transfer.compacted) {
 					metrics.accept({sessionUpdate:"compaction"});
-					progress.report(new vscode.LanguageModelTextPart(`Coco: prepared ${transfer.sentChars?.toLocaleString()} of ${transfer.originalChars?.toLocaleString()} history characters for this handoff. Earlier details and images remain in the full archive: ${transfer.archivePath}. Sending the current request…\n\n`));
+					progress.report(new vscode.LanguageModelTextPart(`Coco: shared context prepared (${transfer.estimatedTokens?.toLocaleString()} estimated history tokens, budget ${tokenBudget.toLocaleString()}). Complete history and earlier images: ${transfer.archivePath}. Sending the current request…\n\n`));
 				}
 				if (transfer.prompt.length === 0) { throw new Error("Coco received an empty conversation."); }
 				if (!imageInput && [...transfer.prompt, ...transfer.imports.flat()].some(part => part.type === "image")) {
@@ -371,6 +418,8 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				metrics.setSession(slot.mode, slot.key, slot.reason, client.transport === "sdk" && transfer.prompt.some(part => part.type === "image") ? "acp (same native session)" : client.transport ?? "acp");
 				this.diagnostic("coco.request.prepared",{
 					requestId:metrics.requestId,modelId,transport:client.transport ?? "acp",sessionMode:slot.mode,reason:slot.reason,
+					sessionPrepareMs,historyPrepareMs,
+					historyTokenBudget: tokenBudget, estimatedHistoryTokens: transfer.estimatedTokens,
 					toolCount:bridge.clientTools.length,maxSdkWireToolNameLength:Math.max(0,...bridge.clientTools.map(tool => (COCO_SDK_TOOL_PREFIX + tool.name).length)),
 					promptChars:transfer.prompt.reduce((n,part) => n + (part.type === "text" ? part.text.length : 0),0),
 					imageCount:transfer.prompt.filter(part => part.type === "image").length,compacted:Boolean(transfer.compacted),

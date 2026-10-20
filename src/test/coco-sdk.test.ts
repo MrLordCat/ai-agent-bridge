@@ -3,6 +3,7 @@ import * as vscode from "vscode";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { CocoSessionStore } from "../coco/session-store";
 import { createHash } from "node:crypto";
 import { CocoTurnBridge } from "../coco/turn-bridge";
 import { CocoChatModelProvider, resolveCocoCli, resolveCocoConnection } from "../coco/coco-provider";
@@ -44,6 +45,51 @@ function fixture(handlers: CocoAcpHandlers = {}) {
 const tool = { name: "vscode_chat_read_test", description: "Read", inputSchema: { type: "object", properties: { path: { type: "string" } } } };
 
 suite("Coco native SDK", () => {
+	test("live Chat callback survives a 35-second tool wait on the selected native transport", async function () {
+		if (process.env.AAB_COCO_LIVE_CALLBACKS !== "1") { this.skip(); return; }
+		this.timeout(180000);
+		const cli = process.env.AAB_COCO_LIVE_CLI ?? resolveCocoCli(); assert.ok(cli);
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "coco-live-callback-"));
+		const provider = new CocoChatModelProvider({ storageRoot: root, isEnabled: () => true, resolveCli: () => cli, resolveConnection: resolveCocoConnection });
+		const cancellation = new vscode.CancellationTokenSource(), marker = `VS_CODE_MARKER_${createHash("sha256").update(root).digest("hex")}`;
+		const messages = [vscode.LanguageModelChatMessage.User("Diagnostic only. Call the supplied diagnostic_probe tool exactly once. Wait for its result and reply only with its returned marker. Use no other tools; do not repeat or invent results.")];
+		const model = mapCocoModel({ id: "claude-opus-5-5", name: "Opus" }, 1000000);
+		const options = { toolMode: vscode.LanguageModelChatToolMode.Auto, tools: [{ name: "diagnostic_probe", description: "Return an inert diagnostic marker. No side effects.", inputSchema: { type: "object", properties: {}, additionalProperties: false } }], modelOptions: { _copilotConversationId: "live-slow-native-callback" } };
+		const first: vscode.LanguageModelResponsePart[] = [], second: vscode.LanguageModelResponsePart[] = [];
+		const timer = setTimeout(() => cancellation.cancel(), 150000);
+		try {
+			await provider.provideLanguageModelChatResponse(model, messages, options, { report: part => first.push(part) }, cancellation.token);
+			const calls = first.filter((part): part is vscode.LanguageModelToolCallPart => part instanceof vscode.LanguageModelToolCallPart);
+			assert.strictEqual(calls.length, 1); assert.strictEqual(calls[0].name, "diagnostic_probe");
+			await new Promise<void>(resolve => setTimeout(resolve, 35000));
+			await provider.provideLanguageModelChatResponse(model, [...messages, vscode.LanguageModelChatMessage.Assistant([calls[0]]), vscode.LanguageModelChatMessage.User([new vscode.LanguageModelToolResultPart(calls[0].callId, [new vscode.LanguageModelTextPart(marker)])])], options, { report: part => second.push(part) }, cancellation.token);
+			const answer = second.filter((part): part is vscode.LanguageModelTextPart => part instanceof vscode.LanguageModelTextPart).map(part => part.value).join("");
+			assert.ok(answer.includes(marker)); assert.ok(!second.some(part => part instanceof vscode.LanguageModelToolCallPart));
+			console.log(JSON.stringify({ liveCocoChatCallback: true, toolWaitMs: 35000, markerReceived: true, nativeTurnCompleted: true }));
+		} finally { clearTimeout(timer); cancellation.cancel(); provider.dispose(); cancellation.dispose(); await fs.rm(root, { recursive: true, force: true }); }
+	});
+	test("rebinds a completed SDK session to ACP tools without replaying its history", async () => {
+		const store = new CocoSessionStore(), loaded: string[] = [];
+		let closed = 0, exited = 0;
+		const identity = CocoSessionStore.identity("cli", "/workspace", "connection", "model");
+		const anchors = [{ key: createHash("sha256").update("first").digest("hex"), index: 0 }];
+		const sdk = { transport: "sdk" as const, initialize: async () => ({ agentCapabilities: { loadSession: true } }),
+			newSession: async () => ({ sessionId: "same-native-id" }), loadSession: async () => ({}),
+			setSessionConfigOption: async () => ({}), prompt: async () => ({}), cancel: () => undefined,
+			dispose: () => { closed++; }, waitForExit: async () => { exited++; } };
+		const acp = { ...sdk, transport: "acp" as const, dispose: () => undefined,
+			loadSession: async (id: string) => { loaded.push(id); return { sessionId: id }; } };
+		try {
+			const first = await store.acquire(identity, "chat", anchors, () => sdk, {});
+			await store.prepare(first, "/workspace", []); await store.checkpoint(first, anchors); store.finish(first);
+			const nextAnchors = [...anchors, { key: createHash("sha256").update("second").digest("hex"), index: 2 }];
+			const next = await store.acquire(identity, "chat", nextAnchors, () => acp, {}, [], true);
+			await store.prepare(next, "/workspace", [tool]);
+			assert.deepStrictEqual(loaded, ["same-native-id"]); assert.strictEqual(next.fresh, false);
+			assert.strictEqual(next.deltaStart, 2); assert.strictEqual(next.client.transport, "acp");
+			assert.strictEqual(closed, 1); assert.strictEqual(exited, 1);
+		} finally { store.dispose(); }
+	});
 	test("logs request bounds without the private prompt",async () => {
 		const f = fixture(), events: unknown[] = [];
 		const provider = new CocoChatModelProvider({isEnabled:() => true,resolveCli:() => "fixture-cli",log:(event,data) => events.push({event,data}),

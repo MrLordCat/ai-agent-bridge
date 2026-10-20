@@ -7,6 +7,7 @@ import {
 } from "../claude/claude-provider";
 import { CODEX_WORKING_CONTEXT_MIN } from "../codex/codex-provider";
 import { CONFIG_SECTION } from "../constants";
+import { resolveSharedContextLimit, SHARED_CONTEXT_MAX } from "../context/provider-handoff";
 import { clampInteger, formatTokenCount } from "../utils";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 
@@ -16,11 +17,14 @@ const DEEPSEEK_MAX_OUTPUT_MIN = 1_024;
 const DEEPSEEK_MAX_OUTPUT_MAX = 393_216;
 
 export interface ContextControlState {
+	/** One working context for Codex, Claude, Coco and Cursor. */
+	sharedTarget: number;
+	sharedMinimum: number;
+	sharedMaximum: number;
 	claudeTarget: number;
 	claudeMinimum: number;
 	claudeMaximum: number;
 	codexTarget: number;
-	codexMinimum: number;
 	codexMaximum: number;
 	codexMaximumObserved: boolean;
 	deepSeekContextTarget: number;
@@ -47,24 +51,18 @@ export function resolveContextControlState(
 	const codexMaximum = hasObservedCodexWindow
 		? Math.max(CODEX_WORKING_CONTEXT_MIN, Math.floor(observedCodexWindow!))
 		: configuredCodexWindow;
+	const sharedTarget = clampInteger(resolveSharedContextLimit(configuration), CODEX_WORKING_CONTEXT_MIN, SHARED_CONTEXT_MAX, CODEX_WORKING_CONTEXT_MIN);
 	return {
-		claudeTarget: clampInteger(
-			configuration.get("claudeContextLength", CLAUDE_CONTEXT_TARGET_MIN),
-			CLAUDE_CONTEXT_TARGET_MIN,
-			CLAUDE_CONTEXT_TARGET_MAX,
-			CLAUDE_CONTEXT_TARGET_MIN
-		),
+		sharedTarget,
+		sharedMinimum: CODEX_WORKING_CONTEXT_MIN,
+		sharedMaximum: SHARED_CONTEXT_MAX,
+		claudeTarget: clampInteger(sharedTarget, CLAUDE_CONTEXT_TARGET_MIN, CLAUDE_CONTEXT_TARGET_MAX, CLAUDE_CONTEXT_TARGET_MIN),
 		claudeMinimum: CLAUDE_CONTEXT_TARGET_MIN,
 		claudeMaximum: CLAUDE_CONTEXT_TARGET_MAX,
-		codexTarget: clampInteger(
-			configuration.get("codexWorkingContextTarget", codexMaximum),
-			CODEX_WORKING_CONTEXT_MIN,
-			codexMaximum,
-			codexMaximum
-		),
-		codexMinimum: CODEX_WORKING_CONTEXT_MIN,
+		codexTarget: Math.min(sharedTarget, codexMaximum),
 		codexMaximum,
-		codexMaximumObserved: hasObservedCodexWindow,		deepSeekContextTarget: clampInteger(
+		codexMaximumObserved: hasObservedCodexWindow,
+		deepSeekContextTarget: clampInteger(
 			configuration.get("deepSeekContextLength", 258_400),
 			DEEPSEEK_CONTEXT_MIN,
 			DEEPSEEK_CONTEXT_MAX,
@@ -112,17 +110,11 @@ export function registerContextControlCommand(
 			}
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 			const current = resolveContextControlState(config, getCodexMetrics());
-			const claudeTarget = clampInteger(
-				(message as { claudeTarget?: unknown }).claudeTarget,
-				current.claudeMinimum,
-				current.claudeMaximum,
-				current.claudeTarget
-			);
-			const codexTarget = clampInteger(
-				(message as { codexTarget?: unknown }).codexTarget,
-				current.codexMinimum,
-				current.codexMaximum,
-				current.codexTarget
+			const sharedTarget = clampInteger(
+				(message as { sharedTarget?: unknown }).sharedTarget,
+				current.sharedMinimum,
+				current.sharedMaximum,
+				current.sharedTarget
 			);
 			const deepSeekContextTarget = clampInteger(
 				(message as { deepSeekContextTarget?: unknown }).deepSeekContextTarget,
@@ -137,21 +129,20 @@ export function registerContextControlCommand(
 				current.deepSeekMaxOutputTarget
 			);
 			await Promise.all([
-				config.update("claudeContextLength", claudeTarget, vscode.ConfigurationTarget.Global),
-				config.update("codexWorkingContextTarget", codexTarget, vscode.ConfigurationTarget.Global),
+				config.update("sharedContextLength", sharedTarget, vscode.ConfigurationTarget.Global),
 				config.update("deepSeekContextLength", deepSeekContextTarget, vscode.ConfigurationTarget.Global),
 				config.update("deepSeekDefaultMaxOutputTokens", deepSeekMaxOutputTarget, vscode.ConfigurationTarget.Global),
 			]);
 			refresh();
+			const saved = resolveContextControlState(vscode.workspace.getConfiguration(CONFIG_SECTION), getCodexMetrics());
 			void panel?.webview.postMessage({
 				type: "saved",
-				claudeTarget,
-				codexTarget,
+				sharedTarget,
 				deepSeekContextTarget,
 				deepSeekMaxOutputTarget,
 			});
 			vscode.window.showInformationMessage(
-				`Provider limits: Claude ${formatTokenCount(claudeTarget)} · Codex ${formatTokenCount(codexTarget)} · DeepSeek ctx ${formatTokenCount(deepSeekContextTarget)} · out ${formatTokenCount(deepSeekMaxOutputTarget)}`
+				`Shared context ${formatTokenCount(sharedTarget)} · Codex ${formatTokenCount(saved.codexTarget)} · Claude ${formatTokenCount(saved.claudeTarget)} · DeepSeek ctx ${formatTokenCount(deepSeekContextTarget)} · out ${formatTokenCount(deepSeekMaxOutputTarget)}`
 			);
 		}, undefined);
 		panel.onDidDispose(() => {
@@ -189,16 +180,11 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 	<h1>Provider working context</h1>
 	<p class="lead">Changes apply to new provider sessions. Existing durable transcripts remain available.</p>
 	<section class="card">
-		<div class="row"><h2>Claude Opus 5</h2><span class="value" id="claudeValue"></span></div>
-		<input id="claude" type="range" min="${state.claudeMinimum}" max="${state.claudeMaximum}" step="1" value="${state.claudeTarget}">
-		<div class="bounds"><span>${formatTokenCount(state.claudeMinimum)}</span><span>${formatTokenCount(state.claudeMaximum)}</span></div>
-		<p>Uses the real 1M model variant. The selected value is Claude Code's auto-compaction threshold; 967k leaves headroom below the raw 1M window.</p>
-	</section>
-	<section class="card">
-		<div class="row"><h2>Codex</h2><span class="value" id="codexValue"></span></div>
-		<input id="codex" type="range" min="${state.codexMinimum}" max="${state.codexMaximum}" step="1" value="${state.codexTarget}">
-		<div class="bounds"><span>${formatTokenCount(state.codexMinimum)}</span><span>${formatTokenCount(state.codexMaximum)}</span></div>
-		<p>The target is capped to the ${state.codexMaximumObserved ? "server-reported" : "configured fallback"} model window. Output, tool schemas, developer instructions, and a safety reserve are deducted before cold-start history compaction.</p>
+		<div class="row"><h2>Shared context: Codex, Claude, Coco, Cursor</h2><span class="value" id="sharedValue"></span></div>
+		<input id="shared" type="range" min="${state.sharedMinimum}" max="${state.sharedMaximum}" step="1" value="${state.sharedTarget}">
+		<div class="bounds"><span>${formatTokenCount(state.sharedMinimum)}</span><span>${formatTokenCount(state.sharedMaximum)}</span></div>
+		<p>One working context for every native agent, so a switch after a rate limit keeps the same history budget. Each provider uses min(limit, its real model window) as its window and native auto-compaction threshold.</p>
+		<p id="effective"></p>
 	</section>
 	<section class="card">
 		<div class="row"><h2>DeepSeek context</h2><span class="value" id="deepSeekContextValue"></span></div>
@@ -215,23 +201,26 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 	<button id="save">Apply</button><span id="status"></span>
 	<script nonce="${nonce}">
 		const vscode = acquireVsCodeApi();
-		const claude = document.getElementById('claude');
-		const codex = document.getElementById('codex');
+		const shared = document.getElementById('shared');
 		const deepSeekContext = document.getElementById('deepSeekContext');
 		const deepSeekOutput = document.getElementById('deepSeekOutput');
 		const compact = value => value >= 1000000 ? (value / 1000000).toFixed(2).replace(/\\.00$/, '') + 'M' : (value / 1000).toFixed(1).replace(/\\.0$/, '') + 'k';
+		const codexMaximum = ${state.codexMaximum}, claudeMinimum = ${state.claudeMinimum}, claudeMaximum = ${state.claudeMaximum};
 		const update = () => {
-			document.getElementById('claudeValue').textContent = compact(Number(claude.value));
-			document.getElementById('codexValue').textContent = compact(Number(codex.value));
+			const value = Number(shared.value);
+			document.getElementById('sharedValue').textContent = compact(value);
+			document.getElementById('effective').textContent = 'Effective: Codex ' + compact(Math.min(value, codexMaximum))
+				+ ' (${state.codexMaximumObserved ? "server-reported" : "fallback"} window ' + compact(codexMaximum) + ') · Claude '
+				+ compact(Math.min(claudeMaximum, Math.max(claudeMinimum, value))) + ' (bounds ' + compact(claudeMinimum) + '–' + compact(claudeMaximum)
+				+ ') · Coco and Cursor up to ' + compact(value) + ', capped by each model window.';
 			document.getElementById('deepSeekContextValue').textContent = compact(Number(deepSeekContext.value));
 			document.getElementById('deepSeekOutputValue').textContent = compact(Number(deepSeekOutput.value));
 			document.getElementById('status').textContent = '';
 		};
-		claude.addEventListener('input', update);
-		codex.addEventListener('input', update);
+		shared.addEventListener('input', update);
 		deepSeekContext.addEventListener('input', update);
 		deepSeekOutput.addEventListener('input', update);
-		document.getElementById('save').addEventListener('click', () => vscode.postMessage({ type: 'save', claudeTarget: Number(claude.value), codexTarget: Number(codex.value), deepSeekContextTarget: Number(deepSeekContext.value), deepSeekMaxOutputTarget: Number(deepSeekOutput.value) }));
+		document.getElementById('save').addEventListener('click', () => vscode.postMessage({ type: 'save', sharedTarget: Number(shared.value), deepSeekContextTarget: Number(deepSeekContext.value), deepSeekMaxOutputTarget: Number(deepSeekOutput.value) }));
 		window.addEventListener('message', event => { if (event.data?.type === 'saved') document.getElementById('status').textContent = 'Saved'; });
 		update();
 	</script>

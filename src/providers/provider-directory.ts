@@ -1,7 +1,8 @@
 import * as vscode from "vscode";
 
 import { DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
-import { apiProviderSecretKey } from "../api-providers/api-provider-service";
+import { apiProviderSecretKey, isCursorApiProfile } from "../api-providers/api-provider-service";
+import type { ApiRequestProtocol } from "../model-sources/source-routing";
 import { getModelsEndpoint, isCloudflareWorkersAiBase, isDeepSeekEndpoint } from "../transport/openai-http";
 import { BUILTIN_PROVIDER_SOURCES, type ProviderSourceDefinition } from "./provider-registry";
 
@@ -42,6 +43,7 @@ export interface ApiProviderSource {
 	baseUrl: string;
 	enabled: boolean;
 	hasApiKey: boolean;
+	protocol?: ApiRequestProtocol;
 }
 
 export interface SubscriptionProviderStatus {
@@ -73,6 +75,8 @@ export interface ProviderDirectoryOptions {
 	getCocoStatus?: () => SubscriptionProviderStatus | undefined;
 	getSubscriptionStatuses?: () => ReadonlyMap<string, SubscriptionProviderStatus>;
 	getProviderSources?: () => readonly ProviderSourceDefinition[];
+	/** Last successful authenticated model-catalog load for a source key. */
+	getCatalogLoadedAt?: (key: string) => number | undefined;
 	probeHttp?: HttpProbeFn;
 	probeIntervalMs?: number;
 	probeTimeoutMs?: number;
@@ -80,6 +84,9 @@ export interface ProviderDirectoryOptions {
 
 export const DEFAULT_PROVIDER_PROBE_INTERVAL_MS = 5 * 60_000;
 export const DEFAULT_PROVIDER_PROBE_TIMEOUT_MS = 5_000;
+/** Cursor's catalog request uses the same endpoint with a 15 s timeout. */
+const CURSOR_PROBE_TIMEOUT_MS = 15_000;
+const CATALOG_PROOF_MAX_AGE_MS = 15 * 60_000;
 
 export function defaultProbeHttp(
 	endpoint: string,
@@ -228,11 +235,17 @@ export class ProviderDirectory implements vscode.Disposable {
 			}
 			const endpoint = getModelsEndpoint(profile.baseUrl);
 			const probed = this.probes.get(key);
-			if (!probed || probed.endpoint !== endpoint) {
+			// A real authenticated catalog load outranks a failed or pending probe.
+			const catalogAt = isCursorApiProfile(profile) ? config.getCatalogLoadedAt?.(key) : undefined;
+			const catalogFresh = catalogAt !== undefined && Date.now() - catalogAt <= CATALOG_PROOF_MAX_AGE_MS;
+			if (probed?.endpoint === endpoint && probed.result.ok) {
+				this.setMapped(key, profile.name, "api", true, "online", `Reachable at ${endpoint}.`);
+			} else if (catalogFresh) {
+				const probeFailure = probed?.endpoint === endpoint ? ` The availability probe failed (${probed.result.error ?? "unreachable"}).` : "";
+				this.setMapped(key, profile.name, "api", true, "online", `Model catalog loaded from ${endpoint}.${probeFailure}`);
+			} else if (!probed || probed.endpoint !== endpoint) {
 				this.setMapped(key, profile.name, "api", true, "checking",
 					profile.hasApiKey ? "Awaiting first availability check." : "No API key saved yet.");
-			} else if (probed.result.ok) {
-				this.setMapped(key, profile.name, "api", true, "online", `Reachable at ${endpoint}.`);
 			} else {
 				const status = probed.result.status;
 				const cloudflareHint = (status === 401 || status === 403) && isCloudflareWorkersAiBase(profile.baseUrl)
@@ -276,7 +289,8 @@ export class ProviderDirectory implements vscode.Disposable {
 			const profileKey = profile.hasApiKey
 				? await (this.options.getApiProfileKey?.(profile.id) ?? secrets(apiProviderSecretKey(profile.id))).catch(() => undefined)
 				: undefined;
-			jobs.push(this.probeSource(`api-${profile.id}`, getModelsEndpoint(profile.baseUrl), profileKey, now));
+			jobs.push(this.probeSource(`api-${profile.id}`, getModelsEndpoint(profile.baseUrl), profileKey, now,
+				isCursorApiProfile(profile) ? Math.max(this.probeTimeoutMs, CURSOR_PROBE_TIMEOUT_MS) : this.probeTimeoutMs));
 		}
 
 		await Promise.allSettled(jobs);
@@ -292,9 +306,10 @@ export class ProviderDirectory implements vscode.Disposable {
 		key: string,
 		endpoint: string,
 		apiKey: string | undefined,
-		now: number
+		now: number,
+		timeoutMs = this.probeTimeoutMs
 	): Promise<void> {
-		const result = await this.probeHttp(endpoint, apiKey, this.probeTimeoutMs);
+		const result = await this.probeHttp(endpoint, apiKey, timeoutMs);
 		this.probes.set(key, { lastAttemptAt: now, result, endpoint });
 	}
 

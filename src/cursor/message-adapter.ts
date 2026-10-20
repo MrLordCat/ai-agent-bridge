@@ -17,7 +17,7 @@ export function cursorTranscript(messages: readonly vscode.LanguageModelChatRequ
 		}
 		return "";
 	}).filter(Boolean).join("\n");
-	const blocks = messages.map(message => `${message.role === vscode.LanguageModelChatMessageRole.User ? "User" : "Assistant"}:\n${content(message.content)}`);
+	const blocks = messages.map(message => `${message.role === vscode.LanguageModelChatMessageRole.User ? "User" : message.role === vscode.LanguageModelChatMessageRole.Assistant ? "Assistant" : "System"}:\n${content(message.content)}`);
 	return { text: blocks.join("\n\n"), ...(images.length ? { images } : {}) };
 }
 

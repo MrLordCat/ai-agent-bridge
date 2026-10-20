@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { conversationUserAnchors } from "../providers/conversation-anchors";
+import { conversationUserAnchors, canonicalConversationUserAnchors } from "../providers/conversation-anchors";
 import type { CocoSessionClient, CocoAcpHandlers, CocoInitializeResult } from "./acp-client";
 
 const STORAGE_KEY = "llamacpp.coco.sessions.v1";
@@ -14,7 +14,7 @@ type Json = Record<string, unknown>;
 
 export interface CocoUserAnchor { key: string; index: number }
 export function cocoUserAnchors(messages: readonly vscode.LanguageModelChatRequestMessage[]): CocoUserAnchor[] {
-	return conversationUserAnchors(messages);
+	return canonicalConversationUserAnchors(messages);
 }
 
 interface SavedSession { key: string; identity: string; sessionId: string; users: string[]; updatedAt: number; contextWindow?: number; inflight?: boolean; completedUsers?: string[] }
@@ -74,14 +74,26 @@ export class CocoSessionStore {
 		return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 	}
 
-	async acquire(identity: string, conversation: unknown, anchors: readonly CocoUserAnchor[], create: (handlers: CocoAcpHandlers) => CocoSessionClient, handlers: CocoAcpHandlers, messages: readonly vscode.LanguageModelChatRequestMessage[] = []): Promise<CocoSession> {
+	async acquire(identity: string, conversation: unknown, anchors: readonly CocoUserAnchor[], create: (handlers: CocoAcpHandlers) => CocoSessionClient, handlers: CocoAcpHandlers, messages: readonly vscode.LanguageModelChatRequestMessage[] = [], callbackTools = false): Promise<CocoSession> {
 		await this.ready;
 		const persistent = typeof conversation === "string" && conversation.trim().length > 0 && conversation.length <= 512;
 		const key = persistent ? digest([identity, conversation]) : randomUUID();
 		let session = this.live.get(key);
 		if (session?.busy) { throw new Error("This Coco conversation still has an active request. Finish or cancel it before starting another."); }
+		if (callbackTools && session?.client.transport === "sdk") {
+			const client = session.client;
+			this.drop(key, false);
+			await client.waitForExit?.();
+			session = undefined;
+		}
 		const saved = session ?? this.saved.get(key);
 		const users = anchors.map(a => a.key);
+		if (saved && !saved.users.every((key, index) => key === users[index])) {
+			const legacy = conversationUserAnchors(messages);
+			if (saved.users.length < legacy.length && saved.users.every((key, index) => key === legacy[index].key)) {
+				saved.users = users.slice(0, saved.users.length);
+			}
+		}
 		const stored = this.saved.get(key);
 		if (stored?.inflight && stored.users.length === users.length && stored.users.every((s,i) => s === users[i])) {
 			throw new Error("The previous Coco native turn was interrupted. Send a new user message to continue its saved session. No tools were repeated.");
@@ -190,6 +202,10 @@ export class CocoSessionStore {
 		}
 	}
 	clear(): void { for (const key of [...this.live.keys()]) { this.drop(key, true); } this.saved.clear(); void this.flush(); }
+	/** Stops idle CLI processes; saved bindings reload the same native sessions on the next turn. */
+	releaseIdle(matches: (session: CocoSession) => boolean = () => true): void {
+		for (const session of [...this.live.values()]) { if (!session.busy && matches(session)) { this.drop(session.key, false); } }
+	}
 	async settle(): Promise<void> { await this.writes.catch(() => undefined); }
 	dispose(): void { for (const key of [...this.live.keys()]) { this.drop(key, false); } }
 	private drop(key: string, forget: boolean): void {
