@@ -16,6 +16,18 @@ interface PendingCall {
 
 export { COCO_CHAT_TOOL_POLICY } from "./tool-policy";
 
+/**
+ * Built-in CLI actions that only read Coco's own tool catalog. With many client
+ * tools the CLI defers their schemas and the model loads them through
+ * tool_search; it has no side effects outside the CLI process.
+ */
+const COCO_CATALOG_ACTIONS = new Set(["tool_search"]);
+
+function hasVisibleText(update: JsonObject): boolean {
+	const content = update.content as JsonObject | undefined;
+	return update.sessionUpdate === "agent_message_chunk" && typeof content?.text === "string" && content.text.trim().length > 0;
+}
+
 /** Keep native Chat call IDs and their ACP promises alive across model-provider requests. */
 export class CocoTurnBridge implements vscode.Disposable {
 	private readonly tools = new Map<string, vscode.LanguageModelChatTool>();
@@ -30,6 +42,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 	private progress?: vscode.Progress<vscode.LanguageModelResponsePart>;
 	private cancellation?: vscode.Disposable;
 	private delegationScheduled = false;
+	private segmentOutput = false;
 	private get terminal() { return this.state.terminal; }
 	private get error() { return this.state.error; }
 
@@ -59,6 +72,8 @@ export class CocoTurnBridge implements vscode.Disposable {
 	}
 
 	get isTerminal(): boolean { return this.terminal; }
+	/** Copilot treats a response with only reasoning as a failed request and retries it. */
+	get awaitingOutput(): boolean { return this.state.attached && !this.terminal && !this.segmentOutput; }
 	get pendingCallIds(): ReadonlySet<string> { return new Set(this.pending.keys()); }
 	get issuedCallIds(): ReadonlySet<string> { return this.issued; }
 	rememberResults(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
@@ -111,13 +126,13 @@ export class CocoTurnBridge implements vscode.Disposable {
 		}
 		if (update.sessionUpdate === "tool_call") {
 			// Client tools emit an ACP event too; Chat renders their delegated call, once.
-			if (typeof update.title !== "string" || !this.tools.has(update.title)) {
+			if (typeof update.title !== "string" || (!this.tools.has(update.title) && !COCO_CATALOG_ACTIONS.has(update.title))) {
 				this.blockInternalAction(typeof update.title === "string" ? update.title : "unknown tool");
 			}
 			return;
 		}
 		if (update.sessionUpdate !== "agent_message_chunk" && update.sessionUpdate !== "agent_thought_chunk") { return; }
-		if (this.stream) { this.stream.accept(update); return; }
+		if (this.stream) { this.emit(update); return; }
 		try { this.state.enqueue(update, JSON.stringify(update).length); }
 		catch (error) { this.finish(error instanceof Error ? error : new Error(String(error))); }
 	}
@@ -156,12 +171,18 @@ export class CocoTurnBridge implements vscode.Disposable {
 		if (this.terminal) { return this.error ? Promise.reject(this.error) : Promise.resolve(); }
 		this.progress = progress;
 		this.stream = new CocoResponseStream(progress, token);
+		this.segmentOutput = false;
 		if (this.latestUsage) { this.stream.accept(this.latestUsage); }
 		const completion = this.state.attach();
 		this.cancellation = token.onCancellationRequested(() => this.finish(new vscode.CancellationError()));
 		if (token.isCancellationRequested) { this.finish(new vscode.CancellationError()); return completion; }
-		for (const update of this.state.takeOutput()) { this.stream.accept(update); }
+		for (const update of this.state.takeOutput()) { this.emit(update); }
 		return completion;
+	}
+
+	private emit(update: JsonObject): void {
+		if (hasVisibleText(update)) { this.segmentOutput = true; }
+		this.stream?.accept(update);
 	}
 
 	private reportCalls(): void {
@@ -172,6 +193,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 			this.progress.report(call.part);
 			call.reported = true;
 			reported = true;
+			this.segmentOutput = true;
 		}
 		if (!reported || this.delegationScheduled) { return; }
 		this.delegationScheduled = true;

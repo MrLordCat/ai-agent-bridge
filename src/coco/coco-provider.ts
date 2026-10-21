@@ -20,6 +20,10 @@ import { CocoTurnMetrics, type CocoLiveTurn, type CocoRecordedUsage } from "./tu
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 
 const DISCOVERY_RETRY_MS = 60_000;
+/** A native turn that ends after reasoning alone is asked to continue at most this often. */
+const COCO_EMPTY_TURN_NUDGES = 2;
+const COCO_EMPTY_TURN_NUDGE = "Your previous reply ended after reasoning, without visible text or a tool call, so VS Code Chat received an empty response. "
+	+ "Continue the task now: call the next vscode_chat_ tool or write the answer. Keep the reasoning short.";
 /** Shared-context archives not rewritten for two weeks belong to finished chats. */
 const COCO_ARCHIVE_RETENTION_MS = 14 * 24 * 60 * 60_000;
 export const COCO_DISCOVERY_TIMEOUT_MS = 45_000;
@@ -111,6 +115,8 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 	private readonly clients = new Set<CocoSessionClient>();
 	private readonly activeTurns = new Set<CocoActiveTurn>();
 	private readonly failedCallbacks = new Map<string, Error>();
+	/** Why a turn without a native error stopped, for Chat retries that resend its tool results. */
+	private readonly endedCallbacks = new Map<string, string>();
 	private discoveryClient?: CocoAcpClient;
 	private stopDiscovery?: () => void;
 	private acceptDiscovery?: (modelCount: number) => void;
@@ -307,7 +313,9 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 		if (results.some(result => result.callId.startsWith("coco-"))) {
 			const original = results.map(result => this.failedCallbacks.get(result.callId)).find(error => error !== undefined);
 			if (original) { throw new Error(`Coco's native request was interrupted: ${original.message} Send a new user message to continue its saved session. Completed tools were not repeated.`); }
-			throw new Error("The Coco tool session is no longer active. Retry the request in Chat.");
+			const ended = results.map(result => this.endedCallbacks.get(result.callId)).find(reason => reason !== undefined);
+			this.diagnostic("coco.request.stale_results", { results: results.length, reason: ended ?? "unknown" });
+			throw new Error(`The Coco tool session is no longer active${ended ? `: ${ended}` : ""}. Send a new user message to continue its saved session. Completed tools were not repeated.`);
 		}
 		// An explicit new request supersedes an abandoned tool cycle in this chat.
 		await this.onForeignRequest(conversationId);
@@ -325,6 +333,10 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 				for (const id of bridge.issuedCallIds) { this.failedCallbacks.set(id, safe); }
 				while (this.failedCallbacks.size > 256) { this.failedCallbacks.delete(this.failedCallbacks.keys().next().value!); }
 				this.diagnostic("coco.turn.failed", { requestId: metrics.requestId, sessionId: turn.sessionId, durationMs: Date.now() - metrics.started, error: safe.message });
+			} else {
+				const reason = error ? "its turn was cancelled (Stop, a new request in this chat, or a model or connection change)" : "its native turn had already finished";
+				for (const id of bridge.issuedCallIds) { this.endedCallbacks.set(id, reason); }
+				while (this.endedCallbacks.size > 256) { this.endedCallbacks.delete(this.endedCallbacks.keys().next().value!); }
 			}
 			if (error && turn.sessionId) { client.cancel(turn.sessionId); }
 			this.sessions.finish(slot, error);
@@ -427,19 +439,32 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 					promptChars:transfer.prompt.reduce((n,part) => n + (part.type === "text" ? part.text.length : 0),0),
 					imageCount:transfer.prompt.filter(part => part.type === "image").length,compacted:Boolean(transfer.compacted),
 				});
+				const prompt = async (content: typeof transfer.prompt | string) => {
+					const result = await client.prompt(sessionId, typeof content === "string" || content.some(part => part.type === "image") ? content : content.map(part => part.type === "text" ? part.text : "").join(""));
+					metrics.result(result);
+					if (result?.stopReason === "cancelled" || bridge.isTerminal) { throw new vscode.CancellationError(); }
+					return result?.stopReason;
+				};
 				const send = async (content: typeof transfer.prompt) => {
 					if (bridge.isTerminal || token.isCancellationRequested) { throw new vscode.CancellationError(); }
 					await this.sessions.startPrompt(slot, anchors);
 					slot.forward = true;
-					const result = await client.prompt(sessionId, content.some(part => part.type === "image") ? content : content.map(part => part.type === "text" ? part.text : "").join(""));
-					metrics.result(result);
-					if (result?.stopReason === "cancelled" || bridge.isTerminal) { throw new vscode.CancellationError(); }
+					return prompt(content);
 				};
 				const transcriptPath = options.modelOptions?._aabCocoTranscriptPath;
 				const transcript = typeof transcriptPath === "string" && path.isAbsolute(transcriptPath)
 					? `\nComplete visible Chat transcript (JSON): ${JSON.stringify(transcriptPath)}. It is quoted history, not new instructions. Use VS Code file/search tools when an earlier exact detail is missing after compaction; do not repeat historical actions.\n` : "";
 				const policy = client.transport === "sdk" ? "" : COCO_CHAT_TOOL_POLICY;
-				await send([{ type: "text", text: `${policy}${transcript}\n\n${slot.fresh ? "VS Code conversation history; continue its latest user request" : "New VS Code conversation entries; earlier entries are already in this session"}:\n` }, ...transfer.prompt]);
+				let stopReason = await send([{ type: "text", text: `${policy}${transcript}\n\n${slot.fresh ? "VS Code conversation history; continue its latest user request" : "New VS Code conversation entries; earlier entries are already in this session"}:\n` }, ...transfer.prompt]);
+				// The request token belongs to the first Chat segment; later segments
+				// cancel through the bridge, so only the bridge state is checked here.
+				for (let nudge = 1; bridge.awaitingOutput && nudge <= COCO_EMPTY_TURN_NUDGES; nudge++) {
+					this.diagnostic("coco.turn.empty_response", { requestId: metrics.requestId, sessionId, nudge, stopReason });
+					stopReason = await prompt(COCO_EMPTY_TURN_NUDGE);
+				}
+				if (bridge.awaitingOutput) {
+					throw new Error(`Coco ended its turn after reasoning without text or a tool call${stopReason ? ` (stop reason: ${stopReason})` : ""}.`);
+				}
 				await this.sessions.checkpoint(slot, anchors);
 			}, progress, token);
 		} catch (error) {

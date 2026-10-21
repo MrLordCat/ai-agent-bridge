@@ -195,7 +195,8 @@ suite("Coco conversation continuity", () => {
 			const native = f.make(); await f.send(native, [user("FIRST")]);
 			const blocked = path.join(f.root, "blocked-sidecar"); await fs.writeFile(blocked, "not a directory");
 			const composite = new CompositeChatModelProvider({ history: new ConversationHistory(blocked), providers: [{ id: "coco", provider: native, ownsModel: () => true }] });
-			await assert.rejects(composite.provideLanguageModelChatResponse(model, [user("FIRST"), assistant("Done"), user("NEXT")], options(), { report: () => undefined }, none), /Cannot save.*Chat transcript/);
+			// A file used as a directory can fail at restore (ENOTDIR) or save (after ENOENT), depending on the platform.
+			await assert.rejects(composite.provideLanguageModelChatResponse(model, [user("FIRST"), assistant("Done"), user("NEXT")], options(), { report: () => undefined }, none), /Cannot (restore|save).*Chat transcript/);
 			assert.strictEqual(f.stats().sessions, 1); assert.strictEqual(f.prompts.length, 1); composite.dispose();
 		} finally { await f.dispose(); }
 	});

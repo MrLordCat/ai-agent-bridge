@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.18.18 (local development patch) - 2026-10-21
+
+- Coco: `tool_search` no longer stops the request. With many Chat tools the
+  Coco CLI defers their schemas and loads them through this built-in catalog
+  lookup, which has no side effects; other built-in actions are still stopped.
+- Coco: a native turn that ends after reasoning alone (in the reported case,
+  5 minutes and 620 KB of reasoning with no text or tool call) no longer returns
+  an empty response. Copilot treated it as a failed request and retried it three
+  times with tool results of a finished turn, which failed with `The Coco tool
+  session is no longer active`. The provider now asks the same native session to
+  continue (at most twice) and otherwise reports the empty turn with its stop
+  reason.
+- Coco: `no longer active` now says whether the turn was cancelled or had
+  already finished, and the case is recorded as `coco.request.stale_results`.
+- CI: accept both restore and save failures when testing a blocked common
+  transcript directory; Linux detects the invalid path before Windows does.
+
 ## 1.18.17 (local development patch) - 2026-10-20
 
 Runtime efficiency while agents work (plan:

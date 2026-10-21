@@ -79,6 +79,9 @@ suite("Coco native Chat tools", () => {
 			assert.strictEqual((final[0] as vscode.LanguageModelTextPart).value, "Done");
 			assert.strictEqual(clients, 1); assert.strictEqual(sessions, 1); assert.strictEqual(prompts, 1);
 			assert.strictEqual(disposed, true);
+			await assert.rejects(provider.provideLanguageModelChatResponse(model, continuation(secondCall, "Output from Chat"), options,
+				{ report: () => undefined }, laterToken.token), /no longer active: its native turn had already finished/,
+				"a Chat retry of a finished turn names the reason");
 		} finally { firstToken.dispose(); laterToken.dispose(); provider.dispose(); }
 	});
 
@@ -132,6 +135,57 @@ suite("Coco native Chat tools", () => {
 			await assert.rejects(segment, /internal action.*bash/);
 			assert.strictEqual(stopped, 1);
 		} finally { bridge.dispose(); token.dispose(); }
+	});
+
+	test("lets Coco look up deferred tool schemas through its own catalog", async () => {
+		const bridge = new CocoTurnBridge([tool], () => undefined);
+		const token = new vscode.CancellationTokenSource();
+		const parts: vscode.LanguageModelResponsePart[] = [];
+		try {
+			await bridge.start(async () => {
+				bridge.accept({ sessionUpdate: "tool_call", title: "tool_search", kind: "other", rawInput: { query: "terminal" } });
+				bridge.accept({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Found it" } });
+			}, { report: part => parts.push(part) }, token.token);
+			assert.strictEqual((parts[0] as vscode.LanguageModelTextPart).value, "Found it");
+		} finally { bridge.dispose(); token.dispose(); }
+	});
+
+	const reasoningOnlyProvider = (replies: Array<string | undefined>, prompts: string[]) => new CocoChatModelProvider({
+		isEnabled: () => true, resolveCli: () => "mock-cli",
+		createClient: (_exe, _cwd, _connection, _model, handlers) => ({
+			initialize: async () => undefined, newSession: async () => ({ sessionId: "session" }),
+			prompt: async (_sessionId: string, prompt: string) => {
+				prompts.push(prompt);
+				handlers?.onUpdate?.({ sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "Designing the module" } });
+				const reply = replies[prompts.length - 1];
+				if (reply) { handlers?.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: reply } }); }
+				return { stopReason: "end_turn" };
+			},
+			cancel: () => undefined, dispose: () => undefined,
+		}) as unknown as CocoAcpClient,
+	});
+
+	test("asks the native session to continue after a reasoning-only turn instead of returning an empty response", async () => {
+		const prompts: string[] = [];
+		const provider = reasoningOnlyProvider([undefined, "Next step"], prompts);
+		const token = new vscode.CancellationTokenSource(), parts: vscode.LanguageModelResponsePart[] = [];
+		try {
+			await provider.provideLanguageModelChatResponse(model, [vscode.LanguageModelChatMessage.User("Work")], options, { report: part => parts.push(part) }, token.token);
+			assert.strictEqual(prompts.length, 2, "one follow-up prompt in the same session");
+			assert.match(prompts[1], /without visible text or a tool call/);
+			assert.ok(parts.some(part => part instanceof vscode.LanguageModelTextPart && part.value === "Next step"));
+		} finally { provider.dispose(); token.dispose(); }
+	});
+
+	test("reports a turn that stays empty instead of letting Chat retry stale tool results", async () => {
+		const prompts: string[] = [];
+		const provider = reasoningOnlyProvider([], prompts);
+		const token = new vscode.CancellationTokenSource();
+		try {
+			await assert.rejects(provider.provideLanguageModelChatResponse(model, [vscode.LanguageModelChatMessage.User("Work")], options, { report: () => undefined }, token.token),
+				/ended its turn after reasoning without text or a tool call \(stop reason: end_turn\)/);
+			assert.strictEqual(prompts.length, 3, "the original prompt and two follow-ups");
+		} finally { provider.dispose(); token.dispose(); }
 	});
 
 	test("stops ACP permission requests and closes the CLI without opening a separate approval flow", async () => {

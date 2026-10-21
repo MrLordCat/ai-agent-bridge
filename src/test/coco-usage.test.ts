@@ -66,7 +66,11 @@ suite("Coco context usage", () => {
 			createClient: (_exe, _cwd, _connection, _model, handlers) => ({
 				initialize: async () => undefined,
 				newSession: async () => ({ sessionId: "session" }),
-				prompt: async () => { handlers?.onUpdate?.(update()); return { stopReason: "end_turn", usage: { inputTokens: 999_999_999 } }; },
+				prompt: async () => {
+					handlers?.onUpdate?.(update());
+					handlers?.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Done" } });
+					return { stopReason: "end_turn", usage: { inputTokens: 999_999_999 } };
+				},
 				cancel: () => undefined, dispose: () => undefined,
 			}) as unknown as CocoAcpClient });
 		const token = new vscode.CancellationTokenSource(), parts: vscode.LanguageModelResponsePart[] = [];

@@ -65,8 +65,12 @@ suite("Coco vision", () => {
 		for (const supported of [true, false]) {
 			let sent: string | readonly CocoPromptContent[] | undefined;
 			const provider = new CocoChatModelProvider({ isEnabled: () => true, resolveCli: () => "mock",
-				createClient: () => ({ initialize: async () => init(supported), newSession: async () => session,
-					prompt: async (_id: string, prompt: string | readonly CocoPromptContent[]) => { sent = prompt; return { stopReason: "end_turn" }; },
+				createClient: (_exe, _cwd, _connection, _model, handlers) => ({ initialize: async () => init(supported), newSession: async () => session,
+					prompt: async (_id: string, prompt: string | readonly CocoPromptContent[]) => {
+						sent = prompt;
+						handlers?.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "A chart" } });
+						return { stopReason: "end_turn" };
+					},
 					cancel: () => undefined, dispose: () => undefined }) as unknown as CocoAcpClient });
 			const token = new vscode.CancellationTokenSource();
 			try {
