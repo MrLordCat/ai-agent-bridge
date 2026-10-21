@@ -53,6 +53,13 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		// _copilotConversationId. Normalize once before journaling and routing so
 		// all providers keep the same durable keys across a host update.
 		const usableId = (value: unknown): value is string => typeof value === "string" && Boolean(value.trim()) && value.length <= 512;
+		// A subagent runs under the parent chat's conversation id. Sharing it would
+		// cancel the parent's pending tool turn, take over its native session and
+		// overwrite its journal, so a subagent run stays ephemeral.
+		if (usableId(options.modelOptions?._copilotSubagentInvocationId)) {
+			options = { ...options, modelOptions: Object.fromEntries(Object.entries(options.modelOptions!)
+				.filter(([key]) => key !== "_copilotConversationId" && key !== "_conversationId")) };
+		}
 		if (!usableId(options.modelOptions?._copilotConversationId) && usableId(options.modelOptions?._conversationId)) {
 			options = { ...options, modelOptions: { ...options.modelOptions, _copilotConversationId: options.modelOptions!._conversationId } };
 		}

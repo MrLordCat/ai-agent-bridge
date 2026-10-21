@@ -1182,3 +1182,63 @@ export function formatTokenCount(value: number): string {
 	}
 	return String(value);
 }
+
+/** A trailing, rate-limited callback: bursts of calls run it at most once per interval. */
+export interface CoalescedCallback extends vscode.Disposable {
+	(): void;
+	/** Runs a scheduled call now. */
+	flush(): void;
+}
+
+/**
+ * Coalesces calls so `action` runs at most once per `intervalMs`, after the
+ * last call of a burst has been seen. Live turns and status ticks arrive
+ * several times a second; their consumers only need the latest state.
+ * A promise returned by `action` is awaited before the next run starts.
+ */
+export function coalesce(action: () => void | Promise<void>, intervalMs: number): CoalescedCallback {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let running: Promise<void> | undefined;
+	let pending = false;
+	let disposed = false;
+	const run = (): void => {
+		timer = undefined;
+		if (disposed) {
+			return;
+		}
+		if (running) {
+			pending = true;
+			return;
+		}
+		pending = false;
+		running = Promise.resolve()
+			.then(action)
+			.catch(() => undefined)
+			.finally(() => {
+				running = undefined;
+				if (pending && !disposed) {
+					schedule();
+				}
+			});
+	};
+	const schedule = (): void => {
+		if (!timer && !disposed) {
+			timer = setTimeout(run, intervalMs);
+		}
+	};
+	const callback = (() => schedule()) as CoalescedCallback;
+	callback.flush = () => {
+		if (timer) {
+			clearTimeout(timer);
+			run();
+		}
+	};
+	callback.dispose = () => {
+		disposed = true;
+		if (timer) {
+			clearTimeout(timer);
+			timer = undefined;
+		}
+	};
+	return callback;
+}

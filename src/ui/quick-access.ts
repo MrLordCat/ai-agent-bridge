@@ -17,8 +17,9 @@ import {
 } from "../context/context-budget";
 import { resolveSharedContextLimit } from "../context/provider-handoff";
 import {
-	getCopilotPatchStatus,
+	getCopilotPatchSummary,
 	findCopilotBundle,
+	type CopilotPatchTarget,
 } from "../copilot-patch";
 import {
 	formatCompactTokenCount,
@@ -471,9 +472,19 @@ export function buildCocoItem(
 	});
 }
 
-export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickAccessItem> {
+const QUICK_ACCESS_REFRESH_DELAY_MS = 200;
+let cachedCopilotPatchTarget: CopilotPatchTarget | undefined;
+
+/** The bundle location is fixed for the lifetime of the extension host. */
+function copilotPatchTarget(): CopilotPatchTarget {
+	cachedCopilotPatchTarget ??= findCopilotBundle(vscode.env.appRoot);
+	return cachedCopilotPatchTarget;
+}
+
+export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickAccessItem>, vscode.Disposable {
 	private readonly _onDidChangeTreeData = new vscode.EventEmitter<void>();
 	readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+	private refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	private readonly dependencies: QuickAccessDependencies;
 	constructor(dependencies: QuickAccessDependencies | (() => string | undefined) = {}, ...legacy: unknown[]) {
@@ -497,7 +508,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 	private get getDeepSeekBalance() { return this.dependencies.getDeepSeekBalance ?? (() => undefined); }
 	private get getCodexUsageLimitPercent() { return this.dependencies.getCodexUsageLimitPercent ?? (() => undefined); }
 	private get getCodexUsageLimitReset() { return this.dependencies.getCodexUsageLimitReset ?? (() => undefined); }
-	private get getCodexUsageLimitWindow() { return this.dependencies.getCodexUsageLimitWindow ?? (() => undefined); }
 	private get getClaudeUsageLimitPercent() { return this.dependencies.getClaudeUsageLimitPercent ?? (() => undefined); }
 	private get getClaudeUsageLimitReset() { return this.dependencies.getClaudeUsageLimitReset ?? (() => undefined); }
 	private get getMemoryContextTokens() { return this.dependencies.getMemoryContextTokens ?? (() => 0); }
@@ -508,7 +518,23 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 	private get getCocoStatus() { return this.dependencies.getCocoStatus ?? (() => undefined); }
 
 	refresh(): void {
-		this._onDidChangeTreeData.fire();
+		// Live turns, provider ticks and status probes ask for a refresh several
+		// times a second while an agent runs; one rebuild per window is enough.
+		if (this.refreshTimer) {
+			return;
+		}
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = undefined;
+			this._onDidChangeTreeData.fire();
+		}, QUICK_ACCESS_REFRESH_DELAY_MS);
+	}
+
+	dispose(): void {
+		if (this.refreshTimer) {
+			clearTimeout(this.refreshTimer);
+			this.refreshTimer = undefined;
+		}
+		this._onDidChangeTreeData.dispose();
 	}
 
 	getTreeItem(element: QuickAccessItem): vscode.TreeItem {
@@ -1156,11 +1182,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			],
 		});
 
-		const patchStatus = getCopilotPatchStatus(findCopilotBundle(vscode.env.appRoot));
+		const patchStatus = getCopilotPatchSummary(copilotPatchTarget());
+		const controls = patchStatus.applied ? "controls \u2713" : patchStatus.legacyPatch ? "controls outdated" : "controls \u2717";
 		const patches = new QuickAccessItem("patches", "Copilot Patches", {
-			description: `${patchStatus.applied ? "controls \u2713" : "controls \u2717"} \u00b7 ${patchStatus.workbenchApplied ? "bounds \u2713" : "bounds \u2717"}`,
+			description: `${controls} \u00b7 ${patchStatus.workbenchApplied ? "bounds \u2713" : "bounds \u2717"}`,
 			icon: new vscode.ThemeIcon("pinned"),
-			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. The agent-host thinking patch is toggled below. Click to open the detailed status log.`,
+			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : patchStatus.legacyPatch ? "outdated (an older patch version is installed)" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. The agent-host thinking patch is toggled below. Click to open the detailed status log.`,
 			children: [
 				new QuickAccessItem("patches.thinking", "Thinking picker (Agents)", {
 					description: "toggle the thinking-level picker for BYOK models",

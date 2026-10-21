@@ -20,6 +20,8 @@ import { CocoTurnMetrics, type CocoLiveTurn, type CocoRecordedUsage } from "./tu
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 
 const DISCOVERY_RETRY_MS = 60_000;
+/** Shared-context archives not rewritten for two weeks belong to finished chats. */
+const COCO_ARCHIVE_RETENTION_MS = 14 * 24 * 60 * 60_000;
 export const COCO_DISCOVERY_TIMEOUT_MS = 45_000;
 const AUTO_MODEL: CocoModel = { id: "auto", name: "Auto", description: "Snowflake selects an available model" };
 
@@ -134,6 +136,7 @@ export class CocoChatModelProvider implements vscode.LanguageModelChatProvider, 
 	constructor(private readonly dependencies: CocoProviderDependencies = {}) {
 		this.sessions = new CocoSessionStore(dependencies.state, dependencies.storageRoot ? path.join(dependencies.storageRoot, "sessions.json") : undefined);
 		this.archive = new CocoHistoryArchive(dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge", "coco-history"));
+		void this.archive.prune(COCO_ARCHIVE_RETENTION_MS).catch(() => undefined);
 	}
 
 	private sessionIdentity(modelId: string): string {

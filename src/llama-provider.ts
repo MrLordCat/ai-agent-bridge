@@ -130,6 +130,13 @@ type ToolResultModeConfig = "auto" | "tool" | "user";
 type ToolCallingModeConfig = "classic" | "apiDirect";
 
 const MAX_CONTEXT_LENGTH = 1048576;
+const UNREACHABLE_SOURCE_RETRY_MS = 15_000;
+const UNREACHABLE_SOURCE_MAX_RETRY_MS = 60_000;
+const RUNTIME_CONTEXT_MISS_RETRY_MS = 30_000;
+
+/** A catalog source failed moments ago; its stale catalog is served without a request. */
+class SourceRetryDeferredError extends Error {}
+
 interface RuntimeContextCacheEntry {
     serverUrl: string;
     apiKeyPresent: boolean;
@@ -542,6 +549,14 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private readonly modelListCache = new AsyncResourceCache<LlamaCppModelInfo[]>();
     private readonly catalogCredentials = new Map<string, { key?: string; revision: number }>();
     private readonly runtimeContextCache = new Map<string, RuntimeContextCacheEntry>();
+    /**
+     * Catalog sources whose model list failed recently. VS Code re-reads the
+     * catalog many times a minute while an agent runs; a server that is down
+     * is asked again only after this pause (15 s, doubling up to 60 s).
+     */
+    private readonly unreachableSources = new Map<string, { retryAt: number; delayMs: number }>();
+    /** `/slots` probes that returned nothing, so they are not repeated on every poll. */
+    private readonly runtimeContextMisses = new Map<string, number>();
     private readonly cachePrefixSnapshots = new BoundedMap<string, CachePrefixSnapshot>(32);
     private readonly stableToolCatalogs = new BoundedMap<string, StableToolCatalogSnapshot>(32);
     /** Count of tool results that indicated execution failures in the current turn. */
@@ -653,6 +668,8 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     this.sourceRouter.refresh();
         this.modelListCache.clear();
         this.runtimeContextCache.clear();
+        this.unreachableSources.clear();
+        this.runtimeContextMisses.clear();
         this.serverTokenCounter.clear();
         this.log("models.refresh.requested");
         this._onDidChangeLanguageModelChatInformation.fire();
@@ -2539,7 +2556,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
     private static readonly CONTINUATION_STATE_KEY = "llamacpp.continuation_snapshots.v1";
     private static readonly SESSION_STATE_PERSIST_THROTTLE_MS = 2_000;
     private lastSessionStatePersistAt = 0;
-    private sessionStatePersistPending = false;
 
     private loadPersistedReasoningMap(): void {
         if (this.reasoningMapLoaded || !this.globalState) {
@@ -2738,11 +2754,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         // at the end of each turn (persistContinuationState).
         const now = Date.now();
         if (!force && now - this.lastSessionStatePersistAt < LlamaCppChatModelProvider.SESSION_STATE_PERSIST_THROTTLE_MS) {
-            this.sessionStatePersistPending = true;
             return;
         }
         this.lastSessionStatePersistAt = now;
-        this.sessionStatePersistPending = false;
         try {
             const filePath = this.sessionStateFilePath();
             if (!filePath) {
@@ -3278,25 +3292,6 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         );
     }
 
-    private compactOpenAiMessages(
-        messages: OpenAIChatMessage[],
-        tokenBudget: number,
-        keepLastCount: number,
-        label: string,
-        maxToolResultChars?: number
-    ): OpenAIChatMessage[] {
-        return compactMessages(messages, {
-            tokenBudget,
-            keepLastCount,
-            label,
-            maxToolResultChars,
-            estimateTokens: candidate => Math.max(
-                1,
-                Math.round(this.estimateOpenAiMessageTokens(candidate) * this.heuristicCalibration)
-            ),
-        });
-    }
-
     private async compactOpenAiMessagesWithSemanticSummary(
         messages: OpenAIChatMessage[],
         tokenBudget: number,
@@ -3763,12 +3758,37 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         if (cached !== undefined) {
             return cached;
         }
+        const missKey = this.getSourceCacheKey(source.key, source.serverUrl, apiKeyPresent);
+        const missedAt = this.runtimeContextMisses.get(missKey);
+        if (missedAt !== undefined && Date.now() - missedAt < RUNTIME_CONTEXT_MISS_RETRY_MS) {
+            return undefined;
+        }
 
         const runtimeContextLength = await this.fetchRuntimeContextLength(source, apiKey);
         if (runtimeContextLength !== undefined) {
+            this.runtimeContextMisses.delete(missKey);
             this.cacheRuntimeContextLength(source, apiKeyPresent, runtimeContextLength);
+        } else {
+            this.runtimeContextMisses.set(missKey, Date.now());
         }
         return runtimeContextLength;
+    }
+
+    private isSourceRetryDeferred(cacheKey: string): boolean {
+        const entry = this.unreachableSources.get(cacheKey);
+        return entry !== undefined && Date.now() < entry.retryAt;
+    }
+
+    private recordSourceFailure(cacheKey: string): void {
+        const previous = this.unreachableSources.get(cacheKey);
+        if (previous && Date.now() < previous.retryAt) {
+            // Concurrent callers of one failed load count as one failure.
+            return;
+        }
+        const delayMs = previous
+            ? Math.min(previous.delayMs * 2, UNREACHABLE_SOURCE_MAX_RETRY_MS)
+            : UNREACHABLE_SOURCE_RETRY_MS;
+        this.unreachableSources.set(cacheKey, { retryAt: Date.now() + delayMs, delayMs });
     }
 
     private async fetchModelsWithInflightCache(
@@ -3777,8 +3797,21 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         apiKeyPresent: boolean
     ): Promise<LlamaCppModelInfo[]> {
         void apiKeyPresent;
-        const models = await this.modelListCache.get(this.getCatalogCacheKey(source), () => this.fetchModels(source.serverUrl, apiKey), { ttlMs: 0 });
+        const cacheKey = this.getCatalogCacheKey(source);
+        if (this.isSourceRetryDeferred(cacheKey)) {
+            throw new SourceRetryDeferredError(`${source.label} was unreachable; the next attempt is deferred.`);
+        }
+        let models: LlamaCppModelInfo[] | undefined;
+        try {
+            models = await this.modelListCache.get(cacheKey, () => this.fetchModels(source.serverUrl, apiKey), { ttlMs: 0 });
+        } catch (error) {
+            if (!(error instanceof vscode.CancellationError)) {
+                this.recordSourceFailure(cacheKey);
+            }
+            throw error;
+        }
         if (!models) { throw new vscode.CancellationError(); }
+        this.unreachableSources.delete(cacheKey);
         return models;
     }
 
@@ -3948,14 +3981,17 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                 return;
             }
 
-            this.log("models.request.start", {
-                source: source.key,
-                serverUrl: source.serverUrl,
-                hasApiKey: apiKeyPresent,
-                silent: options.silent,
-                cancelled: token.isCancellationRequested,
-                modelListCacheTtlMs,
-            });
+            const retryDeferred = this.isSourceRetryDeferred(this.getCatalogCacheKey(source));
+            if (!retryDeferred) {
+                this.log("models.request.start", {
+                    source: source.key,
+                    serverUrl: source.serverUrl,
+                    hasApiKey: apiKeyPresent,
+                    silent: options.silent,
+                    cancelled: token.isCancellationRequested,
+                    modelListCacheTtlMs,
+                });
+            }
 
             try {
                 const models = await this.fetchModelsWithInflightCache(source, source.apiKey, apiKeyPresent);
@@ -3976,24 +4012,28 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     })),
                 });
             } catch (err) {
-                this.logError("models.request.failed", err, {
-                    source: source.key,
-                    serverUrl: source.serverUrl,
-                    silent: options.silent,
-                });
+                if (!(err instanceof SourceRetryDeferredError)) {
+                    this.logError("models.request.failed", err, {
+                        source: source.key,
+                        serverUrl: source.serverUrl,
+                        silent: options.silent,
+                    });
+                }
                 const staleModels = this.getAnyCachedModels(source, apiKeyPresent);
                 if (staleModels) {
                     this.publishApiContextMaximum(staleModels, source, runtimeContextLength);
                     const entries = staleModels.map(model => this.mapModelInfo(model, source, runtimeContextLength));
                     allEntries.push(...entries);
-                    this.log("models.request.stale_cache_fallback", {
-                        source: source.key,
-                        serverUrl: source.serverUrl,
-                        count: entries.length,
-                    });
+                    if (!retryDeferred) {
+                        this.log("models.request.stale_cache_fallback", {
+                            source: source.key,
+                            serverUrl: source.serverUrl,
+                            count: entries.length,
+                        });
+                    }
                     return;
                 }
-                if (!options.silent) {
+                if (!options.silent && !retryDeferred) {
                     console.error(`[Llama.cpp Provider] Failed to fetch models from ${source.label}`, err);
                 }
             }

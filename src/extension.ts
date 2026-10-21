@@ -47,6 +47,7 @@ import { CompositeChatModelProvider } from "./composite-provider";
 import { ConversationHistory } from "./providers/conversation-history";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
 import { getSubagentModelProfiles } from "./subagent-guidance";
+import { coalesce } from "./utils";
 import { TokenUsageHistory, type TokenUsageSample } from "./token-usage-history";
 import {
 	renderUsageExperimentMarkdown,
@@ -686,6 +687,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
 	});
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
+	context.subscriptions.push(quickActionsProvider);
 	context.subscriptions.push(apiProviderService.onDidChangeContext(() => {
 		// A loaded catalog is also availability evidence (Cursor's probe can lag).
 		void providerDirectory.refresh().catch(error => logService.logError("providers.catalog_refresh.failed", error));
@@ -696,11 +698,24 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(memoryService.onDidChange(() => MemoryManagerPanel.refreshIfOpen()));
 	context.subscriptions.push(tokenUsageHistory.onDidChange(() => quickActionsProvider.refresh()));
 	context.subscriptions.push(usageExperiments.onDidChange(() => quickActionsProvider.refresh()));
+	// Subscription providers re-announce an unchanged state with every runtime
+	// tick (Codex: every 200 ms while a turn streams). The directory only reads
+	// state and summary, so it is refreshed when those move; the open manager
+	// panel picks up the live numbers at most once a second.
+	const refreshManagerPanel = coalesce(() => ApiProviderManagerPanel.refreshIfOpen(), 1_000);
+	context.subscriptions.push(refreshManagerPanel);
 	for (const { id, provider } of subscriptionProviders) {
 		const onStatus = provider.onDidChangeStatus as vscode.Event<{ state: string; summary: string }>;
 		context.subscriptions.push(onStatus(status => {
+			const previous = subscriptionStatuses.get(id);
 			subscriptionStatuses.set(id, { state: status.state, summary: status.summary });
-			void providerDirectory.refresh(); quickActionsProvider.refresh(); ApiProviderManagerPanel.refreshIfOpen();
+			quickActionsProvider.refresh();
+			if (previous?.state !== status.state || previous?.summary !== status.summary) {
+				void providerDirectory.refresh();
+				ApiProviderManagerPanel.refreshIfOpen();
+			} else {
+				refreshManagerPanel();
+			}
 		}));
 	}
 	context.subscriptions.push(cocoProvider.onDidChangeLanguageModelChatInformation(() => quickActionsProvider.refresh()));
@@ -1054,15 +1069,21 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	};
 
 	// Auto-refresh the live report and webview panel after every completed turn
-	// from any provider (Llama, Codex, Claude).
+	// from any provider (Llama, Codex, Claude). Running turns update the tracker
+	// several times a second: the panel follows at most twice a second and the
+	// file at most every two seconds, one write at a time.
+	const refreshSessionQualityPanel = coalesce(() => SessionQualityPanel.refreshIfOpen(), 500);
+	const scheduleLiveSessionReport = coalesce(writeLiveSessionReport, 2_000);
+	context.subscriptions.push(refreshSessionQualityPanel, {
+		dispose: () => {
+			scheduleLiveSessionReport.flush();
+			scheduleLiveSessionReport.dispose();
+		},
+	});
 	context.subscriptions.push(
-		sessionQuality.onDidChange(async () => {
-			SessionQualityPanel.refreshIfOpen();
-			try {
-				await writeLiveSessionReport();
-			} catch {
-				// Don't block the turn pipeline on a file write.
-			}
+		sessionQuality.onDidChange(() => {
+			refreshSessionQualityPanel();
+			scheduleLiveSessionReport();
 		})
 	);
 

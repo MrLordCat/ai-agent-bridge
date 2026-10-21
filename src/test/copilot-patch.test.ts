@@ -153,8 +153,18 @@ suite("Copilot patch", () => {
 		const originalWorkbench = fs.readFileSync(fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath, "utf8");
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v24"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v26"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
+		// A subagent alternating with its parent must not flip Copilot's
+		// main-agent model: every flip re-announced the model list and made VS
+		// Code re-read all provider catalogs.
+		if (original.includes("this._mainAgentBYOKModel=")) {
+			assert.match(
+				patched,
+				/&&!\(([A-Za-z_$][\w$]*)!==([A-Za-z_$][\w$]*)&&\1\.subAgentInvocationId\)\)\{let [A-Za-z_$][\w$]*=\2\.vendor!=="copilot"\?\2:void 0/,
+				"subagent requests must keep the main agent model"
+			);
+		}
 		// Saved chat sessions keep tool results verbatim unless they are bounded
 		// at the two assignment sites; sessions with view_image calls otherwise
 		// grow past the V8 string limit and VS Code fails to serialize a request.
@@ -231,9 +241,17 @@ suite("Copilot patch", () => {
 			patched.includes("_copilotConversationId:__llamaConversationId"),
 			"llama conversation id must be sent to the model"
 		);
+		// Subagents reuse the parent's conversationId; only webSocketConnectionId
+		// (= request.subAgentInvocationId) tells them apart.
+		if (original.includes("webSocketConnectionId:this.options.request.subAgentInvocationId")) {
+			assert.match(patched, /async makeChatRequest2\(\{[^}]*webSocketConnectionId:([A-Za-z_$][\w$]*)\}[\s\S]*_copilotSubagentInvocationId:\1\}/,
+				"the subagent invocation id must reach the provider");
+		} else {
+			assert.ok(!patched.includes("_copilotSubagentInvocationId"), "bundles without the marker must not guess a subagent id");
+		}
 		assert.match(
 			patched,
-			/async makeChatRequest2\(\{[^}]*telemetryProperties:u,modelCapabilities:[A-Za-z_$][\w$]*(?:,conversationId:[A-Za-z_$][\w$]*)?\}/,
+			/async makeChatRequest2\(\{[^}]*telemetryProperties:u,modelCapabilities:[A-Za-z_$][\w$]*(?:,conversationId:[A-Za-z_$][\w$]*)?(?:,webSocketConnectionId:[A-Za-z_$][\w$]*)?\}/,
 			"request signature must be kept intact for the installed Copilot shape"
 		);
 		assert.ok(

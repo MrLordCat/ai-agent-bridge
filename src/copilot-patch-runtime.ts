@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 
 import {
 	applyCopilotPatch,
+	CopilotPatchBusyError,
 	findCopilotBundles,
 	formatCopilotPatchStatus,
 	getCopilotPatchStatus,
@@ -296,6 +297,11 @@ async function applyPatch(
 		output.appendLine(`[${new Date().toISOString()}] Patch failed: ${message}`);
 		output.appendLine(describeSearch(vscode.env.appRoot).join("\n") + "\n");
 		output.appendLine("");
+		if (!userInitiated && error instanceof CopilotPatchBusyError) {
+			// Another window is patching this bundle right now and reports the
+			// result itself; this window picks the patch up on its next reload.
+			return;
+		}
 		if (userInitiated) {
 			if (permissionError(message)) {
 				await offerPermissionRecovery(context, output, `Copilot Chat patch failed: ${message}`);
@@ -306,7 +312,7 @@ async function applyPatch(
 			return;
 		}
 
-		const failureSignature = `${vscode.version}:${message}`;
+		const failureSignature = `${vscode.version}:${String(context.extension.packageJSON.version)}:${message}`;
 		if (context.globalState.get<string>(LAST_FAILURE_KEY) === failureSignature) {
 			// Permission errors (EPERM, EACCES, EBUSY) are transient — the file
 			// may be locked by a concurrent process or Windows Defender, and a

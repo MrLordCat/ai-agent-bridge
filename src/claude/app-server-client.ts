@@ -249,16 +249,6 @@ export interface ClaudeAgentSessionOptions {
 	callbacks: ClaudeAgentSessionCallbacks;
 }
 
-export async function hasPersistedClaudeSession(sessionId: string, cwd: string): Promise<boolean> {
-	try {
-		const sdk = await import("@anthropic-ai/claude-agent-sdk");
-		const messages = await sdk.getSessionMessages(sessionId, { dir: cwd, limit: 1 });
-		return messages.length > 0;
-	} catch {
-		return false;
-	}
-}
-
 export interface ClaudePersistedSessionValidation {
 	exists: boolean;
 	resumeBoundaryValid: boolean;

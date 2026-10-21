@@ -29,11 +29,23 @@ function decodePart(part: Part): vscode.LanguageModelTextPart | vscode.LanguageM
 }
 function decode(message: Message): vscode.LanguageModelChatRequestMessage { return new vscode.LanguageModelChatMessage(message.role, message.content.map(decodePart)); }
 
+/**
+ * Every step merges the whole stored journal against the incoming request, so
+ * a long chat would otherwise re-encode and re-hash all earlier messages (and
+ * their images) on each tool round. Message objects are never mutated after
+ * they are created, so their key is computed once.
+ */
+const messageKeys = new WeakMap<vscode.LanguageModelChatRequestMessage, string>();
+
 function messageKey(message: vscode.LanguageModelChatRequestMessage): string {
+	const cached = messageKeys.get(message);
+	if (cached !== undefined) { return cached; }
 	const parts = message.content.flatMap(encodePart);
 	const text = parts.filter((p): p is Extract<Part, { type: "text" }> => p.type === "text").map(p => p.text).join("");
 	const stable = parts.filter(p => p.type !== "text").map(p => p.type === "result" ? { type: p.type, callId: p.callId } : p.type === "data" ? { type: p.type, mimeType: p.mimeType, hash: hash(p.data) } : p);
-	return hash(JSON.stringify([message.role, normalizeSystemDate(normalizeVolatileHostContext(text)), stable]));
+	const key = hash(JSON.stringify([message.role, normalizeSystemDate(normalizeVolatileHostContext(text)), stable]));
+	messageKeys.set(message, key);
+	return key;
 }
 
 /** Match retained anchors, preserve missing middle entries, and cut branches before edited requests. */

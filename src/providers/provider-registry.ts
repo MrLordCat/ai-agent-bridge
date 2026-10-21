@@ -18,8 +18,6 @@ export const BUILTIN_PROVIDER_SOURCES: readonly ProviderSourceDefinition[] = [
 	{ id: "coco", label: "Coco", description: "Snowflake Cortex Code", kind: "coco", mode: "subscription", enabledSetting: "enableCoco" },
 ];
 
-export const SUBSCRIPTION_PROVIDER_SOURCES = BUILTIN_PROVIDER_SOURCES.filter(source => source.mode === "subscription");
-
 /** Persisted identifiers retain their format; all consumers use source identity. */
 export function providerSourceId(modelId: string): string {
 	return parseProviderModelId(modelId).sourceKey ?? "primary";
@@ -40,12 +38,29 @@ export interface ChatProviderRegistration {
 	onForeignRequest?: (conversationId?: unknown) => Promise<unknown>;
 }
 
+/**
+ * VS Code re-reads the whole catalog on every model selection, and Copilot
+ * re-selects models on each model-change event, so one agent turn can ask
+ * for it dozens of times within a second. Answers are shared for this long;
+ * any adapter change event drops them at once.
+ */
+const CATALOG_REUSE_MS = 3_000;
+
+interface CatalogEntry {
+	generation: number;
+	at?: number;
+	models?: vscode.LanguageModelChatInformation[];
+	pending?: Promise<vscode.LanguageModelChatInformation[]>;
+}
+
 /** Routing, catalog ownership and change propagation share one registration list. */
 export class ProviderRegistry implements vscode.Disposable {
 	private readonly changed = new vscode.EventEmitter<void>();
 	readonly onDidChange = this.changed.event;
 	private readonly owners = new Map<string, ChatProviderRegistration>();
 	private readonly subscriptions: vscode.Disposable[];
+	private readonly catalogs = new Map<boolean, CatalogEntry>();
+	private generation = 0;
 	readonly registrations: readonly ChatProviderRegistration[];
 	get sources(): readonly ProviderSourceDefinition[] {
 		return [
@@ -67,6 +82,7 @@ export class ProviderRegistry implements vscode.Disposable {
 		this.subscriptions = registrations.flatMap(registration => {
 			const listener = registration.provider.onDidChangeLanguageModelChatInformation?.(() => {
 				for (const [id, owner] of this.owners) { if (owner === registration) { this.owners.delete(id); } }
+				this.generation++; this.catalogs.clear();
 				this.changed.fire();
 			});
 			return listener ? [listener] : [];
@@ -74,22 +90,47 @@ export class ProviderRegistry implements vscode.Disposable {
 	}
 
 	async models(options: { silent: boolean }, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
-		const results = await Promise.allSettled(this.registrations.map(async registration => ({
-			registration, models: await registration.provider.provideLanguageModelChatInformation(options, token) ?? [],
-		})));
-		const models = new Map<string, vscode.LanguageModelChatInformation>();
-		const owners = new Map<string, ChatProviderRegistration>();
-		for (const result of results) {
-			if (result.status !== "fulfilled") { continue; }
-			const { registration, models: catalog } = result.value;
-			for (const model of catalog) {
-				if (owners.has(model.id) && owners.get(model.id) !== registration) { throw new Error(`Model has multiple provider owners: ${model.id}`); }
-				owners.set(model.id, registration); models.set(model.id, model);
-			}
+		const silent = options.silent === true;
+		let entry = this.catalogs.get(silent);
+		if (entry?.generation !== this.generation) {
+			entry = { generation: this.generation };
+			this.catalogs.set(silent, entry);
 		}
-		if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
-		this.owners.clear(); for (const [id, owner] of owners) { this.owners.set(id, owner); }
-		return [...models.values()].sort((a, b) => a.name.localeCompare(b.name));
+		if (entry.models && entry.at !== undefined && Date.now() - entry.at < CATALOG_REUSE_MS) {
+			return [...entry.models];
+		}
+		const current = entry;
+		current.pending ??= this.loadModels(options).then(models => {
+			if (current.generation === this.generation) { current.models = models; current.at = Date.now(); }
+			return models;
+		}).finally(() => { current.pending = undefined; });
+		// The shared load does not follow one caller's token: a cancelled caller
+		// leaves, the others keep waiting for the same answer.
+		const models = await raceCancellation(current.pending, token);
+		return [...models];
+	}
+
+	private async loadModels(options: { silent: boolean }): Promise<vscode.LanguageModelChatInformation[]> {
+		const source = new vscode.CancellationTokenSource();
+		try {
+			const results = await Promise.allSettled(this.registrations.map(async registration => ({
+				registration, models: await registration.provider.provideLanguageModelChatInformation(options, source.token) ?? [],
+			})));
+			const models = new Map<string, vscode.LanguageModelChatInformation>();
+			const owners = new Map<string, ChatProviderRegistration>();
+			for (const result of results) {
+				if (result.status !== "fulfilled") { continue; }
+				const { registration, models: catalog } = result.value;
+				for (const model of catalog) {
+					if (owners.has(model.id) && owners.get(model.id) !== registration) { throw new Error(`Model has multiple provider owners: ${model.id}`); }
+					owners.set(model.id, registration); models.set(model.id, model);
+				}
+			}
+			this.owners.clear(); for (const [id, owner] of owners) { this.owners.set(id, owner); }
+			return [...models.values()].sort((a, b) => a.name.localeCompare(b.name));
+		} finally {
+			source.dispose();
+		}
 	}
 
 	resolve(modelId: string): ChatProviderRegistration {
@@ -107,5 +148,16 @@ export class ProviderRegistry implements vscode.Disposable {
 		}
 	}
 
-	dispose(): void { for (const subscription of this.subscriptions) { subscription.dispose(); } this.owners.clear(); this.changed.dispose(); }
+	dispose(): void { for (const subscription of this.subscriptions) { subscription.dispose(); } this.owners.clear(); this.catalogs.clear(); this.changed.dispose(); }
+}
+
+function raceCancellation<T>(promise: Promise<T>, token: vscode.CancellationToken): Promise<T> {
+	if (token.isCancellationRequested) { return Promise.reject(new vscode.CancellationError()); }
+	return new Promise<T>((resolve, reject) => {
+		const listener = token.onCancellationRequested(() => { listener.dispose(); reject(new vscode.CancellationError()); });
+		promise.then(
+			value => { listener.dispose(); if (token.isCancellationRequested) { reject(new vscode.CancellationError()); } else { resolve(value); } },
+			error => { listener.dispose(); reject(error); }
+		);
+	});
 }

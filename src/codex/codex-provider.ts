@@ -608,6 +608,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.loadDurableConversationThreads();
 		this.loadPendingRollover();
 		this.codexKeepAliveTimer = setInterval(() => void this.runCodexCacheKeepAliveCycle(), 60_000);
+		this.codexKeepAliveTimer.unref?.();
 	}
 
 	get statusSummary(): string {
@@ -1710,6 +1711,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			clearTimeout(this.runtimeRefreshTimer);
 			this.runtimeRefreshTimer = undefined;
 		}
+		if (this.codexKeepAliveTimer) {
+			clearInterval(this.codexKeepAliveTimer);
+			this.codexKeepAliveTimer = undefined;
+		}
 		this.client.dispose();
 		this.modelChanges.dispose();
 		this.statusChanges.dispose();
@@ -2571,10 +2576,16 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	}
 
 	private async runCodexCacheKeepAliveCycle(): Promise<void> {
-		try {
-			await this.refreshStatus();
-		} catch (error) {
-			this.logSink?.logError("codex.usage_periodic_refresh.failed", error);
+		// The extension's usage timer already refreshes the account status every
+		// minute (two app-server requests). The keep-alive needs its own fresh
+		// snapshot only when it may send a turn.
+		const enabled = vscode.workspace.getConfiguration("llamacpp").get<boolean>("codexCacheKeepAliveEnabled", false) === true;
+		if (enabled && Date.now() - this.lastStatusRefreshAt >= CODEX_STATUS_REFRESH_INTERVAL_MS) {
+			try {
+				await this.refreshStatus();
+			} catch (error) {
+				this.logSink?.logError("codex.usage_periodic_refresh.failed", error);
+			}
 		}
 		await this.maybeRunCodexCacheKeepAlive();
 	}
@@ -2662,9 +2673,6 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			this.codexCacheKeepAliveStatusValue = completed
 				? `OK — refreshed ${candidate.prefixTokens.toLocaleString("en-US")}-token prefix`
 				: "Turn rejected (busy/closed)";
-			if (completed) {
-				this.lastCodexKeepAliveAt = Date.now();
-			}
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
 			this.codexCacheKeepAliveStatusValue = `Failed — ${truncate(detail, 160)}`;
@@ -2677,7 +2685,6 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 	}
 
-	private lastCodexKeepAliveAt: number | undefined;
 	private lastCodexKeepAliveAttemptAt: number | undefined;
 
 	private async runCodexKeepAliveTurn(
@@ -2842,18 +2849,6 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private clampNumber(value: unknown, min: number, max: number, fallback: number): number {
 		return typeof value === "number" && Number.isFinite(value)
 			? Math.max(min, Math.min(max, Math.floor(value)))
-			: fallback;
-	}
-
-
-	private clampRatio(value: unknown, min: number, max: number, fallback: number): number {
-		return typeof value === "number" && Number.isFinite(value)
-			? Math.max(min, Math.min(max, value))
-			: fallback;
-	}
-	private clampInt(value: unknown, min: number, max: number, fallback: number): number {
-		return typeof value === "number" && Number.isFinite(value) && Number.isInteger(value)
-			? Math.max(min, Math.min(max, value))
 			: fallback;
 	}
 }

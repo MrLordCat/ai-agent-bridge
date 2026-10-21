@@ -4,6 +4,7 @@ import { CocoAcpClient } from "../coco/acp-client";
 import { CocoChatModelProvider } from "../coco/coco-provider";
 import { mapCocoModel } from "../coco/model-adapter";
 import { CocoTurnBridge, collectCocoToolResults, convertCocoToolResult } from "../coco/turn-bridge";
+import { CompositeChatModelProvider } from "../composite-provider";
 
 suite("Coco native Chat tools", () => {
 	const model = mapCocoModel({ id: "auto", name: "Auto" });
@@ -191,6 +192,62 @@ suite("Coco native Chat tools", () => {
 			await assert.rejects(provider.provideLanguageModelChatResponse(model, continuation(call, "completed result"), options, { report: () => undefined }, token.token), /native request was interrupted:.*Network connection/);
 			assert.strictEqual(callbacks, 1);
 		} finally { provider.dispose(); token.dispose(); }
+	});
+
+	test("keeps a pending tool turn alive while a subagent of the same chat runs on another provider", async () => {
+		let disposed = false;
+		const received: unknown[] = [], seen: unknown[] = [];
+		const coco = new CocoChatModelProvider({
+			isEnabled: () => true, resolveCli: () => "mock-cli",
+			createClient: (_exe, _cwd, _connection, _model, handlers) => {
+				let alias = "";
+				return {
+					initialize: async () => undefined,
+					newSession: async (_cwd: string, tools: Array<Record<string, unknown>>) => { alias = String(tools[0].name); return { sessionId: "parent" }; },
+					prompt: async () => {
+						received.push(await handlers?.onClientTool?.(alias, { command: "runSubagent" }));
+						handlers?.onUpdate?.({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "Parent done" } });
+						return { stopReason: "end_turn" };
+					},
+					cancel: () => undefined, dispose: () => { disposed = true; },
+				} as unknown as CocoAcpClient;
+			},
+		});
+		const composite = new CompositeChatModelProvider([
+			{ id: "coco", provider: coco, ownsModel: id => id.startsWith("coco::"), onForeignRequest: id => coco.onForeignRequest(id) },
+			{ id: "cursor", ownsModel: id => id.startsWith("cursor::"), provider: {
+				provideLanguageModelChatInformation: async () => [], provideTokenCount: async () => 1,
+				provideLanguageModelChatResponse: async (_m, _messages, subagentOptions) => { seen.push(subagentOptions.modelOptions); },
+			} },
+		]);
+		const token = new vscode.CancellationTokenSource();
+		const chat = { ...options, modelOptions: { _copilotConversationId: "parent-chat" } };
+		try {
+			const first: vscode.LanguageModelResponsePart[] = [];
+			await composite.provideLanguageModelChatResponse(model, [vscode.LanguageModelChatMessage.User("Delegate")], chat,
+				{ report: part => first.push(part) }, token.token);
+			const call = callFrom(first);
+			// Copilot sends the subagent with the parent's conversation id.
+			await composite.provideLanguageModelChatResponse({ ...model, id: "cursor::fixture" }, [vscode.LanguageModelChatMessage.User("Subagent task")],
+				{ ...options, modelOptions: { _copilotConversationId: "parent-chat", _conversationId: "parent-chat", _copilotSubagentInvocationId: "sub-1" } },
+				{ report: () => undefined }, token.token);
+			assert.deepStrictEqual(seen, [{ _copilotSubagentInvocationId: "sub-1" }], "a subagent run is not bound to the parent conversation");
+			assert.strictEqual(disposed, false, "the subagent must not close the parent's suspended prompt");
+			const final: vscode.LanguageModelResponsePart[] = [];
+			await composite.provideLanguageModelChatResponse(model, continuation(call, "Subagent report"), chat,
+				{ report: part => final.push(part) }, token.token);
+			assert.deepStrictEqual(received, [{ output: "Subagent report" }]);
+			assert.strictEqual((final[0] as vscode.LanguageModelTextPart).value, "Parent done");
+			// Without the marker the same request is still treated as a provider switch.
+			const second: vscode.LanguageModelResponsePart[] = [];
+			await composite.provideLanguageModelChatResponse(model, [vscode.LanguageModelChatMessage.User("Delegate again")], chat,
+				{ report: part => second.push(part) }, token.token);
+			await composite.provideLanguageModelChatResponse({ ...model, id: "cursor::fixture" }, [vscode.LanguageModelChatMessage.User("Switch")], chat,
+				{ report: () => undefined }, token.token);
+			await new Promise<void>(resolve => setImmediate(resolve));
+			await assert.rejects(composite.provideLanguageModelChatResponse(model, continuation(callFrom(second), "late"), chat,
+				{ report: () => undefined }, token.token), /no longer active|interrupted/);
+		} finally { composite.dispose(); coco.dispose(); token.dispose(); }
 	});
 
 	test("matches trailing results only and bounds text without turning binary data into text", () => {

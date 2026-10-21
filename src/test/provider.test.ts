@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 import { LlamaCppChatModelProvider, stripCacheControlArtifacts } from "../llama-provider";
 import { injectSharedMemoryContext } from "../memory/prompt";
 import { MANUAL_COMPACTION_TRIGGER } from "../context/manual-compaction";
+import { compactMessages } from "../context/message-compaction";
 import { ReasoningRepetitionDetector, ReasoningRepetitionError } from "../context/reasoning-repetition";
 import { ToolCallValidationError, type ToolCallReliabilityMetrics } from "../tools/tool-call-reliability";
 import type { OpenAIChatMessage, OpenAIFunctionToolDef } from "../types";
@@ -592,41 +593,31 @@ suite("Llama.cpp Chat Provider Extension", () => {
         });
 
         test("compact summary redacts verbose tool payloads", () => {
-            const providerAny = provider as unknown as {
-                compactOpenAiMessages: (
-                    messages: Array<{
-                        role: "system" | "user" | "assistant" | "tool";
-                        content?: string;
-                        name?: string;
-                        tool_calls?: Array<{ function?: { name?: string } }>;
-                    }>,
-                    tokenBudget: number,
-                    keepLastCount: number,
-                    label: string
-                ) => Array<{ role: string; content?: string }>;
-            };
-
             const longToolPayload = "tool-payload-very-long-1234567890".repeat(40);
             // Keep the target below the large source payload but high enough
             // for the redacted summary itself under strict final-budget rules.
-            const compacted = providerAny.compactOpenAiMessages(
+            const compacted = compactMessages(
                 [
                     { role: "system", content: "sys" },
                     { role: "user", content: "start" },
                     {
                         role: "assistant",
-                        tool_calls: [{ function: { name: "read_file" } }],
+                        tool_calls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: "{}" } }],
                     },
                     {
                         role: "tool",
                         name: "read_file",
+                        tool_call_id: "call_1",
                         content: longToolPayload,
                     },
                     { role: "user", content: "latest" },
-                ],
-                300,
-                1,
-                "Conversation summary (auto-compact)"
+                ] as OpenAIChatMessage[],
+                {
+                    tokenBudget: 300,
+                    keepLastCount: 1,
+                    label: "Conversation summary (auto-compact)",
+                    estimateTokens: messages => Math.max(1, Math.ceil(JSON.stringify(messages).length / 4)),
+                }
             );
 
             const summary = compacted.find(msg => msg.role === "user" && typeof msg.content === "string" && msg.content.includes("Conversation summary"));

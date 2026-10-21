@@ -1,5 +1,50 @@
 # Changelog
 
+## 1.18.17 (local development patch) - 2026-10-20
+
+Runtime efficiency while agents work (plan:
+[docs/AGENT_RUNTIME_PERFORMANCE_PLAN.md](docs/AGENT_RUNTIME_PERFORMANCE_PLAN.md)).
+
+- Copilot patch v26: a subagent request no longer replaces Copilot's main-agent
+  model. Each parent/subagent alternation used to re-announce the model list,
+  and VS Code re-read every provider catalog (431 reads in 20 minutes of one
+  Cursor subagent, 77 s of extension-host work).
+- One catalog load now answers a burst of model selections (shared for 3 s,
+  dropped by any provider change). An unreachable Local/API server is asked
+  again after 15 s, doubling up to 60 s, instead of on every poll; an empty
+  `/slots` answer is reused for 30 s. Refresh Models retries at once.
+- Quick Access no longer reads and hashes the 19 MB Copilot and workbench
+  bundles on every rebuild (about 110 ms of blocked extension host each time).
+  It rebuilds at most every 200 ms; subscription status ticks refresh the
+  provider directory only when state or summary changes; the live session
+  report is written at most every 2 s and its panel updated at most twice a
+  second.
+- Copilot patch backups: a backup is written only from a bundle without
+  patch markers, a lock file serialises patching across windows, and a
+  contaminated backup is reported and refused with an explicit message.
+  A clean installed bundle replaces a contaminated backup automatically.
+  Quick Access shows `controls outdated` for an older installed patch. On this
+  machine two windows had saved an already patched bundle as the original, so
+  v23-v25 never applied.
+- Codex: the keep-alive timer no longer repeats the account and rate-limit
+  requests of the extension's usage timer when keep-alive is off, and it is
+  cleared on dispose.
+- The shared conversation journal hashes each message once instead of on every
+  step. Coco shared-context archives not rewritten for 14 days are deleted.
+- Removed unused code: `compactCodexMessages`, `hasPersistedClaudeSession`,
+  `SUBSCRIPTION_PROVIDER_SOURCES` and seven unused members.
+
+## 1.18.16 (local development patch) - 2026-10-20
+
+- Fix `The Coco tool session is no longer active` after a subagent: Copilot
+  sends a subagent request with the parent chat's conversation id, so a
+  subagent on another provider was treated as a model switch and closed the
+  Coco prompt waiting for `runSubagent`. Copilot patch v25 forwards the
+  subagent invocation id, and a subagent run no longer carries the parent's
+  conversation id. It cannot cancel the parent's pending tool turn (Coco,
+  Codex, Cursor), take over its native session or overwrite its shared journal.
+  Reload the window after the patch is applied.
+
 ## 1.18.15 (local development patch) - 2026-10-20
 
 - One working context for Codex, Claude, Coco and Cursor:

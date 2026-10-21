@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. The extension applies compatible patches on startup
 and exposes apply, status and restore commands; no installer or external patch
-script is required. Patch v24 makes the following changes:
+script is required. Patch v26 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -82,6 +82,20 @@ script is required. Patch v24 makes the following changes:
 - Copilot's stable conversation id is forwarded through provider-private
   `modelOptions` so completed Codex threads can be reused even when Copilot
   rewrites generated history. The id is never written to extension logs.
+- a subagent request reuses the parent chat's conversation id. Copilot marks
+  it only with `webSocketConnectionId = request.subAgentInvocationId`; v25
+  forwards that value as `modelOptions._copilotSubagentInvocationId` when the
+  bundle assigns it this meaning. The extension then runs the subagent without
+  the parent's conversation id: it does not cancel the parent's pending tool
+  turn (for example a Coco prompt waiting for `runSubagent`), does not take
+  over the parent's native session and does not write the shared journal.
+- a subagent request no longer replaces Copilot's "main agent" model
+  (v26). `getChatEndpoint` fires `onDidModelsRefresh` whenever that model
+  changes, so a subagent on another provider flipped it on every round, and
+  each flip made VS Code re-read every provider's model catalog (431 catalog
+  reads in 20 minutes of one subagent run). Copilot itself already treats
+  subagent requests as not changing the chat's model. The anchor is optional:
+  a bundle without it receives the rest of the patch.
 - advertised tools and schema keys use deterministic ordering. Copilot waits for
   tool definitions only after their cached signature actually changes, avoiding
   an unnecessary tool-catalog cold start on every provider continuation;
@@ -141,9 +155,10 @@ that chat request.
 `llamacpp.autoPatchCopilot` defaults to `true`. On extension startup, the
 runtime discovers installed Copilot bundles and associates them with the active
 desktop workbench. Read-only bundles from another Linux installation are
-skipped. If patch v24 is already present, startup is silent. If a bundle is changed, the extension asks
+skipped. If patch v26 is already present, startup is silent. If a bundle is changed, the extension asks
 for one window reload. A repeated compatibility failure is logged but shown at
-most once per VS Code build.
+most once per VS Code build and extension version. Quick Access shows
+`controls outdated` while an older patch version is installed.
 
 Command Palette exposes:
 
@@ -186,8 +201,23 @@ Before writing, the patcher:
 6. creates separate restorable backups beside both bundles;
 7. records original and patched SHA-256 hashes for both files.
 
-Applying patch v24 over an older supported patch marker uses the preserved
+Applying patch v26 over an older supported patch marker uses the preserved
 original backup rather than stacking edits on the already modified bundle.
+
+The backup itself is checked as well:
+
+- a backup is written only from bundle bytes that carry no AI Agent Bridge
+  marker, and from the bytes that were checked, not from a second read;
+- a lock file next to the bundle (`*.llama-vscode-chat.lock`) serialises
+  patching across VS Code windows and the elevated runner. Two windows that
+  start after an update previously both created the backup, and the slower one
+  could save the bundle the faster one had already patched. A lock older than
+  two minutes is treated as left by a crashed process;
+- a backup that already contains a patch is reported as `contaminated` in the
+  status log. Upgrade and restore refuse it with an explicit message instead of
+  failing on a missing anchor; reinstalling VS Code or Copilot Chat provides a
+  clean bundle. When the installed bundle is clean, a contaminated or identical
+  backup is replaced with it automatically.
 
 The patch is deliberately fail-closed. If a Copilot update changes the bundle
 shape, the extension stops instead of applying a broad replacement and leaves

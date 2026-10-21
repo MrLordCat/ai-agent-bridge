@@ -38,6 +38,35 @@ export function splitCocoHistory(parts: readonly CocoPromptContent[], maximum: n
 /** Workspace-private copies preserve details even after native model compaction. */
 export class CocoHistoryArchive {
 	constructor(private readonly root: string, private readonly maximumBytes = COCO_MAX_PROMPT_BYTES) {}
+	/**
+	 * Deletes archived transcripts and images not written for `maxAgeMs`. Each
+	 * save rewrites the files it references, so a live conversation keeps its
+	 * own. Only the per-scope hash directories are touched: the same root also
+	 * holds the session store.
+	 */
+	async prune(maxAgeMs: number): Promise<number> {
+		const cutoff = Date.now() - maxAgeMs;
+		let removed = 0;
+		const scopes = await fs.readdir(this.root, { withFileTypes: true }).catch(() => []);
+		for (const scope of scopes) {
+			if (!scope.isDirectory() || !/^[0-9a-f]{64}$/.test(scope.name)) { continue; }
+			const directory = path.join(this.root, scope.name);
+			const files = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+			let kept = 0;
+			for (const file of files) {
+				const filePath = path.join(directory, file.name);
+				const stat = file.isFile() ? await fs.stat(filePath).catch(() => undefined) : undefined;
+				if (stat && stat.mtimeMs < cutoff) {
+					await fs.rm(filePath, { force: true });
+					removed++;
+				} else {
+					kept++;
+				}
+			}
+			if (!kept) { await fs.rmdir(directory).catch(() => undefined); }
+		}
+		return removed;
+	}
 	async save(parts: readonly CocoPromptContent[], scope: string): Promise<string> {
 		const directory = path.join(this.root, createHash("sha256").update(scope).digest("hex"));
 		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
