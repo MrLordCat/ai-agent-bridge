@@ -9,6 +9,7 @@ import { CursorProfileTransport } from "../cursor/profile-transport";
 import { CURSOR_NATIVE_TOOL_POLICY, CursorSdkTransport, cursorSdkRuntimeAvailable, type CursorLocalAgent } from "../cursor/sdk-transport";
 import { CursorToolBridge } from "../cursor/tool-bridge";
 import { CursorNativeStore } from "../cursor/native-store";
+import { IndexedLocalAgentStore } from "../cursor/indexed-store";
 import type { ChatModelSource } from "../model-sources/source-routing";
 
 const none: vscode.CancellationToken = { isCancellationRequested: false, onCancellationRequested: () => new vscode.Disposable(() => undefined) };
@@ -104,6 +105,8 @@ suite("Cursor native tools", () => {
 		if (!cursorSdkRuntimeAvailable()) { this.skip(); }
 		const sdk = await import("@cursor/sdk");
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "cursor-sdk-host-test-"));
+		const stores: IndexedLocalAgentStore[] = [];
+		const indexed = () => { const store = new IndexedLocalAgentStore(root, sdk); stores.push(store); return new CursorNativeStore(store).store; };
 		try {
 			const other = { ...tool, name: "search_repo" };
 			const bridge = new CursorToolBridge([tool, other], () => undefined);
@@ -112,14 +115,17 @@ suite("Cursor native tools", () => {
 			assert.strictEqual(JSON.stringify(bridge.customTools), prefix, "Callback declaration order must survive a reloaded catalog");
 			const config: AgentOptions = {
 				apiKey: "offline-test-key", tools: ["mcp"], mcpServers: {}, agents: {},
-				local: { cwd: root, store: new CursorNativeStore(new sdk.JsonlLocalAgentStore(root)).store, settingSources: [], customTools: bridge.customTools, autoReview: false },
+				local: { cwd: root, store: indexed(), settingSources: [], customTools: bridge.customTools, autoReview: false },
 			};
 			const agent = await sdk.Agent.create(config);
 			assert.ok(agent.agentId);
 			agent.close();
-			const restored = await sdk.Agent.resume(agent.agentId, { ...config, local: { ...config.local, store: new CursorNativeStore(new sdk.JsonlLocalAgentStore(root)).store } });
-			assert.strictEqual(restored.agentId, agent.agentId); restored.close(); bridge.dispose();
-		} finally { await fs.rm(root, { recursive: true, force: true }); }
+			const restored = await sdk.Agent.resume(agent.agentId, { ...config, local: { ...config.local, store: indexed() } });
+			assert.strictEqual(restored.agentId, agent.agentId); restored.close();
+			// The files stay readable by the stock SDK store, so a downgrade keeps the native session.
+			const stock = await sdk.Agent.resume(agent.agentId, { ...config, local: { ...config.local, store: new CursorNativeStore(new sdk.JsonlLocalAgentStore(root)).store } });
+			assert.strictEqual(stock.agentId, agent.agentId); stock.close(); bridge.dispose();
+		} finally { await Promise.all(stores.map(store => store.dispose())); await fs.rm(root, { recursive: true, force: true }); }
 	});
 
 	test("starts a new request after historical Cursor results without reviving old tool sessions", async () => {

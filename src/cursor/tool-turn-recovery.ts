@@ -27,6 +27,29 @@ export function matchFailedCursorTurn(failure: CursorFailedTurn, messages: reado
 		replayCallIds: extra.size ? visible.filter(call => extra.has(call.signature)).map(call => call.callId) : undefined };
 }
 
+/**
+ * A failed run's checkpoint ends after its last VS Code tool result. Its unique call IDs locate that
+ * point even when retention or host context has changed the hashes of earlier user messages.
+ */
+export function cursorFailedTurnBoundary(messages: readonly vscode.LanguageModelChatRequestMessage[], callIds: readonly string[]): number {
+	const wanted = new Set(callIds), calls = new Set<string>(), results = new Set<string>();
+	let end = -1;
+	for (const [index, message] of messages.entries()) {
+		for (const part of message.content) {
+			if (part instanceof vscode.LanguageModelToolCallPart && wanted.has(part.callId)) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.Assistant || calls.has(part.callId)) { return -1; }
+				calls.add(part.callId);
+			} else if (part instanceof vscode.LanguageModelToolResultPart && wanted.has(part.callId)) {
+				if (message.role !== vscode.LanguageModelChatMessageRole.User || !calls.has(part.callId) || results.has(part.callId)) { return -1; }
+				results.add(part.callId); end = index;
+			}
+		}
+	}
+	// Older rounds may be retained away, but the last failed call must be complete and followed by a new request.
+	if (!results.has(callIds.at(-1)!) || calls.size !== results.size) { return -1; }
+	return canonicalConversationUserAnchors(messages).some(anchor => anchor.index > end) ? end + 1 : -1;
+}
+
 /** Completed actions absent from the native snapshot are quoted, never re-executed. */
 export function cursorRecoveryReplay(messages: readonly vscode.LanguageModelChatRequestMessage[], ids: readonly string[], before: number): vscode.LanguageModelChatRequestMessage[] {
 	if (!ids.length) { return []; }

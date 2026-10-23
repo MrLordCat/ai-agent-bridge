@@ -1,5 +1,54 @@
 # Changelog
 
+## 1.18.21 (local development patch) - 2026-10-23
+
+- Cursor: a chat whose run failed during tool work (for example "Connection
+  stalled") continues again. 1.18.20 assumed VS Code drops the failed request
+  from history, but VS Code keeps it with all its tool rounds. The real cause
+  was the boundary: it was located by user-message hashes, and those had
+  changed since the checkpoint was saved. The delta then started at the failed
+  request. The completed tool result that the checkpoint lacked fell outside
+  the replay window, so the request stopped with "Cursor recovery is missing a
+  completed tool result".
+- A failed run's checkpoint is now located by that run's own VS Code tool call
+  IDs: the delta starts after its last tool result, and only the results the
+  checkpoint lacks are quoted (not re-executed). The 1.18.20 rule that dropped
+  the last saved user message is removed. Checkpoints saved by older builds
+  are recognised from the failure record written with them.
+- A request rejected before inference no longer overwrites the saved
+  continuation boundary (it had shortened it from 15 to 12 user anchors).
+
+## 1.18.20 (local development patch) - 2026-10-23
+
+- Cursor: a chat whose last run failed (for example "Connection stalled") could
+  not continue after the failure. Every later message was rejected with "Cursor
+  could not match this request to its completed native history". On a failure
+  the provider saves the failed run's checkpoint, and that checkpoint already
+  contains the failed user message. VS Code leaves the errored request out of
+  later history, so the saved boundary never matched again. Such checkpoints
+  are now marked. For them, the history may continue without that one message,
+  on the same native agent, with no replay and no new agent. Checkpoints saved
+  by older builds are recognised from the failure record written with them.
+  Edited branches are still rejected.
+
+## 1.18.19 (local development patch) - 2026-10-23
+
+- Cursor: a long chat no longer waits minutes before the model starts. The
+  SDK's `JsonlLocalAgentStore` re-reads and re-parses a whole file for every
+  record. At run start the SDK loads the agent checkpoint blob by blob, so
+  3,478 blobs in a 100 MB `checkpoints.ndjson` took about 17 minutes, measured
+  between `RUNNING` and the first event. Every streamed run event also rewrote
+  the 45 MB `run_events.ndjson` (about 0.5 s each).
+- The provider now uses its own indexed store over the same files: each file is
+  indexed once, records are read by byte offset, and new checkpoints and run
+  events are appended. On a copy of that store, loading the checkpoint takes
+  0.3 s and an event append takes about 1 ms.
+- The native session, checkpoints and context stay as they are: no data is
+  pruned or migrated. Results and file contents match the SDK store for the
+  same operations, and the stock SDK store still opens the directory.
+- An interrupted final record is ignored, as the SDK does, and cut off before the
+  next write. Changes made by another writer are detected and re-indexed.
+
 ## 1.18.18 (local development patch) - 2026-10-21
 
 - Coco: `tool_search` no longer stops the request. With many Chat tools the

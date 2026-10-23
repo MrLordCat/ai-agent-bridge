@@ -13,6 +13,7 @@ import { CursorTurnMetrics, type CursorRecordedUsage, type CursorLiveTurn } from
 import { CursorHistoryArchive } from "./history-transfer";
 import { cursorTranscript } from "./message-adapter";
 import { CursorNativeStore, type CursorNativeCheckpoint } from "./native-store";
+import { openIndexedLocalAgentStore, type CursorStorePagination } from "./indexed-store";
 import { recoverLegacyCursorSession } from "./legacy-recovery";
 import { cursorRecoveryReplay, matchFailedCursorTurn } from "./tool-turn-recovery";
 import type { CursorFailedTurn } from "./native-store";
@@ -102,7 +103,7 @@ export class CursorSdkTransport implements vscode.Disposable {
 			if (failure?.startCheckpoint?.rootBlobId === interrupted.nativeCheckpoint.rootBlobId) {
 				const matched = matchFailedCursorTurn(failure, messages, interrupted.users);
 				if (matched && key) {
-						await this.sessions.repairFailed(key, identity, interrupted.agentId, matched.users, failure.checkpoint, matched.replayCallIds);
+						await this.sessions.repairFailed(key, identity, interrupted.agentId, matched.users, failure.checkpoint, matched.replayCallIds, matched.callIds);
 					const message = this.backendFailure(failure, source.apiKey);
 					await this.sessions.rememberToolFailure(key, identity, matched.callIds, message);
 					if (cursorResults.length && cursorResults.every(id => matched.callIds.includes(id))) { throw new Error(message); }
@@ -135,10 +136,10 @@ export class CursorSdkTransport implements vscode.Disposable {
 				const sdk = this.dependencies.createAgent ? undefined : await import("@cursor/sdk");
 				if (sdk) {
 					createNative = () => sdk.Agent.create(createOptions);
-					this.native ??= new CursorNativeStore(new sdk.JsonlLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid))));
-					createOptions.local!.store = this.native.store;
+					const native = this.nativeStore(sdk);
+					createOptions.local!.store = native.store;
 					if (session.persistent && !session.agentId && session.reason === "new_conversation" && this.dependencies.storageRoot) {
-						const recovered = await recoverLegacyCursorSession(this.native.raw, this.dependencies.storageRoot, createHash("sha256").update(session.key).digest("hex"), cwd, selection, messages);
+						const recovered = await recoverLegacyCursorSession(native.raw, this.dependencies.storageRoot, createHash("sha256").update(session.key).digest("hex"), cwd, selection, messages);
 						if (recovered && !bridge.isTerminal) { await this.sessions.recover(session, recovered); }
 					}
 				}
@@ -197,6 +198,8 @@ export class CursorSdkTransport implements vscode.Disposable {
 						if (failure && (!failure.uncheckpointedCalls?.length || partial)) {
 							session.nativeCheckpoint = failure.checkpoint;
 							if (partial) { session.nextUsers = partial.users; session.replayCallIds = partial.replayCallIds; }
+							const failedCallIds = turn.callIds.filter(id => id.startsWith("cursor-"));
+							session.failedCallIds = failedCallIds.length ? failedCallIds : undefined;
 							await this.sessions.complete(session); message = this.backendFailure(failure, source.apiKey);
 						}
 					} catch { /* Keep the original backend error if checkpoint inspection fails. */ }
@@ -220,9 +223,12 @@ export class CursorSdkTransport implements vscode.Disposable {
 	private async failedNativeTurn(agentId: string, runId: string | undefined, cwd: string): Promise<CursorFailedTurn | undefined> {
 		if (this.dependencies.failedTurn) { return this.dependencies.failedTurn(agentId, runId); }
 		if (this.dependencies.createAgent) { return undefined; }
-		const sdk = await import("@cursor/sdk");
-		this.native ??= new CursorNativeStore(new sdk.JsonlLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid))));
-		return this.native.failedTurn(agentId, runId, async id => (await sdk.Agent.getRun(id, { cwd, store: this.native!.store, runtime: "local" })).conversation());
+		const sdk = await import("@cursor/sdk"), native = this.nativeStore(sdk);
+		return native.failedTurn(agentId, runId, async id => (await sdk.Agent.getRun(id, { cwd, store: native.store, runtime: "local" })).conversation());
+	}
+	/** Indexed store over the SDK JSONL files: the stock JsonlLocalAgentStore re-parses whole files per record. */
+	private nativeStore(pagination: CursorStorePagination): CursorNativeStore {
+		return this.native ??= new CursorNativeStore(openIndexedLocalAgentStore(this.dependencies.storageRoot ?? path.join(os.tmpdir(), "ai-agent-bridge-cursor", String(process.pid)), pagination));
 	}
 	private async send(turn: Turn, input: CursorPrompt, source: ChatModelSource): Promise<void> {
 		if (turn.bridge.isTerminal) { throw new vscode.CancellationError(); }

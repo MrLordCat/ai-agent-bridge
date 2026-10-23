@@ -6,9 +6,10 @@ import type { CursorLocalAgent } from "./sdk-transport";
 import type { CursorNativeCheckpoint } from "./native-store";
 import type { CursorLegacyRecovery } from "./legacy-recovery";
 import { conversationUserAnchors, canonicalConversationUserAnchors } from "../providers/conversation-anchors";
+import { cursorFailedTurnBoundary } from "./tool-turn-recovery";
 
 const STORAGE_KEY = "llamacpp.cursor.sessions.v1";
-interface Checkpoint { key: string; identity: string; agentId: string; users: string[]; updatedAt: number; anchorVersion?: 2; nativeCheckpoint?: CursorNativeCheckpoint; inflight?: boolean; completedAt?: number; toolCatalogHash?: string; replayCallIds?: string[] }
+interface Checkpoint { key: string; identity: string; agentId: string; users: string[]; updatedAt: number; anchorVersion?: 2; nativeCheckpoint?: CursorNativeCheckpoint; inflight?: boolean; completedAt?: number; toolCatalogHash?: string; replayCallIds?: string[]; failedCallIds?: string[] }
 interface ToolFailure { key: string; identity: string; callIds: string[]; message: string; updatedAt: number }
 const diskWrites = new Map<string, Promise<void>>();
 export interface CursorSession {
@@ -19,6 +20,10 @@ export interface CursorSession {
 	nativeCheckpoint?: CursorNativeCheckpoint;
 	completedAt?: number; toolCatalogHash?: string;
 	replayCallIds?: string[];
+	/** VS Code tool calls of the failed run whose checkpoint this session holds. */
+	failedCallIds?: string[];
+	/** Saved boundary before acquire rebased it; restored when no inference starts. */
+	committed?: { users: string[]; failedCallIds?: string[] };
 }
 
 /** Completed native checkpoints only; credentials and chat text never enter Memento. */
@@ -43,7 +48,7 @@ export class CursorSessionStore {
 				|| !Number.isFinite(value.updatedAt) || Date.now() - value.updatedAt > 7 * 86400_000) { continue; }
 			if (value.nativeCheckpoint && (value.nativeCheckpoint.schemaVersion !== 1 || typeof value.nativeCheckpoint.rootBlobId !== "string" || !/^[\w+/=-]{1,256}$/.test(value.nativeCheckpoint.rootBlobId))) { continue; }
 			if (value.inflight && !value.nativeCheckpoint) { continue; }
-			if (value.replayCallIds !== undefined && (!Array.isArray(value.replayCallIds) || value.replayCallIds.length > 512 || !value.replayCallIds.every(id => typeof id === "string" && /^cursor-[\w-]{1,160}$/.test(id)))) { continue; }
+			if ([value.replayCallIds, value.failedCallIds].some(ids => ids !== undefined && (!Array.isArray(ids) || ids.length > 512 || !ids.every(id => typeof id === "string" && /^cursor-[\w-]{1,160}$/.test(id))))) { continue; }
 			if (!this.saved.has(value.key) || this.saved.get(value.key)!.updatedAt <= value.updatedAt) { this.saved.set(value.key, value); }
 		}
 	}
@@ -71,11 +76,16 @@ export class CursorSessionStore {
 		const previous = record ?? this.saved.get(actualKey), users = canonical.map(anchor => anchor.key);
 		const anchors = previous?.anchorVersion === 2 ? canonical : conversationUserAnchors(messages);
 		const sameIdentity = previous && (previous.identity === identity || legacyIdentities.includes(previous.identity));
-		const prefix = sameIdentity && previous.users.length < anchors.length && previous.users.every((s, i) => s === anchors[i].key);
 		// Retention, host-prefix changes and text-part repacking can alter old entries.
 		// A retained last completed user anchor still establishes the native continuation boundary.
+		const prefix = sameIdentity && previous.users.length < anchors.length && previous.users.every((s, i) => s === anchors[i].key);
 		const retained = sameIdentity && previous.users.length ? anchors.slice(0, -1).findLastIndex(anchor => anchor.key === previous.users.at(-1)) : -1;
-		const compatible = prefix || retained >= 0;
+		// A failed run's checkpoint is located by its own tool calls. Checkpoints saved before
+		// failedCallIds existed are recognised by the failure receipt written with them.
+		const failure = this.failures.get(actualKey);
+		const failedCallIds = previous?.failedCallIds ?? (previous?.completedAt !== undefined && failure?.identity === previous.identity && Math.abs(failure.updatedAt - previous.completedAt) < 60_000 ? failure.callIds : undefined);
+		const failedBoundary = sameIdentity && failedCallIds?.length ? cursorFailedTurnBoundary(messages, failedCallIds) : -1;
+		const compatible = failedBoundary >= 0 || prefix || retained >= 0;
 		if (sameIdentity && !compatible) {
 			throw new Error("Cursor could not match this request to its completed native history. No inference was started and the existing session was preserved. Restore the original chat branch or start a new chat; automatic full-history replay is disabled.");
 		}
@@ -89,9 +99,10 @@ export class CursorSessionStore {
 			this.live.set(actualKey, record);
 		} else { clearTimeout(record.idle); record.busy = true; record.mode = "warm"; record.nextUsers = users; }
 		record.identity = identity; record.anchorVersion = 2;
-		if (compatible) { record.reason = prefix ? "history_extended" : "history_rebased"; }
-		record.deltaStart = compatible ? anchors[prefix ? previous!.users.length : retained + 1].index : 0;
-		if (compatible) { record.users = canonical.filter(anchor => anchor.index < record!.deltaStart).map(anchor => anchor.key); }
+		record.committed = compatible ? { users: [...record.users], failedCallIds } : undefined;
+		if (compatible) { record.reason = failedBoundary >= 0 ? "failed_turn_continued" : prefix ? "history_extended" : "history_rebased"; }
+		record.deltaStart = !compatible ? 0 : failedBoundary >= 0 ? failedBoundary : anchors[prefix ? previous!.users.length : retained + 1].index;
+		if (compatible) { record.users = canonical.filter(anchor => anchor.index < record!.deltaStart).map(anchor => anchor.key); record.failedCallIds = undefined; }
 		return record;
 	}
 	async toolFailure(key: string | undefined, identity: string, callIds: readonly string[]): Promise<string | undefined> {
@@ -108,8 +119,8 @@ export class CursorSessionStore {
 		await this.ready; const saved = key ? this.saved.get(key) : undefined;
 		return saved?.identity === identity && saved.inflight && saved.nativeCheckpoint && !this.live.get(saved.key)?.busy ? saved : undefined;
 	}
-	async repairFailed(key: string, identity: string, agentId: string, users: string[], nativeCheckpoint: CursorNativeCheckpoint, replayCallIds?: string[]): Promise<void> {
-		this.saved.set(key, { key, identity, agentId, users, nativeCheckpoint, replayCallIds, anchorVersion: 2, updatedAt: Date.now() });
+	async repairFailed(key: string, identity: string, agentId: string, users: string[], nativeCheckpoint: CursorNativeCheckpoint, replayCallIds?: string[], failedCallIds?: string[]): Promise<void> {
+		this.saved.set(key, { key, identity, agentId, users, nativeCheckpoint, replayCallIds, failedCallIds, anchorVersion: 2, updatedAt: Date.now() });
 		const live = this.live.get(key); if (live && !live.busy) { this.close(live); }
 		await this.flush();
 	}
@@ -133,7 +144,7 @@ export class CursorSessionStore {
 		const agentId = record.agent?.agentId;
 		if (record.persistent && agentId && /^[\w-]{1,160}$/.test(agentId)) {
 			record.agentId = agentId;
-			this.saved.set(record.key, { key: record.key, identity: record.identity, agentId, users: record.users, updatedAt: record.touchedAt, anchorVersion: 2, nativeCheckpoint: record.nativeCheckpoint, completedAt: record.completedAt, toolCatalogHash: record.toolCatalogHash, replayCallIds: record.replayCallIds });
+			this.saved.set(record.key, { key: record.key, identity: record.identity, agentId, users: record.users, updatedAt: record.touchedAt, anchorVersion: 2, nativeCheckpoint: record.nativeCheckpoint, completedAt: record.completedAt, toolCatalogHash: record.toolCatalogHash, replayCallIds: record.replayCallIds, failedCallIds: record.failedCallIds });
 			await this.flush();
 		}
 		if (record.closed) { return; }
@@ -146,9 +157,11 @@ export class CursorSessionStore {
 	async releaseUnstarted(record: CursorSession): Promise<void> {
 		if (record.closed) { return; }
 		const agentId = record.agent?.agentId ?? record.agentId;
+		// Nothing reached the native agent, so keep the boundary that was saved before this request.
+		if (record.committed) { record.users = record.committed.users; record.failedCallIds = record.committed.failedCallIds; record.committed = undefined; }
 		if (!record.persistent || !agentId || !record.users.length || record.mode === "resume-fallback") { this.close(record); return; }
 		record.busy = false;
-		this.saved.set(record.key, { key: record.key, identity: record.identity, agentId, users: record.users, updatedAt: Date.now(), anchorVersion: 2, nativeCheckpoint: record.nativeCheckpoint, completedAt: record.completedAt, toolCatalogHash: record.toolCatalogHash, replayCallIds: record.replayCallIds });
+		this.saved.set(record.key, { key: record.key, identity: record.identity, agentId, users: record.users, updatedAt: Date.now(), anchorVersion: 2, nativeCheckpoint: record.nativeCheckpoint, completedAt: record.completedAt, toolCatalogHash: record.toolCatalogHash, replayCallIds: record.replayCallIds, failedCallIds: record.failedCallIds });
 		record.idle = setTimeout(() => this.close(record), 30 * 60_000); record.idle.unref?.();
 		await this.flush();
 	}

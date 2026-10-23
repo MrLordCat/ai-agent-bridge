@@ -179,6 +179,39 @@ suite("Cursor conversation continuity", () => {
 			assert.strictEqual(f.created.length, 1); assert.strictEqual(f.sent.length, 2);
 		} finally { await f.dispose(); }
 	});
+	test("continues a failed tool run from its last tool result when earlier user anchors no longer match", async () => {
+		for (const legacy of [false, true]) {
+			const f = await fixture();
+			try {
+				await f.respond([user("COMPLETED")]);
+				const file = path.join(f.root, "completed-sessions.json"), document = JSON.parse(await fs.readFile(file, "utf8"));
+				const [session] = document.sessions, callIds = ["cursor-first", "cursor-tail"];
+				// Retention changed the stored user hashes; only the failed run's call IDs still identify its checkpoint.
+				Object.assign(session, { users: ["a", "b", "c"].map(c => c.repeat(64)), replayCallIds: ["cursor-tail"], nativeCheckpoint: { schemaVersion: 1, rootBlobId: "native-failed-safe" } });
+				if (legacy) { document.failures = [{ key: session.key, identity: session.identity, callIds, message: "Connection stalled.", updatedAt: session.completedAt + 13 }]; }
+				else { session.failedCallIds = callIds; }
+				await fs.writeFile(file, JSON.stringify(document)); f.reload();
+				const call = (id: string, input: object) => new vscode.LanguageModelChatMessage(vscode.LanguageModelChatMessageRole.Assistant, [new vscode.LanguageModelToolCallPart(id, "read_file", input)]);
+				const result = (id: string, text: string) => new vscode.LanguageModelChatMessage(vscode.LanguageModelChatMessageRole.User, [new vscode.LanguageModelToolResultPart(id, [new vscode.LanguageModelTextPart(text)])]);
+				const failed = [user("COMPLETED"), assistant("Cursor continued."), user("STALLED_REQUEST"), call("cursor-first", { file: "a" }), result("cursor-first", "FIRST_OUTPUT"), call("cursor-tail", { file: "b" })];
+				await assert.rejects(f.respond([...failed, user("NEW")]), /No inference was started/);
+				f.failResume();
+				const visible = [...failed, result("cursor-tail", "TAIL_OUTPUT"), user("Try Again"), user("NEW")];
+				await assert.rejects(f.respond(visible), /could not restore its saved native session/);
+				const kept = JSON.parse(await fs.readFile(file, "utf8")).sessions[0];
+				assert.deepStrictEqual(kept.users, session.users, "a request that never started keeps the saved boundary");
+				f.allowResume(); await f.respond(visible);
+				assert.strictEqual(f.created.length, 1); assert.deepStrictEqual(f.restored, ["agent-1", "agent-1"]); assert.strictEqual(f.sent.length, 2);
+				const text = f.sent[1].input.text;
+				for (const expected of ["Try Again", "NEW", "TAIL_OUTPUT", "Do not execute them again"]) { assert.ok(text.includes(expected), expected); }
+				for (const old of ["STALLED_REQUEST", "FIRST_OUTPUT", "COMPLETED"]) { assert.ok(!text.includes(old), old); }
+				const saved = JSON.parse(await fs.readFile(file, "utf8")).sessions[0];
+				assert.strictEqual(saved.users.length, 4); assert.strictEqual(saved.failedCallIds, undefined); assert.strictEqual(saved.replayCallIds, undefined);
+				await f.respond([...visible, assistant("Cursor continued."), user("NEXT")]);
+				assert.strictEqual(f.sent.length, 3); assert.ok(!f.sent[2].input.text.includes("TAIL_OUTPUT")); assert.match(f.sent[2].input.text, /NEXT/);
+			} finally { await f.dispose(); }
+		}
+	});
 	test("model catalog refresh preserves a warm native session", async () => {
 		const f = await fixture();
 		const profile = new CursorProfileTransport(s => new CursorApiClient(s.apiKey!, s.serverUrl), f.sdk);
