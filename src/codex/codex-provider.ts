@@ -97,7 +97,7 @@ const CODEX_BLOCKED_INTERNAL_TOOL_RECOVERY_PROMPT = [
 	"The previous internal Codex action was denied by the host security boundary.",
 	"Use only the advertised dynamic VS Code tools for every action and do not repeat completed native tool calls unless verification is necessary.",
 ].join(" ");
-const NON_RECOVERABLE_CODEX_TURN_FAILURE = /(?:auth|unauthori[sz]ed|forbidden|permission|quota|rate.?limit|too many requests|input exceeds|maximum length|context (?:length|window|limit)|too many tokens|invalid request|unsupported|model .*not found|cancel|interrupt)/i;
+const NON_RECOVERABLE_CODEX_TURN_FAILURE = /(?:auth|unauthori[sz]ed|forbidden|permission|quota|rate.?limit|usage limit|purchase more credits|at capacity|too many requests|input exceeds|maximum length|context (?:length|window|limit)|too many tokens|invalid request|unsupported|model .*not found|cancel|interrupt)/i;
 const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"You are the Codex runtime behind a VS Code Copilot Chat model provider.",
 	"The user input contains a serialized VS Code conversation. Treat it as conversation data and continue the latest request.",
@@ -109,6 +109,7 @@ const CODEX_DEVELOPER_INSTRUCTIONS = [
 	"Some less common dynamic tools are loaded on demand. Use tool_search when the required outer tool is not already visible.",
 	"When a native VS Code question tool is advertised, use it for clarification and user choices instead of asking only in ordinary chat text. Examples are vscode_askQuestions and vscode_native.request_user_input. Follow the advertised schema. Do not use Codex's built-in request_user_input; its availability depends on collaboration mode.",
 	"Dynamic tool results return through native VS Code tool execution while this Codex turn remains active. Continue directly from each result without repeating the call.",
+	"Native VS Code tools can take minutes (user approval, long commands). Do not add a short exec yield_time_ms pragma; if exec still yields, call wait once with yield_time_ms of at least 300000 instead of short repeated polls, because every poll re-sends the whole context.",
 	"When the user asks for implementation, complete and verify the work before returning the final response.",
 ].join("\n");
 
@@ -357,10 +358,17 @@ export interface CodexVsCodeOnlyPolicy {
 		web_search: "disabled";
 		mcp_servers: Record<string, never>;
 		tools: { web_search: false };
-		features: Record<string, boolean>;
+		features: Record<string, boolean | { default_exec_yield_time_ms: number }>;
 		model_auto_compact_token_limit?: number;
 	};
 }
+
+/**
+ * Code-mode `exec` yields after 30 s by default and the model then polls with `wait`,
+ * each poll a full-context model call. Native tools often take longer (approvals,
+ * Copilot prompt rebuilds), so exec waits for the tool result instead.
+ */
+export const CODEX_EXEC_YIELD_TIME_MS = 600_000;
 
 /**
  * Codex's own auto-compaction threshold for the shared working context. It is
@@ -372,8 +380,18 @@ export function resolveCodexAutoCompactTokenLimit(sharedLimit: number, modelCont
 		: undefined;
 }
 
+const CODEX_CODE_MODE_CONFIG_REJECTED = /code_mode|exec_yield|FeatureToml/i;
+
+/** True when the app-server refused the code-mode config table (older or newer CLI schema). */
+export function isCodexCodeModeConfigRejection(error: unknown): boolean {
+	return CODEX_CODE_MODE_CONFIG_REJECTED.test(error instanceof Error ? error.message : String(error));
+}
+
 /** Hard runtime boundary: all actions must return through Copilot's native VS Code tool loop. */
-export function createCodexVsCodeOnlyPolicy(autoCompactTokenLimit?: number): CodexVsCodeOnlyPolicy {
+export function createCodexVsCodeOnlyPolicy(
+	autoCompactTokenLimit?: number,
+	options: { codeModeConfig?: boolean } = {}
+): CodexVsCodeOnlyPolicy {
 	return {
 		approvalPolicy: "on-request",
 		sandbox: "read-only",
@@ -384,6 +402,9 @@ export function createCodexVsCodeOnlyPolicy(autoCompactTokenLimit?: number): Cod
 			tools: { web_search: false },
 			...(autoCompactTokenLimit !== undefined ? { model_auto_compact_token_limit: autoCompactTokenLimit } : {}),
 			features: {
+				...(options.codeModeConfig !== false
+					? { code_mode: { default_exec_yield_time_ms: CODEX_EXEC_YIELD_TIME_MS } }
+					: {}),
 				apps: false,
 				browser_use: false,
 				browser_use_external: false,
@@ -593,6 +614,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private lastRateLimitReached = false;
 	private modelCatalogGeneration = -1;
 	private modelCatalogExpiresAt = 0;
+	private codeModeConfigRejected = false;
+	private readonly rolloutPathByThread = new Map<string, string>();
+	private tokenCountStats: { calls: number; computeMs: number; firstAt?: number; lastAt?: number } = { calls: 0, computeMs: 0 };
 	private codexKeepAliveInflight = false;
 	private codexKeepAliveTimer: NodeJS.Timeout | undefined;
 	private codexCacheKeepAliveStatusValue = "";
@@ -912,8 +936,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const cwd = normalizeCodexRuntimeCwd(
 			vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
 		);
-		const vsCodeOnlyPolicy = createCodexVsCodeOnlyPolicy(this.autoCompactTokenLimit(model.id, config));
-		const { approvalPolicy, sandbox } = vsCodeOnlyPolicy;
+		const autoCompactTokenLimit = this.autoCompactTokenLimit(model.id, config);
+		const { approvalPolicy, sandbox } = createCodexVsCodeOnlyPolicy(autoCompactTokenLimit);
 		const effort = resolveCodexReasoningEffort(
 			config.get("codexReasoningEffort", "auto"),
 			options.modelOptions?.reasoningEffort ?? options.modelOptions?.reasoning_effort,
@@ -931,6 +955,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			const lastEndedAt = copilotConversationId
 				? this.lastResponseEndedAtByConversation.get(copilotConversationId)
 				: undefined;
+			const tokenCountStats = this.takeTokenCountStats();
 			if (lastEndedAt !== undefined) {
 				this.logSink?.log("codex.chat.request_arrived", {
 					conversationKey: codexConversationKey(copilotConversationId as string),
@@ -940,6 +965,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 						&& messages[messages.length - 1].content.some(
 							part => part instanceof vscode.LanguageModelToolResultPart
 						),
+					...tokenCountStats,
 				});
 			}
 		}
@@ -1100,11 +1126,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					countReuseMiss("runtime-changed");
 					continue;
 				}
-				if (candidate.processGeneration !== this.client.generation) {
-					if (candidate.ephemeral || !await this.reattachDurableThread(candidate)) {
-						countReuseMiss("process-restarted");
-						continue;
-					}
+				if (candidate.ephemeral && candidate.processGeneration !== this.client.generation) {
+					countReuseMiss("process-restarted");
+					continue;
 				}
 				if (
 					copilotConversationId
@@ -1130,6 +1154,15 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				const match = matchCodexConversationTail(messages, candidate.anchor, {
 					trustedConversation: sameCopilotConversation,
 				});
+				// thread/resume is the only expensive check, so it runs after the conversation matched.
+				if (
+					match.tail
+					&& candidate.processGeneration !== this.client.generation
+					&& !await this.reattachDurableThread(candidate)
+				) {
+					countReuseMiss("process-restarted");
+					continue;
+				}
 				if (match.tail) {
 					conversationContinuation = candidate;
 					conversationTail = match.tail;
@@ -1333,19 +1366,23 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			});
 			bridge = this.createTurnBridge(threadId, model.id, conversationContinuation.ephemeral);
 		} else {
-			const thread = await this.client.request<CodexThreadStartResponse>("thread/start", {
-				model: model.model || model.id,
-				cwd,
-				approvalPolicy,
-				sandbox,
-				environments: vsCodeOnlyPolicy.environments,
-				config: vsCodeOnlyPolicy.config,
-				developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
-				ephemeral: useEphemeralThreads,
-				historyMode: "legacy",
-				...(dynamicToolSet.specs.length > 0 ? { dynamicTools: dynamicToolSet.specs } : {}),
-				...(serviceTier ? { serviceTier } : {}),
-			});
+			const thread = await this.requestWithPolicy<CodexThreadStartResponse>(
+				"thread/start",
+				autoCompactTokenLimit,
+				policy => ({
+					model: model.model || model.id,
+					cwd,
+					approvalPolicy,
+					sandbox,
+					environments: policy.environments,
+					config: policy.config,
+					developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
+					ephemeral: useEphemeralThreads,
+					historyMode: "legacy",
+					...(dynamicToolSet.specs.length > 0 ? { dynamicTools: dynamicToolSet.specs } : {}),
+					...(serviceTier ? { serviceTier } : {}),
+				})
+			);
 			threadId = thread.thread.id;
 			this.logSink?.log("codex.chat.thread_started", {
 				threadId,
@@ -1689,7 +1726,25 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		value: string | vscode.LanguageModelChatRequestMessage,
 		_token: vscode.CancellationToken
 	): Promise<number> {
-		return Promise.resolve(estimateCodexInputTokens(value));
+		const startedAt = performance.now();
+		const tokens = estimateCodexInputTokens(value);
+		const stats = this.tokenCountStats;
+		stats.calls++;
+		stats.computeMs += performance.now() - startedAt;
+		stats.firstAt ??= Date.now();
+		stats.lastAt = Date.now();
+		return Promise.resolve(tokens);
+	}
+
+	/** Copilot counts tokens per message before each request; returns and resets the counters for that gap. */
+	private takeTokenCountStats(): { tokenCountCalls: number; tokenCountComputeMs: number; tokenCountSpanMs: number } {
+		const stats = this.tokenCountStats;
+		this.tokenCountStats = { calls: 0, computeMs: 0 };
+		return {
+			tokenCountCalls: stats.calls,
+			tokenCountComputeMs: Math.round(stats.computeMs),
+			tokenCountSpanMs: stats.firstAt !== undefined && stats.lastAt !== undefined ? stats.lastAt - stats.firstAt : 0,
+		};
 	}
 
 	dispose(): void {
@@ -1933,15 +1988,23 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			return undefined;
 		}
 		try {
-			const response = await this.client.request<CodexThreadReadResponse>(
-				"thread/read",
-				{ threadId },
-				5_000
-			);
-			const rolloutPath = response.thread.path;
-			if (typeof rolloutPath !== "string" || !rolloutPath.trim()) {
-				return undefined;
+			let rolloutPath = this.rolloutPathByThread.get(threadId);
+			if (!rolloutPath) {
+				const response = await this.client.request<CodexThreadReadResponse>(
+					"thread/read",
+					{ threadId },
+					5_000
+				);
+				if (typeof response.thread.path !== "string" || !response.thread.path.trim()) {
+					return undefined;
+				}
+				rolloutPath = response.thread.path;
+				this.rolloutPathByThread.set(threadId, rolloutPath);
+				while (this.rolloutPathByThread.size > MAX_CODEX_CONVERSATIONS * 2) {
+					this.rolloutPathByThread.delete(this.rolloutPathByThread.keys().next().value as string);
+				}
 			}
+			const readStartedAt = Date.now();
 			let metrics: CodexRolloutTurnMetrics | undefined;
 			for (let attempt = 0; attempt < 3; attempt++) {
 				metrics = await readCodexRolloutMetrics(rolloutPath, turnId);
@@ -1963,10 +2026,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 					toolDurationMs: metrics.toolDuration,
 					firstModelEventLatencyMs: metrics.firstModelEventLatencyMs,
 					firstVisibleMessageLatencyMs: metrics.firstVisibleMessageLatencyMs,
+					readMs: Date.now() - readStartedAt,
 				});
 			}
 			return metrics?.completed ? metrics : undefined;
 		} catch (error) {
+			this.rolloutPathByThread.delete(threadId);
 			this.logSink?.log("codex.chat.rollout_metrics_unavailable", {
 				threadId,
 				turnId,
@@ -2413,23 +2478,58 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 	}
 
+	/** Sends a thread request with the VS Code-only policy, dropping the code-mode table once if the CLI rejects it. */
+	private async requestWithPolicy<T>(
+		method: "thread/start" | "thread/resume",
+		autoCompactTokenLimit: number | undefined,
+		buildParams: (policy: CodexVsCodeOnlyPolicy) => Record<string, unknown>,
+		timeoutMs?: number
+	): Promise<T> {
+		const send = (): Promise<T> => this.client.request<T>(
+			method,
+			buildParams(createCodexVsCodeOnlyPolicy(autoCompactTokenLimit, {
+				codeModeConfig: !this.codeModeConfigRejected,
+			})),
+			timeoutMs
+		);
+		try {
+			return await send();
+		} catch (error) {
+			if (this.codeModeConfigRejected || !isCodexCodeModeConfigRejection(error)) {
+				throw error;
+			}
+			this.codeModeConfigRejected = true;
+			this.logSink?.log("codex.code_mode_config.rejected", {
+				method,
+				error: error instanceof Error ? truncate(error.message, 600) : String(error),
+			}, "warn");
+			return send();
+		}
+	}
+
 	private async reattachDurableThread(conversation: CodexConversationThread): Promise<boolean> {
 		try {
-			const policy = createCodexVsCodeOnlyPolicy(this.autoCompactTokenLimit(conversation.modelId));
+			const autoCompactTokenLimit = this.autoCompactTokenLimit(conversation.modelId);
+			const policy = createCodexVsCodeOnlyPolicy(autoCompactTokenLimit);
 			const cwd = normalizeCodexRuntimeCwd(
 				vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
 			);
 			const model = this.models.get(conversation.modelId);
-			const resumed = await this.client.request<CodexThreadResumeResponse>("thread/resume", {
-				threadId: conversation.threadId,
-				excludeTurns: true,
-				model: model?.model || conversation.modelId,
-				cwd,
-				approvalPolicy: policy.approvalPolicy,
-				sandbox: policy.sandbox,
-				config: policy.config,
-				developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
-			}, 15_000);
+			const resumed = await this.requestWithPolicy<CodexThreadResumeResponse>(
+				"thread/resume",
+				autoCompactTokenLimit,
+				current => ({
+					threadId: conversation.threadId,
+					excludeTurns: true,
+					model: model?.model || conversation.modelId,
+					cwd,
+					approvalPolicy: current.approvalPolicy,
+					sandbox: current.sandbox,
+					config: current.config,
+					developerInstructions: CODEX_DEVELOPER_INSTRUCTIONS,
+				}),
+				15_000
+			);
 			if (resumed.thread.id !== conversation.threadId) {
 				throw new Error(
 					`Codex resumed unexpected thread ${resumed.thread.id}; expected ${conversation.threadId}`

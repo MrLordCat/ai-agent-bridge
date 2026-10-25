@@ -72,6 +72,27 @@ suite("Shared provider context", () => {
 		const result = mergeConversationHistory(old, [user("SECOND"), assistant("SECOND_FINDING"), user("FOURTH")]);
 		assert.match(text(result), /FIRST/); assert.match(text(result), /THIRD_FINDING/); assert.match(text(result), /FOURTH/);
 	});
+	test("a capped render that drops middle turns keeps the whole journal on a new request", () => {
+		const turns = [0, 1, 2, 3, 4, 5].flatMap(index => [user(`TASK_${index}`), assistant(`FINDING_${index}`)]);
+		const capped = [user("TASK_0"), assistant("FINDING_0"), user("TASK_4"), assistant("FINDING_4"), user("TASK_5"), assistant("FINDING_5"), user("NEW_TASK")];
+		const result = text(mergeConversationHistory(turns, capped));
+		const order = [0, 1, 2, 3, 4, 5].map(index => result.indexOf(`FINDING_${index}`));
+		assert.ok(order.every((position, index) => position >= 0 && (index === 0 || position > order[index - 1])), result);
+		assert.ok(result.indexOf("NEW_TASK") > order[5]);
+	});
+	test("an edit still cuts the abandoned branch when the render dropped middle turns", () => {
+		const turns = [0, 1, 2, 3, 4, 5].flatMap(index => [user(`TASK_${index}`), assistant(`FINDING_${index}`)]);
+		const result = text(mergeConversationHistory(turns, [user("TASK_0"), assistant("FINDING_0"), user("TASK_3"), assistant("FINDING_3"), user("EDITED_TASK")]));
+		assert.match(result, /FINDING_1/); assert.match(result, /FINDING_3/); assert.match(result, /EDITED_TASK/);
+		assert.ok(!result.includes("TASK_4") && !result.includes("FINDING_5"), result);
+	});
+	test("an edit whose text equals a later request does not keep the abandoned branch", () => {
+		const old = [user("A"), assistant("A_FINDING"), user("B"), assistant("B_FINDING"), user("C"), assistant("C_FINDING")];
+		const result = text(mergeConversationHistory(old, [user("A"), assistant("A_FINDING"), user("C")]));
+		assert.ok(!result.includes("B_FINDING") && !result.includes("C_FINDING"), result);
+		const regenerated = text(mergeConversationHistory(old, [user("A"), assistant("A_FINDING"), user("B"), assistant("B_FINDING"), user("C")]));
+		assert.ok(!regenerated.includes("C_FINDING") && regenerated.includes("B_FINDING"), regenerated);
+	});
 	test("replaces the current system snapshot instead of retaining duplicates from each provider", () => {
 		const system = (value: string) => new vscode.LanguageModelChatMessage(3 as vscode.LanguageModelChatMessageRole, [new vscode.LanguageModelTextPart(value)]);
 		const result = mergeConversationHistory([system("OLD_SYSTEM"), user("TASK"), assistant("FINDING")], [system("NEW_SYSTEM"), system("NEW_SYSTEM"), user("TASK"), assistant("FINDING"), user("NEXT")]);
@@ -102,6 +123,18 @@ suite("Shared provider context", () => {
 			const file = path.join(root, "assets", sharedImageName(image.data, image.mimeType));
 			assert.ok(text(plan.compacted).includes(sharedImageName(image.data, image.mimeType)));
 			assert.deepStrictEqual(await fs.readFile(file), Buffer.from(image.data)); await lease.complete([]);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
+	test("reports a journaled conversation only once its transcript is saved, including after reload", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "shared-has-"));
+		try {
+			const journal = new ConversationHistory(root);
+			assert.strictEqual(journal.has("chat"), false, "an unseen chat must be rendered in full once");
+			assert.strictEqual(journal.has(undefined), false);
+			const lease = await journal.begin("chat", [user("FIRST")]); await lease.complete([new vscode.LanguageModelTextPart("Answer")]);
+			assert.strictEqual(journal.has("chat"), true);
+			assert.strictEqual(new ConversationHistory(root).has("chat"), true, "a reloaded host reads the saved transcript");
+			assert.strictEqual(journal.has("other"), false);
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 });

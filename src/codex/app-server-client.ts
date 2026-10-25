@@ -54,24 +54,32 @@ export class CodexAppServerError extends Error {
 /** Buffers newline-delimited JSON without assuming process chunk boundaries. */
 export class JsonLineBuffer {
 	private buffer = "";
+	// The retained buffer never contains a newline, so the next search starts at its end.
+	private scanFrom = 0;
 
 	push(chunk: string): string[] {
 		this.buffer += chunk;
 		const lines: string[] = [];
-		let newlineIndex = this.buffer.indexOf("\n");
+		let start = 0;
+		let newlineIndex = this.buffer.indexOf("\n", this.scanFrom);
 		while (newlineIndex >= 0) {
-			const line = this.buffer.slice(0, newlineIndex).replace(/\r$/, "");
-			this.buffer = this.buffer.slice(newlineIndex + 1);
+			const line = this.buffer.slice(start, newlineIndex).replace(/\r$/, "");
 			if (line.length > 0) {
 				lines.push(line);
 			}
-			newlineIndex = this.buffer.indexOf("\n");
+			start = newlineIndex + 1;
+			newlineIndex = this.buffer.indexOf("\n", start);
 		}
+		if (start > 0) {
+			this.buffer = this.buffer.slice(start);
+		}
+		this.scanFrom = this.buffer.length;
 		return lines;
 	}
 
 	reset(): void {
 		this.buffer = "";
+		this.scanFrom = 0;
 	}
 }
 

@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.18.21",
+	"version": "1.18.25",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -321,8 +321,15 @@
 					"type": "number",
 					"default": 2700000,
 					"minimum": 60000,
-					"maximum": 3600000,
-					"description": "Interval between Claude cache keep-alive turns (45 minutes by default, inside the 1-hour Anthropic cache TTL)."
+					"maximum": 3300000,
+					"description": "Interval between Claude cache keep-alive turns (45 minutes by default). Values above 55 minutes are clamped: the cache lives 1 hour and the keep-alive timer checks every 5 minutes."
+				},
+				"llamacpp.claudeCacheKeepAliveMaxIdleMs": {
+					"type": "number",
+					"default": 7200000,
+					"minimum": 2700000,
+					"maximum": 86400000,
+					"description": "Stop Claude cache keep-alive once a session has had no real Claude turn for this long (2 hours by default), and let the cache expire. Each keep-alive re-reads the cached prefix, so this bounds the cost of an idle session you do not return to."
 				},
 				"llamacpp.claudeCacheKeepAliveIgnoreUsageLimit": {
 					"type": "boolean",
@@ -586,14 +593,28 @@
 					"default": 400,
 					"minimum": 0,
 					"maximum": 2000,
-					"description": "Cap for agent tool-call rounds rendered into the prompt for llama.cpp models. The oldest 20% plus the newest rounds are kept; 0 disables the cap. Large conversations make Copilot's prompt renderer spend minutes per step even when tokens are cached."
+					"description": "Cap for agent tool-call rounds that Copilot renders into the prompt for subagents and for chats without a saved transcript. The oldest 20% plus the newest rounds are kept; 0 restores the default. Large conversations make Copilot's prompt renderer spend minutes per step even when tokens are cached."
 				},
 				"llamacpp.agentHistoryTurns": {
 					"type": "number",
 					"default": 80,
 					"minimum": 0,
 					"maximum": 2000,
-					"description": "Cap for previous conversation turns rendered into the prompt for llama.cpp models. The oldest 20% plus the newest turns are kept, and the drop point moves in steps so the upstream prompt cache stays valid. 0 restores the default."
+					"description": "Cap for previous conversation turns that Copilot renders into the prompt for subagents and for chats without a saved transcript. The oldest 20% plus the newest turns are kept, and the drop point moves in steps so the upstream prompt cache stays valid. 0 restores the default."
+				},
+				"llamacpp.journalRenderRounds": {
+					"type": "number",
+					"default": 12,
+					"minimum": 0,
+					"maximum": 2000,
+					"description": "Tool-call rounds of the current request that Copilot renders for a chat with a saved transcript. The model still receives the full history, restored from the transcript, so a small value only removes Copilot's per-step render cost in long chats. 0 falls back to agentHistoryRounds."
+				},
+				"llamacpp.journalRenderTurns": {
+					"type": "number",
+					"default": 8,
+					"minimum": 0,
+					"maximum": 2000,
+					"description": "Previous conversation turns that Copilot renders for a chat with a saved transcript. The model still receives the full history, restored from the transcript. 0 falls back to agentHistoryTurns."
 				},
 				"llamacpp.maxOutputTokensCap": {
 					"type": "number",

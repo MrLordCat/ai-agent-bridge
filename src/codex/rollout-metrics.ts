@@ -1,4 +1,5 @@
 import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { createInterface } from "node:readline";
 import { asRecord } from "../utils";
 
@@ -420,12 +421,63 @@ export function parseCodexRolloutMetrics(content: string, turnId: string): Codex
 	return accumulator.result();
 }
 
+const ROLLOUT_TAIL_CHUNK_BYTES = 1 << 20;
+const ROLLOUT_MAX_TAIL_SCAN_BYTES = 64 << 20;
+
+/** Byte offset of the `task_started` line for `turnId`, scanning backwards from the end of the rollout. */
+export async function findCodexRolloutTurnStartOffset(
+	filePath: string,
+	turnId: string,
+	options: { chunkBytes?: number; maxScanBytes?: number } = {}
+): Promise<number | undefined> {
+	const chunkBytes = options.chunkBytes ?? ROLLOUT_TAIL_CHUNK_BYTES;
+	const maxScanBytes = options.maxScanBytes ?? ROLLOUT_MAX_TAIL_SCAN_BYTES;
+	const marker = Buffer.from(`"turn_id":"${turnId}"`);
+	const started = Buffer.from("\"task_started\"");
+	const isStartLine = (line: Buffer): boolean => line.includes(marker) && line.includes(started);
+	const handle = await open(filePath, "r");
+	try {
+		const { size } = await handle.stat();
+		let end = size;
+		// Bytes of the line that straddles the previous chunk boundary.
+		let carry = Buffer.alloc(0);
+		while (end > 0 && size - end < maxScanBytes) {
+			const start = Math.max(0, end - chunkBytes);
+			const chunk = Buffer.alloc(end - start);
+			await handle.read(chunk, 0, chunk.length, start);
+			const data = carry.length > 0 ? Buffer.concat([chunk, carry]) : chunk;
+			let lineEnd = data.length;
+			let newline = data.lastIndexOf(0x0a, lineEnd - 1);
+			while (newline >= 0) {
+				if (isStartLine(data.subarray(newline + 1, lineEnd))) {
+					return start + newline + 1;
+				}
+				lineEnd = newline;
+				newline = lineEnd > 0 ? data.lastIndexOf(0x0a, lineEnd - 1) : -1;
+			}
+			if (start === 0) {
+				return isStartLine(data.subarray(0, lineEnd)) ? 0 : undefined;
+			}
+			carry = data.subarray(0, lineEnd);
+			end = start;
+		}
+		return undefined;
+	} finally {
+		await handle.close();
+	}
+}
+
+/** Parses only the requested turn: rollouts of long threads reach tens of megabytes. */
 export async function readCodexRolloutMetrics(
 	filePath: string,
 	turnId: string
 ): Promise<CodexRolloutTurnMetrics | undefined> {
+	const startOffset = await findCodexRolloutTurnStartOffset(filePath, turnId);
+	if (startOffset === undefined) {
+		return undefined;
+	}
 	const accumulator = new CodexRolloutAccumulator(turnId);
-	const input = createReadStream(filePath, { encoding: "utf8" });
+	const input = createReadStream(filePath, { encoding: "utf8", start: startOffset });
 	const lines = createInterface({ input, crlfDelay: Infinity });
 	try {
 		for await (const line of lines) {

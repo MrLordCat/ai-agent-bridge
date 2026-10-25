@@ -105,6 +105,40 @@ suite("agent history cap shapes", () => {
 		// Idempotent.
 		assert.strictEqual(patchAgentHistoryCap(patched), patched);
 	});
+
+	test("renders only the journal tail for a journaled main chat and the full cap otherwise", async () => {
+		const runnable = SHAPE_060.replace(
+			"return;let l=this.props.toolCallRounds.flatMap",
+			"return;let s=0,c=0,l=this.props.toolCallRounds.flatMap"
+		).replace("s,c,a));}}", "s,c,a));return l}}");
+		const X = new Function(`${patchAgentHistoryCap(runnable)};return X`)() as new () => {
+			props: unknown; promptEndpoint: unknown; renderOneToolCallRound(round: number): number[]; render(...args: unknown[]): Promise<number[]>;
+		};
+		const scope = globalThis as Record<string, unknown>;
+		const saved = ["__llamaJournalHas", "__llamaJournalHistoryRounds", "__llamaAgentHistoryRounds"].map(key => [key, scope[key]] as const);
+		const rendered = async (subAgentInvocationId?: string) => {
+			const element = new X();
+			element.props = { toolCallRounds: Array.from({ length: 100 }, (_, index) => index),
+				promptContext: { tools: {}, request: { subAgentInvocationId }, conversation: { sessionId: "journaled" } } };
+			element.promptEndpoint = { modelProvider: "llamacpp" };
+			element.renderOneToolCallRound = round => [round];
+			return element.render(0, 0, 0, 0);
+		};
+		try {
+			scope.__llamaJournalHistoryRounds = 10; scope.__llamaAgentHistoryRounds = 50;
+			scope.__llamaJournalHas = (id: unknown) => id === "journaled";
+			assert.deepStrictEqual(await rendered(), [0, 1, 92, 93, 94, 95, 96, 97, 98, 99]);
+			assert.strictEqual((await rendered("subagent-1")).length, 50, "a subagent has no journal");
+			scope.__llamaJournalHas = () => false;
+			assert.strictEqual((await rendered()).length, 50, "an unjournaled chat must be rendered in full once");
+			delete scope.__llamaJournalHas;
+			assert.strictEqual((await rendered()).length, 50, "without the extension the full cap applies");
+			scope.__llamaJournalHas = () => true; scope.__llamaJournalHistoryRounds = undefined;
+			assert.strictEqual((await rendered()).length, 50, "a disabled journal cap falls back to the full cap");
+		} finally {
+			for (const [key, value] of saved) { if (value === undefined) { delete scope[key]; } else { scope[key] = value; } }
+		}
+	});
 });
 
 suite("Copilot patch", () => {
@@ -153,7 +187,7 @@ suite("Copilot patch", () => {
 		const originalWorkbench = fs.readFileSync(fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath, "utf8");
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v26"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v27"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
 		// A subagent alternating with its parent must not flip Copilot's
 		// main-agent model: every flip re-announced the model list and made VS
@@ -190,6 +224,16 @@ suite("Copilot patch", () => {
 		assert.ok(patched.includes("__llamaAgentHistoryTurns"));
 		assert.ok(patched.includes("__llamaTurnCap"));
 		assert.ok(patched.includes("let __llamaRounds=this.props.toolCallRounds"));
+		// A journaled main-agent chat renders only the short journal caps at all
+		// three history sites; subagents and unjournaled chats keep the full caps.
+		assert.strictEqual(patched.split("globalThis.__llamaJournalHistoryRounds").length - 1, 2);
+		assert.strictEqual(patched.split("globalThis.__llamaJournalHistoryTurns").length - 1, 1);
+		assert.ok(patched.includes(
+			"(!this.props.promptContext.request?.subAgentInvocationId&&globalThis.__llamaJournalHas?.(this.props.promptContext.conversation?.sessionId)===!0"
+		));
+		assert.ok(patched.includes(
+			"(!this.options.request?.subAgentInvocationId&&globalThis.__llamaJournalHas?.(this.options.conversation?.sessionId)===!0"
+		));
 		assert.ok(!patched.includes("async _textTokenLength(e){return e?this.languageModel.countTokens(e):0}"));
 		assert.ok(patched.includes("this._llamaToolsSignature"));
 		assert.ok(patched.includes("if(__llamaToolCurrent!==this._llamaToolsSignature)"));

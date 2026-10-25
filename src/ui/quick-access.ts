@@ -9,6 +9,7 @@ import { providerUsageSummary, type ProviderSnapshot } from "../providers/provid
 import type { CocoProviderStatus } from "../coco/coco-provider";
 import { cocoNativeCompactionTokens } from "../coco/model-adapter";
 import { resolveClaudeContextLength } from "../claude/claude-provider";
+import { resolveClaudeKeepAliveSettings } from "../claude/keepalive-settings";
 import { CONFIG_SECTION, DEFAULT_LOCAL_REASONING_BUDGET, DEFAULT_SERVER_URL, DEEPSEEK_SERVER_URL } from "../constants";
 import { isDeepSeekEndpoint } from "../transport/openai-http";
 import {
@@ -615,11 +616,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const codexUsageLimitReset = this.getCodexUsageLimitReset();
 		const claudeUsageLimitPercent = this.getClaudeUsageLimitPercent();
 		const claudeUsageLimitReset = this.getClaudeUsageLimitReset();
-		const claudeCacheKeepAliveEnabled = config.get<boolean>("claudeCacheKeepAliveEnabled", true) !== false;
-		const claudeCacheKeepAliveMs = Math.max(
-			60_000,
-			Math.min(3_600_000, Number(config.get("claudeCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
-		);
+		const claudeKeepAlive = resolveClaudeKeepAliveSettings(config);
+		const claudeCacheKeepAliveEnabled = claudeKeepAlive.enabled;
 		const claudeUsage = this.getClaudeUsage();
 		const claudeLastRequest = this.getClaudeLastRequest();
 		const claudeUsageLimits = this.getClaudeUsageLimits();
@@ -857,9 +855,9 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				}),
 				new QuickAccessItem("claude.cacheKeepAlive", "Cache Keep-Alive", {
 					description: claudeCacheKeepAliveEnabled
-						? `On (${Math.round(claudeCacheKeepAliveMs / 60_000)} min)`
+						? `On (every ${Math.round(claudeKeepAlive.intervalMs / 60_000)} min, up to ${Number((claudeKeepAlive.maxIdleMs / 3_600_000).toFixed(1))} h idle)`
 						: "Off",
-					tooltip: "Refreshes the Anthropic prompt cache while you are idle so the next turn after a pause stays warm. Runs only when no turn is active and pauses automatically at 90% usage limit.",
+					tooltip: "Refreshes the Anthropic prompt cache while you are idle so the next turn after a pause stays warm. Runs only for a Claude session with a 100K+ token prefix used in this window, stops after the idle limit (llamacpp.claudeCacheKeepAliveMaxIdleMs), and pauses automatically at 90% usage limit.",
 					icon: toggleIcon(claudeCacheKeepAliveEnabled),
 					command: command("llamacpp.toggleClaudeCacheKeepAlive", "Toggle Claude Cache Keep-Alive"),
 				}),

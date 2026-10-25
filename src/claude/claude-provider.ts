@@ -32,6 +32,7 @@ import {
 	encodeClaudeModelId,
 	estimateClaudeTokens,
 } from "./message-adapter";
+import { resolveClaudeKeepAliveSettings } from "./keepalive-settings";
 
 const DEFAULT_CLAUDE_CONTEXT_LENGTH = 258_400;
 const DEFAULT_CLAUDE_MAX_OUTPUT_TOKENS = 32_000;
@@ -64,6 +65,17 @@ const CLAUDE_USAGE_REFRESH_TIMEOUT_MS = 20_000;
 const CLAUDE_USAGE_PROBE_IDLE_GRACE_MS = 10 * 60_000;
 const CLAUDE_KEEPALIVE_USAGE_MAX_AGE_MS = 2 * CLAUDE_USAGE_REFRESH_TTL_MS;
 const CLAUDE_KEEPALIVE_RETRY_DELAY_MS = 5 * 60_000;
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+	let timer: NodeJS.Timeout | undefined;
+	try {
+		return await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+		})]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
 export const DEFAULT_CLAUDE_MAX_AGENT_TURNS = 0;
 export const DEFAULT_CLAUDE_MAX_CUMULATIVE_INPUT_TOKENS = 10_000_000;
 export const DEFAULT_CLAUDE_RESUME_FALLBACK_MAX_INPUT_TOKENS = 256_000;
@@ -169,6 +181,7 @@ export type ClaudeCacheKeepAliveState =
 	| "paused_usage_stale"
 	| "paused_usage_limit"
 	| "no_eligible_session"
+	| "idle_limit"
 	| "waiting"
 	| "running"
 	| "success"
@@ -208,7 +221,7 @@ export interface ClaudeCacheKeepAliveSessionSnapshot {
 
 export interface ClaudeCacheKeepAliveDecision {
 	state: "disabled" | "paused_usage_unknown" | "paused_usage_stale"
-		| "paused_usage_limit" | "no_eligible_session" | "waiting" | "ready";
+		| "paused_usage_limit" | "no_eligible_session" | "idle_limit" | "waiting" | "ready";
 	reason: string;
 	eligibleSessionCount: number;
 	candidateIndex?: number;
@@ -219,15 +232,21 @@ export function resolveClaudeCacheKeepAliveDecision(value: {
 	enabled: boolean;
 	now: number;
 	intervalMs: number;
+	/** Stop once a session has had no real turn for this long; undefined keeps it unbounded. */
+	maxIdleMs?: number;
 	usagePercent?: number;
 	usageSnapshotAgeMs?: number;
 	ignoreUsageLimit?: boolean;
 	sessions: readonly ClaudeCacheKeepAliveSessionSnapshot[];
 }): ClaudeCacheKeepAliveDecision {
-	const eligible = value.sessions
+	const withinIdleLimit = (session: ClaudeCacheKeepAliveSessionSnapshot) =>
+		value.maxIdleMs === undefined || value.now - session.lastUsedAt <= value.maxIdleMs;
+	const large = value.sessions
 		.map((session, index) => ({ session, index }))
 		.filter(({ session }) => session.healthy && !session.busy
-			&& session.prefixTokens >= MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS)
+			&& session.prefixTokens >= MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS);
+	const eligible = large
+		.filter(({ session }) => withinIdleLimit(session))
 		.sort((left, right) => right.session.prefixTokens - left.session.prefixTokens
 			|| right.session.lastUsedAt - left.session.lastUsedAt);
 	const candidateIndex = eligible[0]?.index;
@@ -238,6 +257,32 @@ export function resolveClaudeCacheKeepAliveDecision(value: {
 			eligibleSessionCount: eligible.length,
 			candidateIndex,
 		};
+	}
+	if (eligible.length === 0 && large.length > 0 && !value.sessions.some(session => session.busy)) {
+		const hours = Number(((value.maxIdleMs ?? 0) / 3_600_000).toFixed(1));
+		return {
+			state: "idle_limit",
+			reason: `Stopped: Claude has not been used for over ${hours} h, so the cache is allowed to expire.`,
+			eligibleSessionCount: 0,
+		};
+	}
+	const candidate = eligible[0];
+	if (candidate) {
+		// Not due yet: decided before the usage checks, so a usage snapshot that aged while idle never blocks.
+		const nextAttemptAt = Math.max(
+			candidate.session.lastUsedAt + value.intervalMs * 0.8,
+			(candidate.session.lastKeepAliveAt ?? 0) + value.intervalMs,
+			(candidate.session.lastAttemptAt ?? 0) + Math.min(value.intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS)
+		);
+		if (value.now < nextAttemptAt) {
+			return {
+				state: "waiting",
+				reason: "Eligible Claude session is protected; waiting for the next maintenance window.",
+				eligibleSessionCount: eligible.length,
+				candidateIndex: candidate.index,
+				nextAttemptAt,
+			};
+		}
 	}
 	if (value.usagePercent === undefined) {
 		return {
@@ -293,28 +338,11 @@ export function resolveClaudeCacheKeepAliveDecision(value: {
 				: `No session has a ${MIN_CLAUDE_KEEPALIVE_PREFIX_TOKENS.toLocaleString("en-US")}-token prefix yet.`;
 		return { state: "no_eligible_session", reason, eligibleSessionCount: 0 };
 	}
-
-	const candidate = eligible[0];
-	const retryDelayMs = Math.min(value.intervalMs, CLAUDE_KEEPALIVE_RETRY_DELAY_MS);
-	const nextAttemptAt = Math.max(
-		candidate.session.lastUsedAt + value.intervalMs * 0.8,
-		(candidate.session.lastKeepAliveAt ?? 0) + value.intervalMs,
-		(candidate.session.lastAttemptAt ?? 0) + retryDelayMs
-	);
-	if (value.now < nextAttemptAt) {
-		return {
-			state: "waiting",
-			reason: "Eligible Claude session is protected; waiting for the next maintenance window.",
-			eligibleSessionCount: eligible.length,
-			candidateIndex: candidate.index,
-			nextAttemptAt,
-		};
-	}
 	return {
 		state: "ready",
 		reason: "Eligible Claude session is due for a cache keep-alive turn.",
 		eligibleSessionCount: eligible.length,
-		candidateIndex: candidate.index,
+		candidateIndex: candidate!.index,
 		nextAttemptAt: value.now,
 	};
 }
@@ -459,6 +487,15 @@ export interface ClaudeResumeFallbackDecision {
 	reason: "policy_always" | "policy_never" | "safe_limits" | "input_limit"
 		| "usage_unknown" | "usage_stale" | "usage_limit";
 	detail: string;
+}
+
+export function formatClaudeRecoveryWarning(fullTokens: number, tailTokens: number, cap: number,
+	decision?: ClaudeResumeFallbackDecision): string {
+	const action = decision?.reason === "input_limit"
+		? `Compact the source chat, start a new chat, or raise "llamacpp.claudeResumeFallbackMaxInputTokens" above ${fullTokens} only if you intend to replay the full history.`
+		: `Full replay was blocked: ${decision?.detail ?? "the saved session could not be restored"} Start a new chat or restore the original session.`;
+	return `Claude is continuing with only the latest message; earlier conversation context was not restored. `
+		+ `Estimated full history: ~${fullTokens} tokens; replay cap: ${cap}; latest message: ~${tailTokens} tokens. ${action}`;
 }
 
 export function resolveClaudeResumeFallbackDecision(value: {
@@ -807,23 +844,15 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			return;
 		}
 		const config = vscode.workspace.getConfiguration("llamacpp");
-		const enabled = config.get<boolean>("claudeCacheKeepAliveEnabled", true) !== false;
-		const intervalMs = Math.max(
-			60_000,
-			Math.min(3_600_000, Number(config.get("claudeCacheKeepAliveMs", 45 * 60_000)) || 45 * 60_000)
-		);
-		const now = Date.now();
+		const { enabled, intervalMs, maxIdleMs } = resolveClaudeKeepAliveSettings(config);
 		const sessions = [...this.sessions.values()];
-		const usagePercent = this.claudeUsageLimitPercent;
-		const usageSnapshotAgeMs = this.lastSubscriptionUsageAt > 0
-			? now - this.lastSubscriptionUsageAt
-			: undefined;
-		const decision = resolveClaudeCacheKeepAliveDecision({
+		const decide = (now: number) => resolveClaudeCacheKeepAliveDecision({
 			enabled,
 			now,
 			intervalMs,
-			usagePercent,
-			usageSnapshotAgeMs,
+			maxIdleMs,
+			usagePercent: this.claudeUsageLimitPercent,
+			usageSnapshotAgeMs: this.lastSubscriptionUsageAt > 0 ? now - this.lastSubscriptionUsageAt : undefined,
 			ignoreUsageLimit: config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true,
 			sessions: sessions.map(session => ({
 				healthy: session.client.isStreamHealthy,
@@ -834,6 +863,29 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				lastAttemptAt: session.lastKeepAliveAttemptAt,
 			})),
 		});
+		let now = Date.now();
+		let decision = decide(now);
+		const due = decision.candidateIndex === undefined ? undefined : sessions[decision.candidateIndex];
+		if (due && (decision.state === "paused_usage_stale" || decision.state === "paused_usage_unknown")) {
+			// The CLI usage probe stops after 10 idle minutes; ask the live session itself, which costs no model tokens.
+			this.keepAliveInflight = true;
+			try {
+				await withTimeout(due.client.refreshUsageSnapshot(), CLAUDE_USAGE_REFRESH_TIMEOUT_MS, "Claude usage refresh timed out");
+			} catch (error) {
+				this.logSink?.logError("claude.cache_keepalive_usage_refresh.failed", error);
+			} finally {
+				this.keepAliveInflight = false;
+			}
+			if (this.disposed) {
+				return;
+			}
+			now = Date.now();
+			decision = decide(now);
+		}
+		const usagePercent = this.claudeUsageLimitPercent;
+		const usageSnapshotAgeMs = this.lastSubscriptionUsageAt > 0
+			? now - this.lastSubscriptionUsageAt
+			: undefined;
 		const candidate = decision.candidateIndex === undefined
 			? undefined
 			: sessions[decision.candidateIndex];
@@ -882,7 +934,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			const completed = await candidate.client.runKeepAliveTurn(createClaudeKeepAliveMessage());
 			if (completed) {
 				const completedAt = Date.now();
-				candidate.lastUsedAt = completedAt;
+				// lastUsedAt stays at the last real turn so the idle limit can end keep-alive.
 				candidate.lastKeepAliveAt = completedAt;
 				const usage = candidate.lastKeepAliveUsage as ClaudeAgentUsage | undefined;
 				const totalInputTokens = usage
@@ -1339,6 +1391,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			truncatedChars: number;
 		} | undefined;
 		let recoveryReason: string | undefined;
+		let coldReplayTokens = 0;
+		let coldReplayDecision: ClaudeResumeFallbackDecision | undefined;
 		if (!session && conversationId && this.durableSessionsEnabled()) {
 			const exact = this.durableSessions.get(this.durableSessionKey(modelId, conversationId));
 			if (exact?.quarantinedAt !== undefined) {
@@ -1491,6 +1545,10 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			const fullReplayAllowed = estimatedColdTokens <= safety.resumeFallbackMaxInputTokens
 				&& (recoveryDecision === undefined || recoveryDecision.allowed);
 			if (!fullReplayAllowed) {
+				coldReplayTokens = estimatedColdTokens;
+				coldReplayDecision = estimatedColdTokens > safety.resumeFallbackMaxInputTokens
+					? { allowed: false, reason: "input_limit", detail: `Estimated full history ${estimatedColdTokens} tokens exceeds replay cap ${safety.resumeFallbackMaxInputTokens}.` }
+					: recoveryDecision;
 				latestOnlyRecovery = this.prepareClaudeLatestOnlyRecovery(
 					messages,
 					toolSchemaTokens,
@@ -1546,11 +1604,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			if (!this.boundedRecoveryWarned) {
 				this.boundedRecoveryWarned = true;
 				void vscode.window.showWarningMessage(
-					`Claude is resuming with only the latest message — the full conversation context `
-					+ `was not restored (protected replay cap ${safety.resumeFallbackMaxInputTokens} tokens, `
-					+ `needed ~${latestOnlyRecovery.estimatedTokens} tokens of the tail). `
-					+ `Raise "llamacpp.claudeResumeFallbackMaxInputTokens" (e.g. 500000) to restore the full context, `
-					+ `or continue in a new chat.`
+					formatClaudeRecoveryWarning(coldReplayTokens, latestOnlyRecovery.estimatedTokens,
+						safety.resumeFallbackMaxInputTokens, coldReplayDecision)
 				);
 			}
 			this.logSink?.log("claude.chat.quarantine_recovery", {

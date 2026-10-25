@@ -66,6 +66,12 @@ result and resolves the still-pending app-server dynamic tool request. Parallel
 requests are emitted together and resume only after every matching result is
 available. The original Codex turn continues directly: there is no interrupt,
 second `turn/start`, serialized continuation prompt, or full-history prefill.
+Current models call these tools from code-mode `exec` scripts. The thread sets
+`features.code_mode.default_exec_yield_time_ms` to 10 minutes, so a script waits
+for the native result instead of yielding after 30 s and making the model poll
+with `wait`, where every poll is a full-context model call. Run
+`node scripts/codex-code-mode-smoke.mjs --durable --variant=default,yield` to
+measure this against the installed CLI. It sends two small model turns.
 Continuations are matched by unique native tool call ids, time out after 24
 hours if abandoned, and are never persisted as chat history. If VS Code adds
 or removes advertised tools while a call is running, the active turn keeps its

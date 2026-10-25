@@ -20,6 +20,7 @@ import {
 	createClaudeReasoningConfigurationSchema,
 	createLatestUserMessage,
 	estimateClaudeRecoveryTokens,
+	formatClaudeRecoveryWarning,
 	findLatestPersistedClaudeConversation,
 	truncateLatestUserContent,
 	findPersistedClaudeConversation,
@@ -33,6 +34,7 @@ import {
 	resolveClaudeRuntimeModel,
 } from "../claude/claude-provider";
 import { buildClaudeModelAvailability } from "../claude/availability";
+import { resolveClaudeKeepAliveSettings } from "../claude/keepalive-settings";
 import {
 	CLAUDE_ACTIVE_TURN_TIMEOUT_MS,
 	ClaudeAgentSession,
@@ -43,6 +45,7 @@ import {
 	hasClaudeAccountEvidence,
 	isClaudeVsCodeToolName,
 	parseClaudeAssistantUsage,
+	resolveClaudeCodeBinary,
 } from "../claude/app-server-client";
 
 type UsageSnapshot = Parameters<typeof buildClaudeUsageLimits>[0];
@@ -61,6 +64,49 @@ function usageSnapshot(rateLimits: Record<string, unknown>): UsageSnapshot {
 }
 
 suite("Claude account evidence", () => {
+	test("uses the official Claude Code runtime before the older SDK runtime", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-runtime-"));
+		try {
+			const executable = path.join(dir, "resources", "native-binary", process.platform === "win32" ? "claude.exe" : "claude");
+			fs.mkdirSync(path.dirname(executable), { recursive: true });
+			fs.writeFileSync(executable, "fixture");
+			assert.strictEqual(resolveClaudeCodeBinary({ extensionPath: dir }), executable);
+			fs.unlinkSync(executable);
+			const fallback = resolveClaudeCodeBinary({ extensionPath: dir });
+			assert.notStrictEqual(fallback, executable);
+			assert.ok(fallback === undefined || fs.existsSync(fallback));
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("preserves the API explanation when the SDK reports an unknown error category", () => {
+		const session = new ClaudeAgentSession({ model: "claude-opus-5-5", cwd: process.cwd(), executable: "claude",
+			extensionVersion: "test", tools: [], callbacks: { onUsage: () => undefined, onRateLimit: () => undefined } });
+		const internals = session as unknown as { handleMessage(message: unknown): void; failActiveTurn(error: Error): void };
+		let failure: Error | undefined;
+		internals.failActiveTurn = error => { failure = error; };
+		try {
+			internals.handleMessage({ type: "assistant", error: "unknown", message: { content: [{ type: "text",
+				text: "API Error: 400 Claude Code 2.1.240 does not support this model; version 2.1.280 or newer is required." }] } });
+			assert.match(failure?.message ?? "", /version 2\.1\.280 or newer is required/);
+			internals.handleMessage({ type: "assistant", error: "rate_limit", message: { content: [] } });
+			assert.strictEqual(failure?.message, "Claude API error: rate_limit");
+		} finally { session.dispose(); }
+	});
+
+	test("distinguishes full replay size from the latest message and usage guards", () => {
+		const warning = formatClaudeRecoveryWarning(655806, 45800, 500000,
+			{ allowed: false, reason: "input_limit", detail: "Input exceeds the cap." });
+		assert.match(warning, /full history: ~655806/);
+		assert.match(warning, /latest message: ~45800/);
+		assert.match(warning, /above 655806/);
+		const usageWarning = formatClaudeRecoveryWarning(45800, 1000, 500000,
+			{ allowed: false, reason: "usage_unknown", detail: "Fresh usage is unavailable." });
+		assert.match(usageWarning, /Fresh usage is unavailable/);
+		assert.ok(!usageWarning.includes("raise"));
+	});
+
         test("detects Claude Code login evidence in a temp home", () => {
                 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "claude-auth-"));
                 try {
@@ -149,6 +195,46 @@ suite("Claude subscription provider", () => {
 			sessions: [{ ...sessions[1], lastAttemptAt: now - 60_000 }],
 		});
 		assert.strictEqual(throttled.state, "waiting");
+	});
+
+	test("keep-alive stops after the idle limit and a stale usage snapshot only matters once it is due", () => {
+		const now = Date.parse("2026-08-02T10:00:00Z");
+		const intervalMs = 45 * 60_000, maxIdleMs = 2 * 60 * 60_000;
+		const session = { healthy: true, busy: false, prefixTokens: 280_000, lastUsedAt: now - 10 * 60_000 };
+		// Idle for 10 minutes with a 30-minute-old usage snapshot: waiting, not paused.
+		const notDue = resolveClaudeCacheKeepAliveDecision({
+			enabled: true, now, intervalMs, maxIdleMs, usagePercent: 20, usageSnapshotAgeMs: 30 * 60_000, sessions: [session],
+		});
+		assert.strictEqual(notDue.state, "waiting");
+		// Due with the same stale snapshot: paused, but the candidate is named so the provider can refresh usage from it.
+		const dueStale = resolveClaudeCacheKeepAliveDecision({
+			enabled: true, now, intervalMs, maxIdleMs, usagePercent: 20, usageSnapshotAgeMs: 30 * 60_000,
+			sessions: [{ ...session, lastUsedAt: now - 40 * 60_000 }],
+		});
+		assert.strictEqual(dueStale.state, "paused_usage_stale");
+		assert.strictEqual(dueStale.candidateIndex, 0);
+		// Keep-alives do not move lastUsedAt, so the idle limit ends them.
+		const kept = { ...session, lastUsedAt: now - 100 * 60_000, lastKeepAliveAt: now - 46 * 60_000 };
+		assert.strictEqual(resolveClaudeCacheKeepAliveDecision({
+			enabled: true, now, intervalMs, maxIdleMs, usagePercent: 20, usageSnapshotAgeMs: 1_000, sessions: [kept],
+		}).state, "ready");
+		const expired = resolveClaudeCacheKeepAliveDecision({
+			enabled: true, now, intervalMs, maxIdleMs, usagePercent: 20, usageSnapshotAgeMs: 1_000,
+			sessions: [{ ...kept, lastUsedAt: now - maxIdleMs - 60_000 }],
+		});
+		assert.strictEqual(expired.state, "idle_limit");
+		assert.strictEqual(expired.candidateIndex, undefined);
+	});
+
+	test("clamps the keep-alive interval inside the cache TTL and bounds the idle limit", () => {
+		const read = (values: Record<string, unknown>) => resolveClaudeKeepAliveSettings({
+			get: <T>(key: string, fallback: T) => (key in values ? values[key] : fallback) as T,
+		});
+		assert.deepStrictEqual(read({}), { enabled: true, intervalMs: 45 * 60_000, maxIdleMs: 2 * 60 * 60_000 });
+		assert.strictEqual(read({ claudeCacheKeepAliveMs: 3_600_000 }).intervalMs, 55 * 60_000);
+		assert.strictEqual(read({ claudeCacheKeepAliveEnabled: false }).enabled, false);
+		assert.strictEqual(read({ claudeCacheKeepAliveMaxIdleMs: 60_000 }).maxIdleMs, 45 * 60_000, "never shorter than one interval");
+		assert.strictEqual(read({ claudeCacheKeepAliveMaxIdleMs: 1e12 }).maxIdleMs, 24 * 60 * 60_000);
 	});
 
 	test("uses conservative Claude safety defaults and clamps invalid values", () => {
@@ -690,7 +776,7 @@ test("marks the session stream as closed after an interrupt", async () => {
 		);
 	});
 
-	test("round-trips provider model ids and advertises only Opus 5", () => {
+	test("round-trips provider model ids and advertises both Opus generations", () => {
 		assert.strictEqual(
 			decodeClaudeModelId(encodeClaudeModelId("claude-opus-5")),
 			"claude-opus-5"
@@ -698,8 +784,10 @@ test("marks the session stream as closed after an interrupt", async () => {
 		assert.strictEqual(decodeClaudeModelId("other::claude-opus-5"), undefined);
 		assert.deepStrictEqual(
 			CLAUDE_SUBSCRIPTION_MODELS.map(model => model.id),
-			["claude-opus-5"]
+			["claude-opus-5-5", "claude-opus-5"]
 		);
+		// The CLI spells the 1M variant per model id, so both must resolve.
+		assert.strictEqual(resolveClaudeRuntimeModel("claude-opus-5-5"), "claude-opus-5-5[1m]");
 	});
 
 	test("estimates text, native tool calls, and native tool results", () => {

@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { statSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import * as vscode from "vscode";
@@ -63,14 +64,24 @@ function mergeConversationBody(previous: readonly vscode.LanguageModelChatReques
 	const toolContinuation = incoming.at(-1)?.content.some(p => p instanceof vscode.LanguageModelToolResultPart) === true;
 	let ceiling = previous.length;
 	if (!toolContinuation && oldUsers.length && newUsers.length) {
-		let common = 0;
-		while (common < Math.min(oldUsers.length, newUsers.length) && oldUsers[common].key === newUsers[common].key) { common++; }
-		if (common && common < oldUsers.length) { ceiling = oldUsers[common].index; }
-		if (common === newUsers.length && newUsers.length <= oldUsers.length) {
-			ceiling = oldUsers[Math.max(0, common - 1)].index;
+		// The capped Copilot render drops middle turns, so incoming anchors are an ordered
+		// subsequence of the stored ones; only an anchor missing from that order is an edit.
+		let matched = 0, cursor = 0, last = -1;
+		for (const [position, anchor] of newUsers.entries()) {
+			let found = -1;
+			// The capped render keeps the first turn, so a window starting elsewhere is only retained, never
+			// an edit; the current request only matches the next stored one (a regeneration).
+			const end = position === 0 || position === newUsers.length - 1 ? Math.min(cursor + 1, oldUsers.length) : oldUsers.length;
+			for (let index = cursor; index < end; index++) { if (oldUsers[index].key === anchor.key) { found = index; break; } }
+			if (found < 0) { break; }
+			matched++; last = found; cursor = found + 1;
+		}
+		if (matched && cursor < oldUsers.length) { ceiling = oldUsers[cursor].index; }
+		if (matched === newUsers.length && newUsers.length <= oldUsers.length) {
+			ceiling = oldUsers[Math.max(0, last)].index;
 		}
 		const oldKeys = new Set(oldUsers.map(anchor => anchor.key));
-		if (!common && !newUsers.slice(0, -1).some(n => oldKeys.has(n.key))) { return [...incoming]; }
+		if (!matched && !newUsers.slice(0, -1).some(n => oldKeys.has(n.key))) { return [...incoming]; }
 	}
 	const keys = incoming.map(messageKey);
 	const positions = new Map<string, { first: number; last: number }>();
@@ -142,6 +153,17 @@ export class ConversationHistory {
 		const writeTask = (owner.pending ?? Promise.resolve()).catch(() => undefined).then(commit);
 		owner.pending = writeTask;
 		try { await writeTask; } finally { if (owner.pending === writeTask) { owner.pending = undefined; } }
+	}
+	/**
+	 * Whether a saved transcript already backs this conversation. Copilot may
+	 * render only a short tail of such a chat, because begin() restores the rest;
+	 * a chat without one must still be rendered in full once to seed it.
+	 */
+	has(conversation: unknown): boolean {
+		if (typeof conversation !== "string" || !conversation.trim() || conversation.length > 512) { return false; }
+		const key = hash(conversation), entry = this.entries.get(key);
+		if (entry) { return entry.messages.length > 0; }
+		try { return statSync(path.join(this.root, `${key}.json`)).size > 0; } catch { return false; }
 	}
 	async begin(conversation: unknown, incoming: readonly vscode.LanguageModelChatRequestMessage[]): Promise<ConversationHistoryLease> {
 		if (typeof conversation !== "string" || !conversation.trim() || conversation.length > 512) {

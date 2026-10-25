@@ -440,7 +440,9 @@ export function hasClaudeAccountEvidence(homeDir = os.homedir()): boolean {
         return false;
 }
 
-export function resolveClaudeCodeBinary(): string | undefined {
+export function resolveClaudeCodeBinary(
+	extension: Pick<vscode.Extension<unknown>, "extensionPath"> | undefined = vscode.extensions.getExtension("anthropic.claude-code")
+): string | undefined {
 	const configuredPath = vscode.workspace.getConfiguration("llamacpp")
 		.get<string>("claudeCliPath", "")
 		.trim();
@@ -448,25 +450,26 @@ export function resolveClaudeCodeBinary(): string | undefined {
 		return configuredPath;
 	}
 
+	const executable = process.platform === "win32" ? "claude.exe" : "claude";
+	if (extension) {
+		const native = path.join(extension.extensionPath, "resources", "native-binary", executable);
+		if (existsSync(native)) {
+			return native;
+		}
+	}
+
 	try {
 		const sdkEntry = createRequire(__filename).resolve("@anthropic-ai/claude-agent-sdk");
 		const packageName = `claude-agent-sdk-${process.platform}-${process.arch}`;
-		const executable = process.platform === "win32" ? "claude.exe" : "claude";
 		const bundled = path.join(path.dirname(path.dirname(sdkEntry)), packageName, executable);
 		if (existsSync(bundled)) {
 			return bundled;
 		}
 	} catch {
-		// Fall through to the official Claude Code extension.
+		// Neither installed runtime is available.
 	}
 
-	const extension = vscode.extensions.getExtension("anthropic.claude-code");
-	if (!extension) {
-		return undefined;
-	}
-	const executable = process.platform === "win32" ? "claude.exe" : "claude";
-	const bundled = path.join(extension.extensionPath, "resources", "native-binary", executable);
-	return existsSync(bundled) ? bundled : undefined;
+	return undefined;
 }
 
 export class ClaudeAgentSession implements vscode.Disposable {
@@ -852,7 +855,11 @@ export class ClaudeAgentSession implements vscode.Disposable {
 		if (message.type === "assistant") {
 			this.recordModelEvent();
 			if (message.error) {
-				this.failActiveTurn(new Error(`Claude API error: ${message.error}`), "failed");
+				const detail = asArray(asRecord(message.message).content)
+					.map(block => asRecord(block))
+					.filter(block => block.type === "text" && typeof block.text === "string")
+					.map(block => block.text as string).join("\n");
+				this.failActiveTurn(new Error(`Claude API error: ${detail || message.error}`), "failed");
 				return;
 			}
 			// The SDK emits thinking/text/tool_use as separate assistant records.

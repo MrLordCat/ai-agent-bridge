@@ -584,6 +584,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		const cfg = vscode.workspace.getConfiguration(CONFIG_SECTION);
 		(globalThis as Record<string, unknown>).__llamaAgentHistoryRounds = cfg.get<number>("agentHistoryRounds", 400);
 		(globalThis as Record<string, unknown>).__llamaAgentHistoryTurns = cfg.get<number>("agentHistoryTurns", 80);
+		// A journaled chat gets its full history from the journal, so Copilot only
+		// renders the newest tail of it (see patchAgentHistoryCap). 0 falls back to the full caps.
+		(globalThis as Record<string, unknown>).__llamaJournalHistoryRounds = cfg.get<number>("journalRenderRounds", 12) || undefined;
+		(globalThis as Record<string, unknown>).__llamaJournalHistoryTurns = cfg.get<number>("journalRenderTurns", 8) || undefined;
 	};
 	updateAgentHistoryCaps();
 	context.subscriptions.push(
@@ -591,6 +595,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			if (
 				e.affectsConfiguration(`${CONFIG_SECTION}.agentHistoryRounds`)
 				|| e.affectsConfiguration(`${CONFIG_SECTION}.agentHistoryTurns`)
+				|| e.affectsConfiguration(`${CONFIG_SECTION}.journalRenderRounds`)
+				|| e.affectsConfiguration(`${CONFIG_SECTION}.journalRenderTurns`)
 			) {
 				updateAgentHistoryCaps();
 			}
@@ -638,6 +644,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ id: "claude", provider: claudeProvider, onForeignRequest: () => claudeProvider.refreshSubscriptionUsage() },
 		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
+	const conversationHistory = new ConversationHistory(path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history"));
+	// The patched Copilot prompt asks this before rendering only a short history tail.
+	(globalThis as Record<string, unknown>).__llamaJournalHas = (conversation: unknown) => conversationHistory.has(conversation);
+	context.subscriptions.push({ dispose: () => { delete (globalThis as Record<string, unknown>).__llamaJournalHas; } });
 	const compositeProvider = new CompositeChatModelProvider({ providers: [
 		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel,
 			usesConversationHistory: model => llamaProvider.usesConversationHistory(model),
@@ -646,7 +656,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === registration.id),
 			ownsModel: (id: string) => providerSourceId(id) === registration.id,
 		})),
-	], history: new ConversationHistory(path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history")) });
+	], history: conversationHistory });
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
 
@@ -1947,6 +1957,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				if (
 					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveEnabled") ||
 					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveMs") ||
+					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveMaxIdleMs") ||
 					event.affectsConfiguration("llamacpp.claudeCacheKeepAliveIgnoreUsageLimit")
 				) {
 					quickActionsProvider.refresh();

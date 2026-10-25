@@ -11,12 +11,14 @@ import {
 	assertCodexThreadPersistence,
 	calculateCodexCompactionBudget,
 	canResumeCodexToolTurn,
+	CODEX_EXEC_YIELD_TIME_MS,
 	CodexChatModelProvider,
 	createCodexRuntimeFingerprints,
 	createCodexVsCodeOnlyPolicy,
 	diffCodexThreadUsage,
 	findLatestCodexUserTail,
 	intersectCodexThreadTools,
+	isCodexCodeModeConfigRejection,
 	isCompleteImageDataUri,
 	findTempImageWithPrefix,
 	mapCodexTokenUsageMetrics,
@@ -53,7 +55,11 @@ import {
 	summarizeCodexRateLimits,
 } from "../codex/model-adapter";
 import type { CodexModel } from "../codex/protocol";
-import { parseCodexRolloutMetrics } from "../codex/rollout-metrics";
+import {
+	findCodexRolloutTurnStartOffset,
+	parseCodexRolloutMetrics,
+	readCodexRolloutMetrics,
+} from "../codex/rollout-metrics";
 import {
 	CodexInternalToolBlockedError,
 	CodexStaleTurnError,
@@ -109,6 +115,15 @@ suite("Codex subscription provider", () => {
 			'{"method":"ready"}',
 		]);
 		assert.deepStrictEqual(buffer.push(" line\n"), ["partial line"]);
+	});
+
+	test("assembles a large JSONL message from many small chunks", () => {
+		const buffer = new JsonLineBuffer();
+		const payload = JSON.stringify({ id: 1, result: "x".repeat(200_000) });
+		for (let offset = 0; offset < payload.length; offset += 1_000) {
+			assert.deepStrictEqual(buffer.push(payload.slice(offset, offset + 1_000)), []);
+		}
+		assert.deepStrictEqual(buffer.push("\r\n\n{\"id\":2}\n"), [payload, "{\"id\":2}"]);
 	});
 
 	test("drops an incomplete JSONL fragment when the app-server generation changes", () => {
@@ -176,6 +191,50 @@ suite("Codex subscription provider", () => {
 		]) {
 			assert.strictEqual(policy.config.features[feature], false, `${feature} must be disabled`);
 		}
+	});
+
+	test("keeps code-mode exec waiting for native tools instead of polling", () => {
+		assert.deepStrictEqual(createCodexVsCodeOnlyPolicy().config.features.code_mode, {
+			default_exec_yield_time_ms: CODEX_EXEC_YIELD_TIME_MS,
+		});
+		assert.ok(CODEX_EXEC_YIELD_TIME_MS >= 300_000);
+		assert.ok(!("code_mode" in createCodexVsCodeOnlyPolicy(undefined, { codeModeConfig: false }).config.features));
+		assert.strictEqual(isCodexCodeModeConfigRejection(new Error("unknown field `code_mode` in features")), true);
+		assert.strictEqual(isCodexCodeModeConfigRejection(new Error("data did not match any variant of untagged enum FeatureToml")), true);
+		assert.strictEqual(isCodexCodeModeConfigRejection(new Error("model not found")), false);
+	});
+
+	test("retries thread/start once without the code-mode table when the CLI rejects it", async () => {
+		const provider = new CodexChatModelProvider("test");
+		const calls: Array<Record<string, unknown>> = [];
+		const fakeClient = {
+			generation: 1,
+			request: async (_method: string, params: Record<string, unknown>) => {
+				calls.push(params);
+				if (calls.length === 1) {
+					throw new Error("invalid config: unknown field `default_exec_yield_time_ms`");
+				}
+				return { ok: true };
+			},
+			dispose: () => undefined,
+		};
+		const internals = provider as unknown as {
+			requestWithPolicy: <T>(
+				method: "thread/start",
+				limit: number | undefined,
+				build: (policy: ReturnType<typeof createCodexVsCodeOnlyPolicy>) => Record<string, unknown>
+			) => Promise<T>;
+		};
+		Object.defineProperty(provider, "client", { value: fakeClient });
+		const build = (policy: ReturnType<typeof createCodexVsCodeOnlyPolicy>) => ({ config: policy.config });
+		assert.deepStrictEqual(await internals.requestWithPolicy("thread/start", undefined, build), { ok: true });
+		await internals.requestWithPolicy("thread/start", undefined, build);
+		const features = calls.map(call => (call.config as { features: Record<string, unknown> }).features);
+		assert.strictEqual(calls.length, 3);
+		assert.ok("code_mode" in features[0]);
+		assert.ok(!("code_mode" in features[1]));
+		assert.ok(!("code_mode" in features[2]));
+		provider.dispose();
 	});
 
 	test("counts completed Codex thread usage by cumulative delta", () => {
@@ -290,6 +349,49 @@ suite("Codex subscription provider", () => {
 		assert.strictEqual(rolloutToolStep?.status, "completed");
 		assert.strictEqual(rolloutToolStep?.toolCategory, "vscode");
 		assert.doesNotMatch(JSON.stringify(metrics), /private/);
+	});
+
+	test("reads rollout metrics from the tail of a long rollout", async () => {
+		const line = (timestamp: string, type: string, payload: Record<string, unknown>) =>
+			JSON.stringify({ timestamp, type, payload });
+		const usage = (input: number) => ({
+			type: "token_count",
+			info: { last_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: 1, reasoning_output_tokens: 0, total_tokens: input + 1 } },
+		});
+		const lines = [line("2026-10-24T10:00:00.000Z", "session_meta", { id: "thread" })];
+		for (let turn = 0; turn < 20; turn++) {
+			lines.push(
+				line(`2026-10-24T10:${String(turn).padStart(2, "0")}:00.000Z`, "event_msg", { type: "task_started", turn_id: `turn-${turn}` }),
+				line(`2026-10-24T10:${String(turn).padStart(2, "0")}:01.000Z`, "event_msg", usage(100 + turn)),
+				line(`2026-10-24T10:${String(turn).padStart(2, "0")}:02.000Z`, "event_msg", { type: "task_complete", turn_id: `turn-${turn}` }),
+			);
+		}
+		lines.push(line("2026-10-24T11:00:00.000Z", "event_msg", { type: "task_started", turn_id: "turn-child", root_turn_id: "turn-19" }));
+		const content = `${lines.join("\n")}\n`;
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "codex-rollout-"));
+		const file = path.join(dir, "rollout.jsonl");
+		try {
+			await fs.writeFile(file, content, "utf8");
+			for (const turnId of ["turn-0", "turn-7", "turn-19", "turn-child"]) {
+				const index = lines.findIndex(entry => entry.includes("task_started") && entry.includes(`"turn_id":"${turnId}"`));
+				const expected = Buffer.byteLength(lines.slice(0, index).join("\n")) + 1;
+				for (const chunkBytes of [17, 64, 1 << 20]) {
+					assert.strictEqual(
+						await findCodexRolloutTurnStartOffset(file, turnId, { chunkBytes }),
+						expected,
+						`${turnId} with ${chunkBytes}-byte chunks`
+					);
+				}
+			}
+			assert.strictEqual(await findCodexRolloutTurnStartOffset(file, "turn-missing", { chunkBytes: 64 }), undefined);
+			assert.strictEqual(await findCodexRolloutTurnStartOffset(file, "turn-0", { chunkBytes: 64, maxScanBytes: 256 }), undefined);
+			const metrics = await readCodexRolloutMetrics(file, "turn-7");
+			assert.strictEqual(metrics?.completed, true);
+			assert.strictEqual(metrics?.inputTokens, 107);
+			assert.deepStrictEqual(metrics, parseCodexRolloutMetrics(content, "turn-7"));
+		} finally {
+			await fs.rm(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("keeps only the latest user turn when resuming an interrupted Codex thread", () => {
@@ -790,6 +892,8 @@ suite("Codex subscription provider", () => {
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Internal server error"), true);
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Input exceeds the maximum length"), false);
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Rate limit exceeded"), false);
+		assert.strictEqual(shouldRecoverCodexFailedToolTurn("You’ve hit your usage limit. Upgrade to Pro"), false);
+		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Selected model is at capacity. Please try a different model."), false);
 		assert.strictEqual(shouldRecoverCodexFailedToolTurn("Request was interrupted"), false);
 		assert.strictEqual(shouldRecoverCodexToolTurnException(new CodexStaleTurnError("stale")), true);
 		assert.strictEqual(shouldRecoverCodexToolTurnException(new CodexInternalToolBlockedError("commandExecution")), true);

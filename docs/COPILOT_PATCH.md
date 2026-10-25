@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. The extension applies compatible patches on startup
 and exposes apply, status and restore commands; no installer or external patch
-script is required. Patch v26 makes the following changes:
+script is required. Patch v27 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -128,14 +128,25 @@ script is required. Patch v26 makes the following changes:
   1 500-message conversation, while the provider itself spent 11ms on them.
   Built-in models already use a cached local tokenizer.
 - the rendered agent history is capped for llama.cpp models
-  (`llamacpp.agentHistoryRounds`, default 400 tool-call rounds, 0 disables the
-  cap). Copilot's prompt-tsx builds a node tree from every tool-call round and
-  walks it repeatedly for token accounting and node coalescing, so a
-  1 500-message conversation costs minutes of host CPU per step even after the
-  token-count RPCs are memoised. The oldest 20% of rounds are kept as a stable
-  prefix for the upstream prompt cache plus the newest rounds; the cap only
-  trims what is rendered into the prompt — the persisted chat session is never
-  modified.
+  (`llamacpp.agentHistoryRounds`, default 400 tool-call rounds, and
+  `llamacpp.agentHistoryTurns`, default 80 previous turns). Copilot's
+  prompt-tsx builds a node tree from every tool-call round and walks it
+  repeatedly for token accounting and node coalescing, so a 1 500-message
+  conversation costs minutes of host CPU per step even after the token-count
+  RPCs are memoised. The oldest 20% of rounds are kept as a stable prefix for
+  the upstream prompt cache plus the newest rounds; the cap only trims what is
+  rendered into the prompt — the persisted chat session is never modified.
+- a main-agent chat that already has a saved transcript renders only a short
+  tail (v27): `llamacpp.journalRenderRounds` (default 12) rounds of the current
+  request and `llamacpp.journalRenderTurns` (default 8) previous turns. The
+  extension restores the full history from the transcript before calling the
+  provider, so the model still receives every turn. In a chat with 16 user
+  turns and about 2 400 tool rounds, Copilot spent about 35 s of extension-host
+  CPU per step rendering history at the 400-round cap; with the journal caps the gap between
+  tool rounds fell to 0.7–1.6 s. The patch asks `globalThis.__llamaJournalHas`
+  before using the short caps. Subagents (no transcript), chats without a saved
+  transcript, and hosts without the extension keep the full caps, so a chat is
+  rendered in full once before its transcript exists.
 
 The extension maps native values to its request modes:
 

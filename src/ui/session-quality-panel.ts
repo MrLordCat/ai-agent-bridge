@@ -714,7 +714,7 @@ function renderCacheTab(d) {
 		const stateLabels = {
 			checking: 'Checking', disabled: 'Disabled', paused_usage_unknown: 'Paused · usage unknown',
 			paused_usage_stale: 'Paused · usage stale', paused_usage_limit: 'Paused · limit protection',
-			no_eligible_session: 'No eligible session', waiting: 'Waiting', running: 'Running',
+			no_eligible_session: 'No eligible session', idle_limit: 'Stopped · idle limit', waiting: 'Waiting', running: 'Running',
 			success: 'Success', failed: 'Failed',
 		};
 		const keepAliveTone = keepAlive.state === 'failed'

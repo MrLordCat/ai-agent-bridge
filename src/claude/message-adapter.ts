@@ -10,9 +10,14 @@ export function decodeClaudeModelId(modelId: string): string | undefined { retur
  */
 export const CLAUDE_SUBSCRIPTION_MODELS = [
 	{
+		id: "claude-opus-5-5",
+		name: "Opus 5.5 (Claude)",
+		description: "Latest high-capability Claude model for complex analysis and implementation",
+	},
+	{
 		id: "claude-opus-5",
 		name: "Opus 5 (Claude)",
-		description: "Latest high-capability Claude model for complex analysis and implementation",
+		description: "Previous Opus generation, kept for comparison and for sessions pinned to it",
 	},
 ];
 

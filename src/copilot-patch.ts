@@ -13,7 +13,7 @@ import {
 	type SearchOptions,
 } from "./vscode-app-root";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v26";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v27";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID = "llama-vscode-chat:copilot-git-repositories-guard:v1";
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER = `/* ${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID} */`;
@@ -22,6 +22,7 @@ export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_
 export const VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER = "/* llama-vscode-chat:vscode-chat-history-bounds:v1 */";
 
 const LEGACY_PATCH_MARKERS = [
+	"/* llama-vscode-chat:copilot-native-model-controls:v26 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v25 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v24 */",
 	"/* llama-vscode-chat:copilot-native-model-controls:v23 */",
@@ -385,22 +386,44 @@ export function patchCopilotGitRepositoriesGuard(source: string): string {
  * covered by focused synthetic tests. The regexes capture the minified names
  * and keep the original ones in the replacement.
  */
+/**
+ * Injected declaration of a history cap. A main-agent chat whose transcript is
+ * already journaled uses the small journal cap: the extension restores the
+ * full history from the journal, so Copilot's prompt-tsx render (35 s of host
+ * CPU per step at 1.5k messages) only has to cover the newest tail. Subagents
+ * have no journal and chats without a saved transcript keep the full cap.
+ */
+function injectedHistoryCap(variable: string, journalGlobal: string, agentGlobal: string, request: string, conversation: string): string {
+	return (
+		`let ${variable}=(!${request}?.subAgentInvocationId&&` +
+		`globalThis.__llamaJournalHas?.(${conversation})===!0?globalThis.${journalGlobal}:void 0)??globalThis.${agentGlobal};`
+	);
+}
+
 export function patchAgentHistoryCap(source: string): string {
 	if (
 		source.includes(
 			"__llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;"
 		) &&
-		source.includes("l=__llamaRounds.flatMap")
+		source.includes("l=__llamaRounds.flatMap") &&
+		source.includes("globalThis.__llamaJournalHistoryRounds")
 	) {
 		return source;
 	}
+	const roundsCap = injectedHistoryCap(
+		"__llamaCap",
+		"__llamaJournalHistoryRounds",
+		"__llamaAgentHistoryRounds",
+		"this.props.promptContext.request",
+		"this.props.promptContext.conversation?.sessionId"
+	);
 	let patched = replacePatternOnce(
 		source,
 		/([A-Za-z_$][\w$]*)=o\.userQueryTagName,([A-Za-z_$][\w$]*)=o\.ReminderInstructionsClass,([A-Za-z_$][\w$]*)=o\.ToolReferencesHintClass;return this\.props\.enableSummarization\?/,
 		"$1=o.userQueryTagName,$2=o.ReminderInstructionsClass,$3=o.ToolReferencesHintClass;" +
 			"let __llamaRounds=this.props.promptContext.toolCallRounds,__llamaResults=this.props.promptContext.toolCallResults;" +
 			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-			"let __llamaCap=globalThis.__llamaAgentHistoryRounds;" +
+			roundsCap +
 			"if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);" +
 			"if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){" +
 			"let __llamaHead=Math.floor(__llamaCap*.2);" +
@@ -423,7 +446,7 @@ export function patchAgentHistoryCap(source: string): string {
 		"async render($1,r,o,a){if(!this.props.promptContext.tools||!this.props.toolCallRounds?.length)return;" +
 			"let __llamaRounds=this.props.toolCallRounds;" +
 			'if(this.promptEndpoint.modelProvider==="llamacpp"){' +
-			"let __llamaCap=globalThis.__llamaAgentHistoryRounds;" +
+			roundsCap +
 			"if(!Number.isFinite(__llamaCap)||__llamaCap<1)__llamaCap=400;else __llamaCap=Math.min(Math.floor(__llamaCap),2000);" +
 			"if(Array.isArray(__llamaRounds)&&__llamaRounds.length>__llamaCap){" +
 			"let __llamaHead=Math.floor(__llamaCap*.2);" +
@@ -676,7 +699,13 @@ export function patchCopilotBundle(source: string): string {
 		/let ([A-Za-z_$][\w$]*)=this\.options\.conversation\.turns\.slice\(0,-1\)\.filter\(([A-Za-z_$][\w$]*)=>\2\.responseStatus!=="prompt-filtered"\);return\{requestId:this\.turn\.id,query:([A-Za-z_$][\w$]*),history:\1,/,
 		'let $1=this.options.conversation.turns.slice(0,-1).filter($2=>$2.responseStatus!=="prompt-filtered");' +
 			'if(this.options.request?.model?.vendor==="llamacpp"){' +
-			"let __llamaTurnCap=globalThis.__llamaAgentHistoryTurns;" +
+			injectedHistoryCap(
+				"__llamaTurnCap",
+				"__llamaJournalHistoryTurns",
+				"__llamaAgentHistoryTurns",
+				"this.options.request",
+				"this.options.conversation?.sessionId"
+			) +
 			"if(!Number.isFinite(__llamaTurnCap)||__llamaTurnCap<1)__llamaTurnCap=80;" +
 			"else __llamaTurnCap=Math.min(Math.floor(__llamaTurnCap),2000);" +
 			"if($1.length>__llamaTurnCap){" +

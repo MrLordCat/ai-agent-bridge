@@ -42,7 +42,7 @@ Quick Access → **Copilot Patches** has apply, status and restore actions.
 `llamacpp.autoPatchCopilot` controls the Copilot patch;
 `llamacpp.workbenchTerminalPatchEnabled` and
 `llamacpp.agentHostThinkingPatchEnabled` control the other two.
-Implementation details: [Patch v26](docs/COPILOT_PATCH.md).
+Implementation details: [Patch v27](docs/COPILOT_PATCH.md).
 
 ## Install
 
@@ -141,16 +141,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md),
 [provider architecture](docs/PROVIDER_ARCHITECTURE.md), and
 [Quick Access](docs/QUICK_ACCESS.md) for the current maintenance contracts.
 
-**Stable release: 1.18.0. Current build: 1.18.21.**
+**Stable release: 1.18.0. Current build: 1.18.25.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 810 extension-host tests in the current 1.18.21 build
+npm test              # 824 extension-host tests in the current 1.18.25 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-1.18.21.vsix --force
+code --install-extension ./llama-vscode-chat-1.18.25.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

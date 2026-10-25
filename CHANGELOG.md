@@ -1,5 +1,80 @@
 # Changelog
 
+## 1.18.25 (local development patch) - 2026-10-25
+
+- Claude cache keep-alive now actually runs while you are idle. It needs a
+  usage snapshot no older than 10 minutes, but the background CLI usage probe
+  stops 10 minutes after the last Claude request, so every attempt (first due
+  after about 36 idle minutes) was paused as "usage stale". A due keep-alive
+  now refreshes usage from the live Claude session itself, a control request
+  that costs no model tokens and starts no extra process. Before it is due, a
+  stale snapshot no longer matters.
+- Claude cache keep-alive stops after `llamacpp.claudeCacheKeepAliveMaxIdleMs`
+  (2 hours by default) without a real Claude turn and lets the cache expire.
+  Keep-alive turns no longer count as use, so an enabled keep-alive cannot keep
+  re-reading the prefix of a chat you have left. Quick Access shows the interval
+  and the idle limit.
+- `llamacpp.claudeCacheKeepAliveMs` is clamped to 55 minutes. At 60 minutes,
+  every keep-alive after the first arrived after the 1-hour cache had expired,
+  because the timer only checks every 5 minutes.
+
+## 1.18.24 (local development patch) - 2026-10-24
+
+- Long chats: Copilot no longer re-renders the whole history on every tool
+  round. Copilot patch v27 renders only the newest 12 rounds and 8 previous
+  turns for a chat that already has a saved transcript
+  (`llamacpp.journalRenderRounds`, `llamacpp.journalRenderTurns`). The
+  extension restores the full history from the transcript, so every provider
+  still receives all turns. In a chat with 16 user turns and about 2 400 tool
+  rounds, the gap between tool rounds fell from 35 s or more of host CPU to
+  0.7–1.6 s. Subagents and chats without a transcript keep
+  `agentHistoryRounds`/`agentHistoryTurns`.
+- Transcript merge: a render that drops middle turns no longer cuts the saved
+  history. Incoming requests are matched as an ordered subsequence of the stored
+  ones, so only a request missing from that order counts as an edit. Before
+  this, a turn cap combined with a new request could drop hundreds of saved
+  messages.
+
+## 1.18.23 (local development patch) - 2026-10-24
+
+- Codex: VS Code tools no longer trigger repeated full-context `wait` polls.
+  Codex calls our tools from code-mode `exec`, which used to yield after 30 s.
+  The model then polled with `wait` (often every 1 s), and each poll re-sent
+  the whole ~240K-token context. In real rollouts these polls were 34–46% of
+  model calls and input tokens. Threads now set
+  `features.code_mode.default_exec_yield_time_ms` to 10 minutes, so `exec`
+  returns when the tool does. The developer instructions also ask for one long
+  `wait` instead of short polls. Measured with
+  `scripts/codex-code-mode-smoke.mjs` on CLI 0.162 and 0.164: one `exec`, no
+  `wait`. If a CLI rejects the table, the request is retried once without it.
+- Codex: per-turn rollout metrics read only the finished turn, found by
+  scanning backwards from the end of the file, instead of parsing the whole
+  rollout (tens of MB in long threads) before the response finishes. On a 77 MB
+  rollout this took 5 ms instead of over 200 ms. The rollout path is cached per
+  thread, so the `thread/read` call is not repeated on every turn.
+- Codex: "usage limit" and "model at capacity" failures are final; the provider
+  no longer sends a recovery turn that fails the same way.
+- Codex: after an app-server restart, `thread/resume` runs only for the stored
+  thread that matches the conversation, not for every compatible candidate.
+- Codex: JSONL output from the app-server is split without rescanning the whole
+  buffer for every chunk of a large message.
+- Codex: `codex.chat.request_arrived` logs how many token counts VS Code
+  requested during the gap (`tokenCountCalls`, `tokenCountComputeMs`,
+  `tokenCountSpanMs`). This shows how much of the 6–60 s gap between tool
+  rounds in large chats comes from token counting.
+
+## 1.18.22 (local development patch) - 2026-10-24
+
+- Claude: Opus 5.5 is selectable. The subscription catalog advertised only
+  `claude-opus-5`, while the installed Claude Code CLI (2.1.310) accepts
+  `claude-opus-5-5` and its `[1m]` variant. Both generations are now offered,
+  with Opus 5.5 first.
+- Claude: prefer the official Claude Code runtime over the SDK-bundled CLI.
+  The bundled 2.1.240 cannot run Opus 5.5; the API requires 2.1.280 or newer.
+  API errors now retain the server's explanation instead of only `unknown`.
+- Claude: recovery warnings distinguish the full-history token estimate from
+  the latest-message estimate and explain the actual replay guard.
+
 ## 1.18.21 (local development patch) - 2026-10-23
 
 - Cursor: a chat whose run failed during tool work (for example "Connection

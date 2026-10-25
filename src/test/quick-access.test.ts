@@ -370,7 +370,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 
 		// Claude cache keep-alive toggle is visible and defaults to on.
 		const keepAlive = (await getItems(provider, claude)).find(item => labelOf(item) === "Cache Keep-Alive");
-		assert.strictEqual(keepAlive?.description, "On (45 min)");
+		assert.strictEqual(keepAlive?.description, "On (every 45 min, up to 2 h idle)");
 		assert.strictEqual(keepAlive?.command?.command, "llamacpp.toggleClaudeCacheKeepAlive");
 	});
 
