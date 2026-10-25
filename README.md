@@ -53,9 +53,9 @@ Requires **VS Code 1.131+**, GitHub Copilot Chat and Windows x64 or Linux x64.
 
    ```sh
    # Windows x64
-   code --install-extension llama-vscode-chat-v1.17.3-win32-x64.vsix
+   code --install-extension llama-vscode-chat-v1.19.0-win32-x64.vsix
    # Linux x64
-   code --install-extension llama-vscode-chat-v1.17.3-linux-x64.vsix
+   code --install-extension llama-vscode-chat-v1.19.0-linux-x64.vsix
    ```
 
 3. Run **Developer: Reload Window**, then reload again if a patch notification asks.
@@ -141,16 +141,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md),
 [provider architecture](docs/PROVIDER_ARCHITECTURE.md), and
 [Quick Access](docs/QUICK_ACCESS.md) for the current maintenance contracts.
 
-**Stable release: 1.18.0. Current build: 1.18.25.**
+**Stable release: 1.19.0. Current build: 1.19.0.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 824 extension-host tests in the current 1.18.25 build
+npm test              # 824 extension-host tests in the current 1.19.0 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-1.18.25.vsix --force
+code --install-extension ./llama-vscode-chat-1.19.0.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

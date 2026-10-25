@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.19.0 (stable release) - 2026-10-25
+
+Consolidates the development work since 1.18.0: the 1.18.1/1.18.2 patch
+releases and the 1.18.1–1.18.25 development patches below.
+
+- Long chats stay fast. Copilot patch v27 renders only a short history tail for
+  a chat backed by the shared transcript, and every provider still receives the
+  full history from it. The transcript merge no longer loses saved turns when
+  Copilot drops middle turns. Subagent alternation no longer makes VS Code
+  re-read every provider catalog (patch v26). Catalog loads, Quick Access and
+  Copilot patch status no longer block the extension host.
+- One working context for Codex, Claude, Coco and Cursor
+  (`sharedContextLength`), passed to each backend's own auto-compaction, with
+  one handoff planner and a shared workspace journal restored before routing.
+- Codex: no full-context `wait` polls around VS Code tools, rollout metrics read
+  only the finished turn, and usage-limit failures are final.
+- Claude: Opus 5.5 through the official Claude Code runtime. Cache keep-alive
+  works while idle, stops after an idle limit and stays inside the 1-hour TTL.
+- Cursor: indexed native store (a long chat started in seconds instead of
+  minutes), persistent bindings, and continuation after failed or interrupted
+  runs without re-executing completed tools.
+- Coco: native ACP sessions for long-running callbacks, bounded tool names,
+  `tool_search` allowed, recovery from reasoning-only turns, and large handoffs
+  prepared locally with complete archives.
+- Copilot patches: stored tool results bounded (v23), MCP tuple schemas accepted
+  (v24), subagents isolated from the parent's native session (v25), and
+  backups protected against contamination.
+
 ## 1.18.25 (local development patch) - 2026-10-25
 
 - Claude cache keep-alive now actually runs while you are idle. It needs a
