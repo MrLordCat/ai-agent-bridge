@@ -2715,7 +2715,11 @@ export function createLatestUserMessage(
 		}
 		return chars;
 	};
-	const latest = candidates.find(message => textChars(message) <= CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS)
+	// A Copilot chat turn wraps the question in <userRequest>; its context (skills, instructions,
+	// terminals) can exceed the size limit, so it is never skipped for an older, shorter turn.
+	const isChatTurn = (message: vscode.LanguageModelChatRequestMessage): boolean => message.content.some(part =>
+		part instanceof vscode.LanguageModelTextPart && part.value.includes("<userRequest>"));
+	const latest = candidates.find(message => isChatTurn(message) || textChars(message) <= CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS)
 		?? candidates[0];
 	if (!latest) {
 		return createSdkUserMessage([{ type: "text", text: "Continue." }]);

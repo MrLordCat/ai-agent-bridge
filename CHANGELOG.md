@@ -1,5 +1,37 @@
 # Changelog
 
+## 1.19.3 (local development patch) - 2026-10-26
+
+- Shared transcript: screenshots no longer fill the 64 MiB transcript limit.
+  Images inside tool results were stored inline as base64 in addition to their
+  `assets/` file. Eleven screenshots (one 9.9 MB PNG three times) took 46 MB of
+  a 62 MB transcript, and the next round failed with "Cannot save the incoming
+  Chat transcript". The transcript now references each image by its asset
+  name and restores the bytes on reload. Older transcripts are read as before
+  and rewritten in the new form on their next save. The save error now names
+  its cause.
+
+## 1.19.2 (local development patch) - 2026-10-26
+
+- Codex, Coco, Cursor: a long autonomous request no longer fails with "The
+  current request and required instructions exceed the shared context budget".
+  The shared handoff treated every tool round since the last user message as
+  the untouchable current request, so a turn with 160 tool rounds could never
+  start a new thread again, for example on a retry after an error. Only the
+  request message is pinned now. The newest steps that fit are kept verbatim
+  and the older steps of the same request become an "Earlier steps of the
+  current request" summary.
+
+## 1.19.1 (local development patch) - 2026-10-25
+
+- Claude: a new chat message is sent to Claude again. Copilot now adds about
+  16K characters of `<customizationsUpdate>` context (skills, instructions,
+  agents) to every follow-up request. The provider skipped user messages above
+  6,000 characters, a rule meant for Agents Window transcripts that carry no
+  question, so every warm turn re-sent the first, shorter request. Claude then
+  answered that the same message had arrived again. A message with
+  `<userRequest>` is a real chat turn and is now always used.
+
 ## 1.19.0 (stable release) - 2026-10-25
 
 Consolidates the development work since 1.18.0: the 1.18.1/1.18.2 patch

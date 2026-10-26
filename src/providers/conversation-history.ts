@@ -7,10 +7,22 @@ import { normalizeSystemDate, normalizeVolatileHostContext } from "../context/ca
 import { canonicalConversationUserAnchors as cocoUserAnchors } from "./conversation-anchors";
 import { sharedImageName } from "../context/provider-handoff";
 
-type Part = { type: "text"; text: string } | { type: "data"; data: string; mimeType: string }
+type Part = { type: "text"; text: string } | { type: "data"; data: string; mimeType: string } | { type: "asset"; name: string; mimeType: string }
 	| { type: "call"; callId: string; name: string; input: object } | { type: "result"; callId: string; content: Part[] };
 interface Message { role: vscode.LanguageModelChatMessageRole; content: Part[] }
 const hash = (text: string) => createHash("sha256").update(text).digest("hex");
+const imageNames = new WeakMap<Uint8Array, string>();
+function imageName(part: vscode.LanguageModelDataPart): string {
+	let name = imageNames.get(part.data);
+	if (!name) { name = sharedImageName(part.data, part.mimeType); imageNames.set(part.data, name); }
+	return name;
+}
+/** Saved images live once in assets/; inline base64 let a few screenshots exceed the transcript size limit. */
+function storePart(part: unknown): Part[] {
+	if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) { return [{ type: "asset", name: imageName(part), mimeType: part.mimeType }]; }
+	if (part instanceof vscode.LanguageModelToolResultPart) { return [{ type: "result", callId: part.callId, content: part.content.flatMap(storePart) }]; }
+	return encodePart(part);
+}
 
 function encodePart(part: unknown): Part[] {
 	if (part instanceof vscode.LanguageModelTextPart) { return [{ type: "text", text: part.value }]; }
@@ -19,16 +31,26 @@ function encodePart(part: unknown): Part[] {
 	if (part instanceof vscode.LanguageModelToolResultPart) { return [{ type: "result", callId: part.callId, content: part.content.flatMap(encodePart) }]; }
 	return [];
 }
-function encode(message: vscode.LanguageModelChatRequestMessage): Message { return { role: message.role, content: message.content.flatMap(encodePart) }; }
-function decodePart(part: Part): vscode.LanguageModelTextPart | vscode.LanguageModelDataPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelToolResultPart {
+function store(message: vscode.LanguageModelChatRequestMessage): Message { return { role: message.role, content: message.content.flatMap(storePart) }; }
+type Assets = ReadonlyMap<string, Uint8Array | undefined>;
+function decodePart(part: Part, assets: Assets): vscode.LanguageModelTextPart | vscode.LanguageModelDataPart | vscode.LanguageModelToolCallPart | vscode.LanguageModelToolResultPart {
 	switch (part.type) {
 		case "text": return new vscode.LanguageModelTextPart(part.text);
 		case "data": return new vscode.LanguageModelDataPart(Buffer.from(part.data, "base64"), part.mimeType);
+		case "asset": {
+			const bytes = assets.get(part.name);
+			if (!bytes) { return new vscode.LanguageModelTextPart(`[Historical image ${part.mimeType} unavailable: ${part.name}]`); }
+			const data = new vscode.LanguageModelDataPart(bytes, part.mimeType); imageNames.set(data.data, part.name); return data;
+		}
 		case "call": return new vscode.LanguageModelToolCallPart(part.callId, part.name, part.input);
-		case "result": return new vscode.LanguageModelToolResultPart(part.callId, part.content.filter(p => p.type === "text" || p.type === "data").map(p => decodePart(p) as vscode.LanguageModelTextPart | vscode.LanguageModelDataPart));
+		case "result": return new vscode.LanguageModelToolResultPart(part.callId, part.content.filter(p => p.type === "text" || p.type === "data" || p.type === "asset").map(p => decodePart(p, assets) as vscode.LanguageModelTextPart | vscode.LanguageModelDataPart));
 	}
 }
-function decode(message: Message): vscode.LanguageModelChatRequestMessage { return new vscode.LanguageModelChatMessage(message.role, message.content.map(decodePart)); }
+function decode(message: Message, assets: Assets = new Map()): vscode.LanguageModelChatRequestMessage { return new vscode.LanguageModelChatMessage(message.role, message.content.map(part => decodePart(part, assets))); }
+function assetNames(parts: readonly Part[], names = new Set<string>()): Set<string> {
+	for (const part of parts) { if (part.type === "asset") { names.add(part.name); } else if (part.type === "result") { assetNames(part.content, names); } }
+	return names;
+}
 
 /**
  * Every step merges the whole stored journal against the incoming request, so
@@ -134,7 +156,7 @@ export class ConversationHistory {
 		const assets = new Map<string, Uint8Array>();
 		const collect = (part: unknown): void => {
 			if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) {
-				const name = sharedImageName(part.data, part.mimeType); if (!this.savedImages.has(name)) { assets.set(name, part.data); }
+				const name = imageName(part); if (!this.savedImages.has(name)) { assets.set(name, part.data); }
 			} else if (part instanceof vscode.LanguageModelToolResultPart) { part.content.forEach(collect); }
 		};
 		messages.forEach(message => message.content.forEach(collect));
@@ -142,7 +164,7 @@ export class ConversationHistory {
 			await fs.mkdir(path.join(this.root, "assets"), { recursive: true, mode: 0o700 });
 			for (const [name, bytes] of assets) { await fs.writeFile(path.join(this.root, "assets", name), bytes, { mode: 0o600 }); this.savedImages.add(name); }
 		}
-		const payload = JSON.stringify({ version: 1, messages: messages.map(encode) });
+		const payload = JSON.stringify({ version: 1, messages: messages.map(store) });
 		if (Buffer.byteLength(payload) > 64 * 1024 * 1024) { throw new Error("The saved Chat transcript exceeds 64 MiB. Compact the source Chat before another cross-provider handoff."); }
 		const commit = async () => {
 			if (owner.revision !== revision) { return; }
@@ -180,7 +202,13 @@ export class ConversationHistory {
 				if (stat.size > 64 * 1024 * 1024) { throw new Error("Saved conversation exceeds the supported size."); }
 				const document = JSON.parse(await fs.readFile(file, "utf8")) as { version?: unknown; messages?: unknown };
 				if (document.version !== 1 || !Array.isArray(document.messages)) { throw new Error("Invalid conversation checkpoint."); }
-				stored = document.messages.map(message => decode(message as Message));
+				const messages = document.messages as Message[], assets = new Map<string, Uint8Array | undefined>();
+				for (const name of assetNames(messages.flatMap(message => message.content))) {
+					if (!/^[0-9a-f]{64}\.[a-z]+$/.test(name)) { continue; }
+					assets.set(name, await fs.readFile(path.join(this.root, "assets", name)).catch(() => undefined));
+					if (assets.get(name)) { this.savedImages.add(name); }
+				}
+				stored = messages.map(message => decode(message, assets));
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw new Error("Cannot restore the common Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
 			}
@@ -195,7 +223,7 @@ export class ConversationHistory {
 		owner.messages = mergeConversationHistory(owner.messages, incoming);
 		const messages = [...owner.messages];
 		try { await this.persist(owner, file, revision, messages); }
-		catch (error) { owner.active--; throw new Error("Cannot save the incoming Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
+		catch (error) { owner.active--; throw new Error(`Cannot save the incoming Chat transcript (${error instanceof Error ? error.message : String(error)}). Check workspace storage before continuing or switching models.`, { cause: error }); }
 		let finished = false;
 		return { messages, transcriptPath: file, complete: async parts => {
 			if (finished) { return; } finished = true; owner.active--;

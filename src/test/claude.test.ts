@@ -16,6 +16,7 @@ import {
 	canonicalizeClaudeTools,
 	classifyClaudeResumeFailure,
 	clearPersistedClaudeSessionState,
+	CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS,
 	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
 	createLatestUserMessage,
@@ -881,6 +882,26 @@ test("marks the session stream as closed after an interrupt", async () => {
 
 		assert.strictEqual(content.length, 1);
 		assert.strictEqual(content[0].text, "fix the failing test please");
+	});
+
+	test("sends the new chat request even when Copilot's context makes it longer than the earlier one", () => {
+		// Regression: Copilot adds ~16K characters of <customizationsUpdate> context to follow-up
+		// requests, so the size limit skipped them and Claude received the first request every turn.
+		const turn = (request: string, context = "") => vscode.LanguageModelChatMessage.User(
+			`<context>${context}</context>\n<userRequest>\n${request}\n</userRequest>`);
+		const customizations = `<customizationsUpdate>${"<skill>description</skill>".repeat(700)}</customizationsUpdate>`;
+		const messages = [
+			turn("FIRST_REQUEST"),
+			vscode.LanguageModelChatMessage.Assistant("done"),
+			turn("SECOND_REQUEST", customizations),
+			vscode.LanguageModelChatMessage.Assistant("ok"),
+			turn("THIRD_REQUEST", customizations),
+		];
+		assert.ok(customizations.length > CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS);
+		const content = createLatestUserMessage(messages).message.content as Array<{ type: string; text?: string }>;
+		assert.strictEqual(content.length, 1);
+		assert.ok(content[0].text?.includes("THIRD_REQUEST"));
+		assert.ok(!content[0].text?.includes("FIRST_REQUEST"));
 	});
 
 	test("falls back to Continue when the tail has no real user content", () => {

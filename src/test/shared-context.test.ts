@@ -114,6 +114,20 @@ suite("Shared provider context", () => {
 		assert.match(text(plan.compacted), /Conversation summary \(shared provider context\)/);
 		assert.throws(() => prepareSharedHandoff([user("x".repeat(10000))], 1024), /current request.*shared context budget/);
 	});
+	test("a long autonomous turn compacts its older tool rounds instead of failing", () => {
+		const request = user("CONTINUE_THE_PORT");
+		const rounds = Array.from({ length: 160 }, (_, index) => [
+			assistant([new vscode.LanguageModelTextPart(`STEP_${index}`), new vscode.LanguageModelToolCallPart(`call-${index}`, "read_file", { index })]),
+			user([new vscode.LanguageModelToolResultPart(`call-${index}`, [new vscode.LanguageModelTextPart(`output ${index} `.repeat(400))])]),
+		]).flat();
+		const plan = prepareSharedHandoff([user("EARLY_RULE"), assistant("EARLY_FINDING"), request, ...rounds], 20000);
+		const rendered = text(plan.compacted);
+		assert.ok(plan.wasCompacted); assert.ok(plan.tokenEstimateAfter <= 20000);
+		assert.ok(plan.compacted.includes(request)); assert.strictEqual(plan.compacted.at(-1), rounds.at(-1));
+		assert.match(rendered, /Earlier steps of the current request/); assert.match(rendered, /STEP_159/);
+		const first = plan.compacted.indexOf(request) + 1;
+		assert.ok(plan.compacted[first].role === vscode.LanguageModelChatMessageRole.Assistant, "retained steps must not start with an orphaned tool result");
+	});
 	test("historical image references resolve to exact workspace files after journaling", async () => {
 		const root = await fs.mkdtemp(path.join(os.tmpdir(), "shared-images-"));
 		try {
@@ -123,6 +137,26 @@ suite("Shared provider context", () => {
 			const file = path.join(root, "assets", sharedImageName(image.data, image.mimeType));
 			assert.ok(text(plan.compacted).includes(sharedImageName(image.data, image.mimeType)));
 			assert.deepStrictEqual(await fs.readFile(file), Buffer.from(image.data)); await lease.complete([]);
+		} finally { await fs.rm(root, { recursive: true, force: true }); }
+	});
+	test("repeated screenshots in tool results are saved once as assets and restored after reload", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "shared-assets-"));
+		try {
+			const bytes = new Uint8Array(4 * 1024 * 1024).map((_, index) => index % 251);
+			const shot = (id: string) => [assistant([new vscode.LanguageModelToolCallPart(id, "screenshot", {})]),
+				user([new vscode.LanguageModelToolResultPart(id, [vscode.LanguageModelDataPart.image(bytes, "image/png"), new vscode.LanguageModelTextPart(`SHOT_${id}`)])])];
+			const messages = [user("CURRENT"), ...shot("a"), ...shot("b"), ...shot("c")];
+			const lease = await new ConversationHistory(root).begin("chat", messages); await lease.complete([]);
+			assert.ok((await fs.stat(lease.transcriptPath!)).size < 64 * 1024, "the transcript must reference images instead of embedding them");
+			const restored = await new ConversationHistory(root).begin("chat", [user("CURRENT"), user("NEXT")]);
+			const results = restored.messages.flatMap(message => message.content).filter(part => part instanceof vscode.LanguageModelToolResultPart);
+			assert.strictEqual(results.length, 3);
+			for (const result of results) {
+				const image = result.content[0] as vscode.LanguageModelDataPart;
+				assert.ok(image instanceof vscode.LanguageModelDataPart); assert.strictEqual(image.mimeType, "image/png");
+				assert.deepStrictEqual(Buffer.from(image.data), Buffer.from(bytes));
+			}
+			await restored.complete([]);
 		} finally { await fs.rm(root, { recursive: true, force: true }); }
 	});
 	test("reports a journaled conversation only once its transcript is saved, including after reload", async () => {

@@ -82,28 +82,37 @@ export function prepareSharedHandoff(messages: readonly vscode.LanguageModelChat
 	const systems = trimmed.map((message, index) => ({ message, index })).filter(({ message }) => message.role !== vscode.LanguageModelChatMessageRole.User && message.role !== vscode.LanguageModelChatMessageRole.Assistant);
 	const systemIndices = new Set(systems.map(({ index }) => index));
 	const fixed = systems.reduce((sum, { index }) => sum + costs[index], 0);
-	const currentCost = costs.slice(latest).reduce((sum, cost, index) => sum + (systemIndices.has(latest + index) ? 0 : cost), fixed);
-	if (currentCost > budget) { throw new Error(`The current request and required instructions exceed the shared context budget (${currentCost} estimated tokens, budget ${budget}). No inference was started; the complete transcript is preserved.`); }
+	// Only the request message itself is pinned; a long autonomous turn may compact its older tool rounds.
+	const pinnedCost = fixed + (systemIndices.has(latest) ? 0 : costs[latest]);
+	if (pinnedCost > budget) { throw new Error(`The current request and required instructions exceed the shared context budget (${pinnedCost} estimated tokens, budget ${budget}). No inference was started; the complete transcript is preserved.`); }
 	let result: vscode.LanguageModelChatRequestMessage[] = [...trimmed];
 	if (costs.reduce((sum, cost) => sum + cost, 0) > budget) {
-		const summaryReserve = Math.min(16000, Math.floor((budget - currentCost) / 3));
-		let start = latest, used = currentCost;
+		const summaryReserve = Math.min(16000, Math.floor((budget - pinnedCost) / 3));
+		let start = trimmed.length, used = pinnedCost;
 		while (start > 0) {
-			const next = start - 1, cost = systemIndices.has(next) ? 0 : costs[next];
+			const next = start - 1, cost = systemIndices.has(next) || next === latest ? 0 : costs[next];
 			if (used + cost + summaryReserve > budget) { break; }
 			used += cost; start = next;
 		}
 		// Do not start a suffix with an orphaned tool result.
-		while (start < latest && trimmed[start].content.some(part => part instanceof vscode.LanguageModelToolResultPart)) { start++; }
-		const head = trimmed.slice(0, start).filter((_, index) => !systemIndices.has(index));
-		const raw: OpenAIChatMessage[] = head.map(message => ({ role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" : "user", content: message.content.map(renderPart).join("\n") }));
-		const summary = buildSummaryContent("Conversation summary (shared provider context)", [], raw, undefined);
-		const suffix = trimmed.slice(start).filter((_, index) => !systemIndices.has(start + index));
+		while (start < trimmed.length && start !== latest && trimmed[start].content.some(part => part instanceof vscode.LanguageModelToolResultPart)) { start++; }
+		const kept = (index: number) => !systemIndices.has(index) && (index >= start || index === latest);
+		const raw = (from: number, to: number): OpenAIChatMessage[] => trimmed.slice(from, to).flatMap((message, offset) => kept(from + offset) || systemIndices.has(from + offset) ? [] : [{
+			role: message.role === vscode.LanguageModelChatMessageRole.Assistant ? "assistant" as const : "user" as const, content: message.content.map(renderPart).join("\n"),
+		}]);
+		const head = raw(0, latest), progress = raw(latest + 1, trimmed.length);
+		let headSummary = head.length || !progress.length ? buildSummaryContent("Conversation summary (shared provider context)", [], head, undefined) : "";
+		let progressSummary = progress.length ? buildSummaryContent("Earlier steps of the current request (already done; continue from the retained recent steps)", [], progress, undefined) : "";
+		const suffix = trimmed.filter((_, index) => kept(index));
 		const suffixCost = suffix.reduce((sum, message) => sum + estimateSharedMessageTokens(message), fixed);
 		const reference = archivePath ? `\nComplete original transcript: ${JSON.stringify(archivePath)}. Search/read it when exact earlier details matter. Do not repeat historical actions.\n` : "\nEarlier details remain in the shared Chat transcript. Do not repeat historical actions.\n";
 		const availableBytes = Math.max(0, (budget - suffixCost - estimateSharedTextTokens(reference) - 32) * 2);
-		let excerpt = summary;
-		while (Buffer.byteLength(excerpt, "utf8") > availableBytes) { excerpt = excerpt.slice(0, Math.max(0, Math.floor(excerpt.length * .9))); }
+		const excerptOf = () => [headSummary, progressSummary].filter(Boolean).join("\n\n");
+		const shrink = (text: string) => text.slice(0, Math.max(0, Math.floor(text.length * .9)));
+		// Recent progress of the running request outranks older conversation history.
+		while (headSummary && Buffer.byteLength(excerptOf(), "utf8") > availableBytes) { headSummary = shrink(headSummary); }
+		while (progressSummary && Buffer.byteLength(excerptOf(), "utf8") > availableBytes) { progressSummary = shrink(progressSummary); }
+		const excerpt = excerptOf();
 		const summaryMessage = vscode.LanguageModelChatMessage.User(excerpt + reference);
 		if (estimateSharedMessageTokens(summaryMessage) + suffixCost > budget) { throw new Error("The current request leaves no room for the shared context summary. Reduce the request or increase the working context; no inference was started."); }
 		result = [...systems.map(({ message }) => message), summaryMessage, ...suffix];
