@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.19.3",
+	"version": "1.19.4",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -601,6 +601,18 @@
 					"minimum": 0,
 					"maximum": 2000,
 					"description": "Cap for previous conversation turns that Copilot renders into the prompt for subagents and for chats without a saved transcript. The oldest 20% plus the newest turns are kept, and the drop point moves in steps so the upstream prompt cache stays valid. 0 restores the default."
+				},
+				"llamacpp.autoUpdate": {
+					"type": "string",
+					"enum": ["notify", "install", "off"],
+					"enumDescriptions": [
+						"Check GitHub every 6 hours and offer a newer stable release.",
+						"Download a newer stable release, verify its SHA-256 digest, install it and offer a window reload.",
+						"Never check automatically; use Check for Updates in Quick Access."
+					],
+					"default": "notify",
+					"scope": "application",
+					"description": "Automatic updates from the stable GitHub releases of MrLordCat/ai-agent-bridge. Only versions newer than the installed one are offered, so a local development build is never replaced by an older release."
 				},
 				"llamacpp.journalRenderRounds": {
 					"type": "number",
@@ -1360,6 +1372,20 @@
 			{
 				"command": "llamacpp.applyCopilotPatch",
 				"title": "AI Agent Bridge: Apply Copilot Chat Patch"
+			},
+			{
+				"command": "llamacpp.checkForUpdates",
+				"title": "AI Agent Bridge: Check for Updates",
+				"icon": "$(sync)"
+			},
+			{
+				"command": "llamacpp.installUpdate",
+				"title": "AI Agent Bridge: Install Update",
+				"icon": "$(cloud-download)"
+			},
+			{
+				"command": "llamacpp.chooseAutoUpdateMode",
+				"title": "AI Agent Bridge: Choose Automatic Update Mode"
 			},
 			{
 				"command": "llamacpp.prepareUserVsCode",

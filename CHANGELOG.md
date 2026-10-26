@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.19.4 (local development patch) - 2026-10-26
+
+- Updates from GitHub releases. The extension checks the latest stable release
+  of MrLordCat/ai-agent-bridge one minute after startup and then every 6 hours.
+  The new `llamacpp.autoUpdate` setting is `notify` (default), `install` or
+  `off`. Only a version newer than the installed one is offered. The VSIX for
+  the current platform is downloaded from this repository only and installed
+  only when its size and SHA-256 digest match the release. A reload is offered
+  afterwards. Several windows show one notification per version, and only one
+  window installs at a time.
+- Quick Access has an **AI Agent Bridge** group: Current Version, Last Check
+  (time and latest release, or the failure reason), Check for Updates, Install
+  Update or Reload Window, and Automatic Updates. The same actions are
+  available as commands.
+
 ## 1.19.3 (local development patch) - 2026-10-26
 
 - Shared transcript: screenshots no longer fill the 64 MiB transcript limit.

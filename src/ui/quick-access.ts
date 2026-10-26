@@ -33,6 +33,7 @@ import {
 	resolveDeepSeekPricingSnapshot,
 } from "../deepseek-peak-hours";
 import type { SubagentModelProfile } from "../subagent-guidance";
+import type { AutoUpdateMode, UpdateStatus } from "../update/extension-updater";
 import {
 	emptyTokenUsageHistorySummary,
 	TOKEN_USAGE_PROVIDERS,
@@ -101,6 +102,45 @@ export interface QuickAccessDependencies {
 	getCodexUsageLimits?: () => readonly { label: string; description: string }[];
 	getCocoStatus?: () => QuickAccessCocoStatus | undefined;
 	getProviderSnapshots?: () => ReadonlyMap<string, ProviderSnapshot>;
+	getUpdateStatus?: () => UpdateStatus | undefined;
+}
+
+const AUTO_UPDATE_LABELS: Record<AutoUpdateMode, string> = { notify: "Notify", install: "Install automatically", off: "Off" };
+
+export function buildUpdateItem(status: UpdateStatus, now = Date.now()): QuickAccessItem {
+	const latest = status.latest?.version;
+	const summary = status.installing ? `installing ${latest ?? "update"}…`
+		: status.installedVersion ? `${status.installedVersion} installed · reload`
+			: status.available ? `update ${latest} available`
+				: status.checking ? "checking…" : status.lastCheckAt ? "up to date" : "not checked yet";
+	const age = status.lastCheckAt === undefined ? undefined : Math.max(0, now - status.lastCheckAt);
+	const ago = age === undefined ? "never" : age < 60_000 ? "just now" : age < 3_600_000 ? `${Math.floor(age / 60_000)} min ago` : age < 86_400_000 ? `${Math.floor(age / 3_600_000)} h ago` : `${Math.floor(age / 86_400_000)} d ago`;
+	const action = status.installedVersion
+		? new QuickAccessItem("update.reload", "Reload Window", { description: `use ${status.installedVersion}`, icon: new vscode.ThemeIcon("refresh"), command: command("workbench.action.reloadWindow", "Reload Window") })
+		: status.available
+			? new QuickAccessItem("update.install", "Install Update", { description: status.installing ? "installing…" : `${latest}`, tooltip: `Download ${status.latest!.asset.name}, verify its SHA-256 digest and install it.`, icon: new vscode.ThemeIcon("cloud-download"), command: command("llamacpp.installUpdate", "Install AI Agent Bridge Update") })
+			: undefined;
+	return new QuickAccessItem("update", "AI Agent Bridge", {
+		description: `v${status.currentVersion} · ${summary}`,
+		tooltip: `Installed version ${status.currentVersion}. Stable releases come from github.com/MrLordCat/ai-agent-bridge.`,
+		icon: new vscode.ThemeIcon(status.available || status.installedVersion ? "cloud-download" : "versions"),
+		children: [
+			new QuickAccessItem("update.current", "Current Version", { description: status.currentVersion, icon: new vscode.ThemeIcon("tag") }),
+			new QuickAccessItem("update.lastCheck", "Last Check", {
+				description: status.checking ? "checking…" : status.error ? `${ago} · failed` : latest ? `${ago} · latest ${latest}` : ago,
+				tooltip: [status.lastCheckAt === undefined ? "No update check yet." : `Checked ${new Date(status.lastCheckAt).toLocaleString()}.`, status.error].filter(Boolean).join("\n"),
+				icon: new vscode.ThemeIcon(status.error ? "warning" : "history"),
+			}),
+			new QuickAccessItem("update.check", "Check for Updates", { description: status.checking ? "checking…" : undefined, icon: new vscode.ThemeIcon("sync"), command: command("llamacpp.checkForUpdates", "Check for AI Agent Bridge Updates") }),
+			...(action ? [action] : []),
+			new QuickAccessItem("update.mode", "Automatic Updates", {
+				description: AUTO_UPDATE_LABELS[status.mode],
+				tooltip: "Notify: check every 6 hours and offer new stable releases. Install automatically: download, verify and install them, then offer a reload. Off: only manual checks.",
+				icon: toggleIcon(status.mode !== "off"),
+				command: command("llamacpp.chooseAutoUpdateMode", "Choose Automatic Update Mode"),
+			}),
+		],
+	});
 }
 
 /** Capture source data once so asynchronous profile rendering cannot mix snapshots. */
@@ -1236,6 +1276,8 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const genericProviders = [...view.snapshots.values()]
 			.filter(snapshot => !["primary", "local", "deepseek", "codex", "claude", "coco"].includes(snapshot.sourceId) && !snapshot.sourceId.startsWith("api-") && snapshot.state !== "offline")
 			.map(buildProviderSnapshotItem);
-		return [apiProviders, ...apiProfileItems, ...visibleProviders, ...genericProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches];
+		const updateStatus = this.dependencies.getUpdateStatus?.();
+		return [apiProviders, ...apiProfileItems, ...visibleProviders, ...genericProviders, tokenUsage, experiments, agents, modelBehavior, memory, diagnostics, patches,
+			...(updateStatus ? [buildUpdateItem(updateStatus)] : [])];
 	}
 }

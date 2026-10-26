@@ -45,6 +45,7 @@ import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
 import { ConversationHistory } from "./providers/conversation-history";
+import { AUTO_UPDATE_MODES, ExtensionUpdater, resolveAutoUpdateMode, type AutoUpdateMode } from "./update/extension-updater";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
 import { getSubagentModelProfiles } from "./subagent-guidance";
 import { coalesce } from "./utils";
@@ -666,6 +667,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	let lastHealthStatus: string | undefined;
 	let lastHealthEnriched: unknown | undefined;
 	const runtimeMetrics = new Map<RuntimeSource, ProviderRuntimeMetrics>();
+	const updater = new ExtensionUpdater({ state: context.globalState, storageDir: context.globalStorageUri.fsPath,
+		currentVersion: String(context.extension.packageJSON.version), log: (event, data) => logService.log(event, data) });
+	context.subscriptions.push(updater,
+		vscode.commands.registerCommand("llamacpp.checkForUpdates", () => updater.check(true)),
+		vscode.commands.registerCommand("llamacpp.installUpdate", () => updater.install(true)),
+		vscode.commands.registerCommand("llamacpp.chooseAutoUpdateMode", async () => {
+			const current = resolveAutoUpdateMode();
+			const labels: Record<AutoUpdateMode, string> = { notify: "Notify", install: "Install automatically", off: "Off" };
+			const details: Record<AutoUpdateMode, string> = { notify: "Check every 6 hours and offer new stable releases", install: "Download, verify and install new stable releases, then offer a reload", off: "Only manual checks from Quick Access" };
+			const picked = await vscode.window.showQuickPick(AUTO_UPDATE_MODES.map(mode => ({ label: labels[mode], description: mode === current ? "current" : undefined, detail: details[mode], mode })), { title: "AI Agent Bridge: Automatic Updates" });
+			if (picked && picked.mode !== current) { await vscode.workspace.getConfiguration(CONFIG_SECTION).update("autoUpdate", picked.mode, vscode.ConfigurationTarget.Global); }
+		}));
+	// Development and test hosts never contact GitHub on their own.
+	if (context.extensionMode === vscode.ExtensionMode.Production) { updater.start(); }
 	const quickActionsProvider = new LlamaQuickActionsProvider({
 		getLastThroughput: () => lastThroughput,
 		getLastContextUsage: () => lastContextUsage,
@@ -695,7 +710,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getProviderSnapshots: () => providerSnapshots(providerDirectory.list(),
 			new Map([...runtimeMetrics, ["codex", codexProvider.runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}], ["coco", cocoProvider.runtimeMetrics ?? {}]]),
 			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
+		getUpdateStatus: () => updater.status,
 	});
+	context.subscriptions.push(updater.onDidChange(() => quickActionsProvider.refresh()));
+	context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => { if (event.affectsConfiguration(`${CONFIG_SECTION}.autoUpdate`)) { quickActionsProvider.refresh(); } }));
 	context.subscriptions.push(vscode.window.registerTreeDataProvider("llamacpp-quick-actions", quickActionsProvider));
 	context.subscriptions.push(quickActionsProvider);
 	context.subscriptions.push(apiProviderService.onDidChangeContext(() => {
