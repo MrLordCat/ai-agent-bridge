@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.20.0 (stable release) - 2026-10-26
+
+Consolidates the 1.19.1–1.19.4 development patches below.
+
+- Updates from GitHub releases (`llamacpp.autoUpdate`: notify, install, off),
+  verified by SHA-256, with an **AI Agent Bridge** group in Quick Access: the
+  current version, the last check, Check for Updates, Install Update and the
+  automatic update mode.
+- Claude sends the newest chat turn again instead of the first request.
+- A long autonomous request (Codex, Coco, Cursor) compacts its older tool
+  rounds instead of failing the shared context budget.
+- Screenshots are stored once in `assets/` instead of inline in the shared
+  transcript, which no longer hits its 64 MiB limit.
+
 ## 1.19.4 (local development patch) - 2026-10-26
 
 - Updates from GitHub releases. The extension checks the latest stable release
