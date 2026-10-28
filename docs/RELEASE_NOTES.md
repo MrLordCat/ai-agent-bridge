@@ -1,68 +1,73 @@
-# AI Agent Bridge 1.20.0
+# AI Agent Bridge 1.20.2
 
-The extension now updates itself from GitHub releases. This stable release also
-fixes three failures in long, tool-heavy chats. It consolidates the
-1.19.1–1.19.4 development patches.
+The first patch release. Patch releases are now published like stable ones,
+and the updater offers them. This release also makes the Codex window known
+before the first turn, lets the shared context follow it, fixes failing update
+checks and keeps screenshots out of saved chat sessions (1.20.1).
 
-## Updates from GitHub releases
+## Codex context window
 
-- The extension checks the latest stable release one minute after startup and
-  then every 6 hours. `llamacpp.autoUpdate` is `notify` (default: offer the
-  update), `install` (download, verify, install and offer a reload) or `off`
-  (manual checks only).
-- Only a version newer than the installed one is offered, so a local
-  development build is never replaced by an older release.
-- The VSIX for the current platform is downloaded only from this repository's
-  releases. It is installed only when its size and SHA-256 digest match the
-  release. Several windows show one notification per version, and only one
-  window installs at a time.
-- Quick Access has a new **AI Agent Bridge** group: Current Version, Last Check
-  (time and latest release, or the failure reason), Check for Updates, Install
-  Update or Reload Window, and Automatic Updates. The same actions are
-  available as commands.
+- Codex models have different windows: 475K for gpt-6.1-sol and
+  gpt-6.1-terra, 258.4K for the others. The window now comes from Codex's own
+  model catalog (`models_cache.json`, context_window × effective percent), so
+  it is right immediately after a reload. Before, the 258.4K fallback was
+  advertised until the first turn, and Copilot compacted to the smaller budget.
+  A value Codex reports during a turn still takes precedence.
+- New `llamacpp.sharedContextFollowCodex`, off by default, with a toggle in
+  Provider Context. With it on, the shared context for Codex, Claude, Coco and
+  Cursor is the window of the last used Codex model. It grows when that window
+  is larger and shrinks after switching to a smaller model. The slider value is
+  kept for when the toggle is off. A window change rewrites the Claude and Coco
+  prompt caches once, as moving the slider does.
+- Provider Context lists each Codex model with its window and source and shows
+  the largest Codex window.
 
-## Fixes for long chats
+## Updates
 
-- **Claude follow-up messages.** Claude received the first message of the chat
-  on every follow-up turn and answered that it had arrived again. Copilot adds
-  about 16K characters of skills and instructions context to each follow-up
-  request, and a size rule skipped those requests. A real chat turn
-  (`<userRequest>`) is now always sent.
-- **Long autonomous requests (Codex, Coco, Cursor).** A request that ran for
-  hundreds of tool rounds failed with "The current request and required
-  instructions exceed the shared context budget" on retry or after an error.
-  Only the request message is pinned now. The newest steps that fit are kept
-  as they are, and the older steps of the same request become a summary.
-- **Screenshot-heavy transcripts.** Screenshots in tool results were stored
-  inline in the shared transcript in addition to their `assets/` file. A few
-  large screenshots filled the 64 MiB limit and the next round failed with
-  "Cannot save the incoming Chat transcript". The transcript now references
-  each image by its asset file. Older transcripts are rewritten on their next
-  save. The save error now names its cause.
+- Patch releases such as this one are offered by the updater.
+- The automatic check runs at most every 5 hours (was 6). When GitHub cannot be
+  reached, for example right after the computer wakes up, it retries after
+  30 minutes. Before, such a check showed a bare `fetch failed` in Last Check
+  until the next check 6 hours later; the error now names the network cause.
+- A manual check asks GitHub at most once every 5 minutes. Within that time it
+  shows the last result and when the next check is possible.
+
+## Release retention
+
+- After each publication the workflow deletes old releases with their tags.
+  x.y.0 of the three newest lines (1.20, 1.19, 1.18) and the two newest patches
+  of the newest line stay; a new x.y.0 removes the patches of the previous line.
+  `npm run prune:local` applies the same rule to local VSIX files and tags.
+
+## Screenshots in saved chat sessions (1.20.1)
+
+- Copilot patch v28: screenshots no longer make a chat fail with
+  `Invalid string length`. Copilot saved each `view_image` result in the turn
+  metadata with its full bytes; one chat reached 632 MB. The saved copy now
+  replaces image and binary tool data above 64 KB with a short note. The
+  running request still sees the image.
+- A Copilot bundle with any older patch version is upgraded from its backup.
+  Before, v28 failed with "Backup already exists" and the bundle kept v27.
 
 ## Boundaries and verification
 
-- Automatic updates start with this version. Installations of 1.19.0 or older
-  need this release installed manually once.
-- Windows: 834 extension-host tests passed on VS Code 1.131 (12 platform or
-  opt-in skips), together with compile, lint, metadata and unused-locals
-  checks. Release CI repeats metadata checks, lint and tests on Windows and
-  Linux with VS Code 1.131 and 1.141 before packaging and publication.
+- Windows: 840 extension-host tests passed on the installed VS Code (14
+  platform or opt-in skips), together with compile, lint and metadata checks
+  and the retention script tests. Release CI repeats metadata checks, lint and
+  tests on Windows and Linux before packaging and publication.
 
 ## Install from VSIX
 
-Download the package matching your platform from this release:
+Installations of 1.20.0 or newer are offered this release by the updater.
+To install it manually, download the package matching your platform:
 
 ```sh
 # Windows x64
-code --install-extension llama-vscode-chat-v1.20.0-win32-x64.vsix --force
+code --install-extension llama-vscode-chat-v1.20.2-win32-x64.vsix --force
 # Linux x64
-code --install-extension llama-vscode-chat-v1.20.0-linux-x64.vsix --force
+code --install-extension llama-vscode-chat-v1.20.2-linux-x64.vsix --force
 ```
 
 Run **Developer: Reload Window**. Existing profiles and chat keys are retained.
 Compatible Chat, terminal and agent-host patches apply on startup; reload again
-if a patch notification asks for it. Native capabilities are detected first.
-For a system-owned Linux installation, use **Prepare User VS Code (Linux,
-no root)** or the existing administrator-authorization flow. Remote
-SSH/WSL/container windows still need the desktop application prepared locally.
+if a patch notification asks for it.

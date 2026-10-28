@@ -62,8 +62,10 @@ Requires **VS Code 1.131+**, GitHub Copilot Chat and Windows x64 or Linux x64.
 
 ### Updates
 
-From 1.20.0 the extension checks the latest stable GitHub release every 6 hours
-and offers a newer version. The **AI Agent Bridge** group in Quick Access shows
+From 1.20.0 the extension checks the latest GitHub release every 5 hours
+(30 minutes after a check that could not reach GitHub) and offers a newer
+version. Patch releases such as 1.20.2 are offered too. Manual checks ask
+GitHub at most once every 5 minutes. The **AI Agent Bridge** group in Quick Access shows
 the installed version and the time of the last check. It also has **Check for
 Updates**, **Install Update** and the **Automatic Updates** mode. The setting
 `llamacpp.autoUpdate` is `notify` (default), `install` (download, verify and
@@ -153,16 +155,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md),
 [provider architecture](docs/PROVIDER_ARCHITECTURE.md), and
 [Quick Access](docs/QUICK_ACCESS.md) for the current maintenance contracts.
 
-**Stable release: 1.20.0. Current build: 1.20.1.**
+**Stable release: 1.20.0. Current build: 1.20.2.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 835 extension-host tests in the current 1.20.1 build
+npm test              # 840 extension-host tests in the current 1.20.2 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-1.20.1.vsix --force
+code --install-extension ./llama-vscode-chat-1.20.2.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

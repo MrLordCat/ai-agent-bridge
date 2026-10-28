@@ -11,8 +11,12 @@ export const UPDATE_REPOSITORY = "MrLordCat/ai-agent-bridge";
 const LATEST_RELEASE_URL = `https://api.github.com/repos/${UPDATE_REPOSITORY}/releases/latest`;
 const DOWNLOAD_PREFIX = `https://github.com/${UPDATE_REPOSITORY}/releases/download/`;
 const STATE_KEY = "llamacpp.update.state";
-export const UPDATE_CHECK_INTERVAL_MS = 6 * 60 * 60_000;
-const UPDATE_POLL_MS = 30 * 60_000;
+export const UPDATE_CHECK_INTERVAL_MS = 5 * 60 * 60_000;
+/** Retry delay after a check that never reached GitHub (offline, sleep, DNS). */
+export const UPDATE_OFFLINE_RETRY_MS = 30 * 60_000;
+/** A manual check within this window reports the last result instead of asking GitHub again. */
+export const MANUAL_CHECK_COOLDOWN_MS = 5 * 60_000;
+const UPDATE_POLL_MS = 10 * 60_000;
 const UPDATE_START_DELAY_MS = 60_000;
 const API_TIMEOUT_MS = 15_000;
 const DOWNLOAD_TIMEOUT_MS = 10 * 60_000;
@@ -34,16 +38,38 @@ export interface UpdateStatus {
 	mode: AutoUpdateMode;
 	lastCheckAt?: number;
 	latest?: UpdateRelease;
-	/** A newer stable release exists and is not installed yet. */
+	/** A newer release exists and is not installed yet. */
 	available: boolean;
 	/** Installed by the updater; the window still runs the old version until reload. */
 	installedVersion?: string;
 	checking: boolean;
 	installing: boolean;
 	error?: string;
+	/** The last check never reached GitHub; the automatic retry follows after UPDATE_OFFLINE_RETRY_MS. */
+	offline?: boolean;
+	/** Earliest time a manual check asks GitHub again. */
+	manualCheckAt?: number;
 }
 
-interface StoredState { lastCheckAt?: number; latest?: UpdateRelease; error?: string; installedVersion?: string }
+/** offline: the last check failed before GitHub answered. */
+interface StoredState { lastCheckAt?: number; latest?: UpdateRelease; error?: string; installedVersion?: string; offline?: boolean }
+
+class UpdateNetworkError extends Error {}
+
+/** Node reports every network failure as "fetch failed"; the reason is in its cause. */
+export function describeNetworkError(error: unknown, timeoutMs = API_TIMEOUT_MS): string {
+	if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+		return `GitHub did not answer within ${Math.round(timeoutMs / 1000)} s.`;
+	}
+	const cause = error instanceof Error ? (error as { cause?: unknown }).cause : undefined;
+	const detail = cause instanceof Error ? cause.message || (cause as NodeJS.ErrnoException).code : undefined;
+	const message = error instanceof Error ? error.message : String(error);
+	return `Cannot reach GitHub (${detail || message}).`;
+}
+
+function formatAgo(ms: number): string {
+	return ms < 60_000 ? "just now" : `${Math.floor(ms / 60_000)} min ago`;
+}
 
 type Ui = Pick<typeof vscode.window, "showInformationMessage" | "showWarningMessage" | "showErrorMessage">;
 
@@ -129,21 +155,45 @@ export class ExtensionUpdater implements vscode.Disposable {
 		const installedVersion = stored.installedVersion && compareVersions(stored.installedVersion, current) > 0 ? stored.installedVersion : undefined;
 		const available = !!latest && compareVersions(latest.version, current) > 0 && latest.version !== installedVersion;
 		return { currentVersion: current, mode: this.mode, lastCheckAt: stored.lastCheckAt, latest, available, installedVersion,
-			checking: !!this.checking, installing: !!this.installing, error: stored.error };
+			checking: !!this.checking, installing: !!this.installing, error: stored.error, offline: stored.offline,
+			manualCheckAt: stored.lastCheckAt === undefined ? undefined : stored.lastCheckAt + MANUAL_CHECK_COOLDOWN_MS };
 	}
 
-	/** Automatic checks: shortly after startup, then whenever the last check is older than the interval. */
+	/** At most every 5 hours; 30 minutes after a check that never reached GitHub. The state is shared by all windows. */
+	automaticCheckDue(): boolean {
+		const stored = this.stored;
+		return this.mode !== "off" && this.now() - (stored.lastCheckAt ?? 0) >= (stored.offline ? UPDATE_OFFLINE_RETRY_MS : UPDATE_CHECK_INTERVAL_MS);
+	}
+
+	/** Automatic checks: shortly after startup, then whenever automaticCheckDue() allows. */
 	start(): void {
-		const tick = () => {
-			const last = this.stored.lastCheckAt ?? 0;
-			if (this.mode !== "off" && this.now() - last >= UPDATE_CHECK_INTERVAL_MS) { void this.check(false); }
-		};
+		const tick = () => { if (this.automaticCheckDue()) { void this.check(false); } };
 		this.startTimer = setTimeout(tick, UPDATE_START_DELAY_MS);
 		this.timer = setInterval(tick, UPDATE_POLL_MS);
 	}
 
+	/** Milliseconds until a manual check may ask GitHub again; 0 when it may now. */
+	manualCheckWaitMs(): number {
+		const last = this.stored.lastCheckAt, now = this.now();
+		return last === undefined || now < last ? 0 : Math.max(0, last + MANUAL_CHECK_COOLDOWN_MS - now);
+	}
+
 	check(manual: boolean): Promise<UpdateStatus> {
+		if (manual && !this.checking && this.manualCheckWaitMs() > 0) { return Promise.resolve(this.reportRecentCheck()); }
 		return this.track(manual, true);
+	}
+
+	/** A manual check inside the cooldown repeats the last result without a request. */
+	private reportRecentCheck(): UpdateStatus {
+		const status = this.status;
+		if (status.available && status.latest) { void this.offer(status.latest); return status; }
+		const ago = formatAgo(this.now() - (status.lastCheckAt ?? this.now()));
+		const wait = Math.max(1, Math.ceil(this.manualCheckWaitMs() / 60_000));
+		const result = status.error ? `the check failed: ${status.error}`
+			: status.installedVersion ? `${status.installedVersion} is installed, reload the window to use it`
+				: `${status.currentVersion} is up to date (latest release ${status.latest?.version ?? "unknown"})`;
+		void this.ui.showInformationMessage(`AI Agent Bridge was checked ${ago}: ${result}. The next manual check is possible in ${wait} min.`);
+		return status;
 	}
 
 	private track(manual: boolean, react: boolean): Promise<UpdateStatus> {
@@ -155,18 +205,22 @@ export class ExtensionUpdater implements vscode.Disposable {
 	private async runCheck(manual: boolean, react: boolean): Promise<UpdateStatus> {
 		const previous = this.stored;
 		try {
-			const response = await this.fetch(LATEST_RELEASE_URL, { signal: AbortSignal.timeout(API_TIMEOUT_MS), headers: {
-				Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": `ai-agent-bridge/${this.options.currentVersion}`,
-			} });
+			let response: Response;
+			try {
+				response = await this.fetch(LATEST_RELEASE_URL, { signal: AbortSignal.timeout(API_TIMEOUT_MS), headers: {
+					Accept: "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28", "User-Agent": `ai-agent-bridge/${this.options.currentVersion}`,
+				} });
+			} catch (error) { throw new UpdateNetworkError(describeNetworkError(error)); }
 			if (response.status === 403 || response.status === 429) { throw new Error("GitHub rate limit reached; try again later."); }
 			if (!response.ok) { throw new Error(`GitHub answered ${response.status}.`); }
 			const latest = parseLatestRelease(await response.json(), this.options.platform ?? process.platform, this.options.arch ?? process.arch);
-			await this.store({ ...previous, lastCheckAt: this.now(), latest, error: undefined });
+			await this.store({ ...previous, lastCheckAt: this.now(), latest, error: undefined, offline: undefined });
 			this.options.log?.("update.check", { manual, current: this.options.currentVersion, latest: latest.version });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-			await this.store({ ...previous, lastCheckAt: this.now(), error: message });
-			this.options.log?.("update.check_failed", { manual, error: message });
+			const offline = error instanceof UpdateNetworkError;
+			await this.store({ ...previous, lastCheckAt: this.now(), error: message, offline: offline || undefined });
+			this.options.log?.("update.check_failed", { manual, offline, error: message });
 			if (manual) { void this.ui.showErrorMessage(`AI Agent Bridge update check failed: ${message}`); }
 			return this.status;
 		}
@@ -208,7 +262,7 @@ export class ExtensionUpdater implements vscode.Disposable {
 
 	private async runInstall(manual: boolean): Promise<boolean> {
 		let status = this.status;
-		if (!status.available && manual && !status.installedVersion) { status = await this.track(false, false); }
+		if (!status.available && manual && !status.installedVersion && this.manualCheckWaitMs() === 0) { status = await this.track(false, false); }
 		const latest = status.latest;
 		if (!status.available || !latest) {
 			if (manual) { void this.ui.showInformationMessage(status.installedVersion ? `AI Agent Bridge ${status.installedVersion} is already installed. Reload the window to use it.` : "No AI Agent Bridge update is available."); }

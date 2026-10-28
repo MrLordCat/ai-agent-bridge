@@ -26,12 +26,44 @@ export const SHARED_CONTEXT_MIN = 32_768;
 export const SHARED_CONTEXT_MAX = 1_048_576;
 const DEFAULT_SHARED_CONTEXT_LENGTH = 258_400;
 
+export interface FollowedCodexContext {
+	modelId: string;
+	window: number;
+}
+
+let followedCodexContext: FollowedCodexContext | undefined;
+const followedCodexContextChanges = new vscode.EventEmitter<void>();
+/** Fires when the followed Codex window changes, regardless of sharedContextFollowCodex. */
+export const onDidChangeFollowedCodexContext = followedCodexContextChanges.event;
+
+export function getFollowedCodexContext(): FollowedCodexContext | undefined {
+	return followedCodexContext;
+}
+
+/** Window of the last used Codex model, from Codex itself (turn usage or its catalog), never the fallback setting. */
+export function setFollowedCodexContext(value: FollowedCodexContext | undefined): void {
+	const next = value && Number.isFinite(value.window) && value.window > 0
+		? { modelId: value.modelId, window: Math.floor(Math.min(SHARED_CONTEXT_MAX, Math.max(SHARED_CONTEXT_MIN, value.window))) }
+		: undefined;
+	const windowChanged = next?.window !== followedCodexContext?.window;
+	followedCodexContext = next;
+	if (windowChanged) { followedCodexContextChanges.fire(); }
+}
+
 /**
  * One working-context limit, in tokens, for Codex, Claude, Coco and Cursor.
- * Zero keeps the historical codexWorkingContextTarget value. Each provider then
- * applies only its real model window (and native threshold bounds) on top.
+ * With sharedContextFollowCodex it is the last used Codex model window, once
+ * known; the manual value stays stored. Zero keeps the historical
+ * codexWorkingContextTarget value. Each provider then applies only its real
+ * model window (and native threshold bounds) on top.
  */
 export function resolveSharedContextLimit(config: Pick<vscode.WorkspaceConfiguration, "get"> = vscode.workspace.getConfiguration("llamacpp")): number {
+	const followed = config.get<boolean>("sharedContextFollowCodex", false) === true ? followedCodexContext?.window : undefined;
+	return followed ?? resolveManualSharedContextLimit(config);
+}
+
+/** The slider value, ignoring sharedContextFollowCodex. */
+export function resolveManualSharedContextLimit(config: Pick<vscode.WorkspaceConfiguration, "get"> = vscode.workspace.getConfiguration("llamacpp")): number {
 	const shared = Number(config.get("sharedContextLength", 0));
 	const value = Number.isFinite(shared) && shared > 0 ? shared : Number(config.get("codexWorkingContextTarget", DEFAULT_SHARED_CONTEXT_LENGTH));
 	return Math.floor(Math.min(SHARED_CONTEXT_MAX, Math.max(SHARED_CONTEXT_MIN, Number.isFinite(value) && value > 0 ? value : DEFAULT_SHARED_CONTEXT_LENGTH)));

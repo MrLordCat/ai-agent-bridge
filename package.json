@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.1",
+	"version": "1.20.2",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -179,12 +179,17 @@
 					"maximum": 1048576,
 					"description": "Shared working context in TOKENS for Codex, Claude, Coco and Cursor, so switching providers keeps the same history budget. Each provider uses min(this value, its real model window) as its advertised window and native auto-compaction threshold (Codex model_auto_compact_token_limit, Claude Code auto-compact window, Coco CLI threshold fraction). Zero inherits codexWorkingContextTarget. Claude is bounded to 258.4K-967K."
 				},
+				"llamacpp.sharedContextFollowCodex": {
+					"type": "boolean",
+					"default": false,
+					"description": "Use the context window of the last used Codex model as the shared working context instead of llamacpp.sharedContextLength. The window comes from Codex itself (its model catalog, then the value reported during a turn), so a larger Codex window enlarges the shared context for every provider and a smaller one shrinks it. Until a Codex model has been used, llamacpp.sharedContextLength applies; it is kept unchanged."
+				},
 				"llamacpp.codexContextLength": {
 					"type": "number",
 					"default": 258400,
 					"minimum": 32768,
 					"maximum": 1048576,
-					"description": "Fallback Codex model window before app-server reports the real value. Server telemetry takes precedence; changing this value cannot enlarge the provider limit."
+					"description": "Fallback Codex model window, used only for a model missing from Codex's model catalog (models_cache.json) until app-server reports its real value. Server telemetry and the catalog take precedence; changing this value cannot enlarge the provider limit."
 				},
 				"llamacpp.codexWorkingContextTarget": {
 					"type": "number",
@@ -604,15 +609,19 @@
 				},
 				"llamacpp.autoUpdate": {
 					"type": "string",
-					"enum": ["notify", "install", "off"],
+					"enum": [
+						"notify",
+						"install",
+						"off"
+					],
 					"enumDescriptions": [
-						"Check GitHub every 6 hours and offer a newer stable release.",
-						"Download a newer stable release, verify its SHA-256 digest, install it and offer a window reload.",
-						"Never check automatically; use Check for Updates in Quick Access."
+						"Check GitHub every 5 hours and offer a newer release.",
+						"Download a newer release, verify its SHA-256 digest, install it and offer a window reload.",
+						"Never check automatically; use Check for Updates in Quick Access (at most once every 5 minutes)."
 					],
 					"default": "notify",
 					"scope": "application",
-					"description": "Automatic updates from the stable GitHub releases of MrLordCat/ai-agent-bridge. Only versions newer than the installed one are offered, so a local development build is never replaced by an older release."
+					"description": "Automatic updates from the GitHub releases of MrLordCat/ai-agent-bridge, stable and patch releases. Automatic checks run at most every 5 hours, 30 minutes after a check that could not reach GitHub. Only versions newer than the installed one are offered, so a local development build is never replaced by an older release."
 				},
 				"llamacpp.journalRenderRounds": {
 					"type": "number",
@@ -1498,7 +1507,8 @@
 		"compile": "tsc -p ./",
 		"lint": "eslint",
 		"check": "npm run lint && npm test",
-		"check:metadata": "node --test scripts/check-repository.test.mjs && node scripts/check-repository.mjs",
+		"check:metadata": "node --test scripts/check-repository.test.mjs scripts/prune-releases.test.mjs && node scripts/check-repository.mjs",
+		"prune:local": "node scripts/prune-releases.mjs --local",
 		"test:claude-native": "node ./scripts/claude-native-sdk-smoke.mjs",
 		"test:codex-persistence": "node ./scripts/codex-thread-persistence-smoke.mjs",
 		"package": "vsce package",

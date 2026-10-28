@@ -210,8 +210,9 @@ shown or written to extension logs.
 | `llamacpp.codexFastServiceTier` | `false` | Request priority service when offered; uses quota faster. |
 | `llamacpp.persistProviderSessions` | `true` | Resume completed Codex and Claude sessions across reloads. |
 | `llamacpp.codexEphemeralThreads` | `false` | Force Codex threads to stay in-memory and disable cross-reload resume. |
-| `llamacpp.codexContextLength` | `258400` | Pre-telemetry fallback window; server-reported model context takes precedence. |
-| `llamacpp.sharedContextLength` | `0` | Shared working context for Codex, Claude, Coco and Cursor, capped to the server window. Below 90% of that window it is also sent as `model_auto_compact_token_limit`. `0` inherits `codexWorkingContextTarget`. |
+| `llamacpp.codexContextLength` | `258400` | Fallback window for a model missing from Codex's `models_cache.json`; the catalog and server-reported model context take precedence. |
+| `llamacpp.sharedContextLength` | `0` | Shared working context for Codex, Claude, Coco and Cursor, capped to the model window. Below 90% of that window it is also sent as `model_auto_compact_token_limit`. `0` inherits `codexWorkingContextTarget`. |
+| `llamacpp.sharedContextFollowCodex` | `false` | Use the window of the last used Codex model as the shared context (see [shared context](SHARED_CONTEXT.md#окно-codex)). |
 | `llamacpp.codexWorkingContextTarget` | `258400` | Legacy value, used only while `sharedContextLength` is `0`. |
 | `llamacpp.codexMaxInputChars` | `900000` | Serialized conversation hard cap after token-aware compaction. |
 | `llamacpp.codexMaxToolResultChars` | `12000` | Per-result history cap that preserves more conversational turns. |

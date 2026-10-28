@@ -115,6 +115,7 @@ export function buildUpdateItem(status: UpdateStatus, now = Date.now()): QuickAc
 				: status.checking ? "checking…" : status.lastCheckAt ? "up to date" : "not checked yet";
 	const age = status.lastCheckAt === undefined ? undefined : Math.max(0, now - status.lastCheckAt);
 	const ago = age === undefined ? "never" : age < 60_000 ? "just now" : age < 3_600_000 ? `${Math.floor(age / 60_000)} min ago` : age < 86_400_000 ? `${Math.floor(age / 3_600_000)} h ago` : `${Math.floor(age / 86_400_000)} d ago`;
+	const manualWait = status.manualCheckAt === undefined ? 0 : Math.max(0, status.manualCheckAt - now);
 	const action = status.installedVersion
 		? new QuickAccessItem("update.reload", "Reload Window", { description: `use ${status.installedVersion}`, icon: new vscode.ThemeIcon("refresh"), command: command("workbench.action.reloadWindow", "Reload Window") })
 		: status.available
@@ -122,20 +123,26 @@ export function buildUpdateItem(status: UpdateStatus, now = Date.now()): QuickAc
 			: undefined;
 	return new QuickAccessItem("update", "AI Agent Bridge", {
 		description: `v${status.currentVersion} · ${summary}`,
-		tooltip: `Installed version ${status.currentVersion}. Stable releases come from github.com/MrLordCat/ai-agent-bridge.`,
+		tooltip: `Installed version ${status.currentVersion}. Releases come from github.com/MrLordCat/ai-agent-bridge.`,
 		icon: new vscode.ThemeIcon(status.available || status.installedVersion ? "cloud-download" : "versions"),
 		children: [
 			new QuickAccessItem("update.current", "Current Version", { description: status.currentVersion, icon: new vscode.ThemeIcon("tag") }),
 			new QuickAccessItem("update.lastCheck", "Last Check", {
 				description: status.checking ? "checking…" : status.error ? `${ago} · failed` : latest ? `${ago} · latest ${latest}` : ago,
-				tooltip: [status.lastCheckAt === undefined ? "No update check yet." : `Checked ${new Date(status.lastCheckAt).toLocaleString()}.`, status.error].filter(Boolean).join("\n"),
+				tooltip: [status.lastCheckAt === undefined ? "No update check yet." : `Checked ${new Date(status.lastCheckAt).toLocaleString()}.`, status.error,
+					status.offline && status.mode !== "off" ? "GitHub was not reached; the automatic check retries after 30 minutes." : undefined].filter(Boolean).join("\n"),
 				icon: new vscode.ThemeIcon(status.error ? "warning" : "history"),
 			}),
-			new QuickAccessItem("update.check", "Check for Updates", { description: status.checking ? "checking…" : undefined, icon: new vscode.ThemeIcon("sync"), command: command("llamacpp.checkForUpdates", "Check for AI Agent Bridge Updates") }),
+			new QuickAccessItem("update.check", "Check for Updates", {
+				description: status.checking ? "checking…" : manualWait > 0 ? `again in ${Math.ceil(manualWait / 60_000)} min` : undefined,
+				tooltip: "Manual checks ask GitHub at most once every 5 minutes; a check within that time shows the last result.",
+				icon: new vscode.ThemeIcon("sync"),
+				command: command("llamacpp.checkForUpdates", "Check for AI Agent Bridge Updates"),
+			}),
 			...(action ? [action] : []),
 			new QuickAccessItem("update.mode", "Automatic Updates", {
 				description: AUTO_UPDATE_LABELS[status.mode],
-				tooltip: "Notify: check every 6 hours and offer new stable releases. Install automatically: download, verify and install them, then offer a reload. Off: only manual checks.",
+				tooltip: "Notify: check every 5 hours and offer new releases. Install automatically: download, verify and install them, then offer a reload. Off: only manual checks.",
 				icon: toggleIcon(status.mode !== "off"),
 				command: command("llamacpp.chooseAutoUpdateMode", "Choose Automatic Update Mode"),
 			}),
@@ -678,8 +685,10 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			tooltip: "Manage multiple OpenAI-compatible API endpoints and credentials. API keys are stored in VS Code SecretStorage.",
 			children: [
 				new QuickAccessItem("apiProviders.sharedContext", "Shared Context", {
-					description: formatCompactTokenCount(sharedContext),
-					tooltip: "One working context for Codex, Claude, Coco and Cursor. Each provider caps it to its real model window and uses it as the native auto-compaction threshold.",
+					description: config.get<boolean>("sharedContextFollowCodex", false) === true
+						? `${formatCompactTokenCount(sharedContext)} · follows Codex`
+						: formatCompactTokenCount(sharedContext),
+					tooltip: "One working context for Codex, Claude, Coco and Cursor. Each provider caps it to its real model window and uses it as the native auto-compaction threshold. It can follow the window of the last used Codex model.",
 					icon: new vscode.ThemeIcon("symbol-numeric"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),

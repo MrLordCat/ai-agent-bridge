@@ -20,13 +20,20 @@ and both root entries in package-lock.json. Update README's Current build and
 CHANGELOG. Compile, package and install through `code --install-extension`;
 verify the installed version and `source: vsix`, then reload the window.
 Development patches do not automatically create Git tags or GitHub Releases.
+A patch is published only on an explicit request, the same way as a stable
+release.
 
-A stable release requires an explicit release request. Prepare the requested
+A stable or patch release requires an explicit release request. Prepare the requested
 version and docs/RELEASE_NOTES.md before tagging. The release workflow rejects
 a mismatching tag, lockfile or release-notes heading, and publishes only after
 all tests and both platform packages succeed. Only the publication job has
 repository write permission. The existing stable-release.sh helper remains
 the explicit tagging/push entry point.
+
+After publishing, the workflow deletes old releases and their tags with
+`scripts/prune-releases.mjs`: x.y.0 of the three newest lines and the two
+newest patches of the newest line stay. `npm run prune:local` applies the same
+rule to local VSIX files and tags.
 
 CI runs can also be started manually from GitHub Actions. Superseded CI runs
 are cancelled; release runs are not cancelled by a newer run. Build artifacts

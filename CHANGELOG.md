@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.20.2 (patch release) - 2026-10-28
+
+- Patch releases are published on GitHub like stable ones, and the updater
+  offers them. Old releases are deleted automatically after each publication:
+  x.y.0 of the three newest lines (1.20, 1.19, 1.18) and the two newest patches
+  of the newest line stay. `npm run prune:local` applies the same rule to local
+  VSIX files and tags; the release script runs it after the push.
+- Update checks: the automatic check runs at most every 5 hours (was 6) and
+  retries after 30 minutes when GitHub could not be reached. Before, a check
+  right after the computer woke up failed with `fetch failed` and Last Check
+  showed "failed" for 6 hours. The error now names the network cause. A manual
+  check asks GitHub at most once every 5 minutes; within that time it shows the
+  last result and when the next check is possible.
+
+- The Codex window is known before the first turn. Codex models differ:
+  475K for gpt-6.1-sol and gpt-6.1-terra, 258.4K for the others. The window
+  now comes from Codex's own model catalog (`models_cache.json`,
+  context_window × effective percent), and a value Codex reports during a turn
+  still replaces it. Before, a reload advertised the 258.4K fallback until the
+  first turn, so Copilot compacted to the smaller budget.
+- New `llamacpp.sharedContextFollowCodex`, off by default, toggled in Provider
+  Context. With it on, the shared context is the window of the last used Codex
+  model: it grows for every provider when that window is larger and shrinks
+  after switching back to a smaller model. The slider value is kept for when
+  the toggle is off. Changing the window rewrites the Claude and Coco prompt
+  caches once, the same as moving the slider.
+- Provider Context lists each Codex model with its window and source and shows
+  the largest Codex window.
+
 ## 1.20.1 (development patch) - 2026-10-27
 
 - Copilot patch v28: screenshots no longer make a chat fail with

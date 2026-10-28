@@ -11,6 +11,7 @@ import {
 	type QuickAccessItem,
 } from "../ui/quick-access";
 import { resolveContextControlState } from "../ui/context-control";
+import { setFollowedCodexContext } from "../context/provider-handoff";
 import { emptyTokenUsageAggregate, emptyTokenUsageHistorySummary } from "../token-usage-history";
 import { emptyUsageExperimentSummary } from "../usage-experiment";
 
@@ -441,6 +442,39 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.strictEqual(capped.sharedTarget, 1_048_576);
 		assert.strictEqual(capped.claudeTarget, 967_000);
 		assert.strictEqual(capped.codexTarget, 258_400);
+	});
+
+	test("shows Codex model windows and follows the last used model when enabled", () => {
+		const values = new Map<string, unknown>([["sharedContextLength", 440_921]]);
+		const configuration = { get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback };
+		const codex = {
+			lastUsedModelId: "gpt-6.1-sol",
+			models: [
+				{ modelId: "gpt-6-sol", window: 258_400, source: "server" as const },
+				{ modelId: "gpt-6.1-sol", window: 475_000, source: "catalog" as const },
+				{ modelId: "unlisted", window: 600_000, source: "fallback" as const },
+			],
+		};
+		try {
+			setFollowedCodexContext({ modelId: "gpt-6.1-sol", window: 475_000 });
+			const manual = resolveContextControlState(configuration, undefined, codex);
+			assert.strictEqual(manual.followCodex, false);
+			assert.strictEqual(manual.sharedTarget, 440_921);
+			assert.strictEqual(manual.codexMaximum, 475_000);
+			assert.strictEqual(manual.codexMaximumSource, "catalog");
+			assert.strictEqual(manual.codexTarget, 440_921);
+			assert.deepStrictEqual(manual.codexLargest, codex.models[1], "the fallback setting is not a Codex maximum");
+			values.set("sharedContextFollowCodex", true);
+			const followed = resolveContextControlState(configuration, undefined, codex);
+			assert.strictEqual(followed.followCodex, true);
+			assert.strictEqual(followed.sharedTarget, 475_000);
+			assert.strictEqual(followed.manualSharedTarget, 440_921);
+			assert.strictEqual(followed.followedCodexModelId, "gpt-6.1-sol");
+			assert.strictEqual(followed.codexTarget, 475_000);
+			assert.strictEqual(followed.claudeTarget, 475_000);
+		} finally {
+			setFollowedCodexContext(undefined);
+		}
 	});
 
 	test("moves the same last-request metrics into Token Usage for every provider", async () => {

@@ -32,3 +32,10 @@ jobs:
       - run: gh release create "${{ github.ref_name }}" ./*.vsix --title "AI Agent Bridge ${{ github.ref_name }}" --notes-file docs/RELEASE_NOTES.md --verify-tag
         env:
           GH_TOKEN: ${{ github.token }}
+      # Keeps x.y.0 of the three newest lines and the two newest patches of the
+      # newest line; older releases are deleted together with their tags.
+      - name: Prune old releases
+        run: node scripts/prune-releases.mjs --github --current "${{ github.ref_name }}"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

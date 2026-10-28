@@ -4,7 +4,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { compareVersions, ExtensionUpdater, parseLatestRelease, parseStableVersion, type ExtensionUpdaterOptions } from "../update/extension-updater";
+import { compareVersions, describeNetworkError, ExtensionUpdater, MANUAL_CHECK_COOLDOWN_MS, parseLatestRelease, parseStableVersion, UPDATE_CHECK_INTERVAL_MS, UPDATE_OFFLINE_RETRY_MS, type ExtensionUpdaterOptions } from "../update/extension-updater";
 import { buildUpdateItem } from "../ui/quick-access";
 
 const REPO = "https://github.com/MrLordCat/ai-agent-bridge";
@@ -93,6 +93,54 @@ suite("Extension updater", () => {
 		first.dispose(); second.dispose();
 	});
 
+	test("a manual check within 5 minutes repeats the last result without asking GitHub", async () => {
+		const messages: string[] = [];
+		let now = 1_000_000, requests = 0;
+		const updater = new ExtensionUpdater({ state: memento(), storageDir: root, currentVersion: "1.20.2", platform: "win32", arch: "x64", mode: () => "notify",
+			fetch: async () => { requests++; return new Response(JSON.stringify(release("1.20.0", new Uint8Array([1])))); }, ui: ui(messages), now: () => now });
+		await updater.check(true);
+		now += 2 * 60_000;
+		await updater.check(true);
+		assert.strictEqual(requests, 1);
+		assert.match(messages[1], /checked 2 min ago: 1\.20\.2 is up to date \(latest release 1\.20\.0\)\. The next manual check is possible in 3 min/);
+		assert.strictEqual(updater.status.manualCheckAt, 1_000_000 + MANUAL_CHECK_COOLDOWN_MS);
+		now = 1_000_000 + MANUAL_CHECK_COOLDOWN_MS;
+		await updater.check(true);
+		assert.strictEqual(requests, 2);
+		updater.dispose();
+	});
+
+	test("automatic checks wait 5 hours, but retry 30 minutes after GitHub was unreachable", async () => {
+		let now = 100 * 3_600_000, offline = true;
+		const cause = Object.assign(new Error("getaddrinfo ENOTFOUND api.github.com"), { code: "ENOTFOUND" });
+		const updater = new ExtensionUpdater({ state: memento(), storageDir: root, currentVersion: "1.20.2", platform: "win32", arch: "x64", mode: () => "notify",
+			fetch: async () => { if (offline) { throw new TypeError("fetch failed", { cause }); } return new Response(JSON.stringify(release("1.20.0", new Uint8Array([1])))); },
+			ui: ui([]), now: () => now });
+		assert.strictEqual(updater.automaticCheckDue(), true, "never checked");
+		await updater.check(false);
+		assert.strictEqual(updater.status.error, "Cannot reach GitHub (getaddrinfo ENOTFOUND api.github.com).");
+		assert.strictEqual(updater.status.offline, true);
+		now += UPDATE_OFFLINE_RETRY_MS - 1;
+		assert.strictEqual(updater.automaticCheckDue(), false);
+		now += 1;
+		assert.strictEqual(updater.automaticCheckDue(), true);
+		offline = false;
+		await updater.check(false);
+		assert.strictEqual(updater.status.error, undefined);
+		assert.strictEqual(updater.status.offline, undefined);
+		now += UPDATE_CHECK_INTERVAL_MS - 1;
+		assert.strictEqual(updater.automaticCheckDue(), false);
+		now += 1;
+		assert.strictEqual(updater.automaticCheckDue(), true);
+		updater.dispose();
+	});
+
+	test("network errors name their cause", () => {
+		assert.strictEqual(describeNetworkError(new TypeError("fetch failed", { cause: Object.assign(new Error(""), { code: "ECONNRESET" }) })), "Cannot reach GitHub (ECONNRESET).");
+		assert.strictEqual(describeNetworkError(Object.assign(new Error("timed out"), { name: "TimeoutError" })), "GitHub did not answer within 15 s.");
+		assert.strictEqual(describeNetworkError(new TypeError("fetch failed")), "Cannot reach GitHub (fetch failed).");
+	});
+
 	test("Quick Access shows the version, last check and update actions", () => {
 		const latest = parseLatestRelease(release("1.20.0", new Uint8Array([1])), "win32", "x64");
 		const base = { currentVersion: "1.19.3", mode: "notify" as const, checking: false, installing: false };
@@ -109,5 +157,7 @@ suite("Extension updater", () => {
 		assert.ok(!never.children!.some(child => child.id?.endsWith("update.install")));
 		const pending = buildUpdateItem({ ...base, lastCheckAt: 0, latest, available: false, installedVersion: "1.20.0" }, 30_000);
 		assert.strictEqual(pending.children!.find(child => child.id?.endsWith("update.reload"))?.command?.command, "workbench.action.reloadWindow");
+		const cooling = buildUpdateItem({ ...base, lastCheckAt: 0, manualCheckAt: MANUAL_CHECK_COOLDOWN_MS, latest, available: false }, 60_000);
+		assert.strictEqual(cooling.children!.find(child => child.id?.endsWith("update.check"))?.description, "again in 4 min");
 	});
 });

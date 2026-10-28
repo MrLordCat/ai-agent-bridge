@@ -3,7 +3,7 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { prepareSharedHandoff, resolveSharedContextLimit, sharedContextBudget } from "../context/provider-handoff";
+import { prepareSharedHandoff, resolveSharedContextLimit, setFollowedCodexContext, sharedContextBudget } from "../context/provider-handoff";
 
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
@@ -13,6 +13,7 @@ import { PROVIDER_CONTINUATION_TTL_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER
 import { setSubagentModelProfiles } from "../subagent-guidance";
 import { asRecord, formatShortResetTime, normalizeCopilotTurnIndex, truncate } from "../utils";
 import { CodexAppServerClient, CodexAppServerError, type CodexServerRequest } from "./app-server-client";
+import { readCodexModelsCache, type CodexModelContextWindow } from "./context-windows";
 import {
 	buildCodexDynamicTools,
 	type CodexDynamicToolCallResponse,
@@ -83,6 +84,7 @@ const MAX_CODEX_CONTINUATIONS = 64;
 const MAX_CODEX_CONVERSATIONS = 16;
 const CODEX_DURABLE_CONVERSATION_STATE_KEY = "llamacpp.codexDurableConversations.v1";
 const CODEX_PENDING_ROLLOVER_STATE_KEY = "llamacpp.codexPendingRollover.v1";
+const CODEX_LAST_MODEL_STATE_KEY = "llamacpp.codexLastModel.v1";
 const CODEX_PENDING_ROLLOVER_TTL_MS = PROVIDER_PENDING_ROLLOVER_TTL_MS;
 const CODEX_ACCOUNT_CACHE_TTL_MS = 5 * 60_000;
 const CODEX_STATUS_REFRESH_INTERVAL_MS = 60_000;
@@ -603,6 +605,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private lastTokenUsage: CodexThreadTokenUsage | undefined;
 	private lastModelId: string | undefined;
 	private readonly observedContextWindows = new Map<string, number>();
+	/** Effective windows from Codex's models_cache.json, known before the first turn. */
+	private catalogContextWindows = new Map<string, number>();
+	private catalogMtimeMs: number | undefined;
+	private catalogReload: Promise<boolean> | undefined;
+	/** Last Codex model used in this workspace; its window can drive the shared context. */
+	private followedModelId: string | undefined;
 	private readonly tokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
 	private readonly accountedTokenUsageByThread = new Map<string, CodexThreadTokenUsage>();
 	private liveRuntimeMetrics: ProviderRuntimeMetrics | undefined;
@@ -631,6 +639,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.client.setServerRequestHandler(request => this.handleServerRequest(request));
 		this.loadDurableConversationThreads();
 		this.loadPendingRollover();
+		const lastModel = this.workspaceState?.get<unknown>(CODEX_LAST_MODEL_STATE_KEY);
+		this.followedModelId = typeof lastModel === "string" && lastModel.length > 0 && lastModel.length <= 128 ? lastModel : undefined;
+		void this.reloadCatalogContextWindows();
 		this.codexKeepAliveTimer = setInterval(() => void this.runCodexCacheKeepAliveCycle(), 60_000);
 		this.codexKeepAliveTimer.unref?.();
 	}
@@ -703,6 +714,26 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.modelCatalogGeneration = -1;
 		this.modelCatalogExpiresAt = 0;
 		this.modelChanges.fire();
+	}
+
+	/** Re-advertise limits without dropping the model catalog; safe while a request runs. */
+	notifyModelLimitsChanged(): void {
+		this.modelChanges.fire();
+	}
+
+	/** The last used Codex model, persisted per workspace. */
+	get lastUsedModelId(): string | undefined {
+		return this.followedModelId;
+	}
+
+	/** Window and its source for each listed Codex model (catalog models before the first listing). */
+	get contextWindows(): CodexModelContextWindow[] {
+		const ids = this.models.size > 0 ? [...this.models.keys()] : [...this.catalogContextWindows.keys()];
+		if (this.followedModelId && !ids.includes(this.followedModelId)) {
+			ids.push(this.followedModelId);
+		}
+		const config = this.getConfig();
+		return ids.map(modelId => ({ modelId, ...this.resolveModelContextWindowInfo(modelId, config) }));
 	}
 
 	async refreshStatus(): Promise<CodexProviderStatus> {
@@ -896,6 +927,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			}
 			this.modelCatalogGeneration = this.client.generation;
 			this.modelCatalogExpiresAt = Date.now() + CODEX_MODEL_CATALOG_TTL_MS;
+			// model/list refreshes models_cache.json; pick up changed windows before advertising.
+			await this.reloadCatalogContextWindows(false);
 			this.logSink?.log("codex.models.success", {
 				count: discovered.length,
 				models: discovered.map(model => model.id),
@@ -936,6 +969,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const cwd = normalizeCodexRuntimeCwd(
 			vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd()
 		);
+		// Before any limit is computed: with sharedContextFollowCodex this model's window is the shared limit.
+		this.followModel(model.id);
 		const autoCompactTokenLimit = this.autoCompactTokenLimit(model.id, config);
 		const { approvalPolicy, sandbox } = createCodexVsCodeOnlyPolicy(autoCompactTokenLimit);
 		const effort = resolveCodexReasoningEffort(
@@ -2096,6 +2131,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			&& this.observedContextWindows.get(modelId) !== observedContextWindow
 		) {
 			this.observedContextWindows.set(modelId, observedContextWindow);
+			this.logSink?.log("codex.context_window.observed", { model: modelId, window: observedContextWindow });
+			if (modelId === this.followedModelId) {
+				this.publishFollowedContext();
+			}
 			this.modelChanges.fire();
 		}
 		if (phase === "completed") {
@@ -2560,6 +2599,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private mapKnownModels(): vscode.LanguageModelChatInformation[] {
 		const config = this.getConfig();
 		const sharedLimit = Math.max(CODEX_WORKING_CONTEXT_MIN, resolveSharedContextLimit(config));
+		const followCodex = config.get<boolean>("sharedContextFollowCodex", false) === true;
 		const maxOutputTokens = this.clampNumber(
 			config.get("codexMaxOutputTokens", DEFAULT_CODEX_MAX_OUTPUT_TOKENS),
 			1_024,
@@ -2585,19 +2625,89 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		})));
 		return models.map(model => mapCodexModelInformation(
 			model,
-			Math.min(this.resolveModelContextWindow(model.id, config), sharedLimit),
+			// When the shared limit follows Codex, a request makes its own model's
+			// window the shared limit, so each model advertises that window.
+			followCodex
+				? this.resolveModelContextWindow(model.id, config)
+				: Math.min(this.resolveModelContextWindow(model.id, config), sharedLimit),
 			maxOutputTokens
 		));
 	}
 
-	/** Real server-reported window, or the configured fallback before the first turn. */
 	private resolveModelContextWindow(modelId: string, config = this.getConfig()): number {
-		return this.observedContextWindows.get(modelId) ?? this.clampNumber(
-			config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
-			32_768,
-			1_048_576,
-			DEFAULT_CODEX_CONTEXT_LENGTH
-		);
+		return this.resolveModelContextWindowInfo(modelId, config).window;
+	}
+
+	/** Server-reported window, then Codex's catalog, then the configured fallback. */
+	private resolveModelContextWindowInfo(modelId: string, config = this.getConfig()): Omit<CodexModelContextWindow, "modelId"> {
+		const observed = this.observedContextWindows.get(modelId);
+		if (observed !== undefined) {
+			return { window: observed, source: "server" };
+		}
+		const slug = this.models.get(modelId)?.model;
+		const catalog = this.catalogContextWindows.get(modelId) ?? (slug ? this.catalogContextWindows.get(slug) : undefined);
+		if (catalog !== undefined) {
+			return { window: catalog, source: "catalog" };
+		}
+		return {
+			window: this.clampNumber(
+				config.get("codexContextLength", DEFAULT_CODEX_CONTEXT_LENGTH),
+				32_768,
+				1_048_576,
+				DEFAULT_CODEX_CONTEXT_LENGTH
+			),
+			source: "fallback",
+		};
+	}
+
+	/** Remember the model used for a request and publish its window as the followed Codex context. */
+	private followModel(modelId: string): void {
+		if (this.followedModelId !== modelId) {
+			this.followedModelId = modelId;
+			void Promise.resolve(this.workspaceState?.update(CODEX_LAST_MODEL_STATE_KEY, modelId))
+				.catch(error => this.logSink?.logError("codex.last_model.persist_failed", error));
+		}
+		this.publishFollowedContext();
+	}
+
+	/** Only windows Codex itself reported or catalogued; the fallback setting never drives the shared limit. */
+	private publishFollowedContext(): void {
+		if (!this.followedModelId) {
+			return;
+		}
+		const info = this.resolveModelContextWindowInfo(this.followedModelId);
+		if (info.source !== "fallback") {
+			setFollowedCodexContext({ modelId: this.followedModelId, window: info.window });
+		}
+	}
+
+	/** Returns true when any catalogued window changed. */
+	private reloadCatalogContextWindows(fireChanges = true): Promise<boolean> {
+		this.catalogReload ??= (async () => {
+			try {
+				const snapshot = await readCodexModelsCache(undefined, this.catalogMtimeMs);
+				if (!snapshot || this.disposed) {
+					return false;
+				}
+				this.catalogMtimeMs = snapshot.mtimeMs;
+				const previous = this.catalogContextWindows;
+				const changed = previous.size !== snapshot.windows.size
+					|| [...snapshot.windows].some(([slug, window]) => previous.get(slug) !== window);
+				if (!changed) {
+					return false;
+				}
+				this.catalogContextWindows = snapshot.windows;
+				this.logSink?.log("codex.context_window.catalog", { windows: Object.fromEntries(snapshot.windows) });
+				this.publishFollowedContext();
+				if (fireChanges) {
+					this.modelChanges.fire();
+				}
+				return true;
+			} finally {
+				this.catalogReload = undefined;
+			}
+		})();
+		return this.catalogReload;
 	}
 
 	private autoCompactTokenLimit(modelId: string, config = this.getConfig()): number | undefined {

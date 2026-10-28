@@ -25,6 +25,7 @@ import { registerMemoryTools } from "./memory/tools";
 import { registerWaitForTerminalTool } from "./tools/wait-terminal";
 import { registerCocoTerminalTools } from "./coco/terminal-tools";
 import { registerContextControlCommand } from "./ui/context-control";
+import { getFollowedCodexContext, onDidChangeFollowedCodexContext } from "./context/provider-handoff";
 import { registerModelBehaviorCommands } from "./ui/model-behavior-commands";
 import { LlamaQuickActionsProvider } from "./ui/quick-access";
 import { SessionQualityPanel } from "./ui/session-quality-panel";
@@ -675,7 +676,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		vscode.commands.registerCommand("llamacpp.chooseAutoUpdateMode", async () => {
 			const current = resolveAutoUpdateMode();
 			const labels: Record<AutoUpdateMode, string> = { notify: "Notify", install: "Install automatically", off: "Off" };
-			const details: Record<AutoUpdateMode, string> = { notify: "Check every 6 hours and offer new stable releases", install: "Download, verify and install new stable releases, then offer a reload", off: "Only manual checks from Quick Access" };
+			const details: Record<AutoUpdateMode, string> = { notify: "Check every 5 hours and offer new releases", install: "Download, verify and install new releases, then offer a reload", off: "Only manual checks from Quick Access" };
 			const picked = await vscode.window.showQuickPick(AUTO_UPDATE_MODES.map(mode => ({ label: labels[mode], description: mode === current ? "current" : undefined, detail: details[mode], mode })), { title: "AI Agent Bridge: Automatic Updates" });
 			if (picked && picked.mode !== current) { await vscode.workspace.getConfiguration(CONFIG_SECTION).update("autoUpdate", picked.mode, vscode.ConfigurationTarget.Global); }
 		}));
@@ -823,8 +824,22 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	}));
 	context.subscriptions.push(registerContextControlCommand(
 		() => codexProvider.runtimeMetrics,
-		() => quickActionsProvider.refresh()
+		() => quickActionsProvider.refresh(),
+		() => ({ models: codexProvider.contextWindows, lastUsedModelId: codexProvider.lastUsedModelId })
 	));
+	context.subscriptions.push(onDidChangeFollowedCodexContext(() => {
+		if (vscode.workspace.getConfiguration("llamacpp").get<boolean>("sharedContextFollowCodex", false) !== true) {
+			return;
+		}
+		const followed = getFollowedCodexContext();
+		logService.log("shared_context.follow_codex", { model: followed?.modelId, window: followed?.window });
+		// May fire inside a Codex request: re-advertise without dropping the Codex model catalog.
+		llamaProvider.notifyModelLimitsChanged();
+		codexProvider.notifyModelLimitsChanged();
+		claudeProvider.refreshLanguageModelChatInformation();
+		cocoProvider.refreshLanguageModelChatInformation();
+		quickActionsProvider.refresh();
+	}));
 	context.subscriptions.push(...registerModelBehaviorCommands(() => quickActionsProvider.refresh()));
 	llamaProvider.refreshLanguageModelChatInformation();
 	codexProvider.refreshLanguageModelChatInformation();
@@ -1964,6 +1979,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				}
 				if (
 					event.affectsConfiguration("llamacpp.sharedContextLength") ||
+					event.affectsConfiguration("llamacpp.sharedContextFollowCodex") ||
 					event.affectsConfiguration("llamacpp.codexWorkingContextTarget")
 				) {
 					// One working context for Codex, Claude, Coco and Cursor.
