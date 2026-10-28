@@ -6,10 +6,11 @@ import {
 	CLAUDE_CONTEXT_TARGET_MIN,
 } from "../claude/claude-provider";
 import { CODEX_WORKING_CONTEXT_MIN } from "../codex/codex-provider";
-import type { CodexContextWindowSource, CodexModelContextWindow } from "../codex/context-windows";
+import type { CodexContextWindowSource, CodexFollowReason, CodexFollowTarget, CodexModelContextWindow } from "../codex/context-windows";
 import { CONFIG_SECTION } from "../constants";
 import {
 	getFollowedCodexContext,
+	onDidChangeFollowedCodexContext,
 	resolveManualSharedContextLimit,
 	resolveSharedContextLimit,
 	SHARED_CONTEXT_MAX,
@@ -30,14 +31,16 @@ export interface ContextControlState {
 	/** The stored slider value; equals sharedTarget unless the limit follows Codex. */
 	manualSharedTarget: number;
 	followCodex: boolean;
-	/** Last used Codex model and its Codex-reported window, once known. */
+	/** Codex model and Codex-reported window the shared context follows, once known. */
 	followedCodexModelId?: string;
 	followedCodexWindow?: number;
+	/** Why that model is followed: last used, Codex default, or largest known window. */
+	followedCodexReason?: CodexFollowReason;
 	claudeTarget: number;
 	claudeMinimum: number;
 	claudeMaximum: number;
 	codexTarget: number;
-	/** Window of the last used Codex model, or the fallback setting. */
+	/** Window of the followed Codex model, or runtime metrics, or the fallback setting. */
 	codexMaximum: number;
 	codexMaximumObserved: boolean;
 	codexMaximumSource: CodexContextWindowSource;
@@ -54,7 +57,8 @@ export interface ContextControlState {
 
 export interface CodexContextSnapshot {
 	models: readonly CodexModelContextWindow[];
-	lastUsedModelId?: string;
+	/** Last used model, else Codex's default, else the largest known window. */
+	followTarget?: CodexFollowTarget;
 }
 
 export function resolveContextControlState(
@@ -70,10 +74,13 @@ export function resolveContextControlState(
 	);
 	const observedCodexWindow = codexMetrics?.contextWindowTokens;
 	const hasObservedCodexWindow = Number.isFinite(observedCodexWindow) && (observedCodexWindow ?? 0) > 0;
-	const lastUsed = codex?.models.find(model => model.modelId === codex.lastUsedModelId && model.source !== "fallback");
-	const codexMaximumSource: CodexContextWindowSource = lastUsed?.source ?? (hasObservedCodexWindow ? "server" : "fallback");
-	const codexMaximum = lastUsed
-		? Math.max(CODEX_WORKING_CONTEXT_MIN, Math.floor(lastUsed.window))
+	const target = codex?.followTarget;
+	const targetWindow = target
+		? codex?.models.find(model => model.modelId === target.modelId && model.source !== "fallback")
+		: undefined;
+	const codexMaximumSource: CodexContextWindowSource = targetWindow?.source ?? (hasObservedCodexWindow ? "server" : "fallback");
+	const codexMaximum = targetWindow
+		? Math.max(CODEX_WORKING_CONTEXT_MIN, Math.floor(targetWindow.window))
 		: hasObservedCodexWindow
 			? Math.max(CODEX_WORKING_CONTEXT_MIN, Math.floor(observedCodexWindow!))
 			: configuredCodexWindow;
@@ -92,6 +99,7 @@ export function resolveContextControlState(
 		followCodex,
 		followedCodexModelId: followed?.modelId,
 		followedCodexWindow: followed ? clampInteger(followed.window, CODEX_WORKING_CONTEXT_MIN, SHARED_CONTEXT_MAX, CODEX_WORKING_CONTEXT_MIN) : undefined,
+		followedCodexReason: followed && followed.modelId === target?.modelId ? target.reason : undefined,
 		claudeTarget: clampInteger(sharedTarget, CLAUDE_CONTEXT_TARGET_MIN, CLAUDE_CONTEXT_TARGET_MAX, CLAUDE_CONTEXT_TARGET_MIN),
 		claudeMinimum: CLAUDE_CONTEXT_TARGET_MIN,
 		claudeMaximum: CLAUDE_CONTEXT_TARGET_MAX,
@@ -130,7 +138,18 @@ export function registerContextControlCommand(
 		getCodexMetrics(),
 		getCodexContext?.()
 	);
-	return vscode.commands.registerCommand("llamacpp.openContextControl", () => {
+	return vscode.Disposable.from(onDidChangeFollowedCodexContext(() => {
+		if (!panel) {
+			return;
+		}
+		const state = currentState();
+		void panel.webview.postMessage({
+			type: "followed",
+			window: state.followedCodexWindow ?? 0,
+			codexMaximum: state.codexMaximum,
+			label: formatFollowedLabel(state),
+		});
+	}), vscode.commands.registerCommand("llamacpp.openContextControl", () => {
 		if (panel) {
 			panel.reveal(vscode.ViewColumn.Active);
 			panel.webview.html = renderContextControl(panel.webview, currentState());
@@ -190,7 +209,7 @@ export function registerContextControlCommand(
 		panel.onDidDispose(() => {
 			panel = undefined;
 		});
-	});
+	}));
 }
 
 function escapeHtml(value: string): string {
@@ -203,10 +222,25 @@ const CODEX_WINDOW_SOURCE_LABELS: Record<CodexContextWindowSource, string> = {
 	fallback: "fallback setting",
 };
 
+const CODEX_FOLLOW_REASON_LABELS: Record<CodexFollowReason, string> = {
+	lastUsed: "last used",
+	default: "Codex default",
+	largest: "largest known",
+};
+
+function formatFollowedLabel(state: ContextControlState): string {
+	if (!state.followedCodexModelId || !state.followedCodexWindow) {
+		return "no Codex window known yet";
+	}
+	const reason = state.followedCodexReason ? `${CODEX_FOLLOW_REASON_LABELS[state.followedCodexReason]} model ` : "";
+	return `${reason}${state.followedCodexModelId}, ${formatTokenCount(state.followedCodexWindow)}`;
+}
+
 function renderCodexWindows(state: ContextControlState): string {
+	const tag = state.followedCodexReason ? CODEX_FOLLOW_REASON_LABELS[state.followedCodexReason] : "followed";
 	const rows = [...state.codexModels]
 		.sort((left, right) => right.window - left.window || left.modelId.localeCompare(right.modelId))
-		.map(model => `<tr${model.modelId === state.followedCodexModelId ? ' class="current"' : ""}><td>${escapeHtml(model.modelId)}${model.modelId === state.followedCodexModelId ? " <span class=\"tag\">last used</span>" : ""}</td><td>${formatTokenCount(model.window)}</td><td>${CODEX_WINDOW_SOURCE_LABELS[model.source]}</td></tr>`)
+		.map(model => `<tr${model.modelId === state.followedCodexModelId ? ' class="current"' : ""}><td>${escapeHtml(model.modelId)}${model.modelId === state.followedCodexModelId ? ` <span class="tag">${tag}</span>` : ""}</td><td>${formatTokenCount(model.window)}</td><td>${CODEX_WINDOW_SOURCE_LABELS[model.source]}</td></tr>`)
 		.join("");
 	const largest = state.codexLargest
 		? `${formatTokenCount(state.codexLargest.window)} <small>${escapeHtml(state.codexLargest.modelId)}</small>`
@@ -220,9 +254,7 @@ function renderCodexWindows(state: ContextControlState): string {
 
 function renderContextControl(webview: vscode.Webview, state: ContextControlState): string {
 	const nonce = randomBytes(16).toString("base64");
-	const followedLabel = state.followedCodexModelId && state.followedCodexWindow
-		? `${escapeHtml(state.followedCodexModelId)}, ${formatTokenCount(state.followedCodexWindow)}`
-		: "no Codex model used yet";
+	const followedLabel = escapeHtml(formatFollowedLabel(state));
 	return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -252,7 +284,7 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		tr.current td { color: var(--vscode-textLink-foreground); }
 		.tag, small { color: var(--vscode-descriptionForeground); font-size: 12px; font-weight: normal; }
 	</style>
-</head>
+</head><span id="followedLabel">${followedLabel}</span>
 <body>
 	<h1>Provider working context</h1>
 	<p class="lead">Changes apply to new provider sessions. Existing durable transcripts remain available.</p>
@@ -260,7 +292,7 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		<div class="row"><h2>Shared context: Codex, Claude, Coco, Cursor</h2><span class="value" id="sharedValue"></span></div>
 		<input id="shared" type="range" min="${state.sharedMinimum}" max="${state.sharedMaximum}" step="1" value="${state.sharedTarget}">
 		<div class="bounds"><span>${formatTokenCount(state.sharedMinimum)}</span><span>${formatTokenCount(state.sharedMaximum)}</span></div>
-		<label class="toggle"><input id="followCodex" type="checkbox"${state.followCodex ? " checked" : ""}> Follow the Codex window (last used model: ${followedLabel})</label>
+		<label class="toggle"><input id="followCodex" type="checkbox"${state.followCodex ? " checked" : ""}> Follow the Codex window (${followedLabel})</label>
 		<p id="followNote"></p>
 		<p>One working context for every native agent, so a switch after a rate limit keeps the same history budget. Each provider uses min(limit, its real model window) as its window and native auto-compaction threshold.</p>
 		<p id="effective"></p>
@@ -285,15 +317,17 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		const deepSeekContext = document.getElementById('deepSeekContext');
 		const deepSeekOutput = document.getElementById('deepSeekOutput');
 		const compact = value => value >= 1000000 ? (value / 1000000).toFixed(2).replace(/\\.00$/, '') + 'M' : (value / 1000).toFixed(1).replace(/\\.0$/, '') + 'k';
-		const codexMaximum = ${state.codexMaximum}, claudeMinimum = ${state.claudeMinimum}, claudeMaximum = ${state.claudeMaximum};
+		let codexMaximum = ${state.codexMaximum};
+		const claudeMinimum = ${state.claudeMinimum}, claudeMaximum = ${state.claudeMaximum};
 		const followCodex = document.getElementById('followCodex');
-		const manualTarget = ${state.manualSharedTarget}, followedWindow = ${state.followedCodexWindow ?? 0};
+		const manualTarget = ${state.manualSharedTarget};
+		let followedWindow = ${state.followedCodexWindow ?? 0};
 		const applyFollow = () => {
 			shared.disabled = followCodex.checked;
 			shared.value = String(followCodex.checked && followedWindow > 0 ? followedWindow : manualTarget);
 			document.getElementById('followNote').textContent = !followCodex.checked ? ''
-				: followedWindow > 0 ? 'The shared context follows the last used Codex model, including a smaller window after switching models. Changing it rewrites the Claude and Coco prompt caches once.'
-				: 'Until a Codex model is used, the slider value ' + compact(manualTarget) + ' applies.';
+				: followedWindow > 0 ? 'The shared context follows the last used Codex model (before the first use: the Codex default model, else the largest known window), including a smaller window after switching models. Press Apply to save. Changing it rewrites the Claude and Coco prompt caches once.'
+				: 'Until Codex catalogs or reports a model window, the slider value ' + compact(manualTarget) + ' applies.';
 		};
 		const update = () => {
 			const value = Number(shared.value);
@@ -311,7 +345,17 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		deepSeekContext.addEventListener('input', update);
 		deepSeekOutput.addEventListener('input', update);
 		document.getElementById('save').addEventListener('click', () => vscode.postMessage({ type: 'save', followCodex: followCodex.checked, sharedTarget: Number(followCodex.checked ? manualTarget : shared.value), deepSeekContextTarget: Number(deepSeekContext.value), deepSeekMaxOutputTarget: Number(deepSeekOutput.value) }));
-		window.addEventListener('message', event => { if (event.data?.type === 'saved') document.getElementById('status').textContent = 'Saved'; });
+		window.addEventListener('message', event => {
+			if (event.data?.type === 'saved') document.getElementById('status').textContent = 'Saved';
+			if (event.data?.type === 'followed') {
+				// Keeps unsaved slider edits: only the followed window and its label change.
+				followedWindow = Number(event.data.window) || 0;
+				codexMaximum = Number(event.data.codexMaximum) || codexMaximum;
+				document.getElementById('followedLabel').textContent = String(event.data.label ?? '');
+				applyFollow();
+				update();
+			}
+		});
 		applyFollow();
 		update();
 	</script>

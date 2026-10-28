@@ -1632,6 +1632,28 @@ suite("Codex subscription provider", () => {
 		);
 	});
 
+	test("keeps the last used Codex model globally and follows the default model before any use", () => {
+		const memento = (values: Map<string, unknown>) => ({
+			keys: () => [...values.keys()],
+			get: <T>(key: string, defaultValue?: T): T | undefined => (values.has(key) ? values.get(key) as T : defaultValue),
+			update: async (key: string, value: unknown): Promise<void> => { values.set(key, value); },
+		}) as vscode.Memento;
+		const globalValues = new Map<string, unknown>();
+		const legacy = new CodexChatModelProvider("test", undefined, memento(new Map([["llamacpp.codexLastModel.v1", "gpt-6-sol"]])), memento(globalValues));
+		assert.strictEqual(legacy.lastUsedModelId, "gpt-6-sol", "the 1.20.2 workspace value is read");
+		assert.strictEqual(globalValues.get("llamacpp.codexLastModel.v1"), "gpt-6-sol", "and migrated to global state");
+		legacy.dispose();
+
+		const fresh = new CodexChatModelProvider("test", undefined, memento(new Map()), memento(new Map()));
+		const internals = fresh as unknown as { models: Map<string, unknown>; catalogContextWindows: Map<string, number> };
+		internals.catalogContextWindows = new Map([["gpt-6-sol", 258_400], ["gpt-6.1-sol", 475_000]]);
+		assert.deepStrictEqual(fresh.followTarget, { modelId: "gpt-6.1-sol", reason: "largest" });
+		internals.models.set("gpt-6-sol", { id: "gpt-6-sol", isDefault: true });
+		internals.models.set("gpt-6.1-sol", { id: "gpt-6.1-sol", isDefault: false });
+		assert.deepStrictEqual(fresh.followTarget, { modelId: "gpt-6-sol", reason: "default" });
+		fresh.dispose();
+	});
+
 	test("restores durable Codex thread metadata beyond the former four-hour TTL", async () => {
 		const values = new Map<string, unknown>();
 		let updateCompleted = false;

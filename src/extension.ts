@@ -634,7 +634,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		(sourceKey, maximum, reported) => apiProviderService.recordContextMaximum(sourceKey, maximum, reported),
 		{ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "cursor-sdk") }
 	);
-	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState);
+	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState, context.globalState);
 	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
 	const cocoProvider = new CocoChatModelProvider({ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "coco-history"), log: (event,data) => logService.log(event,data) });
@@ -825,7 +825,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	context.subscriptions.push(registerContextControlCommand(
 		() => codexProvider.runtimeMetrics,
 		() => quickActionsProvider.refresh(),
-		() => ({ models: codexProvider.contextWindows, lastUsedModelId: codexProvider.lastUsedModelId })
+		() => ({ models: codexProvider.contextWindows, followTarget: codexProvider.followTarget })
 	));
 	context.subscriptions.push(onDidChangeFollowedCodexContext(() => {
 		if (vscode.workspace.getConfiguration("llamacpp").get<boolean>("sharedContextFollowCodex", false) !== true) {

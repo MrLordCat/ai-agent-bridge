@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.20.3 (patch release) - 2026-10-28
+
+- Follow Codex applies right away. Before, with the toggle on, the shared
+  context stayed at the slider value until a Codex request in this workspace,
+  although Codex had already catalogued 475K for gpt-6.1-sol, and the panel
+  showed the 258.4K fallback setting as the Codex window. Before the first
+  request the shared context now follows Codex's default model, or the largest
+  known window while the model list is not loaded yet.
+- The last used Codex model is stored globally, like the shared context; the
+  1.20.2 workspace value is migrated.
+- Provider Context names why a model is followed (last used, Codex default,
+  largest known) and updates the followed window while open without dropping
+  unsaved edits.
+
 ## 1.20.2 (patch release) - 2026-10-28
 
 - Patch releases are published on GitHub like stable ones, and the updater

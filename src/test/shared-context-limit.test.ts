@@ -10,7 +10,7 @@ import { ApiProviderService, type QuickAccessApiProvider } from "../api-provider
 import { CocoAcpClient } from "../coco/acp-client";
 import { cocoNativeCompactionTokens, COCO_COMPACTION_THRESHOLD_ENV, resolveCocoCompactionThreshold } from "../coco/model-adapter";
 import { createCodexVsCodeOnlyPolicy, resolveCodexAutoCompactTokenLimit } from "../codex/codex-provider";
-import { parseCodexModelsCache, readCodexModelsCache } from "../codex/context-windows";
+import { parseCodexModelsCache, readCodexModelsCache, resolveCodexFollowTarget } from "../codex/context-windows";
 import {
 	getFollowedCodexContext,
 	onDidChangeFollowedCodexContext,
@@ -65,6 +65,20 @@ suite("Shared working context limit", () => {
 		assert.deepStrictEqual([...windows], [["gpt-6.1-sol", 475_000], ["gpt-6-sol", 258_400]]);
 		assert.strictEqual(parseCodexModelsCache("not json").size, 0);
 		assert.strictEqual(parseCodexModelsCache(JSON.stringify({ models: {} })).size, 0);
+	});
+
+	test("follows already known Codex windows before the first request", () => {
+		const models = [
+			{ modelId: "gpt-6-sol", window: 258_400, source: "server" as const },
+			{ modelId: "gpt-6.1-sol", window: 475_000, source: "catalog" as const },
+			{ modelId: "unlisted", window: 900_000, source: "fallback" as const },
+		];
+		assert.deepStrictEqual(resolveCodexFollowTarget(models, "gpt-6-sol", "gpt-6.1-sol"), { modelId: "gpt-6-sol", reason: "lastUsed" });
+		assert.deepStrictEqual(resolveCodexFollowTarget(models, undefined, "gpt-6-sol"), { modelId: "gpt-6-sol", reason: "default" });
+		assert.deepStrictEqual(resolveCodexFollowTarget(models), { modelId: "gpt-6.1-sol", reason: "largest" }, "fallback windows are never the largest");
+		assert.deepStrictEqual(resolveCodexFollowTarget(models, undefined, "unlisted"), { modelId: "gpt-6.1-sol", reason: "largest" });
+		assert.strictEqual(resolveCodexFollowTarget(models, "unlisted"), undefined, "a used model with an unknown window borrows no other window");
+		assert.strictEqual(resolveCodexFollowTarget([models[2]]), undefined);
 	});
 
 	test("rereads the Codex catalog only after it changes", async () => {

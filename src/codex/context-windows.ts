@@ -11,6 +11,40 @@ export interface CodexModelContextWindow {
 	source: CodexContextWindowSource;
 }
 
+/** Why a model drives the followed shared context: it was used last, it is Codex's default, or it has the largest known window. */
+export type CodexFollowReason = "lastUsed" | "default" | "largest";
+
+export interface CodexFollowTarget {
+	modelId: string;
+	reason: CodexFollowReason;
+}
+
+/**
+ * The model whose window the shared context follows. Before any Codex request
+ * the windows Codex already catalogued or reported are used right away: the
+ * Codex default model first, else the largest known window. Fallback-setting
+ * windows never qualify; a used model whose window is still unknown follows
+ * nothing until Codex reports it, rather than another model's window.
+ */
+export function resolveCodexFollowTarget(
+	models: readonly CodexModelContextWindow[],
+	lastUsedModelId?: string,
+	defaultModelId?: string
+): CodexFollowTarget | undefined {
+	const known = models.filter(model => model.source !== "fallback");
+	if (lastUsedModelId) {
+		return known.some(model => model.modelId === lastUsedModelId) ? { modelId: lastUsedModelId, reason: "lastUsed" } : undefined;
+	}
+	if (defaultModelId && known.some(model => model.modelId === defaultModelId)) {
+		return { modelId: defaultModelId, reason: "default" };
+	}
+	const largest = known.reduce<CodexModelContextWindow | undefined>(
+		(best, model) => !best || model.window > best.window ? model : best,
+		undefined
+	);
+	return largest ? { modelId: largest.modelId, reason: "largest" } : undefined;
+}
+
 const MAX_CATALOG_BYTES = 8 * 1024 * 1024;
 const MODEL_SLUG = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 

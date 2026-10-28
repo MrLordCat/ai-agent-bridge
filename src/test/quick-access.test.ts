@@ -448,7 +448,7 @@ test("opens centralized API provider management from Quick Access", async () => 
 		const values = new Map<string, unknown>([["sharedContextLength", 440_921]]);
 		const configuration = { get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback };
 		const codex = {
-			lastUsedModelId: "gpt-6.1-sol",
+			followTarget: { modelId: "gpt-6.1-sol", reason: "lastUsed" as const },
 			models: [
 				{ modelId: "gpt-6-sol", window: 258_400, source: "server" as const },
 				{ modelId: "gpt-6.1-sol", window: 475_000, source: "catalog" as const },
@@ -470,8 +470,28 @@ test("opens centralized API provider management from Quick Access", async () => 
 			assert.strictEqual(followed.sharedTarget, 475_000);
 			assert.strictEqual(followed.manualSharedTarget, 440_921);
 			assert.strictEqual(followed.followedCodexModelId, "gpt-6.1-sol");
+			assert.strictEqual(followed.followedCodexReason, "lastUsed");
 			assert.strictEqual(followed.codexTarget, 475_000);
 			assert.strictEqual(followed.claudeTarget, 475_000);
+		} finally {
+			setFollowedCodexContext(undefined);
+		}
+	});
+
+	test("uses the Codex default model's catalog window before any Codex request", () => {
+		const values = new Map<string, unknown>([["sharedContextLength", 440_921], ["sharedContextFollowCodex", true]]);
+		const configuration = { get: <T>(key: string, fallback?: T) => values.has(key) ? values.get(key) as T : fallback };
+		const codex = {
+			followTarget: { modelId: "gpt-6.1-sol", reason: "default" as const },
+			models: [{ modelId: "gpt-6.1-sol", window: 475_000, source: "catalog" as const }],
+		};
+		try {
+			setFollowedCodexContext({ modelId: "gpt-6.1-sol", window: 475_000 });
+			const state = resolveContextControlState(configuration, undefined, codex);
+			assert.strictEqual(state.codexMaximum, 475_000, "not the 258.4k fallback setting");
+			assert.strictEqual(state.codexMaximumSource, "catalog");
+			assert.strictEqual(state.sharedTarget, 475_000);
+			assert.strictEqual(state.followedCodexReason, "default");
 		} finally {
 			setFollowedCodexContext(undefined);
 		}
