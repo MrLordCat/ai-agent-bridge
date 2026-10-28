@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.4 (dev patch) - 2026-10-28
+
+- Coco no longer signs commits, pull requests or files with "Generated with
+  [Snowflake CoCo](…)" and "Co-authored-by: Snowflake CoCo
+  <noreply@snowflake.com>", which Cortex's own system prompt asks for. The
+  bridge policy forbids it, and the bridge removes that attribution from every
+  Coco tool call before Chat runs it: whole `-m`/`--message`/`--trailer`
+  arguments and lines holding only the attribution. Text an edit must match is
+  kept, and text that only mentions Snowflake CoCo is left alone.
+
 ## 1.20.3 (patch release) - 2026-10-28
 
 - Follow Codex applies right away. Before, with the toggle on, the shared

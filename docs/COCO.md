@@ -89,6 +89,14 @@ The same ACP prompt stays alive while Chat executes each tool and returns its
 result. Tool aliases distinguish these client tools from Cortex built-ins.
 The bridge stops built-in Cortex actions that attempt to bypass Chat, reporting
 the problem in Chat instead of opening a separate permission picker.
+Cortex's own system prompt asks Coco to sign commits and pull requests with
+"Generated with [Snowflake CoCo](…)" and "Co-authored-by: Snowflake CoCo
+<noreply@snowflake.com>". The bridge policy forbids that, and every tool call
+Coco hands to Chat is cleaned before it runs: `-m`, `--message` and `--trailer`
+arguments holding only that attribution are dropped, and lines holding only it
+are removed from commands, messages and file contents. Text an edit must match
+(`oldString`, `old_str`) is kept, so an earlier attribution can still be
+removed from a file; text that only mentions Snowflake CoCo is left alone.
 Use the Snowflake Coco panel for its own built-in SQL and other agent tools.
 Commands run through **cocoRunInTerminal** in ordinary integrated terminals
 named `Coco 1`, `Coco 2`, etc., including in the Agents Window. Sequential commands

@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { DelegatedTurnState } from "../tools/delegated-turn-state";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
+import { stripCocoAttributionFromInput } from "./attribution";
 import { CocoResponseStream } from "./response-stream";
 import { selectCocoChatTools } from "./terminal-tools";
 import { parseCocoContextUsage } from "./usage-adapter";
@@ -145,6 +146,8 @@ export class CocoTurnBridge implements vscode.Disposable {
 		if (!input || typeof input !== "object" || Array.isArray(input)) {
 			return Promise.reject(new Error("Coco client tool arguments must be a JSON object."));
 		}
+		// Cortex's own prompt asks for Snowflake CoCo commit trailers; none reach commits or files.
+		const cleanInput = stripCocoAttributionFromInput(input);
 		const callId = nativeCallId ? `coco-${createHash("sha256").update(nativeCallId).digest("hex")}` : `coco-${randomUUID()}`;
 		if (this.completed.has(callId)) { return Promise.resolve(this.completed.get(callId)!); }
 		const historical = this.historicalResults.get(callId);
@@ -152,7 +155,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		if (this.historicalCalls.has(callId)) { return Promise.reject(new Error("The earlier Coco tool completion is unknown. Verify its outcome before retrying; no action was repeated.")); }
 		if (this.pending.has(callId)) { return Promise.reject(new Error("Duplicate pending Coco callback; no action was repeated.")); }
 		const response = new Promise<JsonObject>(resolve => this.pending.set(callId, {
-			part: new vscode.LanguageModelToolCallPart(callId, tool.name, input), resolve, reported: false,
+			part: new vscode.LanguageModelToolCallPart(callId, tool.name, cleanInput), resolve, reported: false,
 		}));
 		this.issued.add(callId);
 		this.reportCalls();
