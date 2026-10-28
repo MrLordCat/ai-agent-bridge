@@ -187,7 +187,7 @@ suite("Copilot patch", () => {
 		const originalWorkbench = fs.readFileSync(fs.existsSync(workbenchBackup) ? workbenchBackup : workbenchPath, "utf8");
 		const patchedWorkbench = patchVsCodeWorkbenchBundle(originalWorkbench);
 
-		assert.ok(COPILOT_PATCH_ID.endsWith(":v27"));
+		assert.ok(COPILOT_PATCH_ID.endsWith(":v28"));
 		assert.ok(patched.includes(COPILOT_PATCH_MARKER));
 		// A subagent alternating with its parent must not flip Copilot's
 		// main-agent model: every flip re-announced the model list and made VS
@@ -211,6 +211,11 @@ suite("Copilot patch", () => {
 			patched.split("=__llamaBoundStoredToolResult(").length - 1,
 			2,
 			"both stored tool-result assignment sites must be wrapped"
+		);
+		assert.match(
+			patched,
+			/_collectRelevantToolCallResults\([^)]*\)\{let [^;]*;for\([^)]*\)for\([^)]*\)[A-Za-z_$][\w$]*\[[A-Za-z_$][\w$]*\.id\]=__llamaStoredToolResultCopy\(/,
+			"the persisted turn metadata copy must be bounded"
 		);
 		// The tokenizer memoisation cache lives on the class constructor
 		// (module-scoped, outlives instances), so it is referenced as
@@ -317,9 +322,26 @@ suite("Copilot patch", () => {
 		const storedEnd = patched.indexOf("function __llamaConversationMetadata(", storedStart);
 		assert.ok(storedStart > 0 && storedEnd > storedStart, "stored tool-result helper must be present");
 		const storedContext: Record<string, unknown> = {};
+		storedContext.require = (id: string) => id === "vscode" ? vscode : undefined;
 		new Script(
-			`${patched.slice(storedStart, storedEnd)};globalThis.__test={__llamaBoundStoredToolResult};`
+			`${patched.slice(storedStart, storedEnd)};globalThis.__test={__llamaBoundStoredToolResult,__llamaStoredToolResultCopy};`
 		).runInNewContext(storedContext);
+		const storedCopy = (storedContext.__test as { __llamaStoredToolResultCopy: (result: unknown) => vscode.LanguageModelToolResult })
+			.__llamaStoredToolResultCopy;
+		const screenshot = new vscode.LanguageModelDataPart(new Uint8Array(200_000), "image/png");
+		const icon = new vscode.LanguageModelDataPart(new Uint8Array(1_000), "image/png");
+		const live = new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart("caption"), screenshot, icon]);
+		const saved = storedCopy(live);
+		assert.ok(saved instanceof vscode.LanguageModelToolResult, "the saved copy keeps the tool result class");
+		assert.notStrictEqual(saved, live);
+		assert.strictEqual(live.content[1], screenshot, "the live result keeps the image for later rounds");
+		assert.ok(saved.content[1] instanceof vscode.LanguageModelTextPart);
+		assert.match((saved.content[1] as vscode.LanguageModelTextPart).value, /^\[Image was previously shown to you\. Its image\/png bytes \(200000\)/);
+		assert.strictEqual(saved.content[0], live.content[0]);
+		assert.strictEqual(saved.content[2], icon, "small images stay in the saved copy");
+		const textOnly = new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart("x".repeat(100_000))]);
+		assert.strictEqual(storedCopy(textOnly), textOnly);
+		assert.strictEqual(storedCopy(undefined), undefined);
 		interface StoredContent {
 			data?: string;
 			value?: string;

@@ -59,7 +59,7 @@ available; the configured fallback is used otherwise.
 `src/copilot-patch.ts` is compiled into the VSIX and modifies Copilot Chat only
 for the `llamacpp` vendor. The extension applies compatible patches on startup
 and exposes apply, status and restore commands; no installer or external patch
-script is required. Patch v27 makes the following changes:
+script is required. Patch v28 makes the following changes:
 
 - `maxOutputTokens` uses the limit advertised by the selected model instead of
   the wrapper's fixed 8192-token value;
@@ -109,6 +109,13 @@ script is required. Patch v27 makes the following changes:
   several `view_image` calls grew to 544 MB, and VS Code then failed every
   request with `RangeError: Invalid string length` while serializing the
   agent arguments. The live tool card keeps its full result.
+- the turn metadata copy of the tool results (v28,
+  `_collectRelevantToolCallResults`) replaces image and binary data parts
+  above 64 KB with a text note. In the host these parts hold `Uint8Array`
+  bytes, so the string check above never matched `view_image` results; a
+  session with 5120×1440 screenshots reached 632 MB and failed with the same
+  `Invalid string length`. The live map of the running request keeps the
+  image, and later turns render historical images as text anyway.
 - an oversized session that already exists can be repaired with
   `node scripts/repair-chat-sessions.cjs <session.jsonl>`; it writes a
   `*.repaired.jsonl` next to the original and leaves the original intact.

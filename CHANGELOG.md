@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.20.1 (development patch) - 2026-10-27
+
+- Copilot patch v28: screenshots no longer make a chat fail with
+  `Invalid string length`. Copilot saved each `view_image` result in the turn
+  metadata with its full bytes, and VS Code sends all of it with every request;
+  one chat reached 632 MB, about 500 MB of it screenshots. The saved copy now
+  replaces image and binary tool data above 64 KB with a short text note. The
+  running request still sees the image, and later turns already showed old
+  images to the model only as text.
+- A Copilot bundle carrying any older patch version is upgraded from its
+  backup. The hand-kept list of old markers lacked v27, so v28 failed with
+  "Backup already exists" and the bundle kept v27.
+
 ## 1.20.0 (stable release) - 2026-10-26
 
 Consolidates the 1.19.1–1.19.4 development patches below.

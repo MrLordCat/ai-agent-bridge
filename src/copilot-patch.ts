@@ -13,7 +13,7 @@ import {
 	type SearchOptions,
 } from "./vscode-app-root";
 
-export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v27";
+export const COPILOT_PATCH_ID = "llama-vscode-chat:copilot-native-model-controls:v28";
 export const COPILOT_PATCH_MARKER = `/* ${COPILOT_PATCH_ID} */`;
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID = "llama-vscode-chat:copilot-git-repositories-guard:v1";
 export const COPILOT_GIT_REPOSITORIES_GUARD_PATCH_MARKER = `/* ${COPILOT_GIT_REPOSITORIES_GUARD_PATCH_ID} */`;
@@ -21,33 +21,14 @@ export const VSCODE_CHAT_HISTORY_PATCH_ID = "llama-vscode-chat:vscode-chat-histo
 export const VSCODE_CHAT_HISTORY_PATCH_MARKER = `/* ${VSCODE_CHAT_HISTORY_PATCH_ID} */`;
 export const VSCODE_CHAT_HISTORY_PATCH_LEGACY_MARKER = "/* llama-vscode-chat:vscode-chat-history-bounds:v1 */";
 
-const LEGACY_PATCH_MARKERS = [
-	"/* llama-vscode-chat:copilot-native-model-controls:v26 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v25 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v24 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v23 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v22 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v21 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v20 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v19 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v18 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v17 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v16 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v15 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v14 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v13 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v12 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v11 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v10 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v9 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v8 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v7 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v6 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v5 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v4 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v3 */",
-	"/* llama-vscode-chat:copilot-native-model-controls:v2 */",
-];
+const COPILOT_PATCH_VERSION = Number(COPILOT_PATCH_ID.split(":v").pop());
+/** Any older version of this patch is upgraded from the backup; a hand-kept list missed v27. */
+function hasLegacyPatch(source: string): boolean {
+	for (const match of source.matchAll(/\/\* llama-vscode-chat:copilot-native-model-controls:v(\d+) \*\//g)) {
+		if (Number(match[1]) < COPILOT_PATCH_VERSION) { return true; }
+	}
+	return false;
+}
 const BACKUP_SUFFIX = ".llama-vscode-chat.backup";
 const METADATA_SUFFIX = ".llama-vscode-chat.patch.json";
 const LOCK_SUFFIX = ".llama-vscode-chat.lock";
@@ -610,7 +591,17 @@ export function patchCopilotBundle(source: string): string {
 		'else if(typeof c.value=="string"&&c.value.length>12000){c.value=__llamaBoundStoredText(c.value)}' +
 		'else if(typeof c.text=="string"&&c.text.length>12000){c.text=__llamaBoundStoredText(c.text)}}}' +
 		'else if(a&&typeof a=="object"&&typeof a.data=="string"&&a.data.length>200000&&typeof a.mimeType=="string"&&a.mimeType.indexOf("text/")!==0){' +
-		'a.data="["+a.mimeType+" payload omitted from stored chat history: "+a.data.length+" chars]"}return r}';
+		'a.data="["+a.mimeType+" payload omitted from stored chat history: "+a.data.length+" chars]"}return r}' +
+		// Tool data parts carry Uint8Array bytes in the host, so the string-only bound above
+		// never fired for view_image; a 632 MB session with 5120x1440 screenshots broke the request.
+		'function __llamaStoredPayloadSize(c){if(!c||typeof c!="object"||typeof c.mimeType!="string"||c.mimeType.indexOf("text/")===0)return 0;' +
+		'let d=c.data;return typeof d=="string"?d.length:d&&typeof d.byteLength=="number"?d.byteLength:0}' +
+		'function __llamaStoredToolResultCopy(r){let a=r&&r.content;if(!Array.isArray(a)||!a.some(c=>__llamaStoredPayloadSize(c)>65536))return r;' +
+		'let v=require("vscode"),n=Object.assign(Object.create(Object.getPrototypeOf(r)),r);' +
+		'n.content=a.map(c=>{let s=__llamaStoredPayloadSize(c);if(s<=65536)return c;' +
+		'return new v.LanguageModelTextPart(c.mimeType.indexOf("image/")===0' +
+		'?"[Image was previously shown to you. Its "+c.mimeType+" bytes ("+s+") are not kept in the saved chat history; view the source again if you need it.]"' +
+		':"["+c.mimeType+" tool output ("+s+" bytes) is not kept in the saved chat history.]")});return n}';
 	patched = replaceOnce(
 		patched,
 		"function __llamaConversationMetadata(n){",
@@ -626,6 +617,14 @@ export function patchCopilotBundle(source: string): string {
 		},
 		"stored tool result bounds",
 		2
+	);
+	// Only the turn metadata copy is bounded: the live map keeps the image for later rounds of
+	// the same request, and later turns render historical images as text anyway.
+	patched = replacePatternOnce(
+		patched,
+		/(_collectRelevantToolCallResults\(([A-Za-z_$][\w$]*),([A-Za-z_$][\w$]*)\)\{let ([A-Za-z_$][\w$]*)=\{\};for\(let ([A-Za-z_$][\w$]*) of \2\)for\(let ([A-Za-z_$][\w$]*) of \5\.toolCalls\)\4\[\6\.id\]=)\3\[\6\.id\]/,
+		"$1__llamaStoredToolResultCopy($3[$6.id])",
+		"persisted turn tool result bounds"
 	);
 	patched = replacePatternOnce(
 		patched,
@@ -952,7 +951,7 @@ export function getCopilotPatchSummary(target: CopilotPatchTarget): CopilotPatch
 	const summary: CopilotPatchSummary = {
 		copilotVersion: target.manifest.version ?? "unknown",
 		applied: installed.includes(COPILOT_PATCH_MARKER),
-		legacyPatch: LEGACY_PATCH_MARKERS.some((marker) => installed.includes(marker)),
+		legacyPatch: hasLegacyPatch(installed),
 		workbenchApplied: fileContains(target.workbenchPath, VSCODE_CHAT_HISTORY_PATCH_MARKER),
 	};
 	summaryCache.set(target.bundlePath, { key, summary });
@@ -984,7 +983,7 @@ export function getCopilotPatchStatus(target: CopilotPatchTarget): CopilotPatchS
 		metadataPath,
 		applied: installed.includes(COPILOT_PATCH_MARKER),
 		workbenchApplied: installedWorkbench ? installedWorkbench.includes(VSCODE_CHAT_HISTORY_PATCH_MARKER) : false,
-		legacyPatch: LEGACY_PATCH_MARKERS.some((marker) => installed.includes(marker)),
+		legacyPatch: hasLegacyPatch(installed),
 		backupExists: fs.existsSync(backupPath),
 		backupContaminated: fileContains(backupPath, COPILOT_BUNDLE_MARKER_PREFIX),
 		workbenchBackupExists: Boolean(workbenchBackupPath && fs.existsSync(workbenchBackupPath)),

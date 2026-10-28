@@ -105,6 +105,34 @@ suite("Agent runtime performance", () => {
 		assert.ok(fs.readFileSync(target.bundlePath).equals(original));
 	});
 
+	test("upgrades the bundle patched by the previous patch version from its backup", function () {
+		this.timeout(120_000);
+		const version = Number(COPILOT_PATCH_MARKER.match(/:v(\d+) \*\//)?.[1]);
+		const marker = (n: number) => `/* llama-vscode-chat:copilot-native-model-controls:v${n} */`;
+		const legacyStatus = (n: number) => {
+			const probe = tempTarget(fs.mkdtempSync(path.join(directory, "probe-")), `${marker(n)}var copilot=1;`);
+			return getCopilotPatchStatus(probe).legacyPatch;
+		};
+		assert.strictEqual(legacyStatus(version - 1), true);
+		assert.strictEqual(legacyStatus(2), true);
+		assert.strictEqual(legacyStatus(version), false);
+		assert.strictEqual(legacyStatus(version + 1), false, "a newer patch is not downgraded");
+		const source = findCopilotBundles(vscode.env.appRoot)
+			.flatMap(entry => [entry.bundlePath + ".llama-vscode-chat.backup", entry.bundlePath])
+			.find(file => fs.existsSync(file) && !fs.readFileSync(file, "utf8").includes("/* llama-vscode-chat:copilot-"));
+		if (!source) {
+			this.skip();
+			return;
+		}
+		const original = fs.readFileSync(source);
+		const target = tempTarget(directory, `${marker(version - 1)}${original.toString("utf8")}`);
+		fs.writeFileSync(target.bundlePath + ".llama-vscode-chat.backup", original);
+		const result = applyCopilotPatch(target);
+		assert.strictEqual(result.changed, true);
+		assert.ok(fs.readFileSync(target.bundlePath, "utf8").includes(COPILOT_PATCH_MARKER));
+		assert.ok(!fs.readFileSync(target.bundlePath, "utf8").includes(marker(version - 1)));
+	});
+
 	test("patch summary re-reads the bundles only when they change", () => {
 		const target = tempTarget(directory, "var copilot=1;");
 		const first = getCopilotPatchSummary(target);
