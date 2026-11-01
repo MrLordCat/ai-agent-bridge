@@ -650,6 +650,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// The patched Copilot prompt asks this before rendering only a short history tail.
 	(globalThis as Record<string, unknown>).__llamaJournalHas = (conversation: unknown) => conversationHistory.has(conversation);
 	context.subscriptions.push({ dispose: () => { delete (globalThis as Record<string, unknown>).__llamaJournalHas; } });
+	const assetPrune = setTimeout(() => {
+		void conversationHistory.pruneAssets().then(result => { if (result.removed) { logService.log("chat.history.assets_pruned", result); } }).catch(() => undefined);
+	}, 120_000);
+	assetPrune.unref?.();
+	context.subscriptions.push({ dispose: () => clearTimeout(assetPrune) });
 	const compositeProvider = new CompositeChatModelProvider({ providers: [
 		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel,
 			usesConversationHistory: model => llamaProvider.usesConversationHistory(model),

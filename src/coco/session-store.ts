@@ -74,7 +74,7 @@ export class CocoSessionStore {
 		return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
 	}
 
-	async acquire(identity: string, conversation: unknown, anchors: readonly CocoUserAnchor[], create: (handlers: CocoAcpHandlers) => CocoSessionClient, handlers: CocoAcpHandlers, messages: readonly vscode.LanguageModelChatRequestMessage[] = [], callbackTools = false): Promise<CocoSession> {
+	async acquire(identity: string, conversation: unknown, anchors: readonly CocoUserAnchor[], create: (handlers: CocoAcpHandlers) => CocoSessionClient, handlers: CocoAcpHandlers, messages: readonly vscode.LanguageModelChatRequestMessage[] = [], callbackTools = false, providerSwitched = false): Promise<CocoSession> {
 		await this.ready;
 		const persistent = typeof conversation === "string" && conversation.trim().length > 0 && conversation.length <= 512;
 		const key = persistent ? digest([identity, conversation]) : randomUUID();
@@ -95,7 +95,7 @@ export class CocoSessionStore {
 			}
 		}
 		const stored = this.saved.get(key);
-		if (stored?.inflight && stored.users.length === users.length && stored.users.every((s,i) => s === users[i])) {
+		if (!providerSwitched && stored?.inflight && stored.users.length === users.length && stored.users.every((s,i) => s === users[i])) {
 			throw new Error("The previous Coco native turn was interrupted. Send a new user message to continue its saved session. No tools were repeated.");
 		}
 		const previousTurn = saved && saved.users.length > 0 ? anchors[saved.users.length - 1]?.index : undefined;
@@ -103,10 +103,10 @@ export class CocoSessionStore {
 		const failedAnswer = previousTurn !== undefined && nextTurn !== undefined && messages.slice(previousTurn + 1,nextTurn).some(message =>
 			message.role === vscode.LanguageModelChatMessageRole.Assistant && message.content.some(part => part instanceof vscode.LanguageModelTextPart
 				&& /^\s*Error: internal error \(request_id: [a-f0-9-]{36}\)\s*$/i.test(part.value)));
-		const compatible = saved && !failedAnswer && saved.identity === identity && saved.users.length < users.length && saved.users.every((s, i) => s === users[i]);
+		const compatible = saved && !providerSwitched && !failedAnswer && saved.identity === identity && saved.users.length < users.length && saved.users.every((s, i) => s === users[i]);
 		let reason: string | undefined = stored?.inflight ? "interrupted_native_session" : undefined;
 		if (saved && !compatible) {
-			reason = failedAnswer ? "native_error_recovery" : "history_changed";
+			reason = providerSwitched ? "provider_switched" : failedAnswer ? "native_error_recovery" : "history_changed";
 			this.drop(key, true); session = undefined;
 		}
 		if (!session) {

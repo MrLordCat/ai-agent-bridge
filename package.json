@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.4",
+	"version": "1.20.8",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -178,6 +178,13 @@
 					"minimum": 0,
 					"maximum": 1048576,
 					"description": "Shared working context in TOKENS for Codex, Claude, Coco and Cursor, so switching providers keeps the same history budget. Each provider uses min(this value, its real model window) as its advertised window and native auto-compaction threshold (Codex model_auto_compact_token_limit, Claude Code auto-compact window, Coco CLI threshold fraction). Zero inherits codexWorkingContextTarget. Claude is bounded to 258.4K-967K."
+				},
+				"llamacpp.providerSwitchContextTokens": {
+					"type": "integer",
+					"default": 250000,
+					"minimum": 32768,
+					"maximum": 1048576,
+					"description": "Maximum estimated input tokens, including tool schemas, that a model receives when it takes over a chat from another model. Only the newest turns that fit are transferred; older turns are left in the shared transcript. Keeps a provider switch from replaying the whole chat at full price. The Claude resume-recovery limit still applies on top."
 				},
 				"llamacpp.sharedContextFollowCodex": {
 					"type": "boolean",
@@ -1182,7 +1189,7 @@
 				"name": "llamacpp_wait_for_terminal",
 				"displayName": "Wait for Terminal Command",
 				"toolReferenceName": "waitForTerminal",
-				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished — no future notification will arrive and only the safety timeout would resolve.",
+				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished â€” no future notification will arrive and only the safety timeout would resolve.",
 				"userDescription": "Wait for a running terminal command finished notification.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(watch)",

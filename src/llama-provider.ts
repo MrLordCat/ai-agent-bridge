@@ -81,6 +81,7 @@ import {
     type ProviderHealthSourceReport,
 } from "./diagnostics/provider-health";
 import { BoundedMap, convertMessages, convertTools, stableJsonStringify, stripTerminalControlNoise, validateRequest, type ToolCallingMode, type ToolResultMode } from "./utils";
+import { prepareHttpToolHistory } from "./providers/http-tool-history";
 import { ensureBuiltInTools } from "./tools/wait-terminal";
 import { LlamaLogSink } from "./logger";
 import { buildMemoryQuery, injectAppendOnlySharedMemoryContext } from "./memory/prompt";
@@ -4174,9 +4175,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
         const shape = this.describeMessageShape(messages);
         this.log("chat.request.shape", { requestId, ...shape });
         const imageInputSupported = model.capabilities?.imageInput === true;
+        const toolHistory = prepareHttpToolHistory(messages);
+        if (toolHistory.interruptedCalls || toolHistory.detachedResults) {
+            this.log("chat.request.tool_history_normalized", {
+                requestId, interruptedCalls: toolHistory.interruptedCalls, detachedResults: toolHistory.detachedResults,
+            });
+        }
         const processedMessages = imageInputSupported
-            ? messages
-            : this.saveUserImagesToTemp(messages, requestId);
+            ? toolHistory.messages
+            : this.saveUserImagesToTemp(toolHistory.messages, requestId);
 
         validateRequest(processedMessages);
         const inspectionMessages = convertMessages(processedMessages, {

@@ -69,6 +69,20 @@ export function resolveManualSharedContextLimit(config: Pick<vscode.WorkspaceCon
 	return Math.floor(Math.min(SHARED_CONTEXT_MAX, Math.max(SHARED_CONTEXT_MIN, Number.isFinite(value) && value > 0 ? value : DEFAULT_SHARED_CONTEXT_LENGTH)));
 }
 
+export const PROVIDER_SWITCH_CONTEXT_DEFAULT = 250_000;
+
+/**
+ * Tokens a model may receive when it takes over a chat from another model.
+ * Only the newest turns that fit are transferred, so a switch never replays
+ * the whole chat at full price.
+ */
+export function resolveProviderSwitchContextTokens(
+	config: Pick<vscode.WorkspaceConfiguration, "get"> = vscode.workspace.getConfiguration("llamacpp")
+): number {
+	const value = Number(config.get("providerSwitchContextTokens", PROVIDER_SWITCH_CONTEXT_DEFAULT));
+	return Math.floor(Math.min(SHARED_CONTEXT_MAX, Math.max(SHARED_CONTEXT_MIN, Number.isFinite(value) && value > 0 ? value : PROVIDER_SWITCH_CONTEXT_DEFAULT)));
+}
+
 export function sharedContextBudget(contextWindow: number, tools: readonly vscode.LanguageModelChatTool[] = [], configuredTarget?: number): number {
 	const target = configuredTarget ?? resolveSharedContextLimit();
 	const window = Math.min(contextWindow, Math.max(SHARED_CONTEXT_MIN, target));

@@ -371,7 +371,7 @@ suite("Coco lossless handoff contracts", () => {
 			const restored = makeComposite();
 			await restored.provideLanguageModelChatResponse(model, [user("Investigate"), assistant("CODEX_FINDING"), user("Continue in Coco")], options(), { report: () => undefined }, none);
 			assert.match(f.prompts.at(-1)!, /EARLY REQUIREMENT/); assert.match(f.prompts.at(-1)!, /OLD FACT/); assert.match(f.prompts.at(-1)!, /CODEX_FINDING/);
-			assert.match(f.prompts.at(-1)!, /Complete visible Chat transcript \(JSON\)/);
+			assert.match(f.prompts.at(-1)!, /Complete visible Chat transcript \(JSON Lines\)/);
 			restored.dispose();
 		} finally { await f.dispose(); }
 	});

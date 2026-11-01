@@ -126,10 +126,14 @@ function sanitize(node) {
 		return node;
 	}
 	const mime = typeof node.mimeType === "string" ? node.mimeType : undefined;
-	if (typeof node.data === "string" && node.data.length > MAX_BINARY && mime && !mime.startsWith("text/")) {
-		removedPayloads++;
-		removedPayloadChars += node.data.length;
-		node.data = `[${mime} payload removed while repairing the chat session: ${node.data.length} chars]`;
+	// Tool outputs keep screenshots as base64 in `value`, other parts in `data`.
+	for (const field of ["data", "value"]) {
+		const payload = node[field];
+		if (typeof payload === "string" && payload.length > MAX_BINARY && mime && !mime.startsWith("text/") && node.isText !== true) {
+			removedPayloads++;
+			removedPayloadChars += payload.length;
+			node[field] = `[${mime} payload removed while repairing the chat session: ${payload.length} chars]`;
+		}
 	}
 	for (const key of Object.keys(node)) {
 		if (key === "$mid") {

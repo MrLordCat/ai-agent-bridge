@@ -19,6 +19,7 @@ import {
 	CLAUDE_LATEST_USER_FOCUSED_MAX_CHARS,
 	createClaudeKeepAliveMessage,
 	createClaudeReasoningConfigurationSchema,
+	createInitialUserMessage,
 	createLatestUserMessage,
 	estimateClaudeRecoveryTokens,
 	formatClaudeRecoveryWarning,
@@ -29,6 +30,7 @@ import {
 	hasClaudeRateLimits,
 	resolveClaudeResumeFallbackDecision,
 	resolveClaudeSafetySettings,
+	resolveClaudeColdReplayChars,
 	resolveClaudeInitialInputChars,
 	resolveClaudeContextLength,
 	resolveClaudeCacheKeepAliveDecision,
@@ -821,10 +823,49 @@ test("marks the session stream as closed after an interrupt", async () => {
 		const prepared = buildClaudeInitialConversationText(messages, 300_000);
 
 		assert.strictEqual(prepared.truncated, true);
-		assert.strictEqual(prepared.includedMessages, 25);
+		assert.ok(prepared.includedMessages > 400, "the tail fills the character budget");
+		assert.ok(prepared.includedMessages < messages.length);
 		assert.ok(prepared.text.length <= 300_000);
-		assert.ok(prepared.text.includes("older middle messages omitted"));
+		assert.ok(prepared.text.includes("older messages omitted to fit Claude context"));
 		assert.ok(prepared.text.includes("user-5108-"));
+		assert.ok(prepared.text.includes("user-0-"), "the first message stays");
+	});
+
+	test("a cold start after a provider switch keeps the recent user requests and only the current images", () => {
+		const screenshot = new vscode.LanguageModelDataPart(new Uint8Array([1, 2, 3]), "image/png");
+		const toolRound = (index: number) => [
+			vscode.LanguageModelChatMessage.Assistant([new vscode.LanguageModelToolCallPart(`call-${index}`, "read_file", { index })]),
+			vscode.LanguageModelChatMessage.User([new vscode.LanguageModelToolResultPart(`call-${index}`,
+				[new vscode.LanguageModelTextPart(`tool output ${index} ${"x".repeat(4_000)}`)])]),
+		];
+		const messages = [
+			vscode.LanguageModelChatMessage.User("<userRequest>start the project</userRequest>"),
+			vscode.LanguageModelChatMessage.User([new vscode.LanguageModelTextPart("<userRequest>what is the book icon?</userRequest>"), screenshot]),
+			...Array.from({ length: 40 }, (_, index) => toolRound(index)).flat(),
+			vscode.LanguageModelChatMessage.User("<userRequest>fix the audio crash on exit</userRequest>"),
+			...Array.from({ length: 60 }, (_, index) => toolRound(100 + index)).flat(),
+			vscode.LanguageModelChatMessage.User("<userRequest>continue</userRequest>"),
+		];
+		const prepared = buildClaudeInitialConversationText(messages, 120_000);
+		assert.strictEqual(prepared.truncated, true);
+		assert.ok(prepared.text.length <= 120_000);
+		assert.match(prepared.text, /Earlier user requests[^\]]*what is the book icon\?[^\]]*fix the audio crash on exit/);
+		assert.ok(prepared.text.trimEnd().endsWith("continue</userRequest>\"}]}]"), "the latest request closes the transcript");
+
+		const input = createInitialUserMessage(messages, 120_000) as unknown as { message: { content: { type: string }[] } };
+		assert.deepStrictEqual(input.message.content.map(part => part.type), ["text"], "historical screenshots are not re-attached");
+		const withImage = createInitialUserMessage([...messages.slice(0, -1),
+			vscode.LanguageModelChatMessage.User([new vscode.LanguageModelTextPart("<userRequest>look</userRequest>"), screenshot])], 120_000) as unknown as { message: { content: { type: string }[] } };
+		assert.deepStrictEqual(withImage.message.content.map(part => part.type), ["text", "image"]);
+	});
+
+	test("the cold-start transcript stays within the replay cap", () => {
+		const safety = { resumeFallbackPolicy: "safe" as const, resumeFallbackMaxInputTokens: 256_000 };
+		const chars = resolveClaudeColdReplayChars(1_644_000, safety, 36_000);
+		assert.ok(chars < 1_644_000);
+		assert.ok(estimateClaudeRecoveryTokens(Math.ceil(chars / 4), 36_000) <= 256_000);
+		assert.strictEqual(resolveClaudeColdReplayChars(1_644_000, { ...safety, resumeFallbackPolicy: "always" }, 36_000), 1_644_000);
+		assert.strictEqual(resolveClaudeColdReplayChars(1_644_000, { ...safety, resumeFallbackMaxInputTokens: 0 }, 36_000), 32_768);
 	});
 
 	test("keeps a small Claude cold-start transcript intact", () => {
@@ -840,6 +881,29 @@ test("marks the session stream as closed after an interrupt", async () => {
 		assert.ok(prepared.text.includes("first"));
 		assert.ok(prepared.text.includes("second"));
 		assert.ok(prepared.text.includes("latest"));
+	});
+
+	test("a takeover keeps the newest turns inside the 250K switch budget", () => {
+		const rounds = Array.from({ length: 80 }, (_, index) => [
+			vscode.LanguageModelChatMessage.Assistant([new vscode.LanguageModelToolCallPart(`call-${index}`, "read_file", { index })]),
+			vscode.LanguageModelChatMessage.User([new vscode.LanguageModelToolResultPart(`call-${index}`,
+				[new vscode.LanguageModelTextPart(`output ${index} ${"x".repeat(20_000)}`)])]),
+		]).flat();
+		const messages = [
+			vscode.LanguageModelChatMessage.User("<userRequest>FIRST_REQUEST</userRequest>"),
+			...rounds,
+			vscode.LanguageModelChatMessage.User("<userRequest>LATEST_REQUEST</userRequest>"),
+		];
+		const toolSchemaTokens = 31_000;
+		const chars = resolveClaudeColdReplayChars(1_644_000,
+			{ resumeFallbackPolicy: "safe", resumeFallbackMaxInputTokens: Math.min(500_000, 250_000) }, toolSchemaTokens);
+		const prepared = buildClaudeInitialConversationText(messages, chars);
+		assert.ok(estimateClaudeRecoveryTokens(Math.ceil(prepared.text.length / 4), toolSchemaTokens) <= 250_000,
+			"the takeover request stays inside the 250K budget");
+		assert.ok(prepared.text.length < 1_644_000, "the whole transcript is not replayed");
+		assert.ok(prepared.text.includes("LATEST_REQUEST"));
+		assert.ok(prepared.text.includes('"call-79"'), "the newest tool round is kept verbatim");
+		assert.ok(!prepared.text.includes('"call-0"'), "the oldest rounds are not transferred");
 	});
 
 	test("skips orphan tool-result tails when building the latest user message", () => {

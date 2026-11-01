@@ -12,6 +12,7 @@ import {
 	getFollowedCodexContext,
 	onDidChangeFollowedCodexContext,
 	resolveManualSharedContextLimit,
+	resolveProviderSwitchContextTokens,
 	resolveSharedContextLimit,
 	SHARED_CONTEXT_MAX,
 } from "../context/provider-handoff";
@@ -53,7 +54,14 @@ export interface ContextControlState {
 	deepSeekMaxOutputTarget: number;
 	deepSeekMaxOutputMinimum: number;
 	deepSeekMaxOutputMaximum: number;
+	/** Tokens a model may receive when it takes over a chat from another model. */
+	providerSwitchTarget: number;
+	providerSwitchMinimum: number;
+	providerSwitchMaximum: number;
 }
+
+const PROVIDER_SWITCH_MIN = 32_768;
+const PROVIDER_SWITCH_MAX = 1_048_576;
 
 export interface CodexContextSnapshot {
 	models: readonly CodexModelContextWindow[];
@@ -124,7 +132,11 @@ export function resolveContextControlState(
 			70_000
 		),
 		deepSeekMaxOutputMinimum: DEEPSEEK_MAX_OUTPUT_MIN,
-		deepSeekMaxOutputMaximum: DEEPSEEK_MAX_OUTPUT_MAX,	};
+		deepSeekMaxOutputMaximum: DEEPSEEK_MAX_OUTPUT_MAX,
+		providerSwitchTarget: resolveProviderSwitchContextTokens(configuration),
+		providerSwitchMinimum: PROVIDER_SWITCH_MIN,
+		providerSwitchMaximum: PROVIDER_SWITCH_MAX,
+	};
 }
 
 export function registerContextControlCommand(
@@ -187,12 +199,19 @@ export function registerContextControlCommand(
 				current.deepSeekMaxOutputMaximum,
 				current.deepSeekMaxOutputTarget
 			);
+			const providerSwitchTarget = clampInteger(
+				(message as { providerSwitchTarget?: unknown }).providerSwitchTarget,
+				current.providerSwitchMinimum,
+				current.providerSwitchMaximum,
+				current.providerSwitchTarget
+			);
 			await Promise.all([
 				// Following Codex keeps the stored slider value for when the toggle is turned off.
 				...(followCodex ? [] : [config.update("sharedContextLength", sharedTarget, vscode.ConfigurationTarget.Global)]),
 				...(followCodex !== current.followCodex ? [config.update("sharedContextFollowCodex", followCodex, vscode.ConfigurationTarget.Global)] : []),
 				config.update("deepSeekContextLength", deepSeekContextTarget, vscode.ConfigurationTarget.Global),
 				config.update("deepSeekDefaultMaxOutputTokens", deepSeekMaxOutputTarget, vscode.ConfigurationTarget.Global),
+				config.update("providerSwitchContextTokens", providerSwitchTarget, vscode.ConfigurationTarget.Global),
 			]);
 			refresh();
 			const saved = currentState();
@@ -203,7 +222,7 @@ export function registerContextControlCommand(
 				deepSeekMaxOutputTarget,
 			});
 			vscode.window.showInformationMessage(
-				`Shared context ${formatTokenCount(saved.sharedTarget)}${saved.followCodex ? " (follows Codex)" : ""} · Codex ${formatTokenCount(saved.codexTarget)} · Claude ${formatTokenCount(saved.claudeTarget)} · DeepSeek ctx ${formatTokenCount(deepSeekContextTarget)} · out ${formatTokenCount(deepSeekMaxOutputTarget)}`
+				`Shared context ${formatTokenCount(saved.sharedTarget)}${saved.followCodex ? " (follows Codex)" : ""} · switch ${formatTokenCount(providerSwitchTarget)} · Codex ${formatTokenCount(saved.codexTarget)} · Claude ${formatTokenCount(saved.claudeTarget)} · DeepSeek ctx ${formatTokenCount(deepSeekContextTarget)} · out ${formatTokenCount(deepSeekMaxOutputTarget)}`
 			);
 		}, undefined);
 		panel.onDidDispose(() => {
@@ -299,6 +318,12 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 	</section>
 	${renderCodexWindows(state)}
 	<section class="card">
+		<div class="row"><h2>Context handed over on a model switch</h2><span class="value" id="switchValue"></span></div>
+		<input id="providerSwitch" type="range" min="${state.providerSwitchMinimum}" max="${state.providerSwitchMaximum}" step="1024" value="${state.providerSwitchTarget}">
+		<div class="bounds"><span>${formatTokenCount(state.providerSwitchMinimum)}</span><span>${formatTokenCount(state.providerSwitchMaximum)}</span></div>
+		<p>Maximum estimated input tokens, tool schemas included, that a model receives when it takes over a chat from another model. Only the newest turns that fit are transferred; older turns stay in the shared transcript. Claude resume recovery keeps its own, stricter limit.</p>
+	</section>
+	<section class="card">
 		<div class="row"><h2>DeepSeek context</h2><span class="value" id="deepSeekContextValue"></span></div>
 		<input id="deepSeekContext" type="range" min="${state.deepSeekContextMinimum}" max="${state.deepSeekContextMaximum}" step="1024" value="${state.deepSeekContextTarget}">
 		<div class="bounds"><span>${formatTokenCount(state.deepSeekContextMinimum)}</span><span>${formatTokenCount(state.deepSeekContextMaximum)}</span></div>
@@ -316,6 +341,7 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		const shared = document.getElementById('shared');
 		const deepSeekContext = document.getElementById('deepSeekContext');
 		const deepSeekOutput = document.getElementById('deepSeekOutput');
+		const providerSwitch = document.getElementById('providerSwitch');
 		const compact = value => value >= 1000000 ? (value / 1000000).toFixed(2).replace(/\\.00$/, '') + 'M' : (value / 1000).toFixed(1).replace(/\\.0$/, '') + 'k';
 		let codexMaximum = ${state.codexMaximum};
 		const claudeMinimum = ${state.claudeMinimum}, claudeMaximum = ${state.claudeMaximum};
@@ -332,6 +358,7 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		const update = () => {
 			const value = Number(shared.value);
 			document.getElementById('sharedValue').textContent = compact(value);
+			document.getElementById('switchValue').textContent = compact(Number(providerSwitch.value));
 			document.getElementById('effective').textContent = 'Effective: Codex ' + compact(Math.min(value, codexMaximum))
 				+ ' (${CODEX_WINDOW_SOURCE_LABELS[state.codexMaximumSource]} window ' + compact(codexMaximum) + ') · Claude '
 				+ compact(Math.min(claudeMaximum, Math.max(claudeMinimum, value))) + ' (bounds ' + compact(claudeMinimum) + '–' + compact(claudeMaximum)
@@ -344,7 +371,8 @@ function renderContextControl(webview: vscode.Webview, state: ContextControlStat
 		followCodex.addEventListener('change', () => { applyFollow(); update(); });
 		deepSeekContext.addEventListener('input', update);
 		deepSeekOutput.addEventListener('input', update);
-		document.getElementById('save').addEventListener('click', () => vscode.postMessage({ type: 'save', followCodex: followCodex.checked, sharedTarget: Number(followCodex.checked ? manualTarget : shared.value), deepSeekContextTarget: Number(deepSeekContext.value), deepSeekMaxOutputTarget: Number(deepSeekOutput.value) }));
+		providerSwitch.addEventListener('input', update);
+		document.getElementById('save').addEventListener('click', () => vscode.postMessage({ type: 'save', followCodex: followCodex.checked, sharedTarget: Number(followCodex.checked ? manualTarget : shared.value), providerSwitchTarget: Number(providerSwitch.value), deepSeekContextTarget: Number(deepSeekContext.value), deepSeekMaxOutputTarget: Number(deepSeekOutput.value) }));
 		window.addEventListener('message', event => {
 			if (event.data?.type === 'saved') document.getElementById('status').textContent = 'Saved';
 			if (event.data?.type === 'followed') {

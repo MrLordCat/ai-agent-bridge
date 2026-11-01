@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import * as vscode from "vscode";
 import { modelInformation } from "../providers/model-descriptor";
+import { isProviderSwitch } from "../providers/provider-switch";
 
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
-import { resolveSharedContextLimit } from "../context/provider-handoff";
+import { resolveProviderSwitchContextTokens, resolveSharedContextLimit } from "../context/provider-handoff";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_ACTIVE_SESSION_IDLE_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
@@ -438,6 +439,20 @@ export function estimateClaudeRecoveryTokens(
 			+ CLAUDE_RECOVERY_FIXED_OVERHEAD_TOKENS)
 		* CLAUDE_RECOVERY_ESTIMATE_MULTIPLIER
 	);
+}
+
+/** Cold-start transcript size that stays within the replay cap instead of dropping to the latest message only. */
+export function resolveClaudeColdReplayChars(
+	maxInputChars: number,
+	safety: Pick<ClaudeSafetySettings, "resumeFallbackPolicy" | "resumeFallbackMaxInputTokens">,
+	toolSchemaTokens: number
+): number {
+	if (safety.resumeFallbackPolicy === "always") {
+		return maxInputChars;
+	}
+	const messageTokens = Math.floor(safety.resumeFallbackMaxInputTokens / CLAUDE_RECOVERY_ESTIMATE_MULTIPLIER)
+		- Math.max(0, toolSchemaTokens) - CLAUDE_RECOVERY_FIXED_OVERHEAD_TOKENS - 64;
+	return Math.max(32_768, Math.min(maxInputChars, messageTokens * 4));
 }
 
 export interface ClaudeSafetySettings {
@@ -1375,12 +1390,26 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		);
 		const toolSchemaChars = JSON.stringify(nativeTools.map(tool => tool.inputSchema)).length;
 		const toolSchemaTokens = Math.ceil(toolSchemaChars / 4);
+		const providerSwitched = isProviderSwitch(options.modelOptions);
+		// A takeover transfers only the newest turns, bounded by providerSwitchContextTokens.
+		const switchBudget = Math.min(safety.resumeFallbackMaxInputTokens, resolveProviderSwitchContextTokens(config));
+		const coldInputChars = resolveClaudeColdReplayChars(maxInputChars,
+			providerSwitched ? { resumeFallbackPolicy: "safe", resumeFallbackMaxInputTokens: switchBudget } : safety,
+			toolSchemaTokens);
 		let session = this.findConversationSession({
 			conversationId,
 			userSignatures,
 			modelId,
 			runtimeKey,
 		});
+		if (providerSwitched) {
+			// Another model worked on the chat since this session's last turn; its context is stale.
+			if (session) {
+				this.removeSession(session.key);
+				session = undefined;
+			}
+			this.logSink?.log("claude.chat.provider_switch_cold_start", { model: modelId, previousModel: options.modelOptions?._aabProviderSwitched });
+		}
 		let restored = false;
 		let rolledOver = false;
 		let runtimeChanged: boolean | undefined;
@@ -1393,7 +1422,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		let recoveryReason: string | undefined;
 		let coldReplayTokens = 0;
 		let coldReplayDecision: ClaudeResumeFallbackDecision | undefined;
-		if (!session && conversationId && this.durableSessionsEnabled()) {
+		if (!session && conversationId && this.durableSessionsEnabled() && !providerSwitched) {
 			const exact = this.durableSessions.get(this.durableSessionKey(modelId, conversationId));
 			if (exact?.quarantinedAt !== undefined) {
 				recoveryReason = `quarantined:${exact.quarantineReason ?? "unknown"}`;
@@ -1525,7 +1554,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			&& !rolledOver
 			&& (recoveryReason !== undefined || safety.resumeFallbackPolicy !== "always")
 		) {
-			const coldReplay = buildClaudeInitialConversationText(messages, maxInputChars);
+			const coldReplay = buildClaudeInitialConversationText(messages, coldInputChars);
 			const estimatedColdTokens = estimateClaudeRecoveryTokens(
 				estimateClaudeTokens(coldReplay.text),
 				toolSchemaTokens
@@ -1689,7 +1718,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				? latestOnlyRecovery.input
 				: reused
 				? createLatestUserMessage(messages)
-				: createInitialUserMessage(messages, maxInputChars);
+				: createInitialUserMessage(messages, coldInputChars);
 		} catch (error) {
 			this.logSink?.logError("claude.chat.input_prepare_failed", error);
 			this.removeSession(session.key);
@@ -1711,6 +1740,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			maxInputChars,
 			conversationIdPresent: conversationId !== undefined,
 			copilotTurnIndex,
+			providerSwitched,
 			toolCount: nativeTools.length,
 			toolSchemaChars,
 			effort: effort ?? "auto",
@@ -1756,7 +1786,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 						session,
 						`${resumeFailure.reason}:${resumeFailure.detail}`
 					);
-					const replay = buildClaudeInitialConversationText(messages, maxInputChars);
+					const replay = buildClaudeInitialConversationText(messages, coldInputChars);
 					const estimatedReplayTokens = estimateClaudeRecoveryTokens(
 						estimateClaudeTokens(replay.text),
 						toolSchemaTokens
@@ -1771,7 +1801,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 							: undefined,
 						maxUsagePercent: safety.resumeFallbackMaxUsagePercent,
 					});
-					let fallbackInput = createInitialUserMessage(messages, maxInputChars);
+					let fallbackInput = createInitialUserMessage(messages, coldInputChars);
 					let fallbackInputMode: ClaudeAgentTurnContext["inputMode"] = "full";
 					let selectedDecision = fallbackDecision;
 					let selectedEstimatedTokens = estimatedReplayTokens;
@@ -2579,7 +2609,8 @@ export interface ClaudeInitialConversationText {
  */
 export function buildClaudeInitialConversationText(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
-	maxChars: number
+	maxChars: number,
+	prefix = CLAUDE_INITIAL_CONVERSATION_PREFIX
 ): ClaudeInitialConversationText {
 	const normalizedMaxChars = Math.max(1, Math.floor(maxChars));
 	const separator = "\n\n";
@@ -2593,7 +2624,7 @@ export function buildClaudeInitialConversationText(
 			+ (encodedMessages.length > 0 ? 1 : 0)
 			+ encoded.length;
 		if (
-			CLAUDE_INITIAL_CONVERSATION_PREFIX.length
+			prefix.length
 			+ separator.length
 			+ nextArrayChars
 			> normalizedMaxChars
@@ -2607,41 +2638,92 @@ export function buildClaudeInitialConversationText(
 
 	if (fullHistoryFits && encodedMessages.length === messages.length) {
 		return {
-			text: `${CLAUDE_INITIAL_CONVERSATION_PREFIX}${separator}[${encodedMessages.join(",")}]`,
+			text: `${prefix}${separator}[${encodedMessages.join(",")}]`,
 			truncated: false,
 			includedMessages: messages.length,
 		};
 	}
 
-	const tailStart = Math.max(messages.length > 0 ? 1 : 0, messages.length - 24);
-	const selected = [
-		...(messages.length > 0 ? [serializeMessage(messages[0])] : []),
-		{ role: "system", content: "[older middle messages omitted to fit Claude context]" },
-		...messages.slice(tailStart).map(message => serializeMessage(message)),
-	];
-	let text = `${CLAUDE_INITIAL_CONVERSATION_PREFIX}${separator}${JSON.stringify(selected)}`;
+	// A fixed 24-message tail after a provider switch held only the other provider's last
+	// tool rounds, so Claude lost the user's recent requests and resumed an older task.
+	const head = messages.length > 0 ? JSON.stringify(serializeMessage(messages[0])) : undefined;
+	const tail: string[] = [];
+	let tailStart = messages.length;
+	let used = prefix.length + separator.length + 2
+		+ (head ? head.length + 1 : 0) + CLAUDE_REQUESTS_DIGEST_MAX_CHARS + 256;
+	for (let index = messages.length - 1; index >= (head ? 1 : 0); index--) {
+		const encoded = JSON.stringify(serializeMessage(messages[index]));
+		if (tail.length > 0 && used + encoded.length + 1 > normalizedMaxChars) {
+			break;
+		}
+		tail.unshift(encoded);
+		used += encoded.length + 1;
+		tailStart = index;
+	}
+	const omitted = messages.slice(head ? 1 : 0, tailStart);
+	const digest = summarizeEarlierUserRequests(omitted);
+	const marker = JSON.stringify({ role: "system", content: `[${omitted.length} older messages omitted to fit Claude context]${digest}` });
+	let text = `${prefix}${separator}[${[...(head ? [head] : []), marker, ...tail].join(",")}]`;
 	if (text.length > normalizedMaxChars) {
-		const marker = "\n...[conversation truncated]...\n";
-		const contentBudget = Math.max(0, normalizedMaxChars - marker.length);
+		const cut = "\n...[conversation truncated]...\n";
+		const contentBudget = Math.max(0, normalizedMaxChars - cut.length);
 		const headChars = Math.ceil(contentBudget / 2);
 		const tailChars = contentBudget - headChars;
-		text = `${text.slice(0, headChars)}${marker}${tailChars > 0 ? text.slice(-tailChars) : ""}`;
+		text = `${text.slice(0, headChars)}${cut}${tailChars > 0 ? text.slice(-tailChars) : ""}`;
 	}
 
 	return {
 		text,
 		truncated: true,
-		includedMessages: (messages.length > 0 ? 1 : 0) + (messages.length - tailStart),
+		includedMessages: (head ? 1 : 0) + tail.length,
 	};
 }
 
-function createInitialUserMessage(
+const CLAUDE_REQUESTS_DIGEST_MAX_CHARS = 8_000;
+
+function summarizeEarlierUserRequests(messages: readonly vscode.LanguageModelChatRequestMessage[]): string {
+	const requests: string[] = [];
+	for (let index = messages.length - 1; index >= 0 && requests.length < 12; index--) {
+		const message = messages[index];
+		if (message.role !== vscode.LanguageModelChatMessageRole.User) {
+			continue;
+		}
+		const text = message.content
+			.filter(part => part instanceof vscode.LanguageModelTextPart)
+			.map(part => part.value)
+			.join("\n");
+		const wrapped = /<userRequest>([\s\S]*?)<\/userRequest>/.exec(text)?.[1];
+		const request = (wrapped ?? (text.length <= 2_000 ? text : "")).replace(/\s+/g, " ").trim();
+		if (request) {
+			requests.unshift(request.length > 600 ? `${request.slice(0, 600)}…` : request);
+		}
+	}
+	if (requests.length === 0) {
+		return "";
+	}
+	let digest = "\nEarlier user requests, oldest first (already handled; answer the latest user message at the end):";
+	for (const request of requests) {
+		if (digest.length + request.length + 3 > CLAUDE_REQUESTS_DIGEST_MAX_CHARS) {
+			break;
+		}
+		digest += `\n- ${request}`;
+	}
+	return digest;
+}
+
+export function createInitialUserMessage(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
 	maxChars: number
 ): SDKUserMessage {
 	const { text } = buildClaudeInitialConversationText(messages, maxChars);
 	const content: Record<string, unknown>[] = [{ type: "text", text }];
-	appendImages(messages, content);
+	// Historical images trailing the transcript read as a fresh attachment (Claude reopened a
+	// days-old screenshot on "continue"); only the current request's images are sent.
+	const latest = [...messages].reverse().find(message => message.role === vscode.LanguageModelChatMessageRole.User
+		&& !message.content.every(part => part instanceof vscode.LanguageModelToolResultPart));
+	if (latest) {
+		appendImages([latest], content);
+	}
 	return createSdkUserMessage(content);
 }
 

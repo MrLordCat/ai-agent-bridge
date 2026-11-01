@@ -141,6 +141,16 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.strictEqual(manage?.command?.command, "llamacpp.openApiProviders");
 	});
 
+	test("shows the model-switch context budget next to the shared context", async () => {
+		const provider = new LlamaQuickActionsProvider(() => undefined, () => undefined, () => 0);
+		const apiProviders = (await getItems(provider)).find(item => labelOf(item) === "Providers");
+		const switchBudget = (await getItems(provider, apiProviders)).find(item => labelOf(item) === "Context on Model Switch");
+		assert.ok(switchBudget);
+		assert.strictEqual(switchBudget.description, "250.0K");
+		assert.strictEqual(switchBudget.command?.command, "llamacpp.openContextControl");
+		assert.match(String(switchBudget.tooltip), /newest turns/);
+	});
+
 	test("keeps detailed diagnostics inside the collapsed group", async () => {
 		const provider = new LlamaQuickActionsProvider(
 			() => "24.5 tok/s",

@@ -4,6 +4,7 @@ import type { ClaudeChatModelProvider } from "./claude/claude-provider";
 import type { CocoChatModelProvider } from "./coco/coco-provider";
 import { ProviderRegistry, ownsHttpModel, providerSourceId, type ChatProviderRegistration } from "./providers/provider-registry";
 import type { ConversationHistory } from "./providers/conversation-history";
+import { PROVIDER_SWITCH_OPTION } from "./providers/provider-switch";
 
 interface CompositeProviderOptions { providers: readonly ChatProviderRegistration[]; history: ConversationHistory }
 
@@ -74,8 +75,10 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		const emitted: vscode.LanguageModelResponsePart[] = [];
 		let failed = false;
 		let providerError: unknown;
+		// Native sessions predate another model's turns and compactions, so a switch always starts cold.
+		const switchedFrom = history?.servedBy && history.servedBy !== model.id ? { [PROVIDER_SWITCH_OPTION]: history.servedBy } : {};
 		const responseOptions = usesHistory && history?.transcriptPath
-			? { ...options, modelOptions: { ...options.modelOptions, _aabCocoTranscriptPath: history.transcriptPath, _aabTranscriptPath: history.transcriptPath } } : options;
+			? { ...options, modelOptions: { ...options.modelOptions, ...switchedFrom, _aabCocoTranscriptPath: history.transcriptPath, _aabTranscriptPath: history.transcriptPath } } : options;
 		try { await selected.provider.provideLanguageModelChatResponse(
 			model,
 			usesHistory ? history?.messages ?? messages : messages,
@@ -83,7 +86,8 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 			history ? { report: part => { emitted.push(part); progress.report(part); } } : progress,
 			token
 		); } catch (error) { failed = true; providerError = error; }
-		try { await history?.complete(emitted); }
+		// A request that failed before any output (an exhausted limit) did not take the chat over.
+		try { await history?.complete(emitted, emitted.length > 0 || !failed ? model.id : undefined); }
 		catch (error) { if (usesHistory && !failed) { throw new Error("Cannot save the local handoff transcript. Check workspace storage before reloading.", { cause: error }); } this.warnHistory(); }
 		if (failed) { throw providerError; }
 	}

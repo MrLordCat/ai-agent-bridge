@@ -47,6 +47,42 @@ function decodePart(part: Part, assets: Assets): vscode.LanguageModelTextPart | 
 	}
 }
 function decode(message: Message, assets: Assets = new Map()): vscode.LanguageModelChatRequestMessage { return new vscode.LanguageModelChatMessage(message.role, message.content.map(part => decodePart(part, assets))); }
+const isSystemMessage = (message: vscode.LanguageModelChatRequestMessage) => message.role !== vscode.LanguageModelChatMessageRole.User && message.role !== vscode.LanguageModelChatMessageRole.Assistant;
+const JOURNAL_MAX_BYTES = 512 * 1024 * 1024;
+const JOURNAL_GARBAGE_MIN_BYTES = 8 * 1024 * 1024;
+const ASSET_PRUNE_MIN_AGE_MS = 24 * 60 * 60_000;
+const sameMessage = (a: vscode.LanguageModelChatRequestMessage, b: vscode.LanguageModelChatRequestMessage) => a === b || messageKey(a) === messageKey(b);
+
+/** Version 2 is JSON Lines: header, then `systems`, `servedBy` and `message` records; the last `systems` record wins. */
+function parseJournal(buffer: Buffer): { systems: Message[]; body: Message[]; servedBy?: string; intact: boolean; systemBytes: number; garbage: number } {
+	const firstEnd = buffer.indexOf(10);
+	const header = JSON.parse(buffer.toString("utf8", 0, firstEnd < 0 ? buffer.length : firstEnd)) as { version?: unknown; messages?: unknown; servedBy?: unknown };
+	const servedByOf = (value: unknown) => typeof value === "string" && value.length <= 512 ? value : undefined;
+	if (header.version === 1) {
+		if (!Array.isArray(header.messages)) { throw new Error("Invalid conversation checkpoint."); }
+		const messages = header.messages as Message[];
+		return { systems: messages.filter(m => m.role !== vscode.LanguageModelChatMessageRole.User && m.role !== vscode.LanguageModelChatMessageRole.Assistant),
+			body: messages.filter(m => m.role === vscode.LanguageModelChatMessageRole.User || m.role === vscode.LanguageModelChatMessageRole.Assistant), servedBy: servedByOf(header.servedBy), intact: false, systemBytes: 0, garbage: 0 };
+	}
+	if (header.version !== 2) { throw new Error("Invalid conversation checkpoint."); }
+	let systems: Message[] = [], servedBy = servedByOf(header.servedBy), intact = firstEnd >= 0, systemBytes = 0, garbage = 0;
+	const body: Message[] = [];
+	for (let start = firstEnd + 1; firstEnd >= 0 && start < buffer.length;) {
+		const end = buffer.indexOf(10, start), stop = end < 0 ? buffer.length : end;
+		if (stop > start) {
+			let record: { systems?: unknown; servedBy?: unknown; message?: unknown };
+			try { record = JSON.parse(buffer.toString("utf8", start, stop)); }
+			catch (error) { if (end < 0) { intact = false; break; } throw error; }
+			if (Array.isArray(record.systems)) { garbage += systemBytes; systemBytes = stop - start + 1; systems = record.systems as Message[]; }
+			else if ("servedBy" in record) { servedBy = servedByOf(record.servedBy); }
+			else if (record.message && typeof record.message === "object") { body.push(record.message as Message); }
+			else { throw new Error("Invalid conversation record."); }
+		}
+		if (end < 0) { if (stop > start) { intact = false; } break; }
+		start = end + 1;
+	}
+	return { systems, body, servedBy, intact, systemBytes, garbage };
+}
 function assetNames(parts: readonly Part[], names = new Set<string>()): Set<string> {
 	for (const part of parts) { if (part.type === "asset") { names.add(part.name); } else if (part.type === "result") { assetNames(part.content, names); } }
 	return names;
@@ -73,7 +109,7 @@ function messageKey(message: vscode.LanguageModelChatRequestMessage): string {
 
 /** Match retained anchors, preserve missing middle entries, and cut branches before edited requests. */
 export function mergeConversationHistory(previous: readonly vscode.LanguageModelChatRequestMessage[], incoming: readonly vscode.LanguageModelChatRequestMessage[]): vscode.LanguageModelChatRequestMessage[] {
-	const system = (message: vscode.LanguageModelChatRequestMessage) => message.role !== vscode.LanguageModelChatMessageRole.User && message.role !== vscode.LanguageModelChatMessageRole.Assistant;
+	const system = isSystemMessage;
 	const latestSystems = incoming.filter(system);
 	const systems = latestSystems.length ? latestSystems : previous.filter(system);
 	const uniqueSystems = [...new Map(systems.map(message => [messageKey(message), message])).values()];
@@ -139,11 +175,15 @@ function mergeConversationBody(previous: readonly vscode.LanguageModelChatReques
 	return [...incoming];
 }
 
-interface Entry { messages: vscode.LanguageModelChatRequestMessage[]; revision: number; active: number; pending?: Promise<void> }
+/** What the journal file currently holds; a step appends only what is missing. */
+interface DiskState { systems: readonly vscode.LanguageModelChatRequestMessage[]; body: readonly vscode.LanguageModelChatRequestMessage[]; servedBy?: string; bytes: number; systemBytes: number; garbage: number }
+interface Entry { messages: vscode.LanguageModelChatRequestMessage[]; revision: number; active: number; pending?: Promise<void>; servedBy?: string; disk?: DiskState }
 export interface ConversationHistoryLease {
 	messages: readonly vscode.LanguageModelChatRequestMessage[];
 	transcriptPath?: string;
-	complete(parts: readonly vscode.LanguageModelResponsePart[]): Promise<void>;
+	/** Model that last produced output in this chat, before the current request. */
+	servedBy?: string;
+	complete(parts: readonly vscode.LanguageModelResponsePart[], servedBy?: string): Promise<void>;
 }
 
 /** Workspace-local visible Chat history; hidden provider reasoning is never captured. */
@@ -152,6 +192,26 @@ export class ConversationHistory {
 	private readonly loading = new Map<string, Promise<Entry>>();
 	private readonly savedImages = new Set<string>();
 	constructor(private readonly root: string) {}
+	/** Deletes images no saved chat references; recent ones may belong to a journal still being written. */
+	async pruneAssets(now = Date.now()): Promise<{ removed: number; bytes: number }> {
+		const referenced = new Set<string>(), chunk = 64 * 1024 * 1024;
+		for (const name of await fs.readdir(this.root).catch(() => [] as string[])) {
+			if (!name.endsWith(".json")) { continue; }
+			const buffer = await fs.readFile(path.join(this.root, name));
+			for (let start = 0; start < buffer.length; start += chunk) {
+				for (const match of buffer.toString("latin1", start, Math.min(buffer.length, start + chunk + 80)).matchAll(/[0-9a-f]{64}\.[a-z]+/g)) { referenced.add(match[0]); }
+			}
+		}
+		let removed = 0, bytes = 0;
+		const folder = path.join(this.root, "assets");
+		for (const name of await fs.readdir(folder).catch(() => [] as string[])) {
+			if (referenced.has(name) || !/^[0-9a-f]{64}\.[a-z]+$/.test(name)) { continue; }
+			const file = path.join(folder, name), stat = await fs.stat(file).catch(() => undefined);
+			if (!stat || now - stat.mtimeMs < ASSET_PRUNE_MIN_AGE_MS) { continue; }
+			await fs.rm(file, { force: true }); this.savedImages.delete(name); removed++; bytes += stat.size;
+		}
+		return { removed, bytes };
+	}
 	private async persist(owner: Entry, file: string, revision: number, messages: readonly vscode.LanguageModelChatRequestMessage[]): Promise<void> {
 		const assets = new Map<string, Uint8Array>();
 		const collect = (part: unknown): void => {
@@ -164,13 +224,38 @@ export class ConversationHistory {
 			await fs.mkdir(path.join(this.root, "assets"), { recursive: true, mode: 0o700 });
 			for (const [name, bytes] of assets) { await fs.writeFile(path.join(this.root, "assets", name), bytes, { mode: 0o600 }); this.savedImages.add(name); }
 		}
-		const payload = JSON.stringify({ version: 1, messages: messages.map(store) });
-		if (Buffer.byteLength(payload) > 64 * 1024 * 1024) { throw new Error("The saved Chat transcript exceeds 64 MiB. Compact the source Chat before another cross-provider handoff."); }
 		const commit = async () => {
 			if (owner.revision !== revision) { return; }
 			await fs.mkdir(this.root, { recursive: true, mode: 0o700 });
+			const systems = messages.filter(isSystemMessage), body = messages.filter(message => !isSystemMessage(message));
+			const disk = owner.disk, servedBy = owner.servedBy;
+			const systemsLine = (list: readonly vscode.LanguageModelChatRequestMessage[]) => JSON.stringify({ systems: list.map(store) });
+			const tooLarge = () => new Error(`The saved Chat transcript exceeds ${JOURNAL_MAX_BYTES / 1048576} MiB. Compact the source Chat before another cross-provider handoff.`);
+			if (disk && disk.body.length <= body.length && disk.garbage <= Math.max(JOURNAL_GARBAGE_MIN_BYTES, disk.bytes / 4)
+				&& disk.body.every((message, index) => sameMessage(message, body[index]))) {
+				const lines: string[] = [];
+				let systemBytes = disk.systemBytes, garbage = disk.garbage;
+				if (disk.systems.length !== systems.length || disk.systems.some((message, index) => !sameMessage(message, systems[index]))) {
+					const line = systemsLine(systems); garbage += systemBytes; systemBytes = Buffer.byteLength(line) + 1; lines.push(line);
+				}
+				if (servedBy !== disk.servedBy) { lines.push(JSON.stringify({ servedBy: servedBy ?? null })); }
+				for (let index = disk.body.length; index < body.length; index++) { lines.push(JSON.stringify({ message: store(body[index]) })); }
+				if (!lines.length) { return; }
+				const chunk = lines.join("\n") + "\n", bytes = disk.bytes + Buffer.byteLength(chunk);
+				if (bytes > JOURNAL_MAX_BYTES) { throw tooLarge(); }
+				owner.disk = undefined;
+				await fs.appendFile(file, chunk, { mode: 0o600 });
+				owner.disk = { systems, body, servedBy, bytes, systemBytes, garbage };
+				return;
+			}
+			const header = JSON.stringify({ version: 2, ...(servedBy ? { servedBy } : {}) }), systemLine = systemsLine(systems);
+			const payload = [header, systemLine, ...body.map(message => JSON.stringify({ message: store(message) }))].join("\n") + "\n";
+			const bytes = Buffer.byteLength(payload);
+			if (bytes > JOURNAL_MAX_BYTES) { throw tooLarge(); }
+			owner.disk = undefined;
 			const temporary = `${file}.tmp`;
 			await fs.writeFile(temporary, payload, { mode: 0o600 }); await fs.rename(temporary, file);
+			owner.disk = { systems, body, servedBy, bytes, systemBytes: Buffer.byteLength(systemLine) + 1, garbage: 0 };
 		};
 		const writeTask = (owner.pending ?? Promise.resolve()).catch(() => undefined).then(commit);
 		owner.pending = writeTask;
@@ -197,22 +282,26 @@ export class ConversationHistory {
 		if (!entry) {
 			const load = async (): Promise<Entry> => {
 			let stored: vscode.LanguageModelChatRequestMessage[] = [];
+			let servedBy: string | undefined, disk: DiskState | undefined;
 			try {
 				const stat = await fs.stat(file);
-				if (stat.size > 64 * 1024 * 1024) { throw new Error("Saved conversation exceeds the supported size."); }
-				const document = JSON.parse(await fs.readFile(file, "utf8")) as { version?: unknown; messages?: unknown };
-				if (document.version !== 1 || !Array.isArray(document.messages)) { throw new Error("Invalid conversation checkpoint."); }
-				const messages = document.messages as Message[], assets = new Map<string, Uint8Array | undefined>();
-				for (const name of assetNames(messages.flatMap(message => message.content))) {
+				if (stat.size > JOURNAL_MAX_BYTES) { throw new Error("Saved conversation exceeds the supported size."); }
+				const buffer = await fs.readFile(file), journal = parseJournal(buffer);
+				servedBy = journal.servedBy;
+				const assets = new Map<string, Uint8Array | undefined>();
+				for (const name of assetNames([...journal.systems, ...journal.body].flatMap(message => message.content))) {
 					if (!/^[0-9a-f]{64}\.[a-z]+$/.test(name)) { continue; }
 					assets.set(name, await fs.readFile(path.join(this.root, "assets", name)).catch(() => undefined));
 					if (assets.get(name)) { this.savedImages.add(name); }
 				}
-				stored = messages.map(message => decode(message, assets));
+				const systems = journal.systems.map(message => decode(message, assets)), body = journal.body.map(message => decode(message, assets));
+				stored = [...systems, ...body];
+				// A legacy file or a torn final line is rewritten in full by the next step.
+				if (journal.intact) { disk = { systems, body, servedBy, bytes: buffer.length, systemBytes: journal.systemBytes, garbage: journal.garbage }; }
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw new Error("Cannot restore the common Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
 			}
-			const loaded = { messages: stored, revision: 0, active: 0 }; this.entries.set(key, loaded); return loaded;
+			const loaded: Entry = { messages: stored, revision: 0, active: 0, servedBy, disk }; this.entries.set(key, loaded); return loaded;
 			};
 			const pending = load(); this.loading.set(key, pending);
 			try { entry = await pending; } finally { this.loading.delete(key); }
@@ -225,8 +314,9 @@ export class ConversationHistory {
 		try { await this.persist(owner, file, revision, messages); }
 		catch (error) { owner.active--; throw new Error(`Cannot save the incoming Chat transcript (${error instanceof Error ? error.message : String(error)}). Check workspace storage before continuing or switching models.`, { cause: error }); }
 		let finished = false;
-		return { messages, transcriptPath: file, complete: async parts => {
+		return { messages, transcriptPath: file, servedBy: owner.servedBy, complete: async (parts, servedBy) => {
 			if (finished) { return; } finished = true; owner.active--;
+			if (servedBy) { owner.servedBy = servedBy; }
 			if (owner.revision !== revision) { return; }
 			const content = parts.flatMap(encodePart);
 			if (content.length) {

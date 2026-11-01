@@ -5,6 +5,12 @@ import { stableJsonStringify } from "../utils";
 const MAX_TOOL_DESCRIPTION_CHARS = 4_096;
 export const CODEX_DEFERRED_TOOL_NAMESPACE = "vscode_deferred";
 export const CODEX_NATIVE_TOOL_NAMESPACE = "vscode_native";
+export const CODEX_MCP_TOOL_NAMESPACE = "vscode_mcp";
+
+export function decodeCodexDynamicToolName(name: string, namespace: string | null): string {
+	return namespace === CODEX_MCP_TOOL_NAMESPACE && name.startsWith("tool_")
+		? `mcp__${name.slice(5)}` : name;
+}
 const EAGER_TOOL_SUFFIXES = [
 	"readfile",
 	"grepsearch",
@@ -122,6 +128,7 @@ export function buildCodexDynamicTools(
 ): CodexDynamicToolSet {
 	const eagerSpecs: CodexDynamicFunctionToolSpec[] = [];
 	const nativeSpecs: CodexDynamicFunctionToolSpec[] = [];
+	const mcpSpecs: CodexDynamicFunctionToolSpec[] = [];
 	const deferredSpecs: CodexDynamicFunctionToolSpec[] = [];
 	const callableNames = new Set<string>();
 	const deferredNames = new Set<string>();
@@ -148,11 +155,13 @@ export function buildCodexDynamicTools(
 			continue;
 		}
 		const useNativeNamespace = CODEX_BUILTIN_TOOL_COLLISIONS.has(tool.name);
+		const useMcpNamespace = tool.name.startsWith("mcp__");
 		const deferLoading = !useNativeNamespace && options.deferNonCoreTools === true && !isCoreAgentTool(tool.name);
 		const routedTool = withRequiredSubagentModel(tool);
 		const spec: CodexDynamicFunctionToolSpec = {
 			type: "function",
-			name: routedTool.name,
+			// Codex reserves mcp__ even for tools nested inside a dynamic namespace.
+			name: useMcpNamespace ? `tool_${routedTool.name.slice(5)}` : routedTool.name,
 			description: enhanceSubagentToolDescription(
 				routedTool.name,
 				(routedTool.description || `Invoke the VS Code tool ${routedTool.name}.`)
@@ -161,7 +170,11 @@ export function buildCodexDynamicTools(
 			inputSchema: normalizeJsonSchema(routedTool.inputSchema),
 			...(deferLoading ? { deferLoading: true } : {}),
 		};
-		if (useNativeNamespace) {
+		if (useMcpNamespace) {
+			mcpSpecs.push(spec);
+			toolNamespaces.set(tool.name, CODEX_MCP_TOOL_NAMESPACE);
+			if (deferLoading) { deferredNames.add(tool.name); }
+		} else if (useNativeNamespace) {
 			nativeSpecs.push(spec);
 			toolNamespaces.set(tool.name, CODEX_NATIVE_TOOL_NAMESPACE);
 		} else if (deferLoading) {
@@ -175,6 +188,14 @@ export function buildCodexDynamicTools(
 	}
 
 	const specs: CodexDynamicToolSpec[] = [...eagerSpecs];
+	if (mcpSpecs.length > 0) {
+		specs.push({
+			type: "namespace",
+			name: CODEX_MCP_TOOL_NAMESPACE,
+			description: "MCP tools delegated to the connected VS Code servers.",
+			tools: mcpSpecs,
+		});
+	}
 	if (nativeSpecs.length > 0) {
 		specs.push({
 			type: "namespace",
@@ -192,6 +213,12 @@ export function buildCodexDynamicTools(
 		});
 	}
 	const runtimeSignatures: CodexDynamicToolRuntimeSignature[] = [
+		...mcpSpecs.map(tool => ({
+			namespace: CODEX_MCP_TOOL_NAMESPACE,
+			name: tool.name,
+			inputSchema: tool.inputSchema,
+			deferLoading: tool.deferLoading === true,
+		})),
 		...eagerSpecs.map(tool => ({
 			namespace: null,
 			name: tool.name,

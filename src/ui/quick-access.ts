@@ -16,7 +16,7 @@ import {
 	DEFAULT_COMPACTION_TARGET_RATIO,
 	normalizeCompactionTargetRatio,
 } from "../context/context-budget";
-import { resolveSharedContextLimit } from "../context/provider-handoff";
+import { resolveProviderSwitchContextTokens, resolveSharedContextLimit } from "../context/provider-handoff";
 import {
 	getCopilotPatchSummary,
 	findCopilotBundle,
@@ -690,6 +690,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 						: formatCompactTokenCount(sharedContext),
 					tooltip: "One working context for Codex, Claude, Coco and Cursor. Each provider caps it to its real model window and uses it as the native auto-compaction threshold. It can follow the window of the last used Codex model.",
 					icon: new vscode.ThemeIcon("symbol-numeric"),
+					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
+				}),
+				new QuickAccessItem("apiProviders.switchContext", "Context on Model Switch", {
+					description: formatCompactTokenCount(resolveProviderSwitchContextTokens()),
+					tooltip: "Maximum context a model receives when it takes over a chat from another model. Only the newest turns that fit are transferred, so a switch does not replay the whole chat. Change it with the slider in Provider Context.",
+					icon: new vscode.ThemeIcon("arrow-swap"),
 					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
 				}),
 				new QuickAccessItem("apiProviders.manage", "Providers Manager", {

@@ -68,11 +68,13 @@ export class CursorSessionStore {
 			}
 		} catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw error; } }
 	}
-	async acquire(key: string | undefined, identity: string, messages: readonly vscode.LanguageModelChatRequestMessage[], legacyIdentities: readonly string[] = []): Promise<CursorSession> {
+	async acquire(key: string | undefined, identity: string, messages: readonly vscode.LanguageModelChatRequestMessage[], legacyIdentities: readonly string[] = [], providerSwitched = false): Promise<CursorSession> {
 		await this.ready;
 		const persistent = Boolean(key), actualKey = key ?? randomUUID(), canonical = canonicalConversationUserAnchors(messages);
 		let record = this.live.get(actualKey);
 		if (record?.busy) { throw new Error("This Cursor conversation still has an active request."); }
+		const switched = providerSwitched && Boolean(record ?? this.saved.get(actualKey));
+		if (switched) { this.drop(actualKey); record = undefined; }
 		const previous = record ?? this.saved.get(actualKey), users = canonical.map(anchor => anchor.key);
 		const anchors = previous?.anchorVersion === 2 ? canonical : conversationUserAnchors(messages);
 		const sameIdentity = previous && (previous.identity === identity || legacyIdentities.includes(previous.identity));
@@ -95,7 +97,7 @@ export class CursorSessionStore {
 			record = { key: actualKey, identity, persistent, agentId: checkpoint?.agentId, users: checkpoint?.users ?? [], nextUsers: users,
 				mode: checkpoint ? "restored" : "new", busy: true, closed: false, deltaStart: 0, touchedAt: Date.now(), anchorVersion: 2,
 				nativeCheckpoint: checkpoint?.nativeCheckpoint, completedAt: checkpoint?.completedAt, toolCatalogHash: checkpoint?.toolCatalogHash, replayCallIds: checkpoint?.replayCallIds,
-				reason: previous && !sameIdentity ? "configuration_changed" : checkpoint?.inflight ? "interrupted_request" : checkpoint ? "checkpoint_loaded" : "new_conversation" };
+				reason: switched ? "provider_switched" : previous && !sameIdentity ? "configuration_changed" : checkpoint?.inflight ? "interrupted_request" : checkpoint ? "checkpoint_loaded" : "new_conversation" };
 			this.live.set(actualKey, record);
 		} else { clearTimeout(record.idle); record.busy = true; record.mode = "warm"; record.nextUsers = users; }
 		record.identity = identity; record.anchorVersion = 2;

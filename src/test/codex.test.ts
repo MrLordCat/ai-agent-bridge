@@ -1861,6 +1861,36 @@ suite("Codex subscription provider", () => {
 		);
 	});
 
+	test("aliases reserved MCP names and delegates them to the original VS Code tool", async () => {
+		const original = "mcp__meshy-ai_mes_meshy_analyze_printability";
+		const wireName = `tool_${original.slice(5)}`;
+		for (const deferNonCoreTools of [false, true]) {
+			const tools = [original, "tool_meshy-ai_mes_meshy_analyze_printability", `mcp__${"x".repeat(123)}`]
+				.map(name => ({ name, description: name, inputSchema: { type: "object" } }));
+			const dynamic = buildCodexDynamicTools(tools, { deferNonCoreTools });
+			const namespace = dynamic.specs.find(spec => spec.type === "namespace" && spec.name === "vscode_mcp");
+			assert.ok(namespace?.type === "namespace");
+			assert.ok(namespace.tools.every(tool => !tool.name.startsWith("mcp__") && tool.name.length <= 128));
+			assert.strictEqual(namespace.tools.find(tool => tool.name === wireName)?.deferLoading === true, deferNonCoreTools);
+			assert.ok(dynamic.callableNames.has(original));
+			assert.strictEqual(dynamic.toolNamespaces.get(original), "vscode_mcp");
+			const provider = new CodexChatModelProvider("test");
+			const calls: string[] = [];
+			const internals = provider as unknown as {
+				dynamicToolContexts: Map<string, unknown>;
+				handleDynamicToolCall(params: Record<string, unknown>): Promise<{ success: boolean }>;
+			};
+			internals.dynamicToolContexts.set("thread", { ...dynamic, delegate: async (call: { tool: string }) => {
+				calls.push(call.tool); return { success: true, contentItems: [] };
+			} });
+			try {
+				assert.strictEqual((await internals.handleDynamicToolCall({ threadId: "thread", callId: "mcp", namespace: "vscode_mcp", tool: wireName })).success, true);
+				assert.deepStrictEqual(calls, [original]);
+				assert.strictEqual((await internals.handleDynamicToolCall({ threadId: "thread", callId: "wrong", namespace: null, tool: original })).success, false);
+			} finally { provider.dispose(); }
+		}
+	});
+
 	test("routes namespaced dynamic tools only through their declared namespace", async () => {
 		const provider = new CodexChatModelProvider("test");
 		const delegatedTools: string[] = [];

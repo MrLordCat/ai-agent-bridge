@@ -1,5 +1,68 @@
 # Changelog
 
+## 1.20.8 (dev patch) - 2026-11-01
+
+- The shared chat transcript is append-only JSON Lines. Each step writes only
+  the new messages instead of serializing the whole chat twice per tool round:
+  on a real 29 000-message (51 MB) chat a round costs about 40 ms instead of
+  more than half a second. An edited request, a torn final line or accumulated
+  superseded system prompts trigger one full rewrite. Version 1 transcripts
+  load unchanged and are converted on the next step.
+- The transcript limit rises from 64 MiB to 512 MiB, so long chats no longer
+  stop with "The saved Chat transcript exceeds 64 MiB".
+- Images in `chat-history/assets` that no saved chat references are deleted
+  two minutes after activation (only files older than a day).
+- `scripts/repair-chat-sessions.cjs` also removes screenshots that tool
+  outputs keep as base64 in `resultDetails.output[].value`; the earlier repair
+  only removed payloads stored in `data`.
+
+## 1.20.7 (dev patch) - 2026-10-31
+
+- A model that takes over a chat from another model receives only the newest
+  turns that fit `llamacpp.providerSwitchContextTokens` (default 250 000
+  estimated tokens, tool schemas included). Codex, Claude, Coco and Cursor
+  apply the same budget, so a switch no longer replays the whole chat: Claude
+  was sending up to `claudeResumeFallbackMaxInputTokens` (500 000 in the user
+  settings), which cost about half a million uncached tokens in one request.
+  Older turns stay in the shared transcript, whose path is passed to the
+  model. Claude keeps its short digest of earlier user requests, so a switch
+  does not lose the subject of the chat. The budget has a slider in Provider
+  Context (Providers → Context on Model Switch) and is shown in Quick Access.
+
+## 1.20.6 (dev patch) - 2026-10-30
+
+- Codex accepts VS Code MCP tools whose names start with its reserved `mcp__`
+  prefix. They use safe names inside `vscode_mcp` and route back to the original
+  VS Code tool. Eager and deferred tools keep their schemas and availability.
+- HTTP providers can continue chats containing interrupted tool rounds.
+  Calls without matching results and detached results become quoted historical
+  context before request validation. Complete rounds, steering text and image
+  results are preserved; the shared transcript is unchanged.
+
+## 1.20.5 (dev patch) - 2026-10-29
+
+- After a switch to another model, the first turn of the new model is always
+  cold. The shared chat journal records which model last produced output.
+  When a request goes to a different model, Claude, Codex, Coco and Cursor
+  start a new native session from the shared transcript. They no longer
+  resume their own earlier session or send it only the newest messages:
+  that session lacks the other model's turns and compactions. A request that
+  fails before any output, such as an exhausted limit, does not count as
+  taking the chat over.
+- Claude answers the current request after taking over a chat from another
+  provider. When its own session cannot be resumed, Claude starts from the
+  chat transcript. That start kept only the first message and the last 24
+  messages, which after a long Codex turn were only Codex tool rounds, and it
+  attached every image ever pasted into the chat after the transcript. Claude
+  took a days-old screenshot for a new attachment and went back to that task
+  on "continue". Now:
+  - the recent part of the transcript fills the replay budget instead of
+    24 messages;
+  - a list of the omitted user requests is kept;
+  - only images from the current request are attached;
+  - the start stays within `llamacpp.claudeResumeFallbackMaxInputTokens`
+    instead of falling back to the latest message alone.
+
 ## 1.20.4 (dev patch) - 2026-10-28
 
 - Coco no longer signs commits, pull requests or files with "Generated with

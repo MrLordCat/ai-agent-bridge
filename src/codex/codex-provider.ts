@@ -3,7 +3,8 @@ import { promises as fs } from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { prepareSharedHandoff, resolveSharedContextLimit, setFollowedCodexContext, sharedContextBudget } from "../context/provider-handoff";
+import { prepareSharedHandoff, resolveProviderSwitchContextTokens, resolveSharedContextLimit, setFollowedCodexContext, sharedContextBudget } from "../context/provider-handoff";
+import { isProviderSwitch } from "../providers/provider-switch";
 
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
@@ -21,6 +22,7 @@ import {
 } from "./context-windows";
 import {
 	buildCodexDynamicTools,
+	decodeCodexDynamicToolName,
 	type CodexDynamicToolCallResponse,
 	type CodexDynamicToolRuntimeSignature,
 } from "./dynamic-tools";
@@ -446,7 +448,7 @@ function createCodexToolSignatures(
 	runtimeSignatures: readonly CodexDynamicToolRuntimeSignature[]
 ): Map<string, string> {
 	return new Map(runtimeSignatures.map(signature => [
-		signature.name,
+		decodeCodexDynamicToolName(signature.name, signature.namespace),
 		createCodexFingerprint(signature),
 	]));
 }
@@ -1130,6 +1132,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				copilotTurnIndex
 			);
 		}
+		const providerSwitched = !activeTurn && isProviderSwitch(options.modelOptions);
+		if (providerSwitched) {
+			// Another model worked on the chat since this thread's last turn; its context is stale.
+			interruptedContinuation = undefined;
+			this.logSink?.log("codex.chat.provider_switch_cold_start", { model: model.id, previousModel: options.modelOptions?._aabProviderSwitched });
+		}
 		let conversationContinuation: CodexConversationThread | undefined;
 		let conversationTail: readonly vscode.LanguageModelChatRequestMessage[] | undefined;
 		let conversationMatchStrategy: "exact" | "conversation-id" | "suffix" | "rollover" | undefined;
@@ -1141,13 +1149,13 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			reuseMissReasons.set(reason, (reuseMissReasons.get(reason) ?? 0) + 1);
 		};
 		const pendingRollover = this.getPendingRollover(model.id);
-		if (!activeTurn && !interruptedContinuation && pendingRollover && !copilotConversationId) {
+		if (!activeTurn && !interruptedContinuation && !providerSwitched && pendingRollover && !copilotConversationId) {
 			throw new Error(
 				"Codex rollover is armed, but VS Code did not provide a new conversation id. "
 				+ "Create a new chat and retry with the same Codex model."
 			);
 		}
-		if (!activeTurn && !interruptedContinuation && pendingRollover && copilotConversationId) {
+		if (!activeTurn && !interruptedContinuation && !providerSwitched && pendingRollover && copilotConversationId) {
 			const candidate = this.conversationThreads.get(pendingRollover.threadId);
 			if (!candidate) {
 				await this.clearPendingRollover();
@@ -1173,8 +1181,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				targetConversationId: copilotConversationId,
 			}, "warn");
 		}
-		let threadReuseMissReason: string | undefined;
-		if (!activeTurn && !interruptedContinuation && !conversationContinuation) {
+		let threadReuseMissReason: string | undefined = providerSwitched ? "provider-switched" : undefined;
+		if (!activeTurn && !interruptedContinuation && !conversationContinuation && !providerSwitched) {
 			for (const candidate of [...this.conversationThreads.values()].sort((left, right) => right.lastUsedAt - left.lastUsedAt)) {
 				if (useEphemeralThreads && !candidate.ephemeral) {
 					countReuseMiss("persistence-disabled");
@@ -1288,7 +1296,12 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		// selected working target after real tool, output, instruction, and safety
 		// reserves. The former extra 0.45 multiplier discarded usable context.
 		let compactionResult: CodexCompactionResult | undefined;
-		const compactionTokenBudget = Math.min(compactionBudget.messageTokenBudget, sharedContextBudget(compactionBudget.modelContextWindow, options.tools));
+		const compactionTokenBudget = Math.min(
+			compactionBudget.messageTokenBudget,
+			sharedContextBudget(compactionBudget.modelContextWindow, options.tools),
+			// A takeover transfers only the newest turns that fit the switch budget.
+			providerSwitched ? resolveProviderSwitchContextTokens(config) : Number.POSITIVE_INFINITY
+		);
 		if (inputMode === "full") {
 			const archive = options.modelOptions?._aabTranscriptPath;
 			compactionResult = prepareSharedHandoff(inputMessages, compactionTokenBudget, typeof archive === "string" ? archive : undefined);
@@ -3017,10 +3030,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const threadId = typeof params.threadId === "string" ? params.threadId : "";
 		const turnId = typeof params.turnId === "string" ? params.turnId : undefined;
 		const callId = typeof params.callId === "string" ? params.callId : "";
-		const tool = typeof params.tool === "string" ? params.tool : "";
 		const namespace = params.namespace;
 		const context = this.dynamicToolContexts.get(threadId);
 		const actualNamespace = typeof namespace === "string" ? namespace : null;
+		const tool = decodeCodexDynamicToolName(typeof params.tool === "string" ? params.tool : "", actualNamespace);
 		const expectedNamespace = context?.toolNamespaces.get(tool) ?? null;
 		if (
 			!context

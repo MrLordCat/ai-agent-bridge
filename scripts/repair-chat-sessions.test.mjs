@@ -21,9 +21,11 @@ function fixture(t, records, extension = ".jsonl") {
 }
 
 test("repairs binary/text payloads while preserving the original", t => {
-	const f = fixture(t, [{ kind: 0, v: { requests: [{ content: [{ mimeType: "image/png", data: "A".repeat(300_000) }], text: "x".repeat(2_100_000) }], pendingRequests: ["old"] } }]);
+	const output = [{ mimeType: "image/png", value: "B".repeat(300_000) }, { isText: true, value: "short text" }];
+	const f = fixture(t, [{ kind: 0, v: { requests: [{ content: [{ mimeType: "image/png", data: "A".repeat(300_000) }], resultDetails: { output }, text: "x".repeat(2_100_000) }], pendingRequests: ["old"] } }]);
 	const result = f.run(); assert.equal(result.status, 0, result.stderr); f.unchanged();
 	const repaired = f.read(); assert.match(repaired.requests[0].content[0].data, /payload removed/);
+	assert.match(repaired.requests[0].resultDetails.output[0].value, /image\/png payload removed/); assert.equal(repaired.requests[0].resultDetails.output[1].value, "short text");
 	assert.match(repaired.requests[0].text, /characters removed/); assert.ok(repaired.requests[0].text.length < 7000);
 	assert.deepEqual(repaired.pendingRequests, []);
 });

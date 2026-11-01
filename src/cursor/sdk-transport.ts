@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { sharedContextBudget } from "../context/provider-handoff";
+import { resolveProviderSwitchContextTokens, sharedContextBudget } from "../context/provider-handoff";
+import { isProviderSwitch } from "../providers/provider-switch";
 import type { AgentOptions, SendOptions, SDKUserMessage, TokenUsage } from "@cursor/sdk";
 import type { ChatModelSource } from "../model-sources/source-routing";
 import { encodeProviderModelId } from "../model-sources/source-routing";
@@ -112,7 +113,8 @@ export class CursorSdkTransport implements vscode.Disposable {
 		}
 		if (results.some(result => result.callId.startsWith("cursor-"))) { throw new Error("Cursor tool session is no longer active. Retry the request."); }
 		this.cancelConversation(conversationId);
-		const session = await this.sessions.acquire(key, identity, messages, legacyIdentities);
+		const providerSwitched = isProviderSwitch(options.modelOptions);
+		const session = await this.sessions.acquire(key, identity, messages, legacyIdentities, providerSwitched);
 		const metrics = new CursorTurnMetrics(encodeProviderModelId(source.key, selection.id), source.key, messages.length, session, update => this.live.fire(update));
 		const bridge = new CursorToolBridge(options.tools ?? [], error => {
 			this.turns.delete(turn);
@@ -166,7 +168,8 @@ export class CursorSdkTransport implements vscode.Disposable {
 			const toolChars = JSON.stringify(options.tools ?? []).length;
 			const budget = (maximumChars ?? 550_000) - 49_152 - toolChars;
 			if (budget < 4096) { throw new Error("The Cursor working context is too small for its native prompt and tool definitions. Increase the profile context slider."); }
-			const tokenBudget = historyTokenBudget ?? sharedContextBudget(Math.floor((maximumChars ?? 550000) / 3) + 32768, options.tools);
+			const tokenBudget = Math.min(historyTokenBudget ?? sharedContextBudget(Math.floor((maximumChars ?? 550000) / 3) + 32768, options.tools),
+				providerSwitched ? resolveProviderSwitchContextTokens() : Number.POSITIVE_INFINITY);
 			const transfer = await this.archive.coldHandoff(delta, input, tokenBudget, session.key);
 			if (transfer.archivePath) {
 				progress.report(new vscode.LanguageModelTextPart(`Cursor: shared context prepared (${transfer.estimatedTokens?.toLocaleString()} estimated history tokens, budget ${tokenBudget.toLocaleString()}). Full history: ${transfer.archivePath}. Sending the current request…\n\n`));
