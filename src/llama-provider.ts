@@ -2,6 +2,7 @@
 import * as vscode from "vscode";
 import { ApiSourceRouter } from "./providers/api-source-router";
 import { CursorSourceAdapter } from "./providers/api-source-router";
+import { detectBalanceError, detectBalanceFailure, formatBalanceNotice, ProviderBalanceError } from "./providers/balance-errors";
 import { CursorSdkTransport, type CursorSdkDependencies } from "./cursor/sdk-transport";
 import { CursorProfileTransport } from "./cursor/profile-transport";
 import type { CursorRecordedUsage, CursorLiveTurn } from "./cursor/turn-metrics";
@@ -5573,6 +5574,15 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     const retryHint = attempt.retriedAfterOverflow
                         ? "\nRetry after automatic compaction did not fit context."
                         : "";
+                    // An empty balance rejects every attempt: report it instead of retrying.
+                    const balance = detectBalanceFailure(
+                        attempt.status,
+                        attempt.errorText,
+                        source.label ?? this.providerKindLabel(serverUrl)
+                    );
+                    if (balance) {
+                        throw new ProviderBalanceError(balance);
+                    }
                     throw new Error(`Llama.cpp API error: ${attempt.status} ${attempt.statusText}${retryHint}`);
                 }
 
@@ -6158,6 +6168,18 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
                     outputChars,
                     thinkingChars,
                 });
+            } else if (detectBalanceError(err, source.label ?? this.providerKindLabel(serverUrl))) {
+                // Empty balance: answering completes the request, so the host does not retry
+                // a call that cannot succeed until the account is topped up.
+                const balance = detectBalanceError(err, source.label ?? this.providerKindLabel(serverUrl))!;
+                this.log("chat.turn.balance_exhausted", {
+                    requestId,
+                    provider: balance.providerLabel,
+                    status: balance.status,
+                    modelId: model.id,
+                });
+                progress.report(new vscode.LanguageModelTextPart(formatBalanceNotice(balance)));
+                return;
             } else {
                 this.logError("chat.turn.failed", err, { requestId });
                 console.error("[Llama.cpp Provider] Chat request failed", err);

@@ -579,14 +579,14 @@ export class ApiProviderManagerPanel {
 		getExtras?: () => ProviderManagerLiveData
 	): void {
 		if (ApiProviderManagerPanel.current) {
-			ApiProviderManagerPanel.current.panel.reveal(vscode.ViewColumn.Beside);
+			ApiProviderManagerPanel.current.panel.reveal(vscode.ViewColumn.Active);
 			ApiProviderManagerPanel.current.renderUnlessEditing();
 			return;
 		}
 		const panel = vscode.window.createWebviewPanel(
 			ApiProviderManagerPanel.viewType,
 			"AI Agent Bridge · Providers Manager",
-			vscode.ViewColumn.Beside,
+			vscode.ViewColumn.Active,
 			{
 				enableScripts: true,
 				enableFindWidget: true,

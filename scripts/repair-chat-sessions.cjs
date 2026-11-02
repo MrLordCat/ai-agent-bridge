@@ -22,6 +22,8 @@ const path = require("node:path");
 const { pipeline } = require("node:stream/promises");
 
 const MAX_BINARY = 200_000;
+// VS Code decodes these fields as base64 while loading; a text marker makes the whole session load empty.
+const PLACEHOLDER_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
 const MAX_STRING = 2_000_000;
 const MIN_REQUESTS = 5;
 
@@ -107,9 +109,20 @@ function trimText(text) {
 	return text.slice(0, 4000) + marker + text.slice(-2000);
 }
 
+const BASE64_SAMPLE = /^[A-Za-z0-9+/\-_]+={0,2}$/;
+const looksBase64 = (text) => BASE64_SAMPLE.test(text.slice(0, 4096)) && BASE64_SAMPLE.test(text.slice(-4096));
+
+function removePayload(text, replacement) {
+	removedPayloads++;
+	removedPayloadChars += text.length;
+	return replacement;
+}
+
 function sanitize(node) {
 	if (typeof node === "string") {
 		if (node.length > MAX_STRING) {
+			if (/^data:[\w.+-]+\/[\w.+-]+;base64,/i.test(node)) { return removePayload(node, `data:image/png;base64,${PLACEHOLDER_PNG}`); }
+			if (looksBase64(node)) { return removePayload(node, PLACEHOLDER_PNG); }
 			trimmedStrings++;
 			trimmedChars += node.length;
 			return trimText(node);
@@ -130,10 +143,12 @@ function sanitize(node) {
 	for (const field of ["data", "value"]) {
 		const payload = node[field];
 		if (typeof payload === "string" && payload.length > MAX_BINARY && mime && !mime.startsWith("text/") && node.isText !== true) {
-			removedPayloads++;
-			removedPayloadChars += payload.length;
-			node[field] = `[${mime} payload removed while repairing the chat session: ${payload.length} chars]`;
+			node[field] = removePayload(payload, mime.startsWith("image/") ? PLACEHOLDER_PNG : "");
 		}
+	}
+	// Serialized buffers ({ $base64 }) are revived while the session loads.
+	if (typeof node.$base64 === "string" && node.$base64.length > MAX_BINARY) {
+		node.$base64 = removePayload(node.$base64, PLACEHOLDER_PNG);
 	}
 	for (const key of Object.keys(node)) {
 		if (key === "$mid") {

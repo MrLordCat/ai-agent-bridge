@@ -19,6 +19,7 @@ import {
 } from "./constants";
 import { LlamaLogService } from "./logger";
 import { SessionQualityTracker } from "./diagnostics/session-report";
+import { SubscriptionUsageLedger } from "./diagnostics/subscription-usage";
 import { getCurrentWorkspaceScopeId, filterEntriesVisibleInWorkspace } from "./memory/scope";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
@@ -647,6 +648,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
 	const conversationHistory = new ConversationHistory(path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history"));
+	// Token and limit-window history per subscription, shared by every window of this profile.
+	const subscriptionUsage = new SubscriptionUsageLedger(path.join(context.globalStorageUri.fsPath, "subscription-usage"));
+	void subscriptionUsage.initialize().catch(error => logService.logError("subscription_usage.initialize_failed", error));
+	context.subscriptions.push({ dispose: () => subscriptionUsage.dispose() });
 	// The patched Copilot prompt asks this before rendering only a short history tail.
 	(globalThis as Record<string, unknown>).__llamaJournalHas = (conversation: unknown) => conversationHistory.has(conversation);
 	context.subscriptions.push({ dispose: () => { delete (globalThis as Record<string, unknown>).__llamaJournalHas; } });
@@ -785,7 +790,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			cachedInputTokens: usage.cachedInputTokens,
 			reasoningOutputTokens: usage.reasoningOutputTokens,
 		}, usage.modelId);
+		subscriptionUsage.record({
+			provider: "codex",
+			modelId: usage.modelId,
+			freshInputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
+			cachedInputTokens: usage.cachedInputTokens,
+			outputTokens: usage.outputTokens,
+		});
 		updateCodexSessionQuality(sessionQuality, usage, true);
+		SessionQualityPanel.refreshIfOpen();
 	}));
 	context.subscriptions.push(codexProvider.onDidUpdateLiveTurn(usage => {
 		updateCodexSessionQuality(sessionQuality, usage, usage.phase !== "running");
@@ -801,6 +814,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 			modelTurns: usage.modelTurns,
 			durationMs: usage.durationMs,
 		}, usage.modelId);
+		subscriptionUsage.record({
+			provider: "claude",
+			modelId: usage.modelId,
+			freshInputTokens: usage.inputTokens,
+			cachedInputTokens: usage.cacheReadInputTokens,
+			cacheWriteInputTokens: usage.cacheCreationInputTokens,
+			outputTokens: usage.outputTokens,
+		});
+		SessionQualityPanel.refreshIfOpen();
 	}));
 	context.subscriptions.push(claudeProvider.onDidUpdateLiveTurn(update => {
 		updateClaudeSessionQuality(sessionQuality, update);
@@ -869,6 +891,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		void codexProvider.refreshStatus().catch(error => logService.logError("codex.periodic_status.failed", error));
 		void claudeProvider.refreshSubscriptionUsage().catch(error => logService.logError("claude.periodic_usage.failed", error));
 		void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.periodic_balance.failed", error));
+		subscriptionUsage.observe("codex", codexProvider.subscriptionWindows);
+		subscriptionUsage.observe("claude", claudeProvider.subscriptionWindows);
+		void subscriptionUsage.refresh().catch(error => logService.logError("subscription_usage.refresh_failed", error));
+		SessionQualityPanel.refreshIfOpen();
 	}, 60_000);
 	context.subscriptions.push(new vscode.Disposable(() => clearInterval(usageLimitRefreshTimer)));
 
@@ -1233,7 +1259,8 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					extVersion,
 					vscodeVersion,
 					() => claudeProvider.cacheKeepAliveStatus,
-					() => lastHealthEnriched
+					() => lastHealthEnriched,
+					() => subscriptionUsage.summary()
 				);
 				vscode.window.showInformationMessage(`Local LLM health check: ${lastHealthStatus}`);
 			} finally {
@@ -1248,7 +1275,8 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					extVersion,
 					vscodeVersion,
 					() => claudeProvider.cacheKeepAliveStatus,
-					() => lastHealthEnriched
+					() => lastHealthEnriched,
+					() => subscriptionUsage.summary()
 				);
 			} catch (err: unknown) {
 				void vscode.window.showErrorMessage(

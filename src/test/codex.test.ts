@@ -18,6 +18,8 @@ import {
 	diffCodexThreadUsage,
 	findLatestCodexUserTail,
 	intersectCodexThreadTools,
+	codexToolsMissingFromThread,
+	copilotToolGroupingEnabled,
 	isCodexCodeModeConfigRejection,
 	isCompleteImageDataUri,
 	findTempImageWithPrefix,
@@ -1381,6 +1383,23 @@ suite("Codex subscription provider", () => {
 		assert.strictEqual(normalizeCodexRuntimeCwd("D:/GitHub/Project", "win32"), "d:\\GitHub\\Project");
 		assert.strictEqual(normalizeCodexRuntimeCwd("d:\\GitHub\\Project", "win32"), "d:\\GitHub\\Project");
 		assert.strictEqual(normalizeCodexRuntimeCwd("/work/Project", "linux"), "/work/Project");
+	});
+
+	test("detects tools a Codex thread cannot call after the catalog grows", () => {
+		const thread = { callableNames: new Set(["read_file", "activate_creative_3d_model_generation_tools", "runSubagent"]) };
+		assert.deepStrictEqual(codexToolsMissingFromThread(thread, new Set(["read_file", "runSubagent"])), [],
+			"collapsed groups and schema-only changes keep the thread");
+		assert.deepStrictEqual(codexToolsMissingFromThread(thread,
+			new Set(["read_file", "runSubagent", "mcp__meshy-ai_mes_meshy_text_to_3d", "mcp__meshy-ai_mes_meshy_check_balance"])),
+		["mcp__meshy-ai_mes_meshy_check_balance", "mcp__meshy-ai_mes_meshy_text_to_3d"]);
+	});
+
+	test("treats Copilot tool grouping as disabled only for a threshold of zero or less", () => {
+		const config = (threshold: unknown) => ({ get: <T>() => threshold as T });
+		assert.strictEqual(copilotToolGroupingEnabled(config(undefined)), true);
+		assert.strictEqual(copilotToolGroupingEnabled(config(128)), true);
+		assert.strictEqual(copilotToolGroupingEnabled(config(0)), false);
+		assert.strictEqual(copilotToolGroupingEnabled(config(-1)), false);
 	});
 
 	test("reuses only the safe intersection of stored and current thread tools", () => {

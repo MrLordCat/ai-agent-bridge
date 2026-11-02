@@ -6,6 +6,8 @@ import { isProviderSwitch } from "../providers/provider-switch";
 import type { SDKUserMessage } from "@anthropic-ai/claude-agent-sdk" with { "resolution-mode": "import" };
 import { buildCacheDiagnostics, promptCacheUsageFromCacheReads } from "../context/cache-diagnostics";
 import { resolveProviderSwitchContextTokens, resolveSharedContextLimit } from "../context/provider-handoff";
+import type { SubscriptionObservation } from "../diagnostics/subscription-usage";
+import { detectLimitError, formatLimitNotice, LimitGate } from "../providers/limit-errors";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_ACTIVE_SESSION_IDLE_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
@@ -723,6 +725,8 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 	readonly onDidChangeCacheKeepAliveStatus = this.cacheKeepAliveChanges.event;
 
 	private readonly sessions = new Map<string, ClaudeConversationSession>();
+	/** After a limit error the provider answers with one short notice until the window resets. */
+	private readonly limitGate = new LimitGate();
 	private readonly durableSessions = new Map<string, PersistedClaudeConversationSession>();
 	private readonly contextUsageByModel = new Map<string, ClaudeContextUsageSnapshot>();
 	private pendingRollover: PendingClaudeSessionRollover | undefined;
@@ -816,6 +820,20 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 
 	get subscriptionUsageLimits(): ClaudeUsageLimit[] {
 		return buildClaudeUsageLimits(this.lastSubscriptionUsage);
+	}
+
+	/** Raw 5-hour and weekly windows from the last refresh, used by the subscription statistics. */
+	get subscriptionWindows(): SubscriptionObservation {
+		const limits = this.lastSubscriptionUsage?.rate_limits;
+		const pick = (window: { utilization: number | null; resets_at: string | null } | null | undefined) =>
+			window && typeof window.utilization === "number"
+				? { utilization: window.utilization, ...(window.resets_at ? { resetsAt: window.resets_at } : {}) }
+				: undefined;
+		return {
+			...(this.lastSubscriptionUsage?.subscription_type ? { plan: this.lastSubscriptionUsage.subscription_type } : {}),
+			fiveHour: pick(limits?.five_hour),
+			weekly: pick(limits?.seven_day),
+		};
 	}
 
 	/** Percent (0-100) of the Claude 5-hour session window from the last refresh. */
@@ -1305,6 +1323,14 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		if (token.isCancellationRequested) {
 			throw new vscode.CancellationError();
 		}
+		const limited = this.limitGate.blocked("claude");
+		if (limited) {
+			// A limit is not a request failure: answer with one short line so the host does not
+			// retry the request and no provider turn is started.
+			this.logSink?.log("claude.chat.limit_short_circuit", { model: modelId, notice: limited });
+			progress.report(new vscode.LanguageModelTextPart(limited));
+			return;
+		}
 		const executable = resolveClaudeCodeBinary();
 		if (!executable) {
 			throw new Error("Claude Code CLI not found. Install and sign in to the official Anthropic Claude Code extension.");
@@ -1373,8 +1399,36 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 				followUpTextPresent: followUpText !== undefined,
 				followUpTextPreview: followUpText ? followUpText.slice(0, 120) : undefined,
 			});
-			await continuation.session.client.resumeToolResults(continuation.results, progress, token, followUpText);
+			try {
+				await continuation.session.client.resumeToolResults(continuation.results, progress, token, followUpText);
+			} catch (error) {
+				if (error instanceof vscode.CancellationError) {
+					throw error;
+				}
+				this.logSink?.logError("claude.chat.failed", error);
+				const limit = detectLimitError(error, "claude");
+				if (!limit) {
+					throw error;
+				}
+				this.limitGate.note("claude", limit);
+				this.recordRateLimit({
+					status: "rejected",
+					utilization: 100,
+					...(limit.resetAt ? { resetsAt: limit.resetAt.getTime() } : {}),
+				});
+				this.logSink?.log("claude.chat.limit_reached", {
+					model: modelId,
+					stage: "tool-resume",
+					window: limit.window,
+					resetsAt: limit.resetAt?.toISOString(),
+					timeZone: limit.timeZone,
+				}, "warn");
+				this.removeSession(continuation.session.key);
+				progress.report(new vscode.LanguageModelTextPart(formatLimitNotice("claude", limit)));
+				return;
+			}
 			continuation.session.lastUsedAt = Date.now();
+			this.limitGate.clear("claude");
 			await this.rememberDurableSession(continuation.session);
 			return;
 		}
@@ -1754,6 +1808,7 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 			session.lastUsedAt = Date.now();
 			session.resumeSessionAt = session.client.stableAssistantMessageId ?? session.resumeSessionAt;
 			session.restoredFromDisk = false;
+			this.limitGate.clear("claude");
 			this.reportCacheDiagnostics(modelId, session.key, reused, restored);
 			await this.rememberDurableSession(session);
 			if (rolledOver) {
@@ -1762,6 +1817,26 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		} catch (error) {
 			if (!(error instanceof vscode.CancellationError)) {
 				this.logSink?.logError("claude.chat.failed", error);
+				const limit = detectLimitError(error, "claude");
+				if (limit) {
+					// A usage limit is not a session failure: keep the session, skip every fallback,
+					// and show one short English notice instead of the provider's long text.
+					this.limitGate.note("claude", limit);
+					this.recordRateLimit({
+						status: "rejected",
+						utilization: 100,
+						...(limit.resetAt ? { resetsAt: limit.resetAt.getTime() } : {}),
+					});
+					this.logSink?.log("claude.chat.limit_reached", {
+						model: modelId,
+						window: limit.window,
+						resetsAt: limit.resetAt?.toISOString(),
+						timeZone: limit.timeZone,
+					}, "warn");
+					this.removeSession(session.key);
+					progress.report(new vscode.LanguageModelTextPart(formatLimitNotice("claude", limit)));
+					return;
+				}
 				if (session.restoredFromDisk && session.client.canRetryLastTurn) {
 					if (rolledOver) {
 						this.logSink?.log("claude.chat.rollover_failed", {
@@ -1905,6 +1980,23 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 					} catch (fallbackError) {
 						this.logSink?.logError("claude.chat.resume_fallback_failed", fallbackError);
 						this.removeSession(fallback.key);
+						const fallbackLimit = detectLimitError(fallbackError, "claude");
+						if (fallbackLimit) {
+							this.limitGate.note("claude", fallbackLimit);
+							this.recordRateLimit({
+								status: "rejected",
+								utilization: 100,
+								...(fallbackLimit.resetAt ? { resetsAt: fallbackLimit.resetAt.getTime() } : {}),
+							});
+							this.logSink?.log("claude.chat.limit_reached", {
+								model: modelId,
+								stage: "resume-fallback",
+								window: fallbackLimit.window,
+								resetsAt: fallbackLimit.resetAt?.toISOString(),
+							}, "warn");
+							progress.report(new vscode.LanguageModelTextPart(formatLimitNotice("claude", fallbackLimit)));
+							return;
+						}
 						throw fallbackError;
 					}
 				}
@@ -2207,7 +2299,28 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		this.lastSubscriptionUsage = snapshot;
 		this.lastSubscriptionUsageAt = Date.now();
 		this.refreshSubagentProfiles();
+		this.syncLimitGate(snapshot);
 		this.statusChanges.fire({ state: this.status, summary: this.statusSummary });
+	}
+
+	/** Keeps the fail-fast gate aligned with the provider's own window report. */
+	private syncLimitGate(snapshot: ClaudeSubscriptionUsageSnapshot): void {
+		const window = snapshot.rate_limits?.five_hour;
+		const utilization = typeof window?.utilization === "number" ? window.utilization : undefined;
+		if (utilization === undefined) {
+			return;
+		}
+		if (utilization < 100) {
+			this.limitGate.clear("claude");
+			return;
+		}
+		const resetAt = window?.resets_at ? new Date(window.resets_at) : undefined;
+		this.limitGate.note("claude", {
+			provider: "claude",
+			window: "5-hour",
+			reason: "usage limit",
+			...(resetAt && !Number.isNaN(resetAt.getTime()) ? { resetAt } : {}),
+		});
 	}
 
 	private recordContextUsage(snapshot: ClaudeContextUsageSnapshot): void {

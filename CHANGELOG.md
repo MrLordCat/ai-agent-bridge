@@ -1,5 +1,69 @@
 # Changelog
 
+## 1.20.12 (dev patch) - 2026-11-02
+
+- An empty provider balance no longer produces a failed request and repeated
+  attempts. HTTP 402 Payment Required and balance/quota wording from a provider
+  body become one English line, for example `DeepSeek balance is empty
+  (Insufficient Balance). Top up the account, then send the message again. No
+  retry was made.` The notice completes the request, so the host does not retry
+  it, and context-length or rate-limit errors are not mistaken for a balance.
+- The Subscriptions tab no longer fills with empty windows. An idle provider
+  reports 0% with a reset time that moves every minute, and every change used
+  to start a new one-minute window. Such samples are ignored now, and a window
+  without tracked tokens is never saved: the finished list and the capacity
+  estimate only use windows that were counted from their own usage.
+- Reset timestamps that differ by sub-seconds between polls no longer split a
+  window. A provider timestamp that appears and disappears is ignored as a
+  boundary; only a real reset or a deep utilization drop ends a tracked window.
+- Windows are tracked only for the periods a provider actually reports, so
+  Codex or Claude without a weekly window no longer shows a phantom weekly row,
+  and a window created right after a 100% hit starts without a copied peak.
+
+## 1.20.11 (dev patch) - 2026-11-02
+
+- Diagnostics panels (Live Report, Providers Manager, Shared Memory) open as a
+  tab in the current editor group instead of forcing a new group to the side.
+  Revealing an already open panel also reuses the active group.
+
+## 1.20.10 (dev patch) - 2026-11-01
+
+- The Live Report has a Subscriptions tab: Codex and Claude token use per
+  5-hour and weekly limit window, with input, cache misses, cache reads, cache
+  writes, output, request counts, cache hit percentage and per-model totals.
+- A window that reaches 100% is saved as a finished window and the next one
+  starts from zero, so a period never mixes usage from two windows. Providers
+  that omit reset timestamps are detected by a deep utilization drop.
+- The ledger lives in extension global storage (`subscription-usage`), so every
+  VS Code window of the profile adds to one history and the totals answer how
+  many tokens a plan window really provides. Totals are marked partial when
+  tracking started after the window had already begun.
+- A Claude or Codex usage limit no longer prints the provider's long error and
+  no longer starts repeated attempts. The provider answers with one English
+  line, for example `Claude 5-hour limit reached. It resets at 16:00 EET (in
+  2 h 15 min). Wait for the reset, then send the message again. No retry was
+  made.` The reset is parsed from the provider text (clock with its zone, ISO
+  time, or "try again at ..."), the window is remembered per provider, and
+  every request until the reset returns the same line without calling the
+  provider, opening a thread or running a fallback. Context and payload limits
+  are not treated as subscription limits.
+
+## 1.20.9 (dev patch) - 2026-11-01
+
+- Codex can use tools that appear after its thread started. Codex fixes a
+  thread's dynamic tools at `thread/start`, and a reused thread only kept the
+  tools it already had, so tools behind Copilot's `activate_*` groups (for
+  example Meshy MCP tools) were enabled in VS Code but never callable. When
+  the model activates new tools mid-turn, the turn continues in a new thread
+  that receives the shared context; with Copilot grouping disabled
+  (`github.copilot.chat.virtualTools.threshold` 0) a new turn also starts a
+  new thread after tools were enabled. Schema-only changes and collapsed groups
+  keep the warm thread.
+- `scripts/repair-chat-sessions.cjs` replaces removed screenshots, `$base64`
+  buffers and oversized data URLs with a valid 1×1 PNG instead of a text
+  marker. VS Code decodes these fields while loading, and one invalid value
+  made the whole repaired session open empty.
+
 ## 1.20.8 (dev patch) - 2026-11-01
 
 - The shared chat transcript is append-only JSON Lines. Each step writes only

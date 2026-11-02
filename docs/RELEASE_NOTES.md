@@ -1,31 +1,70 @@
-# AI Agent Bridge 1.20.3
+# AI Agent Bridge 1.20.12
 
-A patch release: "Follow the Codex window" applies right away instead of
-waiting for the first Codex request.
+A patch release: subscription usage statistics for Codex and Claude, short
+notices when a plan limit or a provider balance runs out, tools that appear
+after a Codex thread started, and a cleaner Live Report.
 
-## Shared context follows Codex immediately
+## Subscriptions tab in the Live Report
 
-- With `llamacpp.sharedContextFollowCodex` on, the shared context stayed at
-  the slider value until a Codex request in the current workspace, although
-  Codex had already catalogued 475K for gpt-6.1-sol. Provider Context also
-  showed the 258.4K fallback setting as the Codex window.
-- Before the first request the shared context now follows Codex's default
-  model, or the largest catalogued window while the model list is not loaded.
-  After a request it follows the last used model, as before. A used model whose
-  window is still unknown does not borrow another model's window, and the
-  fallback setting never drives the limit.
-- The last used Codex model is stored globally, like the shared context
-  itself; the 1.20.2 per-workspace value is migrated.
-- Provider Context names why a model is followed (last used, Codex default or
-  largest known) and updates the followed window while the panel is open,
-  without dropping unsaved edits. The toggle is saved with Apply.
+- A new Subscriptions tab shows Codex and Claude token use per 5-hour and
+  weekly limit window: input, cache misses, cache reads, cache writes, output,
+  request counts, cache hit percentage and per-model totals.
+- Each window starts at zero. When a window reaches 100% it is saved as a
+  finished window and the next one starts empty, so a period never mixes usage
+  from two windows. Windows that were already running when tracking began are
+  marked partial, and a provider timestamp that only sometimes appears is not
+  treated as a boundary.
+- Only windows that really tracked tokens are kept. An idle provider reports
+  0% with a reset time that moves every minute; those samples used to create a
+  new one-minute window on every refresh. They are ignored now, so the
+  finished list and the capacity estimate (how many tokens a plan window
+  provides) use real periods only.
+- The ledger lives in extension global storage, so every VS Code window of the
+  profile writes to one history.
 
-## Boundaries and verification
+## One line instead of long errors and retries
 
-- Windows: 843 extension-host tests passed on the installed VS Code (14
-  platform or opt-in skips), together with compile, lint and metadata checks.
-  Release CI repeats metadata checks, lint and tests on Windows and Linux
-  before packaging and publication.
+- A Claude or Codex usage limit now answers with one English line, for example
+  `Claude 5-hour limit reached. It resets at 16:00 EET (in 2 h 15 min). Wait
+  for the reset, then send the message again. No retry was made.` The reset is
+  read from the provider text (clock with its zone, ISO time or "try again at
+  ..."), remembered per provider, and every request until the reset returns
+  the same line without starting a provider turn, thread or fallback.
+- An empty provider balance behaves the same way. HTTP 402 Payment Required
+  and "insufficient balance" bodies (including DeepSeek's JSON error) become
+  `DeepSeek balance is empty (Insufficient Balance). Top up the account, then
+  send the message again. No retry was made.` The request finishes instead of
+  failing, so the host does not repeat it five times. Context-length and
+  rate-limit errors are not mistaken for a balance problem.
+
+## Codex tools and editor behaviour
+
+- Codex can use tools that appear after its thread started. Its dynamic tools
+  are fixed at `thread/start`, and a reused thread kept only the tools it
+  already had, so tools behind Copilot's `activate_*` groups (for example the
+  Meshy MCP tools) were enabled in VS Code but never callable. A mid-turn
+  activation continues in a new thread with the shared context; schema-only
+  changes keep the warm thread.
+- Diagnostics panels (Live Report, Providers Manager, Shared Memory) open as a
+  tab in the current editor group instead of forcing a new group to the side.
+
+## Earlier patches included
+
+- 1.20.4–1.20.8: no Snowflake CoCo attribution in commits and files; a cold
+  first turn after a model switch with a shared transcript; the
+  `providerSwitchContextTokens` budget (default 250K) for every native
+  provider; MCP tools with the `mcp__` prefix for Codex; interrupted tool
+  rounds in HTTP chats; an append-only JSON Lines chat journal that is much
+  faster on long chats; a 512 MiB transcript limit and unreferenced image
+  pruning.
+- 1.20.9: the repaired chat session keeps screenshots as valid placeholder
+  images, so VS Code can load it.
+
+## Verification
+
+- 896 extension-host tests passed on the installed VS Code, together with
+  compile, lint and metadata checks. Release CI repeats metadata checks, lint
+  and tests before packaging and publication.
 
 ## Install from VSIX
 
@@ -34,9 +73,9 @@ To install it manually, download the package matching your platform:
 
 ```sh
 # Windows x64
-code --install-extension llama-vscode-chat-v1.20.3-win32-x64.vsix --force
+code --install-extension llama-vscode-chat-v1.20.12-win32-x64.vsix --force
 # Linux x64
-code --install-extension llama-vscode-chat-v1.20.3-linux-x64.vsix --force
+code --install-extension llama-vscode-chat-v1.20.12-linux-x64.vsix --force
 ```
 
 Run **Developer: Reload Window**. Existing profiles and chat keys are retained.

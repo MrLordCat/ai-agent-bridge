@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -22,12 +23,28 @@ function fixture(t, records, extension = ".jsonl") {
 
 test("repairs binary/text payloads while preserving the original", t => {
 	const output = [{ mimeType: "image/png", value: "B".repeat(300_000) }, { isText: true, value: "short text" }];
-	const f = fixture(t, [{ kind: 0, v: { requests: [{ content: [{ mimeType: "image/png", data: "A".repeat(300_000) }], resultDetails: { output }, text: "x".repeat(2_100_000) }], pendingRequests: ["old"] } }]);
+	const f = fixture(t, [{ kind: 0, v: { requests: [{ content: [{ mimeType: "image/png", data: "A".repeat(300_000) }], resultDetails: { output }, text: "x ".repeat(1_100_000) }], pendingRequests: ["old"] } }]);
 	const result = f.run(); assert.equal(result.status, 0, result.stderr); f.unchanged();
-	const repaired = f.read(); assert.match(repaired.requests[0].content[0].data, /payload removed/);
-	assert.match(repaired.requests[0].resultDetails.output[0].value, /image\/png payload removed/); assert.equal(repaired.requests[0].resultDetails.output[1].value, "short text");
+	const repaired = f.read(), base64 = /^[A-Za-z0-9+/]*={0,2}$/;
+	for (const payload of [repaired.requests[0].content[0].data, repaired.requests[0].resultDetails.output[0].value]) {
+		assert.ok(payload.length < 200 && base64.test(payload), "removed payloads must stay decodable base64");
+		assert.equal(Buffer.from(payload, "base64").subarray(1, 4).toString(), "PNG");
+	}
+	assert.equal(repaired.requests[0].resultDetails.output[1].value, "short text");
 	assert.match(repaired.requests[0].text, /characters removed/); assert.ok(repaired.requests[0].text.length < 7000);
 	assert.deepEqual(repaired.pendingRequests, []);
+});
+
+test("replaces oversized base64 buffers and data URLs with decodable placeholders", t => {
+	const png = "iVBORw0K" + "A".repeat(2_100_000);
+	const f = fixture(t, [{ kind: 0, v: { requests: [{ variableData: { variables: [{ value: { $base64: "A".repeat(300_000) } }] },
+		result: { metadata: { image: { url: `data:image/png;base64,${png}` }, raw: png, log: "line ".repeat(500_000) } } }] } }]);
+	const result = f.run(); assert.equal(result.status, 0, result.stderr); f.unchanged();
+	const request = f.read().requests[0], metadata = request.result.metadata;
+	assert.match(request.variableData.variables[0].value.$base64, /^iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
+	assert.match(metadata.image.url, /^data:image\/png;base64,iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
+	assert.match(metadata.raw, /^iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
+	assert.match(metadata.log, /characters removed/);
 });
 
 test("applies set, delete, append and truncate deltas before selecting recent requests", t => {

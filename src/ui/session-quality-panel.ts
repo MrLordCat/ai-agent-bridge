@@ -113,6 +113,7 @@ export class SessionQualityPanel {
 	private readonly _vscodeVersion: string;
 	private readonly _getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus;
 	private readonly _getHealthData: () => unknown;
+	private readonly _getSubscriptions: () => unknown;
 
 	private constructor(
 		panel: vscode.WebviewPanel,
@@ -121,6 +122,7 @@ export class SessionQualityPanel {
 		vscodeVersion: string,
 		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
 		getHealthData: () => unknown,
+		getSubscriptions: () => unknown = () => undefined,
 	) {
 		this._panel = panel;
 		this._tracker = tracker;
@@ -128,6 +130,7 @@ export class SessionQualityPanel {
 		this._vscodeVersion = vscodeVersion;
 		this._getClaudeCacheKeepAliveStatus = getClaudeCacheKeepAliveStatus;
 		this._getHealthData = getHealthData;
+		this._getSubscriptions = getSubscriptions;
 
 		this._panel.onDidDispose(() => {
 			SessionQualityPanel.current = undefined;
@@ -149,9 +152,10 @@ export class SessionQualityPanel {
 		vscodeVersion: string,
 		getClaudeCacheKeepAliveStatus: () => ClaudeCacheKeepAliveStatus,
 		getHealthData: () => unknown,
+		getSubscriptions: () => unknown = () => undefined,
 	): void {
 		if (SessionQualityPanel.current) {
-			SessionQualityPanel.current._panel.reveal(vscode.ViewColumn.Beside);
+			SessionQualityPanel.current._panel.reveal(vscode.ViewColumn.Active);
 			SessionQualityPanel.current.refresh();
 			return;
 		}
@@ -159,7 +163,7 @@ export class SessionQualityPanel {
 		const panel = vscode.window.createWebviewPanel(
 			SessionQualityPanel.viewType,
 			"Live Report",
-			vscode.ViewColumn.Beside,
+			vscode.ViewColumn.Active,
 			{
 				enableScripts: true,
 				retainContextWhenHidden: true,
@@ -175,6 +179,7 @@ export class SessionQualityPanel {
 				vscodeVersion,
 				getClaudeCacheKeepAliveStatus,
 				getHealthData,
+				getSubscriptions,
 			);
 		} catch (err: unknown) {
 			panel.dispose();
@@ -212,6 +217,7 @@ export class SessionQualityPanel {
 				claudeCacheKeepAlive: this._getClaudeCacheKeepAliveStatus(),
 			},
 			health: this._getHealthData() ?? null,
+			subscriptions: this._getSubscriptions() ?? null,
 			summary: {
 				turns: summary.turns,
 					totalModelTurns: summary.totalModelTurns,
@@ -375,6 +381,7 @@ tr.turn-row.open { border-bottom-color: transparent; }
 .hit-warn { color: var(--warn); }
 .hit-bad { color: var(--bad); }
 .empty { padding: 24px; color: var(--dim); text-align: center; border: 1px dashed var(--border); border-radius: 7px; }
+.tag { margin-left: 6px; padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); color: var(--dim); font-size: 10px; text-transform: uppercase; letter-spacing: .04em; }
 .bar-wrap { display: flex; align-items: center; gap: 0; overflow: hidden; border-radius: 999px; background: var(--track); }
 .bar { display: block; height: 7px; min-width: 1px; }
 .bar-cached { background: var(--good); }
@@ -638,12 +645,14 @@ function render() {
 	h += '<button id="tab-btn-perf" class="tab-btn" role="tab" aria-selected="false" data-tab="perf">Performance</button>';
 	h += '<button id="tab-btn-errors" class="tab-btn' + (d.errors && d.errors.length ? ' tab-has-issues' : '') + '" role="tab" aria-selected="false" data-tab="errors">Errors' + (d.errors && d.errors.length ? ' (' + d.errors.length + ')' : '') + '</button>';
 	h += '<button id="tab-btn-health" class="tab-btn" role="tab" aria-selected="false" data-tab="health">Health</button>';
+	h += '<button id="tab-btn-subs" class="tab-btn" role="tab" aria-selected="false" data-tab="subs">Subscriptions</button>';
 
 	h += '</nav>';
 	h += '<div id="tab-cache" class="tab-panel" data-panel="cache"></div>';
 	h += '<div id="tab-perf" class="tab-panel" data-panel="perf" hidden></div>';
 	h += '<div id="tab-errors" class="tab-panel" data-panel="errors" hidden></div>';
 	h += '<div id="tab-health" class="tab-panel" data-panel="health" hidden></div>';
+	h += '<div id="tab-subs" class="tab-panel" data-panel="subs" hidden></div>';
 	h += '</main>';
 	document.getElementById("app").innerHTML = h;
 	renderActiveTab();
@@ -667,6 +676,7 @@ function renderActiveTab() {
 	else if (name === "perf") h = renderPerfTab(d);
 	else if (name === "errors") h = renderErrorsTab(d);
 	else if (name === "health") h = renderHealthTab(d);
+	else if (name === "subs") h = renderSubscriptionsTab(d);
 	panel.innerHTML = h;
 	panel.setAttribute("data-rendered", "1");
 }
@@ -1346,6 +1356,119 @@ function applyErrorFilters() {
 
 const HEALTH_STATUS_LABEL = { pass: "Pass", warn: "Warning", fail: "Failed", unknown: "Unknown" };
 const HEALTH_TONE = { pass: "tone-good", warn: "tone-warn", fail: "tone-bad", unknown: "tone-info" };
+
+const SUBSCRIPTION_LABEL = { claude: "Claude", codex: "Codex" };
+const SUBSCRIPTION_WINDOW = { fiveHour: "5-hour window", weekly: "Weekly window" };
+const STAMP = (v) => typeof v === "number" ? new Date(v).toLocaleString() : "—";
+const SPAN = (from, to) => {
+	if (typeof from !== "number" || typeof to !== "number" || to <= from) return "—";
+	const minutes = Math.round((to - from) / 60000);
+	return minutes >= 120 ? (minutes / 60).toFixed(1) + " h" : minutes + " min";
+};
+const median = (values) => {
+	if (!values.length) return undefined;
+	const sorted = [...values].sort((a, b) => a - b);
+	const middle = Math.floor(sorted.length / 2);
+	return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+};
+
+function subscriptionTotalsRow(label, totals) {
+	let h = '<tr><td>' + esc(label) + '</td>';
+	h += '<td>' + FMT(totals.requests) + '</td>';
+	h += '<td>' + FMT_SHORT(totals.inputTokens) + '</td>';
+	h += '<td>' + FMT_SHORT(totals.freshInputTokens) + '</td>';
+	h += '<td>' + FMT_SHORT(totals.cachedInputTokens) + '</td>';
+	h += '<td>' + FMT_SHORT(totals.cacheWriteInputTokens) + '</td>';
+	h += '<td>' + FMT_SHORT(totals.outputTokens) + '</td>';
+	h += '<td>' + PCT(totals.cacheHitPercent) + '</td>';
+	return h + '</tr>';
+}
+
+function renderSubscriptionProvider(provider) {
+	const name = SUBSCRIPTION_LABEL[provider.provider] || provider.provider;
+	let h = '';
+	h += '<section class="section"><div class="section-heading"><h2>' + esc(name) + '</h2><span class="section-note">'
+		+ (provider.plan ? esc(provider.plan) + ' plan · ' : '')
+		+ provider.exhausted.length + ' full window' + (provider.exhausted.length === 1 ? '' : 's') + ' recorded</span></div>';
+	h += '<section class="metric-grid" aria-label="' + esc(name) + ' subscription summary">';
+	for (const record of provider.current) {
+		const used = typeof record.peakUtilization === "number" ? record.peakUtilization : undefined;
+		h += metric(SUBSCRIPTION_WINDOW[record.kind] || record.kind,
+			typeof used === "number" ? Math.round(used) + "%" : "n/a",
+			record.resetsAt ? 'resets ' + STAMP(Date.parse(record.resetsAt)) + ' · ' + FMT(record.totals.requests) + ' requests'
+				: FMT(record.totals.requests) + ' requests tracked',
+			typeof used === "number" ? (used >= 90 ? "tone-bad" : used >= 60 ? "tone-warn" : "tone-good") : "tone-info",
+			used);
+	}
+	const exhaustedWindows = provider.exhausted;
+	for (const kind of ["fiveHour", "weekly"]) {
+		const samples = exhaustedWindows.filter(record => record.kind === kind);
+		const tokens = median(samples.map(record => record.totals.totalTokens));
+		if (typeof tokens !== "number") continue;
+		h += metric((SUBSCRIPTION_WINDOW[kind] || kind) + " capacity", FMT_SHORT(tokens) + " tokens",
+			'median of ' + samples.length + ' window' + (samples.length === 1 ? '' : 's') + ' that reached 100%', "tone-purple");
+	}
+	h += '</section>';
+
+	h += '<div class="section-heading"><h2>Current windows</h2><span class="section-note">Counted from zero since the last reset or 100%</span></div>';
+	const current = provider.current;
+	if (!current.length) {
+		h += '<div class="empty">No window has been observed yet. Limits refresh every minute while the provider is signed in.</div>';
+	} else {
+		h += '<div class="table-shell"><table><thead><tr><th>Window</th><th>Started</th><th>Used</th><th>Resets</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th></tr></thead><tbody>';
+		for (const record of current) {
+			h += '<tr><td>' + esc(SUBSCRIPTION_WINDOW[record.kind] || record.kind) + (record.partial ? ' <span class="tag">partial</span>' : '') + '</td>';
+			h += '<td>' + STAMP(record.startedAt) + '</td>';
+			h += '<td>' + (typeof record.peakUtilization === "number" ? Math.round(record.peakUtilization) + '%' : 'n/a') + '</td>';
+			h += '<td>' + (record.resetsAt ? STAMP(Date.parse(record.resetsAt)) : '—') + '</td>';
+			h += '<td>' + FMT(record.totals.requests) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.inputTokens) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.cachedInputTokens) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.outputTokens) + '</td>';
+			h += '<td>' + PCT(record.totals.cacheHitPercent) + '</td></tr>';
+		}
+		h += '</tbody></table></div>';
+	}
+
+	if (provider.completed.length) {
+		h += '<div class="section-heading"><h2>Finished windows</h2><span class="section-note">Newest first · only windows with tracked tokens are kept</span></div>';
+		h += '<div class="table-shell"><table><thead><tr><th>Window</th><th>Period</th><th>Duration</th><th>Ended by</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th></tr></thead><tbody>';
+		for (const record of provider.completed) {
+			h += '<tr><td>' + esc(SUBSCRIPTION_WINDOW[record.kind] || record.kind) + '</td>';
+			h += '<td>' + STAMP(record.startedAt) + ' → ' + STAMP(record.endedAt) + '</td>';
+			h += '<td>' + SPAN(record.startedAt, record.endedAt) + '</td>';
+			h += '<td>' + (record.closedBy === "limit-hit" ? '100% used' : 'window reset') + (record.partial ? ' <span class="tag">partial</span>' : '') + '</td>';
+			h += '<td>' + FMT(record.totals.requests) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.inputTokens) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.cachedInputTokens) + '</td>';
+			h += '<td>' + FMT_SHORT(record.totals.outputTokens) + '</td>';
+			h += '<td>' + PCT(record.totals.cacheHitPercent) + '</td></tr>';
+		}
+		h += '</tbody></table></div>';
+	}
+
+	const models = [];
+	for (const record of current) for (const model of record.models) models.push(model);
+	if (models.length) {
+		h += '<div class="section-heading"><h2>Models in the current windows</h2><span class="section-note">Input includes cached and cache-write tokens</span></div>';
+		h += '<div class="table-shell"><table><thead><tr><th>Model</th><th>Requests</th><th>Input</th><th>Cache miss</th><th>Cached</th><th>Cache write</th><th>Output</th><th>Cache hit</th></tr></thead><tbody>';
+		for (const model of models.sort((left, right) => right.totalTokens - left.totalTokens)) h += subscriptionTotalsRow(model.modelId, model);
+		h += '</tbody></table></div>';
+	}
+	return h + '</section>';
+}
+
+function renderSubscriptionsTab(d) {
+	const data = d.subscriptions;
+	if (!data || !Array.isArray(data.providers) || !data.providers.length) {
+		return '<div class="empty">No subscription usage recorded yet.<br>Codex and Claude limits are read every minute; token totals appear after the next completed request.</div>';
+	}
+	let h = '<p class="section-note">This ledger lives in extension global storage, so every VS Code window of this profile adds to the same numbers (last read '
+		+ CLOCK(data.generatedAt) + '). Each provider window starts at zero: a window that reaches 100% is saved as a finished window and the next one starts empty, instead of continuing mid-period.</p>';
+	for (const provider of data.providers) h += renderSubscriptionProvider(provider);
+	h += '<p class="section-note">Cache miss counts input tokens the provider had to process fresh; cached tokens were served from the prompt cache. A window is marked partial when tracking started after it had already begun, so its totals are a lower bound.</p>';
+	return h;
+}
 
 function renderHealthTab(d) {
 	const hd = d.health;

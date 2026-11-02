@@ -342,14 +342,14 @@ export class MemoryManagerPanel {
 
 	public static createOrShow(extensionUri: vscode.Uri, memory: SharedMemoryService): void {
 		if (MemoryManagerPanel.current) {
-			MemoryManagerPanel.current._panel.reveal(vscode.ViewColumn.Beside);
+			MemoryManagerPanel.current._panel.reveal(vscode.ViewColumn.Active);
 			MemoryManagerPanel.current.render();
 			return;
 		}
 		const panel = vscode.window.createWebviewPanel(
 			MemoryManagerPanel.viewType,
 			"Shared Memory",
-			vscode.ViewColumn.Beside,
+			vscode.ViewColumn.Active,
 			{
 				enableScripts: true,
 				retainContextWhenHidden: true,

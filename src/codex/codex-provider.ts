@@ -8,6 +8,8 @@ import { isProviderSwitch } from "../providers/provider-switch";
 
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
+import type { SubscriptionObservation } from "../diagnostics/subscription-usage";
+import { detectLimitError, formatLimitNotice, LimitGate } from "../providers/limit-errors";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_CONTINUATION_TTL_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
@@ -474,6 +476,23 @@ export function intersectCodexThreadTools(
 	};
 }
 
+/**
+ * Tool names of the current catalog that a thread started earlier lacks: dynamic tools are fixed at thread/start.
+ * Schema-only changes (e.g. the subagent model enum) are not counted; the intersection already drops those.
+ */
+export function codexToolsMissingFromThread(
+	thread: { callableNames: ReadonlySet<string> },
+	currentCallableNames: ReadonlySet<string>
+): string[] {
+	return [...currentCallableNames].filter(name => !thread.callableNames.has(name)).sort();
+}
+
+/** Copilot hides tools behind activate_* groups and reshuffles them each turn unless its threshold is 0 or lower. */
+export function copilotToolGroupingEnabled(config: Pick<vscode.WorkspaceConfiguration, "get"> = vscode.workspace.getConfiguration("github.copilot.chat")): boolean {
+	const threshold = config.get<number>("virtualTools.threshold");
+	return !(typeof threshold === "number" && threshold <= 0);
+}
+
 export function canResumeCodexToolTurn(
 	stored: { modelId: string; runtimeKey: string; processGeneration: number } | undefined,
 	current: { modelId: string; runtimeKey: string; processGeneration: number }
@@ -630,6 +649,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private accountCache: { account: CodexChatGptAccount; generation: number; expiresAt: number } | undefined;
 	private lastStatusRefreshAt = 0;
 	private lastRateLimitSnapshot: CodexRateLimitSnapshot | undefined;
+	/** After a usage limit the provider answers with one short notice until the window resets. */
+	private readonly limitGate = new LimitGate();
 	private lastRateLimitReached = false;
 	private modelCatalogGeneration = -1;
 	private modelCatalogExpiresAt = 0;
@@ -703,6 +724,23 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	/** Primary (5-hour) and secondary (weekly) subscription window summaries. */
 	get codexUsageLimitSummaries(): ReadonlyArray<{ label: string; description: string }> {
 		return summarizeCodexRateLimits(this.lastRateLimitSnapshot);
+	}
+
+	/** Raw 5-hour and weekly windows from the last refresh, used by the subscription statistics. */
+	get subscriptionWindows(): SubscriptionObservation {
+		const snapshot = this.lastRateLimitSnapshot;
+		const pick = (window: { usedPercent: number; resetsAt: number | null } | null | undefined) =>
+			window && Number.isFinite(window.usedPercent)
+				? {
+					utilization: Math.max(0, Math.min(100, window.usedPercent)),
+					...(window.resetsAt ? { resetsAt: new Date(window.resetsAt * 1_000).toISOString() } : {}),
+				}
+				: undefined;
+		return {
+			...(snapshot?.planType ? { plan: snapshot.planType } : {}),
+			fiveHour: pick(snapshot?.primary),
+			weekly: pick(snapshot?.secondary),
+		};
 	}
 
 	/** True when the ChatGPT subscription window is fully consumed. */
@@ -785,6 +823,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			try {
 				const limits = await this.client.request<CodexRateLimitsResponse>("account/rateLimits/read", undefined);
 				this.lastRateLimitSnapshot = this.selectRateLimit(limits);
+				this.syncLimitGate(this.lastRateLimitSnapshot);
 				usage = formatCodexRateLimit(this.lastRateLimitSnapshot);
 				const reached = this.isCodexRateLimitReached();
 				if (reached !== this.lastRateLimitReached) {
@@ -993,6 +1032,14 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		if (token.isCancellationRequested) {
 			throw new vscode.CancellationError();
 		}
+		const limited = this.limitGate.blocked("codex");
+		if (limited) {
+			// A limit is not a request failure: answer with one short line so the host does not
+			// retry the request and no provider thread is started.
+			this.logSink?.log("codex.chat.limit_short_circuit", { model: model.id, notice: limited });
+			progress.report(new vscode.LanguageModelTextPart(limited));
+			return;
+		}
 
 		const config = this.getConfig();
 		const cwd = normalizeCodexRuntimeCwd(
@@ -1077,13 +1124,27 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const storedActiveTurn = continuationMatch
 			? this.activeToolTurns.get(continuationMatch.callId)
 			: undefined;
-		const activeTurn = canResumeCodexToolTurn(storedActiveTurn, {
+		const resumable = canResumeCodexToolTurn(storedActiveTurn, {
 			modelId: model.id,
 			runtimeKey,
 			processGeneration: this.client.generation,
-		})
-			? storedActiveTurn
-			: undefined;
+		});
+		// New tools mid-turn come from an explicit activation (activate_* groups, a late MCP server);
+		// the running thread can never call them, so the turn continues in a new thread.
+		const toolsMissingFromTurn = resumable && storedActiveTurn
+			? codexToolsMissingFromThread(storedActiveTurn, dynamicToolSet.callableNames)
+			: [];
+		const activeTurn = resumable && toolsMissingFromTurn.length === 0 ? storedActiveTurn : undefined;
+		const requireFullCatalog = toolsMissingFromTurn.length > 0 || !copilotToolGroupingEnabled();
+		if (toolsMissingFromTurn.length > 0) {
+			this.logSink?.log("codex.chat.tool_catalog_restart", {
+				threadId: storedActiveTurn?.bridge.threadId,
+				turnId: storedActiveTurn?.bridge.turnId,
+				callId: continuationMatch?.callId,
+				addedToolCount: toolsMissingFromTurn.length,
+				addedTools: toolsMissingFromTurn.slice(0, 20),
+			}, "warn");
+		}
 		if (activeTurn && activeTurn.runtimeKey !== runtimeKey) {
 			this.logSink?.log("codex.chat.runtime_change_deferred", {
 				threadId: activeTurn.bridge.threadId,
@@ -1105,6 +1166,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		if (storedActiveTurn && !activeTurn) {
 			this.abandonActiveToolTurn(storedActiveTurn, "abandoned");
+			if (toolsMissingFromTurn.length > 0) {
+				// These results travel to the new thread with the handoff; later requests still carry them.
+				for (const match of continuationMatches) { this.staleToolCalls.delete(match.callId); }
+			}
 		}
 		let interruptedContinuation: RecoverableInterruptedCodexThread | undefined;
 		if (!activeTurn && !continuationMatch && copilotConversationId) {
@@ -1131,6 +1196,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				copilotConversationId,
 				copilotTurnIndex
 			);
+		}
+		if (interruptedContinuation && requireFullCatalog
+			&& codexToolsMissingFromThread(interruptedContinuation, dynamicToolSet.callableNames).length > 0) {
+			this.logSink?.log("codex.chat.tool_catalog_restart", { threadId: interruptedContinuation.threadId, reason: "interrupted-thread" }, "warn");
+			interruptedContinuation = undefined;
 		}
 		const providerSwitched = !activeTurn && isProviderSwitch(options.modelOptions);
 		if (providerSwitched) {
@@ -1194,6 +1264,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				}
 				if (candidate.runtimeKey !== runtimeKey) {
 					countReuseMiss("runtime-changed");
+					continue;
+				}
+				if (requireFullCatalog && codexToolsMissingFromThread(candidate, dynamicToolSet.callableNames).length > 0) {
+					countReuseMiss("tool-catalog-grew");
 					continue;
 				}
 				if (candidate.ephemeral && candidate.processGeneration !== this.client.generation) {
@@ -1625,6 +1699,18 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 						inputMode,
 						activeTurn: Boolean(activeTurn),
 					});
+					const limit = detectLimitError(normalized, "codex");
+					if (limit) {
+						this.limitGate.note("codex", limit);
+						this.logSink?.log("codex.chat.limit_reached", {
+							threadId,
+							stage: "turn-request",
+							window: limit.window,
+							resetsAt: limit.resetAt?.toISOString(),
+						}, "warn");
+						progress.report(new vscode.LanguageModelTextPart(formatLimitNotice("codex", limit)));
+						return;
+					}
 					throw normalized;
 				}
 			}
@@ -1673,13 +1759,26 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			const completed = outcome.completed;
 			if (completed.turn.status === "failed") {
 				const error = new Error(completed.turn.error?.message || "Codex turn failed");
+				const limit = detectLimitError(error, "codex");
 				this.logSink?.logError("codex.chat.failed", error, {
 					threadId,
 					turnId: completed.turn.id,
 					inputMode,
 					recoveryEligible: Boolean(activeTurn)
+						&& !limit
 						&& shouldRecoverCodexFailedToolTurn(completed.turn.error?.message),
 				});
+				if (limit) {
+					// Waiting is the only useful action: remember the reset and answer with one line.
+					this.limitGate.note("codex", limit);
+					this.logSink?.log("codex.chat.limit_reached", {
+						threadId,
+						window: limit.window,
+						resetsAt: limit.resetAt?.toISOString(),
+					}, "warn");
+					progress.report(new vscode.LanguageModelTextPart(formatLimitNotice("codex", limit)));
+					return;
+				}
 				throw error;
 			}
 			if (completed.turn.status === "interrupted" || token.isCancellationRequested) {
@@ -1763,6 +1862,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			});
 			const finalText = bridge.segmentText;
 			if (finalText.trim()) {
+				this.limitGate.clear("codex");
 				await this.rememberConversationThread({
 					threadId,
 					ephemeral: bridge.ephemeral,
@@ -3074,6 +3174,23 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	private selectRateLimit(response: CodexRateLimitsResponse) {
 		return response.rateLimitsByLimitId?.codex ?? response.rateLimits;
+	}
+
+	/** Keeps the fail-fast gate aligned with the provider's own window report. */
+	private syncLimitGate(snapshot: CodexRateLimitSnapshot | undefined): void {
+		const window = snapshot?.primary;
+		if (!window || !Number.isFinite(window.usedPercent)) {
+			return;
+		}
+		if (window.usedPercent < 100 && !snapshot?.rateLimitReachedType) {
+			this.limitGate.clear("codex");
+			return;
+		}
+		this.limitGate.note("codex", {
+			provider: "codex",
+			reason: "usage limit",
+			...(window.resetsAt ? { resetAt: new Date(window.resetsAt * 1_000) } : {}),
+		});
 	}
 
 	private setStatus(status: CodexProviderStatus): CodexProviderStatus {

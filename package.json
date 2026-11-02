@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.8",
+	"version": "1.20.12",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -1189,7 +1189,7 @@
 				"name": "llamacpp_wait_for_terminal",
 				"displayName": "Wait for Terminal Command",
 				"toolReferenceName": "waitForTerminal",
-				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished â€” no future notification will arrive and only the safety timeout would resolve.",
+				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no future notification will arrive and only the safety timeout would resolve.",
 				"userDescription": "Wait for a running terminal command finished notification.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(watch)",

@@ -4,10 +4,26 @@ import type { ClaudeChatModelProvider } from "./claude/claude-provider";
 import type { CocoChatModelProvider } from "./coco/coco-provider";
 import { ProviderRegistry, ownsHttpModel, providerSourceId, type ChatProviderRegistration } from "./providers/provider-registry";
 import type { ConversationHistory } from "./providers/conversation-history";
+import { detectLimitError, formatLimitNotice, type LimitProvider, type LimitMatch } from "./providers/limit-errors";
+import { detectBalanceError, formatBalanceNotice } from "./providers/balance-errors";
 import { PROVIDER_SWITCH_OPTION } from "./providers/provider-switch";
 
 interface CompositeProviderOptions { providers: readonly ChatProviderRegistration[]; history: ConversationHistory }
+/** Maps an escaped provider error to a subscription limit, using the model id as the provider hint. */
+function resolveLimit(modelId: string, error: unknown): LimitMatch | undefined {
+	const hint: LimitProvider | undefined = modelId.startsWith("claude::") ? "claude" : modelId.startsWith("codex::") ? "codex" : undefined;
+	return detectLimitError(error, hint);
+}
 
+function providerLabelForModel(modelId: string): string {
+	const prefix = modelId.includes("::") ? modelId.slice(0, modelId.indexOf("::")) : "";
+	return prefix === "deepseek" ? "DeepSeek"
+		: prefix === "claude" ? "Claude"
+			: prefix === "codex" ? "Codex"
+				: prefix === "coco" ? "Coco"
+					: prefix === "api" ? "Provider"
+						: prefix && prefix !== "local" ? prefix.charAt(0).toUpperCase() + prefix.slice(1) : "Provider";
+}
 /** Combines independent transports under the existing picker-compatible vendor. */
 export class CompositeChatModelProvider implements vscode.LanguageModelChatProvider, vscode.Disposable {
 	readonly registry: ProviderRegistry;
@@ -86,7 +102,23 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 			history ? { report: part => { emitted.push(part); progress.report(part); } } : progress,
 			token
 		); } catch (error) { failed = true; providerError = error; }
-		// A request that failed before any output (an exhausted limit) did not take the chat over.
+			if (failed) {
+				// A subscription limit or an empty balance escapes as an error only when a provider
+				// could not answer itself; the short notice keeps the host from retrying.
+				const balance = detectBalanceError(providerError, providerLabelForModel(model.id));
+				if (balance) {
+					const notice = new vscode.LanguageModelTextPart(formatBalanceNotice(balance));
+					emitted.push(notice); progress.report(notice);
+					failed = false;
+				}
+				const limit = resolveLimit(model.id, providerError);
+				if (limit) {
+					const notice = new vscode.LanguageModelTextPart(formatLimitNotice(limit.provider, limit));
+					emitted.push(notice); progress.report(notice);
+					failed = false;
+				}
+			}
+			// A request that failed before any output (an exhausted limit) did not take the chat over.
 		try { await history?.complete(emitted, emitted.length > 0 || !failed ? model.id : undefined); }
 		catch (error) { if (usesHistory && !failed) { throw new Error("Cannot save the local handoff transcript. Check workspace storage before reloading.", { cause: error }); } this.warnHistory(); }
 		if (failed) { throw providerError; }

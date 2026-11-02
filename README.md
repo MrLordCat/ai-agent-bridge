@@ -155,16 +155,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md),
 [provider architecture](docs/PROVIDER_ARCHITECTURE.md), and
 [Quick Access](docs/QUICK_ACCESS.md) for the current maintenance contracts.
 
-**Stable release: 1.20.0. Current build: 1.20.8.**
+**Stable release: 1.20.0. Current build: 1.20.12.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 869 extension-host tests in the current 1.20.8 build
+npm test              # 896 extension-host tests in the current 1.20.12 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-1.20.8.vsix --force
+code --install-extension ./llama-vscode-chat-1.20.12.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

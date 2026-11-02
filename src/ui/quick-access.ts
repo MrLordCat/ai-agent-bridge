@@ -1185,6 +1185,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("graph"),
 					command: command("llamacpp.openSessionReport", "Open Live Report"),
 				}),
+				new QuickAccessItem("diagnostics.subscriptions", "Subscription Tokens", {
+					description: "Codex & Claude windows",
+					tooltip: "Input, output, cache hits and misses per 5-hour and weekly subscription window in the Subscriptions tab of the Live Report.",
+					icon: new vscode.ThemeIcon("credit-card"),
+					command: command("llamacpp.openSessionReport", "Open Subscriptions"),
+				}),
 				new QuickAccessItem("diagnostics.resetSession", "Reset Session Metrics", {
 					icon: new vscode.ThemeIcon("clear-all"),
 					command: command("llamacpp.resetSessionReport", "Reset Session Metrics"),
