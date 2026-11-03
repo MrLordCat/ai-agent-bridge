@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import * as path from "node:path";
 import * as vscode from "vscode";
 
@@ -110,6 +110,15 @@ export function resolveBundledCodexCliPath(): string | undefined {
 	return existsSync(candidate) ? candidate : undefined;
 }
 
+export interface CodexAppServerOptions {
+	/** Codex home for this account; the built-in account keeps the process default (~/.codex). */
+	codexHome?: string;
+	/** CLI override for this account only; falls back to llamacpp.codexCliPath. */
+	cliPath?: string;
+	/** Label used in logs, e.g. "work". */
+	accountLabel?: string;
+}
+
 export class CodexAppServerClient implements vscode.Disposable {
 	private readonly notifications = new vscode.EventEmitter<CodexServerNotification>();
 	readonly onNotification = this.notifications.event;
@@ -118,6 +127,7 @@ export class CodexAppServerClient implements vscode.Disposable {
 
 	private readonly lineBuffer = new JsonLineBuffer();
 	private readonly pending = new Map<JsonRpcId, PendingRequest>();
+	private readonly options: CodexAppServerOptions;
 	private process: ChildProcessWithoutNullStreams | undefined;
 	private startPromise: Promise<void> | undefined;
 	private nextRequestId = 1;
@@ -127,8 +137,11 @@ export class CodexAppServerClient implements vscode.Disposable {
 
 	constructor(
 		private readonly clientVersion: string,
-		private readonly logSink?: LlamaLogSink
-	) {}
+		private readonly logSink?: LlamaLogSink,
+		options: CodexAppServerOptions = {}
+	) {
+		this.options = options;
+	}
 
 	setServerRequestHandler(handler: CodexServerRequestHandler): void {
 		this.requestHandler = handler;
@@ -180,11 +193,29 @@ export class CodexAppServerClient implements vscode.Disposable {
 	}
 
 	private async start(): Promise<void> {
-		const configuredPath = vscode.workspace.getConfiguration("llamacpp").get<string>("codexCliPath", "").trim();
+		const configuredPath = this.options.cliPath?.trim()
+			|| vscode.workspace.getConfiguration("llamacpp").get<string>("codexCliPath", "").trim();
 		const executable = configuredPath || resolveBundledCodexCliPath() || "codex";
+		// A named account needs its own home; Codex refuses a home that does not exist.
+		// File credentials keep the two logins from collapsing into one keyring entry,
+		// and writing them into a fresh config.toml avoids CLI flags older versions reject.
+		const env: NodeJS.ProcessEnv = { ...process.env };
+		if (this.options.codexHome) {
+			const configPath = path.join(this.options.codexHome, "config.toml");
+			try {
+				mkdirSync(this.options.codexHome, { recursive: true });
+				if (!existsSync(configPath)) {
+					writeFileSync(configPath, 'cli_auth_credentials_store = "file"\n', "utf8");
+					this.logSink?.log("codex.app_server.home_initialized", { home: this.options.codexHome });
+				}
+			} catch (error) {
+				this.logSink?.logError("codex.app_server.home_create_failed", error);
+			}
+			env.CODEX_HOME = this.options.codexHome;
+		}
 		const child = spawn(executable, ["app-server", "--stdio"], {
 			cwd: vscode.workspace.workspaceFolders?.[0]?.uri.fsPath,
-			env: process.env,
+			env,
 			stdio: ["pipe", "pipe", "pipe"],
 			windowsHide: true,
 		});
@@ -256,7 +287,7 @@ export class CodexAppServerClient implements vscode.Disposable {
 			);
 			this.notify("initialized", {});
 			this.processGeneration++;
-			this.logSink?.log("codex.app_server.started", { executable });
+			this.logSink?.log("codex.app_server.started", { executable, account: this.options.accountLabel });
 		} catch (error) {
 			this.stopProcess(error instanceof Error ? error : new Error(String(error)));
 			throw error;

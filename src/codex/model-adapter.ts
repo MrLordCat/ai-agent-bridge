@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { modelInformation } from "../providers/model-descriptor";
+import { encodeCodexAccountModelId } from "./accounts";
 
 import type { CodexModel, CodexRateLimitSnapshot, CodexRateLimitWindow } from "./protocol";
 
@@ -59,12 +60,14 @@ export function createCodexReasoningConfigurationSchema(model: CodexModel): Code
 export function mapCodexModelInformation(
 	model: CodexModel,
 	contextLength: number,
-	maxOutputTokens: number
+	maxOutputTokens: number,
+	account?: { accountId?: string; accountLabel?: string }
 ): vscode.LanguageModelChatInformation {
 	const outputTokens = Math.max(1024, Math.min(contextLength - 1, Math.floor(maxOutputTokens)));
+	const label = account?.accountLabel ?? "";
 	const info = modelInformation({
-		id: encodeCodexModelId(model.id),
-		name: `${model.displayName} (Codex)` ,
+		id: encodeCodexAccountModelId(account?.accountId ?? "", model.id),
+		name: `${model.displayName} (Codex)${label}`,
 		family: "codex",
 		version: model.model || model.id,
 		contextWindowTokens: contextLength,

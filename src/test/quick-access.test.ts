@@ -385,6 +385,40 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.strictEqual(keepAlive?.command?.command, "llamacpp.toggleClaudeCacheKeepAlive");
 	});
 
+	test("offers per-account Codex sign-in, switching, adding and removal", async () => {
+		const provider = new LlamaQuickActionsProvider({
+			getCodexAccounts: () => [
+				{ id: "", label: "Default", active: true, state: "connected", summary: "Connected (Plus)" },
+				{ id: "work", label: "Work", active: false, state: "signedOut", summary: "Sign in required" },
+			],
+		});
+		const codex = (await getItems(provider)).find(item => labelOf(item) === "Codex");
+		assert.ok(codex);
+		const accounts = (await getItems(provider, codex)).find(item => labelOf(item) === "ChatGPT Accounts");
+		assert.ok(accounts, "the accounts group is present even with one account, so a second one can be added");
+		assert.strictEqual(accounts.description, "Active: Default · 2 total");
+
+		const children = await getItems(provider, accounts);
+		assert.deepStrictEqual(children.map(labelOf), ["Default", "Work", "Add Account…"]);
+		const add = children.find(item => labelOf(item) === "Add Account…");
+		assert.strictEqual(add?.command?.command, "llamacpp.addCodexAccount");
+
+		const work = children.find(item => labelOf(item) === "Work");
+		assert.ok(work);
+		assert.strictEqual(work.command?.command, "llamacpp.selectCodexAccount");
+		assert.deepStrictEqual(work.command?.arguments, [{ accountId: "work" }]);
+		const workChildren = await getItems(provider, work);
+		assert.deepStrictEqual(workChildren.map(labelOf), ["Sign In", "Sign Out", "Remove Account"]);
+		assert.strictEqual(workChildren[0].command?.command, "llamacpp.codexAccountSignIn");
+		assert.strictEqual(workChildren[2].command?.command, "llamacpp.removeCodexAccount");
+
+		const primary = children.find(item => labelOf(item) === "Default");
+		assert.ok(primary);
+		const primaryChildren = await getItems(provider, primary);
+		assert.deepStrictEqual(primaryChildren.map(labelOf), ["Sign In Again", "Sign Out"],
+			"the built-in account cannot be removed");
+	});
+
 	test("keeps the Codex Usage Limit row as an endpoint fallback only", async () => {
 		// Mirrors the duplicated sidebar seen with a live Plus plan: the explicit
 		// Session/Weekly rows already carry percent used and reset time.

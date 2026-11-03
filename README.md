@@ -111,6 +111,44 @@ Command names above use the **AI Agent Bridge:** prefix. Accounts, model access
 and server availability are required separately. API keys are stored in VS Code
 SecretStorage; subscription sign-in is handled by the corresponding runtime.
 
+### Two ChatGPT subscriptions in one window
+
+Codex keeps every credential, thread and limit window under `CODEX_HOME`
+(`~/.codex` by default). Adding an account gives it its own home and its own
+Codex process, so both logins coexist.
+
+Open Quick Access → **Codex** → **ChatGPT Accounts** and pick **Add Account…**:
+enter a short id (`work`) and a name, and the window offers to reload. After the
+reload the ChatGPT sign-in page opens by itself, and the new account is already
+the active one. The same group holds everything afterwards:
+
+- each account has **Sign In** (or **Sign In Again**) and **Sign Out** of its
+  own; signing out of one keeps the other signed in;
+- selecting an account makes it the active one, and its models replace the
+  others in the chat model picker immediately;
+- **Remove Account** takes an account out of the list; its `~/.codex-<id>`
+  folder and login stay on disk, so adding the same id again restores them;
+- threads, the last used model and the usage windows are tracked per account,
+  so the Subscriptions tab reports each subscription separately;
+- `llamacpp.codexShowAllAccounts` shows every account's models at once, with
+  the account name in the model label.
+
+Accounts can also be declared by hand in settings; the home defaults to
+`~/.codex-<id>` and is created on first use:
+
+```json
+"llamacpp.codexAccounts": [
+  { "id": "work", "label": "Work" }
+]
+```
+
+Reload the window after editing the list by hand.
+
+A chat that already uses a model of the previously active account keeps
+working; only the picker follows the active account. The built-in account keeps
+the historical `codex::` model ids, so existing chats and settings are
+unchanged.
+
 Coco uses the CLI's credentials, so it may require a separate browser sign-in.
 Its commands run in visible `Coco` terminals where you can type, interrupt or
 close them. Images and reasoning choices depend on the connected runtime.
@@ -155,16 +193,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md),
 [provider architecture](docs/PROVIDER_ARCHITECTURE.md), and
 [Quick Access](docs/QUICK_ACCESS.md) for the current maintenance contracts.
 
-**Stable release: 1.20.0. Current build: 1.20.12.**
+**Stable release: 1.20.0. Current build: 1.20.14.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 896 extension-host tests in the current 1.20.12 build
+npm test              # 905 extension-host tests in the current 1.20.14 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-1.20.12.vsix --force
+code --install-extension ./llama-vscode-chat-1.20.14.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

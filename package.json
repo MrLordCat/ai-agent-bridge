@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.12",
+	"version": "1.20.14",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -171,6 +171,44 @@
 					"type": "string",
 					"default": "",
 					"description": "Optional path to the Codex CLI executable. Empty uses the CLI bundled with the official OpenAI VS Code extension, then falls back to codex on PATH."
+				},
+				"llamacpp.codexAccounts": {
+					"type": "array",
+					"default": [],
+					"items": {
+						"type": "object",
+						"required": ["id"],
+						"properties": {
+							"id": {
+								"type": "string",
+								"pattern": "^[a-z0-9][a-z0-9_-]{0,31}$",
+								"description": "Short account id used in model ids (for example work)."
+							},
+							"label": {
+								"type": "string",
+								"description": "Name shown in Quick Access and in the model picker."
+							},
+							"codexHome": {
+								"type": "string",
+								"description": "Codex home for this account. Empty uses ~/.codex-<id>, which Codex creates on first use."
+							},
+							"cliPath": {
+								"type": "string",
+								"description": "Optional Codex CLI path for this account only."
+							}
+						}
+					},
+					"description": "Extra ChatGPT subscriptions for Codex. Each account runs its own Codex app-server with its own CODEX_HOME, so the logins, threads and usage windows stay separate. The built-in account (~/.codex) is always available and keeps the historical model ids. Sign in per account from Quick Access Ã¢â€ â€™ Codex Ã¢â€ â€™ ChatGPT Accounts."
+				},
+				"llamacpp.codexActiveAccount": {
+					"type": "string",
+					"default": "",
+					"description": "Id of the Codex account whose models appear in the chat model picker. Empty means the built-in account (~/.codex). Switch it from Quick Access Ã¢â€ â€™ Codex Ã¢â€ â€™ ChatGPT Accounts."
+				},
+				"llamacpp.codexShowAllAccounts": {
+					"type": "boolean",
+					"default": false,
+					"description": "Show the models of every Codex account in the picker instead of only the active account's models. Each model name carries the account label."
 				},
 				"llamacpp.sharedContextLength": {
 					"type": "integer",
@@ -1189,7 +1227,7 @@
 				"name": "llamacpp_wait_for_terminal",
 				"displayName": "Wait for Terminal Command",
 				"toolReferenceName": "waitForTerminal",
-				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â no future notification will arrive and only the safety timeout would resolve.",
+				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â no future notification will arrive and only the safety timeout would resolve.",
 				"userDescription": "Wait for a running terminal command finished notification.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(watch)",
@@ -1259,6 +1297,26 @@
 			{
 				"command": "llamacpp.codexSignIn",
 				"title": "AI Agent Bridge: Sign In to Codex Subscription"
+			},
+			{
+				"command": "llamacpp.selectCodexAccount",
+				"title": "AI Agent Bridge: Switch Codex Account"
+			},
+			{
+				"command": "llamacpp.addCodexAccount",
+				"title": "AI Agent Bridge: Add Codex Account"
+			},
+			{
+				"command": "llamacpp.removeCodexAccount",
+				"title": "AI Agent Bridge: Remove Codex Account"
+			},
+			{
+				"command": "llamacpp.codexAccountSignIn",
+				"title": "AI Agent Bridge: Sign In to a Codex Account"
+			},
+			{
+				"command": "llamacpp.codexAccountSignOut",
+				"title": "AI Agent Bridge: Sign Out of a Codex Account"
 			},
 			{
 				"command": "llamacpp.codexSignOut",

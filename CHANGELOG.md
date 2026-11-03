@@ -1,5 +1,40 @@
 # Changelog
 
+## 1.20.14 (dev patch) - 2026-11-03
+
+- A second ChatGPT subscription can be added without touching settings: Quick
+  Access → Codex → **ChatGPT Accounts** → **Add Account…** asks for an id and a
+  name, stores it, makes it the active account and offers to reload. After the
+  reload the sign-in page opens by itself; a failed deferred sign-in now shows
+  an error that points back to the same group.
+- The accounts group is always visible, including with a single account, so
+  per-account **Sign In** and **Sign Out** are discoverable from the start.
+- **Remove Account** deletes a named account from the list (its folder and
+  login stay on disk) and moves the picker back to the built-in account when
+  the removed one was active.
+
+## 1.20.13 (dev patch) - 2026-11-03
+
+- Two ChatGPT subscriptions can run side by side. `llamacpp.codexAccounts`
+  lists extra accounts; each gets its own `CODEX_HOME` (default
+  `~/.codex-<id>`), its own Codex app-server process and its own file-based
+  credential store, so the logins, native threads, last used model and usage
+  windows never mix. The built-in account keeps `~/.codex` and the historical
+  `codex::<model>` ids, so existing chats are unaffected.
+- Quick Access → Codex → ChatGPT Accounts shows every account with its own
+  **Sign In** and **Sign Out** and switches the active account in one click.
+  Switching re-announces the model catalogs, so the picker immediately shows
+  the new account's models; a chat already using the other account's model
+  keeps working. `llamacpp.codexShowAllAccounts` lists every account at once
+  with the account name in the model label.
+- Each account reports its own subscription windows to the Subscriptions tab
+  (`codex` plus `codex:<id>`), so two plans are compared instead of merged.
+- New commands: **Switch Codex Account**, **Sign In to a Codex Account**,
+  **Sign Out of a Codex Account**.
+- Codex sign-in no longer needs the official VS Code extension: the bridge
+  already drives the app-server `account/login/start` ChatGPT flow, and any
+  Codex CLI can be used through `llamacpp.codexCliPath`.
+
 ## 1.20.12 (dev patch) - 2026-11-02
 
 - An empty provider balance no longer produces a failed request and repeated

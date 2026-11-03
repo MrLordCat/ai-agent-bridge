@@ -17,6 +17,15 @@ import { setSubagentModelProfiles } from "../subagent-guidance";
 import { asRecord, formatShortResetTime, normalizeCopilotTurnIndex, truncate } from "../utils";
 import { CodexAppServerClient, CodexAppServerError, type CodexServerRequest } from "./app-server-client";
 import {
+	CODEX_DEFAULT_ACCOUNT,
+	codexAccountLabelSuffix,
+	codexAccountStateKey,
+	decodeCodexAccountModelId,
+	resolveActiveCodexAccountSetting,
+	type CodexAccountIdentity,
+} from "./accounts";
+import {
+	codexModelsCachePath,
 	readCodexModelsCache,
 	resolveCodexFollowTarget,
 	type CodexFollowTarget,
@@ -48,7 +57,6 @@ import {
 	formatCodexRateLimit,
 	formatCodexWindowDuration,
 	summarizeCodexRateLimits,
-	decodeCodexModelId,
 	mapCodexModelInformation,
 	resolveCodexReasoningEffort,
 } from "./model-adapter";
@@ -666,17 +674,24 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		extensionVersion: string,
 		private readonly logSink?: LlamaLogSink,
 		private readonly workspaceState?: vscode.Memento,
-		private readonly globalState?: vscode.Memento
+		private readonly globalState?: vscode.Memento,
+		/** Built-in (default) account unless a named CODEX_HOME is configured. */
+		private readonly account: CodexAccountIdentity = CODEX_DEFAULT_ACCOUNT
 	) {
-		this.client = new CodexAppServerClient(extensionVersion, logSink);
+		this.client = new CodexAppServerClient(extensionVersion, logSink, {
+			codexHome: account.codexHome,
+			cliPath: account.cliPath,
+			accountLabel: account.id || undefined,
+		});
 		this.client.setServerRequestHandler(request => this.handleServerRequest(request));
 		this.loadDurableConversationThreads();
 		this.loadPendingRollover();
 		// 1.20.2 stored the model per workspace; the global value wins, the workspace one migrates it.
-		this.followedModelId = parseStoredModelId(this.globalState?.get<unknown>(CODEX_LAST_MODEL_STATE_KEY))
-			?? parseStoredModelId(this.workspaceState?.get<unknown>(CODEX_LAST_MODEL_STATE_KEY));
-		if (this.followedModelId && this.globalState && this.globalState.get<unknown>(CODEX_LAST_MODEL_STATE_KEY) === undefined) {
-			void Promise.resolve(this.globalState.update(CODEX_LAST_MODEL_STATE_KEY, this.followedModelId))
+		const lastModelKey = this.stateKey(CODEX_LAST_MODEL_STATE_KEY);
+		this.followedModelId = parseStoredModelId(this.globalState?.get<unknown>(lastModelKey))
+			?? parseStoredModelId(this.workspaceState?.get<unknown>(lastModelKey));
+		if (this.followedModelId && this.globalState && this.globalState.get<unknown>(lastModelKey) === undefined) {
+			void Promise.resolve(this.globalState.update(lastModelKey, this.followedModelId))
 				.catch(error => this.logSink?.logError("codex.last_model.persist_failed", error));
 		}
 		void this.reloadCatalogContextWindows();
@@ -698,6 +713,19 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	get accountSummary(): string {
 		return this.status.summary;
+	}
+
+	/** Account identity: empty id is the built-in ~/.codex login. */
+	get accountId(): string {
+		return this.account.id;
+	}
+
+	get accountLabel(): string {
+		return this.account.label;
+	}
+
+	get providerStatus(): CodexProviderStatus {
+		return this.status;
 	}
 
 	get subscriptionUsageSummary(): string | undefined {
@@ -918,7 +946,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				armedAt: Date.now(),
 			};
 			await Promise.resolve(
-				this.workspaceState.update(CODEX_PENDING_ROLLOVER_STATE_KEY, this.pendingRollover)
+				this.workspaceState.update(this.stateKey(CODEX_PENDING_ROLLOVER_STATE_KEY), this.pendingRollover)
 			);
 			this.logSink?.log("codex.chat.rollover_armed", {
 				threadId: candidate.threadId,
@@ -941,6 +969,11 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	): Promise<vscode.LanguageModelChatInformation[]> {
 		if (!this.isEnabled() || token.isCancellationRequested) {
 			this.setStatus({ state: "disabled", summary: "Off" });
+			return [];
+		}
+		// The picker lists the active account only unless every account is shown;
+		// the other providers stay registered, so an open chat keeps working.
+		if (!this.isVisibleInCatalog()) {
 			return [];
 		}
 		if (
@@ -1017,7 +1050,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		token: vscode.CancellationToken
 	): Promise<void> {
 		const account = await this.requireSubscriptionAccount();
-		const codexModelId = decodeCodexModelId(modelInfo.id);
+		const codexModelId = decodeCodexAccountModelId(modelInfo.id, this.account.id);
 		if (!codexModelId) {
 			throw new Error(`Invalid Codex provider model id: ${modelInfo.id}`);
 		}
@@ -2533,7 +2566,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	}
 
 	private loadDurableConversationThreads(): void {
-		const stored = this.workspaceState?.get<unknown>(CODEX_DURABLE_CONVERSATION_STATE_KEY);
+		const stored = this.workspaceState?.get<unknown>(this.stateKey(CODEX_DURABLE_CONVERSATION_STATE_KEY));
 		if (!Array.isArray(stored)) {
 			return;
 		}
@@ -2584,7 +2617,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	}
 
 	private loadPendingRollover(): void {
-		const candidate = this.workspaceState?.get<unknown>(CODEX_PENDING_ROLLOVER_STATE_KEY);
+		const candidate = this.workspaceState?.get<unknown>(this.stateKey(CODEX_PENDING_ROLLOVER_STATE_KEY));
 		if (!candidate || typeof candidate !== "object") {
 			return;
 		}
@@ -2596,7 +2629,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			|| Date.now() - entry.armedAt > CODEX_PENDING_ROLLOVER_TTL_MS
 		) {
 			void Promise.resolve(
-				this.workspaceState?.update(CODEX_PENDING_ROLLOVER_STATE_KEY, undefined)
+				this.workspaceState?.update(this.stateKey(CODEX_PENDING_ROLLOVER_STATE_KEY), undefined)
 			).catch(error => this.logSink?.logError("codex.rollover_state.clear_failed", error));
 			return;
 		}
@@ -2618,7 +2651,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.pendingRollover = undefined;
 		if (this.workspaceState) {
 			await Promise.resolve(
-				this.workspaceState.update(CODEX_PENDING_ROLLOVER_STATE_KEY, undefined)
+				this.workspaceState.update(this.stateKey(CODEX_PENDING_ROLLOVER_STATE_KEY), undefined)
 			);
 		}
 	}
@@ -2646,7 +2679,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				lastUsedAt: conversation.lastUsedAt,
 			}));
 		try {
-			await this.workspaceState.update(CODEX_DURABLE_CONVERSATION_STATE_KEY, entries);
+			await this.workspaceState.update(this.stateKey(CODEX_DURABLE_CONVERSATION_STATE_KEY), entries);
 			this.logSink?.log("codex.session_state.persisted", {
 				threadCount: entries.length,
 				threadIds: entries.map(entry => entry.threadId),
@@ -2746,13 +2779,14 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			DEFAULT_CODEX_MAX_OUTPUT_TOKENS
 		);
 		const models = [...this.models.values()];
+		const labelSuffix = codexAccountLabelSuffix(this.account);
 		const rateLimitReached = this.isCodexRateLimitReached();
 		setSubagentModelProfiles("codex", models.map(model => ({
 			id: model.id,
 			// Match the model-picker label exactly (`${displayName} (Codex)`) so a
 			// subagent model= value resolves in the picker instead of being
 			// rejected or silently falling back to Auto.
-			label: `${model.displayName} (Codex)`,
+			label: `${model.displayName} (Codex)${labelSuffix}`,
 			provider: "codex",
 			defaultEffort: "high",
 			availability: rateLimitReached ? "unavailable" : "available",
@@ -2769,8 +2803,23 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			followCodex
 				? this.resolveModelContextWindow(model.id, config)
 				: Math.min(this.resolveModelContextWindow(model.id, config), sharedLimit),
-			maxOutputTokens
+			maxOutputTokens,
+			{ accountId: this.account.id, accountLabel: labelSuffix }
 		));
+	}
+
+	/** Durable state is per account, so two ChatGPT subscriptions never share a thread. */
+	private stateKey(baseKey: string): string {
+		return codexAccountStateKey(baseKey, this.account.id);
+	}
+
+	/** The active account owns the picker; named accounts can be hidden outright. */
+	private isVisibleInCatalog(): boolean {
+		const config = this.getConfig();
+		if (config.get<boolean>("codexShowAllAccounts", false) === true) {
+			return true;
+		}
+		return this.account.id === resolveActiveCodexAccountSetting(config);
 	}
 
 	private resolveModelContextWindow(modelId: string, config = this.getConfig()): number {
@@ -2803,7 +2852,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private followModel(modelId: string): void {
 		if (this.followedModelId !== modelId) {
 			this.followedModelId = modelId;
-			void Promise.resolve(this.globalState?.update(CODEX_LAST_MODEL_STATE_KEY, modelId))
+			void Promise.resolve(this.globalState?.update(this.stateKey(CODEX_LAST_MODEL_STATE_KEY), modelId))
 				.catch(error => this.logSink?.logError("codex.last_model.persist_failed", error));
 		}
 		this.publishFollowedContext();
@@ -2829,7 +2878,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private reloadCatalogContextWindows(fireChanges = true): Promise<boolean> {
 		this.catalogReload ??= (async () => {
 			try {
-				const snapshot = await readCodexModelsCache(undefined, this.catalogMtimeMs);
+				const snapshot = await readCodexModelsCache(
+					codexModelsCachePath(this.account.codexHome ? { ...process.env, CODEX_HOME: this.account.codexHome } : process.env),
+					this.catalogMtimeMs
+				);
 				if (!snapshot || this.disposed) {
 					return false;
 				}

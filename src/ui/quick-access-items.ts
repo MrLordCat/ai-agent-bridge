@@ -25,7 +25,9 @@ export class QuickAccessItem extends vscode.TreeItem {
 	}
 }
 
-export function command(command: string, title: string): vscode.Command { return { command, title }; }
+export function command(command: string, title: string, ...args: unknown[]): vscode.Command {
+	return args.length ? { command, title, arguments: [...args] } : { command, title };
+}
 
 export function toggleIcon(enabled: boolean): vscode.ThemeIcon {
 	return new vscode.ThemeIcon(enabled ? "pass-filled" : "circle-slash", new vscode.ThemeColor(enabled ? "testing.iconPassed" : "disabledForeground"));

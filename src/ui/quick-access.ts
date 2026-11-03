@@ -68,6 +68,14 @@ export interface QuickAccessCocoStatus extends CocoProviderStatus {
 	thinkingLevels?: readonly string[];
 }
 
+export interface QuickAccessCodexAccount {
+	id: string;
+	label: string;
+	active: boolean;
+	state: string;
+	summary: string;
+}
+
 export interface QuickAccessDependencies {
 	getLastThroughput?: () => string | undefined;
 	getLastContextUsage?: () => QuickAccessContextUsage | undefined;
@@ -100,6 +108,8 @@ export interface QuickAccessDependencies {
 	getTotalMemoryCount?: () => number | undefined;
 	getApiProviders?: () => Promise<readonly QuickAccessApiProvider[]>;
 	getCodexUsageLimits?: () => readonly { label: string; description: string }[];
+	/** Every configured Codex account; the active one owns the model picker. */
+	getCodexAccounts?: () => readonly QuickAccessCodexAccount[];
 	getCocoStatus?: () => QuickAccessCocoStatus | undefined;
 	getProviderSnapshots?: () => ReadonlyMap<string, ProviderSnapshot>;
 	getUpdateStatus?: () => UpdateStatus | undefined;
@@ -563,6 +573,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 	private get getTotalMemoryCount() { return this.dependencies.getTotalMemoryCount ?? (() => undefined); }
 	private get getApiProviders() { return this.dependencies.getApiProviders ?? (async () => []); }
 	private get getCodexUsageLimits() { return this.dependencies.getCodexUsageLimits ?? (() => []); }
+	private get getCodexAccounts() { return this.dependencies.getCodexAccounts ?? (() => []); }
 	private get getCocoStatus() { return this.dependencies.getCocoStatus ?? (() => undefined); }
 
 	refresh(): void {
@@ -819,6 +830,41 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		// «Usage Limit» is only a fallback for when the rate-limits endpoint has no
 		// window data — otherwise it repeats the explicit Session/Weekly rows.
 		const codexUsageLimits = this.getCodexUsageLimits();
+		const codexAccounts = this.getCodexAccounts();
+		const activeCodexAccount = codexAccounts.find(account => account.active) ?? codexAccounts[0];
+		const codexAccountItems = codexAccounts.map(account => {
+			const accountId = account.id;
+			const signedIn = account.state === "connected";
+			return new QuickAccessItem(`codex.account.${account.id || "default"}`, account.label, {
+				description: account.active ? `Active · ${account.summary}` : account.summary,
+				tooltip: account.active
+					? `${account.label} owns the Codex model picker. Its models are the ones shown in chat.`
+					: `Switch to ${account.label}. Its ChatGPT subscription and models replace the current ones in the picker.`,
+				icon: account.active ? new vscode.ThemeIcon("pass-filled") : new vscode.ThemeIcon("circle-large-outline"),
+				command: command("llamacpp.selectCodexAccount", `Switch to Codex Account ${account.label}`, { accountId }),
+				children: [
+					new QuickAccessItem(`codex.account.${account.id || "default"}.signIn`, signedIn ? "Sign In Again" : "Sign In", {
+						icon: new vscode.ThemeIcon("sign-in"),
+						tooltip: signedIn
+							? "Sign in again to this Codex home; the current login of this account is replaced."
+							: "Open the ChatGPT sign-in flow for this account in your browser",
+						command: command("llamacpp.codexAccountSignIn", `Sign In to ${account.label}`, { accountId }),
+					}),
+					new QuickAccessItem(`codex.account.${account.id || "default"}.signOut`, "Sign Out", {
+						icon: new vscode.ThemeIcon("sign-out"),
+						tooltip: "Sign out of this account only; the other ChatGPT account stays signed in",
+						command: command("llamacpp.codexAccountSignOut", `Sign Out of ${account.label}`, { accountId }),
+					}),
+					...(account.id
+						? [new QuickAccessItem(`codex.account.${account.id}.remove`, "Remove Account", {
+							icon: new vscode.ThemeIcon("trash"),
+							tooltip: "Remove this account from Quick Access. Its ~/.codex-<id> folder and login stay on disk, so adding the same id again restores it.",
+							command: command("llamacpp.removeCodexAccount", `Remove Codex Account ${account.label}`, { accountId }),
+						})]
+						: []),
+				],
+			});
+		});
 		const codex = new QuickAccessItem("codex", "Codex", {
 			description: codexEnabled
 				? formatProviderUsageLine(codexStatus ?? "Checking...", codexUsageLimitPercent, codexUsageLimitReset)
@@ -830,6 +876,22 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					tooltip: "ChatGPT subscription account used by Codex",
 					icon: new vscode.ThemeIcon("account"),
 					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+				}),
+				// Always present: adding a second subscription starts here, and each
+				// account keeps its own sign-in without editing settings by hand.
+				new QuickAccessItem("codex.accounts", "ChatGPT Accounts", {
+					description: `Active: ${activeCodexAccount?.label ?? "Default"} · ${codexAccounts.length} total`,
+					tooltip: "Switch between ChatGPT subscriptions. Each account keeps its own Codex home, login, threads and usage windows; only the active account's models appear in the picker.",
+					icon: new vscode.ThemeIcon("organization"),
+					children: [
+						...codexAccountItems,
+						new QuickAccessItem("codex.accounts.add", "Add Account…", {
+							description: "Second ChatGPT subscription",
+							tooltip: "Create a new Codex account with its own home (~/.codex-<id>), then sign in to it. The window reloads so the account joins the picker.",
+							icon: new vscode.ThemeIcon("add"),
+							command: command("llamacpp.addCodexAccount", "Add Codex Account"),
+						}),
+					],
 				}),
 				new QuickAccessItem("codex.contextTarget", "Working Context", {
 					description: codexMetrics?.contextWindowTokens

@@ -19,7 +19,7 @@ import {
 } from "./constants";
 import { LlamaLogService } from "./logger";
 import { SessionQualityTracker } from "./diagnostics/session-report";
-import { SubscriptionUsageLedger } from "./diagnostics/subscription-usage";
+import { SubscriptionUsageLedger, type SubscriptionProvider } from "./diagnostics/subscription-usage";
 import { getCurrentWorkspaceScopeId, filterEntriesVisibleInWorkspace } from "./memory/scope";
 import { SharedMemoryService } from "./memory/shared-memory-service";
 import { registerMemoryTools } from "./memory/tools";
@@ -37,10 +37,17 @@ import { ProviderDirectory } from "./providers/provider-directory";
 import { applyAgentHostThinkingPatch, findAgentHostBundle, getAgentHostThinkingPatchStatus, restoreAgentHostThinkingPatch } from "./byok/agent-host-thinking-patch";
 import { applyWorkbenchTerminalPatch, findWorkbenchBundle, getWorkbenchTerminalPatchStatus, restoreWorkbenchTerminalPatch } from "./byok/workbench-terminal-patch";
 import { CodexChatModelProvider, type CodexUsageRecord } from "./codex/codex-provider";
+import {
+	CODEX_DEFAULT_ACCOUNT_ID,
+	decodeCodexAccountModelId,
+	findCodexAccount,
+	resolveActiveCodexAccountId,
+	resolveCodexAccounts,
+} from "./codex/accounts";
 import { ClaudeChatModelProvider, type ClaudeLiveTurnUpdate } from "./claude/claude-provider";
 import { CocoChatModelProvider } from "./coco/coco-provider";
 import { showProviderModelPicker } from "./ui/provider-model-picker";
-import { BUILTIN_PROVIDER_SOURCES, ownsHttpModel, providerSourceId } from "./providers/provider-registry";
+import { BUILTIN_PROVIDER_SOURCES, ownsHttpModel, providerSourceId, type ChatProviderRegistration } from "./providers/provider-registry";
 import { providerSnapshots } from "./providers/provider-snapshot";
 import { usageProviderForSource } from "./token-usage-history";
 import { registerCocoCommands } from "./coco/commands";
@@ -635,15 +642,43 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		(sourceKey, maximum, reported) => apiProviderService.recordContextMaximum(sourceKey, maximum, reported),
 		{ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "cursor-sdk") }
 	);
-	const codexProvider = new CodexChatModelProvider(extVersion, logService, context.workspaceState, context.globalState);
+	const codexAccounts = resolveCodexAccounts(
+		vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>("codexAccounts", [])
+	);
+	const codexProviders = new Map<string, CodexChatModelProvider>();
+	for (const account of codexAccounts) {
+		codexProviders.set(account.id, new CodexChatModelProvider(extVersion, logService, context.workspaceState, context.globalState, account));
+	}
+	const activeCodexAccountId = (): string => resolveActiveCodexAccountId(
+		codexAccounts,
+		vscode.workspace.getConfiguration(CONFIG_SECTION).get("codexActiveAccount", "")
+	);
+	const activeCodex = (): CodexChatModelProvider =>
+		codexProviders.get(activeCodexAccountId()) ?? codexProviders.get(CODEX_DEFAULT_ACCOUNT_ID)!;
+	const codexAccountStatusKey = (accountId: string): string => accountId ? `codex:${accountId}` : "codex";
+	const allCodexProviders = (): Array<[string, CodexChatModelProvider]> => [...codexProviders.entries()];
+	/** Set by "Add Account": the sign-in flow starts on its own after the reload. */
+	const CODEX_PENDING_SIGN_IN_KEY = "llamacpp.codexPendingSignIn.v1";
+	const pendingCodexSignIn = (): string | undefined => {
+		const stored = context.globalState.get<unknown>(CODEX_PENDING_SIGN_IN_KEY);
+		return typeof stored === "string" && codexProviders.has(stored) ? stored : undefined;
+	};
 	context.subscriptions.push({ dispose: () => llamaProvider.disposeCursorTransport() });
 	const claudeProvider = new ClaudeChatModelProvider(extVersion, logService, context.workspaceState);
 	const cocoProvider = new CocoChatModelProvider({ state: context.workspaceState, storageRoot: path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "coco-history"), log: (event,data) => logService.log(event,data) });
-	context.subscriptions.push(codexProvider);
 	context.subscriptions.push(claudeProvider);
 	context.subscriptions.push(cocoProvider);
+	for (const provider of codexProviders.values()) {
+		context.subscriptions.push(provider);
+	}
+	const codexRegistrations: ChatProviderRegistration[] = allCodexProviders().map(([accountId, provider]) => ({
+		id: codexAccountStatusKey(accountId),
+		provider,
+		...(accountId ? {} : { source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === "codex") }),
+		ownsModel: (modelId: string) => decodeCodexAccountModelId(modelId, accountId) !== undefined,
+	}));
 	const subscriptionProviders = [
-		{ id: "codex", provider: codexProvider },
+		...codexRegistrations,
 		{ id: "claude", provider: claudeProvider, onForeignRequest: () => claudeProvider.refreshSubscriptionUsage() },
 		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
@@ -664,10 +699,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ id: "http", provider: llamaProvider, ownsModel: ownsHttpModel,
 			usesConversationHistory: model => llamaProvider.usesConversationHistory(model),
 			onForeignRequest: async id => llamaProvider.cancelCursorConversation(id) },
-		...subscriptionProviders.map(registration => ({ ...registration,
-			source: BUILTIN_PROVIDER_SOURCES.find(source => source.id === registration.id),
-			ownsModel: (id: string) => providerSourceId(id) === registration.id,
-		})),
+		...subscriptionProviders.map(registration => {
+			const explicit = "ownsModel" in registration ? registration.ownsModel : undefined;
+			const source = "source" in registration ? registration.source : undefined;
+			return { ...registration,
+				source: source ?? BUILTIN_PROVIDER_SOURCES.find(entry => entry.id === registration.id),
+				ownsModel: explicit ?? ((id: string) => providerSourceId(id) === registration.id),
+			};
+		}),
 	], history: conversationHistory });
 	context.subscriptions.push(compositeProvider);
 	context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider(PROVIDER_VENDOR, compositeProvider));
@@ -702,25 +741,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		getClaudeUsage: () => claudeProvider.usageSummary,
 		getClaudeLastRequest: () => claudeProvider.lastRequestUsage,
 		getClaudeUsageLimits: () => claudeProvider.subscriptionUsageLimits,
-		getCodexSubscriptionUsage: () => codexProvider.subscriptionUsageSummary,
+		getCodexSubscriptionUsage: () => activeCodex().subscriptionUsageSummary,
 		getSubagentProfiles: () => getSubagentModelProfiles(),
 		getTokenUsageHistory: () => tokenUsageHistory.summary,
 		getUsageExperiments: () => usageExperiments.summary,
 		getDeepSeekBalance: () => llamaProvider.deepSeekBalanceSummary,
-		getCodexUsageLimitPercent: () => codexProvider.codexUsageLimitPercent,
-		getCodexUsageLimitReset: () => codexProvider.codexUsageLimitResetLabel,
-		getCodexUsageLimitWindow: () => codexProvider.codexUsageLimitWindowLabel,
+		getCodexUsageLimitPercent: () => activeCodex().codexUsageLimitPercent,
+		getCodexUsageLimitReset: () => activeCodex().codexUsageLimitResetLabel,
+		getCodexUsageLimitWindow: () => activeCodex().codexUsageLimitWindowLabel,
 		getClaudeUsageLimitPercent: () => claudeProvider.claudeUsageLimitPercent,
 		getClaudeUsageLimitReset: () => claudeProvider.claudeUsageLimitResetLabel,
 		getMemoryContextTokens: () => estimateMemoryTokens(filterEntriesVisibleInWorkspace(memoryService.list(), getCurrentWorkspaceScopeId())),
 		getApiProviderSummary: () => ({ total: apiProviderService.count, enabled: apiProviderService.enabledCount }),
 		getTotalMemoryCount: () => memoryService.count,
 		getApiProviders: () => apiProviderService.quickAccessApiProviders(false),
-		getCodexUsageLimits: () => codexProvider.codexUsageLimitSummaries,
+		getCodexUsageLimits: () => activeCodex().codexUsageLimitSummaries,
+		getCodexAccounts: () => { const active = activeCodexAccountId(); return codexAccounts.map(account => {
+			const provider = codexProviders.get(account.id)!;
+			return { id: account.id, label: account.label, active: account.id === active,
+				state: provider.providerStatus.state, summary: provider.accountSummary };
+		}); },
 		getCocoStatus: () => ({ ...cocoProvider.providerStatus, thinkingLevels: cocoProvider.thinkingLevels }),
 		getProviderSnapshots: () => providerSnapshots(providerDirectory.list(),
-			new Map([...runtimeMetrics, ["codex", codexProvider.runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}], ["coco", cocoProvider.runtimeMetrics ?? {}]]),
-			new Map([["codex", codexProvider.accountSummary], ["claude", claudeProvider.accountSummary]])),
+			new Map([...runtimeMetrics, ["codex", activeCodex().runtimeMetrics ?? {}], ["claude", claudeProvider.runtimeMetrics ?? {}], ["coco", cocoProvider.runtimeMetrics ?? {}]]),
+			new Map([["codex", activeCodex().accountSummary], ["claude", claudeProvider.accountSummary]])),
 		getUpdateStatus: () => updater.status,
 	});
 	context.subscriptions.push(updater.onDidChange(() => quickActionsProvider.refresh()));
@@ -743,8 +787,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	// panel picks up the live numbers at most once a second.
 	const refreshManagerPanel = coalesce(() => ApiProviderManagerPanel.refreshIfOpen(), 1_000);
 	context.subscriptions.push(refreshManagerPanel);
-	for (const { id, provider } of subscriptionProviders) {
-		const onStatus = provider.onDidChangeStatus as vscode.Event<{ state: string; summary: string }>;
+	const statusProviders: Array<{ id: string; provider: { onDidChangeStatus: vscode.Event<{ state: string; summary: string }> } }> = [
+		...allCodexProviders().map(([accountId, provider]) => ({ id: codexAccountStatusKey(accountId), provider })),
+		{ id: "claude", provider: claudeProvider },
+		{ id: "coco", provider: cocoProvider },
+	];
+	for (const { id, provider } of statusProviders) {
+		const onStatus = provider.onDidChangeStatus;
 		context.subscriptions.push(onStatus(status => {
 			const previous = subscriptionStatuses.get(id);
 			subscriptionStatuses.set(id, { state: status.state, summary: status.summary });
@@ -782,27 +831,33 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		quickActionsProvider.refresh();
 		SessionQualityPanel.refreshIfOpen();
 	}));
-	context.subscriptions.push(codexProvider.onDidRecordUsage(usage => {
-		recordUsage({
-			provider: "codex",
-			inputTokens: usage.inputTokens,
-			outputTokens: usage.outputTokens,
-			cachedInputTokens: usage.cachedInputTokens,
-			reasoningOutputTokens: usage.reasoningOutputTokens,
-		}, usage.modelId);
-		subscriptionUsage.record({
-			provider: "codex",
-			modelId: usage.modelId,
-			freshInputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
-			cachedInputTokens: usage.cachedInputTokens,
-			outputTokens: usage.outputTokens,
-		});
-		updateCodexSessionQuality(sessionQuality, usage, true);
-		SessionQualityPanel.refreshIfOpen();
-	}));
-	context.subscriptions.push(codexProvider.onDidUpdateLiveTurn(usage => {
-		updateCodexSessionQuality(sessionQuality, usage, usage.phase !== "running");
-	}));
+	for (const [accountId, provider] of allCodexProviders()) {
+		// Each subscription keeps its own window history: mixing two accounts in one
+		// ledger would hide how many tokens each plan actually provides.
+		const ledgerProvider: SubscriptionProvider = accountId ? `codex:${accountId}` : "codex";
+		const accountLabel = provider.accountLabel;
+		context.subscriptions.push(provider.onDidRecordUsage(usage => {
+			recordUsage({
+				provider: "codex",
+				inputTokens: usage.inputTokens,
+				outputTokens: usage.outputTokens,
+				cachedInputTokens: usage.cachedInputTokens,
+				reasoningOutputTokens: usage.reasoningOutputTokens,
+			}, usage.modelId);
+			subscriptionUsage.record({
+				provider: ledgerProvider,
+				modelId: accountId ? `${accountLabel} / ${usage.modelId}` : usage.modelId,
+				freshInputTokens: Math.max(0, usage.inputTokens - usage.cachedInputTokens),
+				cachedInputTokens: usage.cachedInputTokens,
+				outputTokens: usage.outputTokens,
+			});
+			updateCodexSessionQuality(sessionQuality, usage, true);
+			SessionQualityPanel.refreshIfOpen();
+		}));
+		context.subscriptions.push(provider.onDidUpdateLiveTurn(usage => {
+			updateCodexSessionQuality(sessionQuality, usage, usage.phase !== "running");
+		}));
+	}
 	context.subscriptions.push(claudeProvider.onDidRecordUsage(usage => {
 		const totalInput = usage.inputTokens + usage.cacheReadInputTokens + usage.cacheCreationInputTokens;
 		recordUsage({
@@ -850,9 +905,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		quickActionsProvider.refresh();
 	}));
 	context.subscriptions.push(registerContextControlCommand(
-		() => codexProvider.runtimeMetrics,
+		() => activeCodex().runtimeMetrics,
 		() => quickActionsProvider.refresh(),
-		() => ({ models: codexProvider.contextWindows, followTarget: codexProvider.followTarget })
+		() => ({ models: activeCodex().contextWindows, followTarget: activeCodex().followTarget })
 	));
 	context.subscriptions.push(onDidChangeFollowedCodexContext(() => {
 		if (vscode.workspace.getConfiguration("llamacpp").get<boolean>("sharedContextFollowCodex", false) !== true) {
@@ -862,20 +917,44 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		logService.log("shared_context.follow_codex", { model: followed?.modelId, window: followed?.window });
 		// May fire inside a Codex request: re-advertise without dropping the Codex model catalog.
 		llamaProvider.notifyModelLimitsChanged();
-		codexProvider.notifyModelLimitsChanged();
+		for (const provider of codexProviders.values()) {
+			provider.notifyModelLimitsChanged();
+		}
 		claudeProvider.refreshLanguageModelChatInformation();
 		cocoProvider.refreshLanguageModelChatInformation();
 		quickActionsProvider.refresh();
 	}));
 	context.subscriptions.push(...registerModelBehaviorCommands(() => quickActionsProvider.refresh()));
 	llamaProvider.refreshLanguageModelChatInformation();
-	codexProvider.refreshLanguageModelChatInformation();
+	for (const provider of codexProviders.values()) {
+		provider.refreshLanguageModelChatInformation();
+	}
 	claudeProvider.refreshLanguageModelChatInformation();
 	cocoProvider.refreshLanguageModelChatInformation();
 	void cocoProvider.refreshStatus();
-	void codexProvider.refreshStatus().then(status => {
-		subscriptionStatuses.set("codex", { state: status.state, summary: status.summary });
-	}).catch(error => logService.logError("codex.initial_status.failed", error));
+	for (const [accountId, provider] of allCodexProviders()) {
+		void provider.refreshStatus().then(status => {
+			subscriptionStatuses.set(codexAccountStatusKey(accountId), { state: status.state, summary: status.summary });
+		}).catch(error => logService.logError("codex.initial_status.failed", error));
+	}
+	// A freshly added account signs in right after the reload that created it.
+	const pendingSignInAccount = pendingCodexSignIn();
+	if (pendingSignInAccount) {
+		void context.globalState.update(CODEX_PENDING_SIGN_IN_KEY, undefined);
+		logService.log("codex.account.pending_sign_in", { account: pendingSignInAccount });
+		const timer = setTimeout(() => {
+			void codexProviders.get(pendingSignInAccount)?.signIn()
+				.then(() => quickActionsProvider.refresh())
+				.catch(error => {
+					logService.logError("codex.account.pending_sign_in_failed", error);
+					const message = error instanceof Error ? error.message : String(error);
+					void vscode.window.showErrorMessage(
+						`Codex account sign-in did not finish: ${message}. Open Quick Access → Codex → ChatGPT Accounts to retry.`
+					);
+				});
+		}, 3_000);
+		timer.unref?.();
+	}
 	void claudeProvider.refreshStatus().then(status => {
 		subscriptionStatuses.set("claude", { state: status.state, summary: status.summary });
 	}).catch(error => logService.logError("claude.initial_status.failed", error));
@@ -888,10 +967,12 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	const usageLimitRefreshTimer = setInterval(() => {
 		quickActionsProvider.refresh();
 		ApiProviderManagerPanel.refreshIfOpen();
-		void codexProvider.refreshStatus().catch(error => logService.logError("codex.periodic_status.failed", error));
 		void claudeProvider.refreshSubscriptionUsage().catch(error => logService.logError("claude.periodic_usage.failed", error));
 		void llamaProvider.refreshDeepSeekBalance().catch(error => logService.logError("deepseek.periodic_balance.failed", error));
-		subscriptionUsage.observe("codex", codexProvider.subscriptionWindows);
+		for (const [accountId, provider] of allCodexProviders()) {
+			subscriptionUsage.observe(accountId ? `codex:${accountId}` : "codex", provider.subscriptionWindows);
+			void provider.refreshStatus().catch(error => logService.logError("codex.periodic_status.failed", error));
+		}
 		subscriptionUsage.observe("claude", claudeProvider.subscriptionWindows);
 		void subscriptionUsage.refresh().catch(error => logService.logError("subscription_usage.refresh_failed", error));
 		SessionQualityPanel.refreshIfOpen();
@@ -1244,8 +1325,8 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 						keepAlive: claudeProvider.cacheKeepAliveStatus,
 					},
 					codex: {
-						status: codexProvider.accountSummary === "Connected" ? "connected" : "warning",
-						summary: codexProvider.accountSummary,
+						status: activeCodex().accountSummary === "Connected" ? "connected" : "warning",
+						summary: activeCodex().accountSummary,
 					},
 				};
 				lastHealthStatus = report.overallStatus.toUpperCase();
@@ -1353,9 +1434,9 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				() => ({
 					deepSeek: { balance: llamaProvider.deepSeekBalanceSummary },
 					codex: {
-						   summary: subscriptionStatuses.get("codex")?.summary ?? codexProvider.accountSummary,
-						usagePercent: codexProvider.codexUsageLimitPercent,
-						usageReset: codexProvider.codexUsageLimitResetLabel,
+						   summary: subscriptionStatuses.get("codex")?.summary ?? activeCodex().accountSummary,
+						usagePercent: activeCodex().codexUsageLimitPercent,
+						usageReset: activeCodex().codexUsageLimitResetLabel,
 					},
 					claude: {
 						   summary: subscriptionStatuses.get("claude")?.summary ?? claudeProvider.accountSummary,
@@ -1449,13 +1530,154 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 		})
 	);
 
+	const codexProviderFor = (accountId: unknown): CodexChatModelProvider => {
+		const account = findCodexAccount(codexAccounts, accountId);
+		return (account && codexProviders.get(account.id)) || activeCodex();
+	};
+	const refreshAllCodexCatalogs = (): void => {
+		for (const provider of codexProviders.values()) {
+			provider.refreshLanguageModelChatInformation();
+		}
+	};
+	const setActiveCodexAccount = async (accountId: unknown): Promise<void> => {
+		const account = findCodexAccount(codexAccounts, accountId);
+		if (!account) {
+			return;
+		}
+		const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
+		await config.update("codexActiveAccount", account.id, vscode.ConfigurationTarget.Global);
+		// Every provider re-announces its catalog: the new account appears, the old one hides.
+		refreshAllCodexCatalogs();
+		quickActionsProvider.refresh();
+		const provider = codexProviders.get(account.id);
+		await provider?.refreshStatus().catch(error => logService.logError("codex.switch_status.failed", error));
+		vscode.window.showInformationMessage(`Codex account: ${account.label}. Its models are now in the picker.`);
+	};
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.selectCodexAccount", async (arg?: { accountId?: string } | string) => {
+			const requested = typeof arg === "string" ? arg : arg?.accountId;
+			if (requested !== undefined) {
+				await setActiveCodexAccount(requested);
+				return;
+			}
+			const active = activeCodexAccountId();
+			const picked = await vscode.window.showQuickPick(codexAccounts.map(account => ({
+				label: `${account.id === active ? "$(check) " : ""}${account.label}`,
+				description: account.id || "~/.codex",
+				detail: codexProviders.get(account.id)?.accountSummary,
+				accountId: account.id,
+			})), { title: "AI Agent Bridge: Codex Account", placeHolder: "Choose the ChatGPT subscription used by the model picker" });
+			if (picked) {
+				await setActiveCodexAccount(picked.accountId);
+			}
+		})
+	);
+
+	/** Raw entries stay in the stored order; the resolved list only feeds the runtime. */
+	const rawCodexAccounts = (): Array<Record<string, unknown>> => {
+		const raw = vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>("codexAccounts", []);
+		return Array.isArray(raw)
+			? raw.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object")
+			: [];
+	};
+	const offerReload = async (question: string): Promise<void> => {
+		const reload = await vscode.window.showInformationMessage(question, "Reload Window", "Later");
+		if (reload === "Reload Window") {
+			await vscode.commands.executeCommand("workbench.action.reloadWindow");
+		}
+	};
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.addCodexAccount", async () => {
+			const used = new Set(codexAccounts.map(account => account.id).filter(id => id !== CODEX_DEFAULT_ACCOUNT_ID));
+			const id = await vscode.window.showInputBox({
+				title: "AI Agent Bridge: Add Codex Account",
+				prompt: "Short id for the second ChatGPT subscription. It names the Codex home (~/.codex-<id>) and its models.",
+				placeHolder: "work",
+				ignoreFocusOut: true,
+				validateInput: value => {
+					const normalized = value.trim().toLowerCase();
+					if (!normalized) {
+						return "Enter an id, for example work";
+					}
+					if (!/^[a-z0-9][a-z0-9_-]{0,31}$/.test(normalized)) {
+						return "Use lowercase letters, digits, - or _ (up to 32 characters), starting with a letter or digit";
+					}
+					if (used.has(normalized)) {
+						return `An account with the id "${normalized}" already exists`;
+					}
+					return undefined;
+				},
+			});
+			if (!id?.trim()) {
+				return;
+			}
+			const accountId = id.trim().toLowerCase();
+			const label = await vscode.window.showInputBox({
+				title: "AI Agent Bridge: Add Codex Account",
+				prompt: "Name shown in Quick Access and in the model picker",
+				value: accountId,
+				ignoreFocusOut: true,
+			});
+			if (label === undefined) {
+				return;
+			}
+			const entries = rawCodexAccounts();
+			entries.push({ id: accountId, label: label.trim() || accountId });
+			await vscode.workspace.getConfiguration(CONFIG_SECTION)
+				.update("codexAccounts", entries, vscode.ConfigurationTarget.Global);
+			// The new subscription becomes the active one, so its models are the ones
+			// the picker offers once the reload finishes and the sign-in succeeds.
+			await vscode.workspace.getConfiguration(CONFIG_SECTION)
+				.update("codexActiveAccount", accountId, vscode.ConfigurationTarget.Global);
+			// Providers are created at activation, so the sign-in runs after the reload.
+			await context.globalState.update(CODEX_PENDING_SIGN_IN_KEY, accountId);
+			logService.log("codex.account.added", { account: accountId });
+			await offerReload(
+				`Codex account "${label.trim() || accountId}" added and selected. Reload the window to finish; the ChatGPT sign-in page opens by itself.`
+			);
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.removeCodexAccount", async (arg?: { accountId?: string } | string) => {
+			const requested = typeof arg === "string" ? arg : arg?.accountId;
+			const account = findCodexAccount(codexAccounts, requested);
+			if (!account || !account.id) {
+				vscode.window.showInformationMessage("The built-in Codex account cannot be removed.");
+				return;
+			}
+			const confirmed = await vscode.window.showWarningMessage(
+				`Remove the Codex account "${account.label}"? Its folder and login stay on disk; adding the same id again restores them.`,
+				{ modal: true },
+				"Remove"
+			);
+			if (confirmed !== "Remove") {
+				return;
+			}
+			const entries = rawCodexAccounts().filter(entry => String(entry.id ?? "").trim().toLowerCase() !== account.id);
+			await vscode.workspace.getConfiguration(CONFIG_SECTION)
+				.update("codexAccounts", entries, vscode.ConfigurationTarget.Global);
+			if (activeCodexAccountId() === account.id) {
+				// Never leave the picker pointing at an account that no longer exists.
+				await vscode.workspace.getConfiguration(CONFIG_SECTION)
+					.update("codexActiveAccount", CODEX_DEFAULT_ACCOUNT_ID, vscode.ConfigurationTarget.Global);
+			}
+			logService.log("codex.account.removed", { account: account.id });
+			await offerReload(`Codex account "${account.label}" removed. Reload the window to finish.`);
+		})
+	);
+
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.toggleCodexSubscription", async () => {
 			const config = vscode.workspace.getConfiguration(CONFIG_SECTION);
 			const next = config.get<boolean>("enableCodexSubscription", true) === false;
 			await config.update("enableCodexSubscription", next, vscode.ConfigurationTarget.Global);
-			codexProvider.refreshLanguageModelChatInformation();
-			await codexProvider.refreshStatus();
+			refreshAllCodexCatalogs();
+			for (const provider of codexProviders.values()) {
+				await provider.refreshStatus();
+			}
 			quickActionsProvider.refresh();
 			vscode.window.showInformationMessage(`Codex subscription source ${next ? "enabled" : "disabled"}.`);
 		})
@@ -1477,7 +1699,9 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			const next = config.get<boolean>("codexCacheKeepAliveEnabled", false) === false;
 			await config.update("codexCacheKeepAliveEnabled", next, vscode.ConfigurationTarget.Global);
 			quickActionsProvider.refresh();
-			codexProvider.refreshCodexCacheKeepAliveStatus();
+			for (const provider of codexProviders.values()) {
+				provider.refreshCodexCacheKeepAliveStatus();
+			}
 			vscode.window.showInformationMessage(
 				`Codex cache keep-alive ${next ? "enabled" : "disabled"}.`
 			);
@@ -1490,7 +1714,9 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 			const next = config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === false;
 			await config.update("codexCacheKeepAliveIgnoreUsageLimit", next, vscode.ConfigurationTarget.Global);
 			quickActionsProvider.refresh();
-			codexProvider.refreshCodexCacheKeepAliveStatus();
+			for (const provider of codexProviders.values()) {
+				provider.refreshCodexCacheKeepAliveStatus();
+			}
 			vscode.window.showInformationMessage(
 				`Codex cache keep-alive usage-limit pause ${next ? "ignored" : "respected"}.`
 			);
@@ -1500,11 +1726,29 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.codexSignIn", async () => {
 			try {
-				await codexProvider.signIn();
+				await activeCodex().signIn();
 				quickActionsProvider.refresh();
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				vscode.window.showErrorMessage(`Unable to sign in to Codex: ${message}`);
+			}
+		})
+	);
+
+	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.codexAccountSignIn", async (arg?: { accountId?: string } | string) => {
+			const requested = typeof arg === "string" ? arg : arg?.accountId;
+			const account = findCodexAccount(codexAccounts, requested);
+			if (!account) {
+				await vscode.commands.executeCommand("llamacpp.codexSignIn");
+				return;
+			}
+			try {
+				await codexProviderFor(account.id).signIn();
+				quickActionsProvider.refresh();
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to sign in to Codex (${account.label}): ${message}`);
 			}
 		})
 	);
@@ -1520,7 +1764,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				return;
 			}
 			try {
-				await codexProvider.signOut();
+				await activeCodex().signOut();
 				quickActionsProvider.refresh();
 				vscode.window.showInformationMessage("Codex signed out.");
 			} catch (error) {
@@ -1531,9 +1775,38 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	);
 
 	context.subscriptions.push(
+		vscode.commands.registerCommand("llamacpp.codexAccountSignOut", async (arg?: { accountId?: string } | string) => {
+			const requested = typeof arg === "string" ? arg : arg?.accountId;
+			const account = findCodexAccount(codexAccounts, requested);
+			if (!account) {
+				await vscode.commands.executeCommand("llamacpp.codexSignOut");
+				return;
+			}
+			const confirmed = await vscode.window.showWarningMessage(
+				account.id
+					? `Sign out of the Codex account "${account.label}"? The other accounts stay signed in.`
+					: "Sign out of the built-in Codex account? This also signs out the shared local Codex CLI session.",
+				{ modal: true },
+				"Sign Out"
+			);
+			if (confirmed !== "Sign Out") {
+				return;
+			}
+			try {
+				await codexProviderFor(account.id).signOut();
+				quickActionsProvider.refresh();
+				vscode.window.showInformationMessage(`Codex account ${account.label} signed out.`);
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				vscode.window.showErrorMessage(`Unable to sign out of Codex (${account.label}): ${message}`);
+			}
+		})
+	);
+
+	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.codexShowStatus", async () => {
 			try {
-				await codexProvider.showStatus();
+				await activeCodex().showStatus();
 				quickActionsProvider.refresh();
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
@@ -1545,7 +1818,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.codexContinueLatestInNewChat", async () => {
 			try {
-				const prepared = await codexProvider.prepareLatestDurableThreadRollover();
+				const prepared = await activeCodex().prepareLatestDurableThreadRollover();
 				await vscode.commands.executeCommand("workbench.action.chat.newChat");
 				vscode.window.showInformationMessage(
 					`New chat opened. Keep the same Codex model selected and send the next message within 30 minutes `
@@ -1833,10 +2106,12 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 	context.subscriptions.push(
 		vscode.commands.registerCommand("llamacpp.refreshModels", async () => {
 			llamaProvider.refreshLanguageModelChatInformation();
-			codexProvider.refreshLanguageModelChatInformation();
+			refreshAllCodexCatalogs();
 			claudeProvider.refreshLanguageModelChatInformation();
 			cocoProvider.refreshLanguageModelChatInformation();
-			void codexProvider.refreshStatus();
+			for (const provider of codexProviders.values()) {
+				void provider.refreshStatus();
+			}
 			void claudeProvider.refreshStatus();
 			quickActionsProvider.refresh();
 			vscode.window.showInformationMessage("Local, DeepSeek, Codex, Claude, and Coco models refreshed.");
@@ -1986,10 +2261,21 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					event.affectsConfiguration("llamacpp.enableCodexSubscription") ||
 					event.affectsConfiguration("llamacpp.codexCliPath") ||
 					event.affectsConfiguration("llamacpp.codexContextLength") ||
-					event.affectsConfiguration("llamacpp.codexMaxOutputTokens")
+					event.affectsConfiguration("llamacpp.codexMaxOutputTokens") ||
+					event.affectsConfiguration("llamacpp.codexShowAllAccounts")
 				) {
-					codexProvider.refreshLanguageModelChatInformation();
-					void codexProvider.refreshStatus();
+					refreshAllCodexCatalogs();
+					for (const provider of codexProviders.values()) {
+						void provider.refreshStatus();
+					}
+				}
+				if (event.affectsConfiguration("llamacpp.codexAccounts")) {
+					// Provider instances and their registry entries are created at activation.
+					void vscode.window.showInformationMessage("Reload the window to apply the updated Codex account list.");
+				}
+				if (event.affectsConfiguration("llamacpp.codexActiveAccount") || event.affectsConfiguration("llamacpp.codexShowAllAccounts")) {
+					refreshAllCodexCatalogs();
+					quickActionsProvider.refresh();
 				}
 				if (
 					event.affectsConfiguration("llamacpp.enableClaudeSubscription") ||
@@ -2017,7 +2303,7 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 				) {
 					// One working context for Codex, Claude, Coco and Cursor.
 					llamaProvider.notifyModelLimitsChanged();
-					codexProvider.refreshLanguageModelChatInformation();
+					refreshAllCodexCatalogs();
 					claudeProvider.refreshLanguageModelChatInformation();
 					cocoProvider.refreshLanguageModelChatInformation();
 				}
@@ -2046,7 +2332,9 @@ const performanceStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarA
 					event.affectsConfiguration("llamacpp.codexCacheKeepAliveIgnoreUsageLimit")
 				) {
 					quickActionsProvider.refresh();
-					codexProvider.refreshCodexCacheKeepAliveStatus();
+					for (const provider of codexProviders.values()) {
+						provider.refreshCodexCacheKeepAliveStatus();
+					}
 				}
 				quickActionsProvider.refresh();
 			}

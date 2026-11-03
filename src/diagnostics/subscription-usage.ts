@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-export type SubscriptionProvider = "claude" | "codex";
+export type SubscriptionProvider = "claude" | "codex" | `codex:${string}`;
 export type SubscriptionWindowKind = "fiveHour" | "weekly";
 
 export interface SubscriptionWindowObservation {
@@ -322,9 +322,11 @@ function parseEvent(line: string): LedgerEvent | undefined {
 	if (record.type !== "usage" && record.type !== "window") {
 		return undefined;
 	}
-	if (record.provider !== "claude" && record.provider !== "codex") {
+	if (typeof record.provider !== "string"
+		|| !/^(?:claude|codex)(?::[a-z0-9][a-z0-9_-]{0,31})?$/.test(record.provider)) {
 		return undefined;
 	}
+	const provider = record.provider as SubscriptionProvider;
 	const number = (input: unknown) => typeof input === "number" && Number.isFinite(input) && input >= 0 ? Math.floor(input) : 0;
 	const at = number(record.at);
 	if (!at) {
@@ -333,8 +335,8 @@ function parseEvent(line: string): LedgerEvent | undefined {
 	if (record.type === "usage") {
 		return {
 			type: "usage",
-			id: typeof record.id === "string" ? record.id : `${record.provider}:${at}`,
-			provider: record.provider,
+			id: typeof record.id === "string" ? record.id : `${provider}:${at}`,
+			provider,
 			at,
 			modelId: typeof record.modelId === "string" ? record.modelId.slice(0, 200) : undefined,
 			fresh: number(record.fresh),
@@ -349,7 +351,7 @@ function parseEvent(line: string): LedgerEvent | undefined {
 	}
 	return {
 		type: "window",
-		provider: record.provider,
+		provider,
 		kind,
 		at,
 		utilization: Math.max(0, Math.min(100, number(record.utilization))),

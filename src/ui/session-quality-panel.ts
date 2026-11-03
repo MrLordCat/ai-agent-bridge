@@ -1358,6 +1358,11 @@ const HEALTH_STATUS_LABEL = { pass: "Pass", warn: "Warning", fail: "Failed", unk
 const HEALTH_TONE = { pass: "tone-good", warn: "tone-warn", fail: "tone-bad", unknown: "tone-info" };
 
 const SUBSCRIPTION_LABEL = { claude: "Claude", codex: "Codex" };
+const subscriptionLabel = (provider) => {
+	const [base, account] = String(provider || "").split(":");
+	const label = SUBSCRIPTION_LABEL[base] || base || provider;
+	return account ? label + " \u00b7 " + account : label;
+};
 const SUBSCRIPTION_WINDOW = { fiveHour: "5-hour window", weekly: "Weekly window" };
 const STAMP = (v) => typeof v === "number" ? new Date(v).toLocaleString() : "—";
 const SPAN = (from, to) => {
@@ -1385,7 +1390,7 @@ function subscriptionTotalsRow(label, totals) {
 }
 
 function renderSubscriptionProvider(provider) {
-	const name = SUBSCRIPTION_LABEL[provider.provider] || provider.provider;
+	const name = subscriptionLabel(provider.provider);
 	let h = '';
 	h += '<section class="section"><div class="section-heading"><h2>' + esc(name) + '</h2><span class="section-note">'
 		+ (provider.plan ? esc(provider.plan) + ' plan · ' : '')
