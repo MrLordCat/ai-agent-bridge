@@ -17,6 +17,12 @@ export interface LimitMatch {
 	timeZone?: string;
 	/** Short provider-neutral cause, e.g. "usage limit". */
 	reason: string;
+	/**
+	 * True when the limit was read from an error message rather than from the
+	 * provider's own window report. A message can be old, and its bare clock time
+	 * resolves to the next occurrence, so such a block needs verification.
+	 */
+	provisional?: boolean;
 }
 
 const CLAUDE_PATTERNS: readonly RegExp[] = [
@@ -66,6 +72,7 @@ export function detectLimitError(error: unknown, provider?: LimitProvider, now =
 		...(window ? { window: window.toLowerCase() } : {}),
 		...(reset ? { resetAt: reset.at, ...(reset.timeZone ? { timeZone: reset.timeZone } : {}) } : {}),
 		reason: /\b429\b|too many requests/i.test(text) && !/hit your/i.test(text) ? "rate limit" : "usage limit",
+		provisional: true,
 	};
 }
 
@@ -214,8 +221,7 @@ export function formatResetClock(reset: Pick<LimitMatch, "resetAt" | "timeZone">
 	}
 }
 
-export function formatLimitNotice(provider: LimitProvider, match: LimitMatch | undefined, now = new Date()): string {
-	const owner = provider === "claude" ? "Claude" : "Codex";
+export function formatLimitNotice(provider: LimitProvider, match: LimitMatch | undefined, now = new Date()): string {	const owner = provider === "claude" ? "Claude" : "Codex";
 	const window = match?.window ? ` ${match.window}` : "";
 	const clock = formatResetClock(match ?? {});
 	if (!match?.resetAt || !clock) {
@@ -223,6 +229,26 @@ export function formatLimitNotice(provider: LimitProvider, match: LimitMatch | u
 	}
 	return `${owner}${window} limit reached. It resets at ${clock} (in ${formatWait(match.resetAt, now)}). `
 		+ "Wait for the reset, then send the message again. No retry was made.";
+}
+
+/**
+ * A text-derived block may not outlive the window it talks about. A bare clock
+ * time in a day-old message resolves to the next occurrence, which would hold
+ * the chat for up to a whole day after the real reset.
+ */
+export function limitBlockCeilingMs(match: Pick<LimitMatch, "window">): number {
+	const hours = /(\d+)-hour/i.exec(match.window ?? "")?.[1];
+	if (hours) {
+		return (Number(hours) + 1) * 3_600_000;
+	}
+	if (/week/i.test(match.window ?? "")) {
+		return 7.5 * 24 * 3_600_000;
+	}
+	if (/day/i.test(match.window ?? "")) {
+		return 26 * 3_600_000;
+	}
+	// Unknown window: the shortest subscription window in use is five hours.
+	return 6 * 3_600_000;
 }
 
 /** Short error shown in chat instead of the raw provider text. */
@@ -242,12 +268,30 @@ export class SubscriptionLimitError extends Error {
 
 /** Fails fast after a limit error until the provider window resets. */
 export class LimitGate {
-	private readonly blockedUntil = new Map<LimitProvider, { until: number; match?: LimitMatch; notice: string }>();
+	private readonly blockedUntil = new Map<LimitProvider, { until: number; armedAt: number; match?: LimitMatch; notice: string }>();
 
 	/** Records a hit; without a reset time the provider is blocked until the next successful turn. */
 	note(provider: LimitProvider, match: LimitMatch | undefined, now = Date.now()): void {
-		const until = match?.resetAt ? Math.max(match.resetAt.getTime(), now + 60_000) : Number.POSITIVE_INFINITY;
-		this.blockedUntil.set(provider, { until, match, notice: formatLimitNotice(provider, match, new Date(now)) });
+		const ceiling = match?.provisional ? now + limitBlockCeilingMs(match) : Number.POSITIVE_INFINITY;
+		const until = match?.resetAt
+			? Math.min(Math.max(match.resetAt.getTime(), now + 60_000), ceiling)
+			: ceiling;
+		this.blockedUntil.set(provider, { until, armedAt: now, match, notice: formatLimitNotice(provider, match, new Date(now)) });
+	}
+
+	/**
+	 * True when the block came from provider text, or is old enough that the
+	 * provider's own report should be read again before a request is refused.
+	 */
+	shouldRecheck(provider: LimitProvider, now = Date.now(), recheckAfterMs = 2 * 60_000): boolean {
+		const entry = this.blockedUntil.get(provider);
+		if (!entry) {
+			return false;
+		}
+		if (Number.isFinite(entry.until) && now >= entry.until) {
+			return false;
+		}
+		return entry.match?.provisional === true || now - entry.armedAt >= recheckAfterMs;
 	}
 
 	/** Returns the short notice when the provider is still limited, otherwise undefined. */

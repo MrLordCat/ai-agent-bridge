@@ -1325,11 +1325,19 @@ export class ClaudeChatModelProvider implements vscode.LanguageModelChatProvider
 		}
 		const limited = this.limitGate.blocked("claude");
 		if (limited) {
-			// A limit is not a request failure: answer with one short line so the host does not
-			// retry the request and no provider turn is started.
-			this.logSink?.log("claude.chat.limit_short_circuit", { model: modelId, notice: limited });
-			progress.report(new vscode.LanguageModelTextPart(limited));
-			return;
+			// A text-derived block can outlive the window it named. Re-read the last
+			// provider snapshot (no extra CLI probe) before refusing the request.
+			if (this.lastSubscriptionUsage && this.limitGate.shouldRecheck("claude")) {
+				this.syncLimitGate(this.lastSubscriptionUsage);
+			}
+			const unresolved = this.limitGate.blocked("claude");
+			if (unresolved) {
+				// A limit is not a request failure: answer with one short line so the host does not
+				// retry the request and no provider turn is started.
+				this.logSink?.log("claude.chat.limit_short_circuit", { model: modelId, notice: unresolved });
+				progress.report(new vscode.LanguageModelTextPart(unresolved));
+				return;
+			}
 		}
 		const executable = resolveClaudeCodeBinary();
 		if (!executable) {

@@ -9,7 +9,7 @@ import { isProviderSwitch } from "../providers/provider-switch";
 import { buildCacheDiagnostics } from "../context/cache-diagnostics";
 import { calculatePromptCacheUsage } from "../context/usage";
 import type { SubscriptionObservation } from "../diagnostics/subscription-usage";
-import { detectLimitError, formatLimitNotice, LimitGate } from "../providers/limit-errors";
+import { detectLimitError, formatLimitNotice, LimitGate, type LimitMatch } from "../providers/limit-errors";
 import type { LlamaLogSink } from "../logger";
 import type { ProviderRuntimeMetrics } from "../provider-metrics";
 import { PROVIDER_CONTINUATION_TTL_MS, PROVIDER_DURABLE_SESSION_TTL_MS, PROVIDER_PENDING_ROLLOVER_TTL_MS } from "../session-retention";
@@ -85,6 +85,7 @@ import type {
 	CodexModel,
 	CodexModelListResponse,
 	CodexRateLimitSnapshot,
+	CodexRateLimitWindow,
 	CodexRateLimitsResponse,
 	CodexThreadReadResponse,
 	CodexThreadResumeResponse,
@@ -105,6 +106,46 @@ const CODEX_LAST_MODEL_STATE_KEY = "llamacpp.codexLastModel.v1";
 
 function parseStoredModelId(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 && value.length <= 128 ? value : undefined;
+}
+
+export type CodexLimitGateDecision =
+	/** The report carries no window numbers; the current gate state stays as it is. */
+	| { kind: "unknown" }
+	/** Every reported window has room, so the chat may continue. */
+	| { kind: "clear" }
+	| { kind: "limited"; match: LimitMatch };
+
+/**
+ * Decides the fail-fast gate from Codex's own rate-limit windows. Only a window
+ * that is actually at 100% blocks the chat: `rateLimitReachedType` keeps its old
+ * value after the window resets, and a bare clock time parsed from an old error
+ * message would otherwise hold the chat for up to a day past the real reset.
+ */
+export function resolveCodexLimitGate(snapshot: CodexRateLimitSnapshot | undefined): CodexLimitGateDecision {
+	const windows = [snapshot?.primary, snapshot?.secondary].filter(
+		(window): window is CodexRateLimitWindow => Boolean(window) && Number.isFinite(window?.usedPercent)
+	);
+	if (windows.length === 0) {
+		return { kind: "unknown" };
+	}
+	const full = windows.find(window => window.usedPercent >= 100);
+	if (!full) {
+		return { kind: "clear" };
+	}
+	const minutes = full.windowDurationMins ?? undefined;
+	const window = minutes === null || minutes === undefined
+		? undefined
+		: minutes >= 1440 ? "weekly" : minutes % 60 === 0 ? `${minutes / 60}-hour` : undefined;
+	const resetAt = full.resetsAt ? new Date(full.resetsAt * 1_000) : undefined;
+	return {
+		kind: "limited",
+		match: {
+			provider: "codex",
+			...(window ? { window } : {}),
+			reason: "usage limit",
+			...(resetAt && !Number.isNaN(resetAt.getTime()) ? { resetAt } : {}),
+		},
+	};
 }
 const CODEX_PENDING_ROLLOVER_TTL_MS = PROVIDER_PENDING_ROLLOVER_TTL_MS;
 const CODEX_ACCOUNT_CACHE_TTL_MS = 5 * 60_000;
@@ -773,12 +814,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	/** True when the ChatGPT subscription window is fully consumed. */
 	isCodexRateLimitReached(): boolean {
-		const window = this.lastRateLimitSnapshot?.primary;
-		return Boolean(
-			(window && window.usedPercent >= 100)
-			|| this.lastRateLimitSnapshot?.rateLimitReachedType
-			|| this.lastRateLimitReached
+		const snapshot = this.lastRateLimitSnapshot;
+		const windows = [snapshot?.primary, snapshot?.secondary].filter(
+			(window): window is CodexRateLimitWindow => Boolean(window) && Number.isFinite(window?.usedPercent)
 		);
+		if (windows.length > 0) {
+			// The window numbers are authoritative. `rateLimitReachedType` and the
+			// previous state lag behind the reset, and a sticky OR kept the provider
+			// "limited" forever after the first hit.
+			return windows.some(window => window.usedPercent >= 100);
+		}
+		return Boolean(snapshot?.rateLimitReachedType);
 	}
 
 	get runtimeMetrics(): ProviderRuntimeMetrics | undefined {
@@ -1067,11 +1113,20 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		const limited = this.limitGate.blocked("codex");
 		if (limited) {
-			// A limit is not a request failure: answer with one short line so the host does not
-			// retry the request and no provider thread is started.
-			this.logSink?.log("codex.chat.limit_short_circuit", { model: model.id, notice: limited });
-			progress.report(new vscode.LanguageModelTextPart(limited));
-			return;
+			// A text-derived block can outlive the window it named. Read the provider's
+			// own report first: every window below 100% means the chat may continue.
+			this.syncLimitGate(this.lastRateLimitSnapshot);
+			if (this.limitGate.shouldRecheck("codex") && Date.now() - this.lastStatusRefreshAt > 60_000) {
+				await this.refreshStatus().catch(error => this.logSink?.logError("codex.limit.recheck_failed", error));
+			}
+			const unresolved = this.limitGate.blocked("codex");
+			if (unresolved) {
+				// A limit is not a request failure: answer with one short line so the host does not
+				// retry the request and no provider thread is started.
+				this.logSink?.log("codex.chat.limit_short_circuit", { model: model.id, notice: unresolved });
+				progress.report(new vscode.LanguageModelTextPart(unresolved));
+				return;
+			}
 		}
 
 		const config = this.getConfig();
@@ -3230,19 +3285,17 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 
 	/** Keeps the fail-fast gate aligned with the provider's own window report. */
 	private syncLimitGate(snapshot: CodexRateLimitSnapshot | undefined): void {
-		const window = snapshot?.primary;
-		if (!window || !Number.isFinite(window.usedPercent)) {
+		const decision = resolveCodexLimitGate(snapshot);
+		if (decision.kind === "unknown") {
 			return;
 		}
-		if (window.usedPercent < 100 && !snapshot?.rateLimitReachedType) {
+		if (decision.kind === "clear") {
+			// Every reported window still has room. `rateLimitReachedType` lags behind
+			// the windows and stays set after a reset, so it never keeps the gate armed.
 			this.limitGate.clear("codex");
 			return;
 		}
-		this.limitGate.note("codex", {
-			provider: "codex",
-			reason: "usage limit",
-			...(window.resetsAt ? { resetAt: new Date(window.resetsAt * 1_000) } : {}),
-		});
+		this.limitGate.note("codex", decision.match);
 	}
 
 	private setStatus(status: CodexProviderStatus): CodexProviderStatus {

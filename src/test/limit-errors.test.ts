@@ -45,6 +45,47 @@ suite("Subscription limit errors", () => {
 		assert.strictEqual(formatWait(match.resetAt, now), "1 h 30 min");
 	});
 
+	test("a text-derived block never outlives its window", () => {
+		const gate = new LimitGate();
+		// A day-old "try again at 23:33" resolves to the next 23:33: 16 hours out.
+		const now = new Date("2026-11-04T07:51:00.000Z").getTime();
+		const match = detectLimitError(new Error("You've hit your usage limit. Try again at 23:33."), "codex", new Date(now));
+		assert.strictEqual(match?.provisional, true);
+		// A bare clock time is local and resolves to the next occurrence of 23:33.
+		assert.strictEqual(match?.resetAt?.getHours(), 23);
+		assert.strictEqual(match?.resetAt?.getMinutes(), 33);
+		assert.ok((match?.resetAt?.getTime() ?? 0) - now <= 24 * 3_600_000);
+		gate.note("codex", match, now);
+		assert.match(gate.blocked("codex", now + 60_000) ?? "", /Codex limit reached/);
+		assert.strictEqual(
+			gate.blocked("codex", now + 6.5 * 3_600_000),
+			undefined,
+			"a five-hour window cannot stay limited for sixteen hours"
+		);
+		// A weekly window keeps a longer ceiling.
+		const weekly = new LimitGate();
+		weekly.note("codex", {
+			provider: "codex", window: "weekly", provisional: true, reason: "usage limit",
+			resetAt: new Date(now + 5 * 24 * 3_600_000),
+		}, now);
+		assert.ok(weekly.blocked("codex", now + 3 * 24 * 3_600_000), "a weekly block survives several days");
+	});
+
+	test("a provisional block asks to be verified before the next refusal", () => {
+		const gate = new LimitGate();
+		const now = Date.now();
+		gate.note("codex", {
+			provider: "codex", reason: "usage limit", provisional: true,
+			resetAt: new Date(now + 3 * 3_600_000),
+		}, now);
+		assert.strictEqual(gate.shouldRecheck("codex", now + 1_000), true, "text-derived limits are re-checked");
+		gate.note("codex", { provider: "codex", reason: "usage limit", resetAt: new Date(now + 3 * 3_600_000) }, now);
+		assert.strictEqual(gate.shouldRecheck("codex", now + 1_000), false, "a provider-reported window is trusted");
+		assert.strictEqual(gate.shouldRecheck("codex", now + 3 * 60_000), true, "an older block is re-checked too");
+		gate.clear("codex");
+		assert.strictEqual(gate.shouldRecheck("codex", now + 3 * 60_000), false);
+	});
+
 	test("keeps the short notice for both providers", () => {
 		const claude = new SubscriptionLimitError("claude",
 			detectLimitError(new Error("You've hit your 5-hour limit · resets 4pm (Europe/Tallinn)"), undefined, reference), reference);

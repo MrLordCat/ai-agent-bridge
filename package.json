@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.14",
+	"version": "1.20.15",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -198,12 +198,12 @@
 							}
 						}
 					},
-					"description": "Extra ChatGPT subscriptions for Codex. Each account runs its own Codex app-server with its own CODEX_HOME, so the logins, threads and usage windows stay separate. The built-in account (~/.codex) is always available and keeps the historical model ids. Sign in per account from Quick Access Ã¢â€ â€™ Codex Ã¢â€ â€™ ChatGPT Accounts."
+					"description": "Extra ChatGPT subscriptions for Codex. Each account runs its own Codex app-server with its own CODEX_HOME, so the logins, threads and usage windows stay separate. The built-in account (~/.codex) is always available and keeps the historical model ids. Sign in per account from Quick Access ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Codex ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ChatGPT Accounts."
 				},
 				"llamacpp.codexActiveAccount": {
 					"type": "string",
 					"default": "",
-					"description": "Id of the Codex account whose models appear in the chat model picker. Empty means the built-in account (~/.codex). Switch it from Quick Access Ã¢â€ â€™ Codex Ã¢â€ â€™ ChatGPT Accounts."
+					"description": "Id of the Codex account whose models appear in the chat model picker. Empty means the built-in account (~/.codex). Switch it from Quick Access ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ Codex ÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢ ChatGPT Accounts."
 				},
 				"llamacpp.codexShowAllAccounts": {
 					"type": "boolean",
@@ -1227,7 +1227,7 @@
 				"name": "llamacpp_wait_for_terminal",
 				"displayName": "Wait for Terminal Command",
 				"toolReferenceName": "waitForTerminal",
-				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â no future notification will arrive and only the safety timeout would resolve.",
+				"modelDescription": "Wait until the next terminal command finishes. Call this right after starting a command (e.g. run_in_terminal) instead of sleeping with a guessed duration; the tool returns as soon as a terminal command notification arrives. Returns the command line, exit code and duration. timeoutMs is only a safety net (default 10 min). Do not call this tool for a command that already finished ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â¦ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Â¦Ãƒâ€šÃ‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â no future notification will arrive and only the safety timeout would resolve.",
 				"userDescription": "Wait for a running terminal command finished notification.",
 				"canBeReferencedInPrompt": true,
 				"icon": "$(watch)",

@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.20.15 (dev patch) - 2026-11-04
+
+- A reset ChatGPT window no longer keeps answering with "limit reached". The
+  fail-fast gate was armed from an old error message and held the chat until the
+  next occurrence of the clock time in that text (up to a day later), even though
+  the panel reported 0% used. The gate now follows Codex's own windows only: a
+  window at 100% blocks the chat, every window below it clears the block.
+  `rateLimitReachedType` is ignored while window numbers exist, because it keeps
+  its old value after a reset.
+- A limit read from provider text is provisional: it is clamped to the length of
+  its window (five hours plus slack for a 5-hour window, a week for a weekly one)
+  and verified against the provider's own report before the next request is
+  refused. Codex reads `account/rateLimits/read`, Claude reuses its latest usage
+  snapshot; a below-100% answer lets the message through.
+- "Limit reached" is no longer sticky: it was computed as
+  `window >= 100 || rateLimitReachedType || previouslyReached`, so the previous
+  value kept it true forever and Codex models stayed marked unavailable after a
+  reset. The current window numbers now decide it.
+
 ## 1.20.14 (dev patch) - 2026-11-03
 
 - A second ChatGPT subscription can be added without touching settings: Quick
