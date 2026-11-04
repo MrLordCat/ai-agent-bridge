@@ -59,6 +59,7 @@ Memory is the main asset. You must **initiate** saving yourself — do not wait 
 ## 4. Terminals and commands
 
 - Check commands before running them; run **targeted**, not destructively. `rm -rf`, `git reset --hard`, force-push — only when clearly needed and in a narrow scope.
+- **In this repository, install the extension immediately after packaging.** `npm run package` and `code --install-extension ./llama-vscode-chat-<version>.vsix --force` are one step: build the VSIX, install it at once, verify the version in `extensions.json`, and tell the user to reload the window. Never wait for a separate "install" command and never leave the install to manual UI steps unless the user explicitly asks not to install.
 - Batch independent commands in one call; for long processes use background mode and read the output afterwards.
 - Read output fully: exit code, errors, warnings are part of the result.
 - On Windows/git-bash remember path differences (`/d/...` vs `D:\...`, `cygpath` when passing paths to node).
