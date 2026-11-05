@@ -53,7 +53,7 @@ import { usageProviderForSource } from "./token-usage-history";
 import { registerCocoCommands } from "./coco/commands";
 import { classifyCodexTurnCache } from "./context/cache-diagnostics";
 import { CompositeChatModelProvider } from "./composite-provider";
-import { ConversationHistory } from "./providers/conversation-history";
+import { ConversationHistory, resolveHistoryImageLimit } from "./providers/conversation-history";
 import { AUTO_UPDATE_MODES, ExtensionUpdater, resolveAutoUpdateMode, type AutoUpdateMode } from "./update/extension-updater";
 import type { ProviderRuntimeMetrics } from "./provider-metrics";
 import { getSubagentModelProfiles } from "./subagent-guidance";
@@ -682,7 +682,11 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 		{ id: "claude", provider: claudeProvider, onForeignRequest: () => claudeProvider.refreshSubscriptionUsage() },
 		{ id: "coco", provider: cocoProvider, onForeignRequest: (id?: unknown) => cocoProvider.onForeignRequest(id) },
 	];
-	const conversationHistory = new ConversationHistory(path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history"));
+	const conversationHistory = new ConversationHistory(
+		path.join(context.storageUri?.fsPath ?? context.globalStorageUri.fsPath, "chat-history"),
+		// Read live: a changed limit applies to the next save without a reload.
+		() => resolveHistoryImageLimit(vscode.workspace.getConfiguration(CONFIG_SECTION).get<unknown>("journalImageRetention"))
+	);
 	// Token and limit-window history per subscription, shared by every window of this profile.
 	const subscriptionUsage = new SubscriptionUsageLedger(path.join(context.globalStorageUri.fsPath, "subscription-usage"));
 	void subscriptionUsage.initialize().catch(error => logService.logError("subscription_usage.initialize_failed", error));

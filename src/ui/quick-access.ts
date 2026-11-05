@@ -1257,6 +1257,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("clear-all"),
 					command: command("llamacpp.resetSessionReport", "Reset Session Metrics"),
 				}),
+				new QuickAccessItem("diagnostics.chatImages", "Chat Images Kept", {
+					description: `${Math.max(0, Math.round(Number(config.get("journalImageRetention", 100)) || 0))}`,
+					tooltip: "Images kept in the shared chat transcript used for model switches and reloads. Older screenshots are replaced with a short marker and their files are deleted, so a long chat does not load hundreds of images on the next request. Change it in Settings.",
+					icon: new vscode.ThemeIcon("files"),
+					command: command("workbench.action.openSettings", "Open Chat Image Retention Setting", "@id:llamacpp.journalImageRetention"),
+				}),
 				new QuickAccessItem("diagnostics.throughput", "Throughput", {
 					description: lastThroughput ?? "n/a",
 					icon: new vscode.ThemeIcon("dashboard"),

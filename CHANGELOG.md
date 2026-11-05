@@ -1,5 +1,20 @@
 # Changelog
 
+## 1.20.17 (dev patch) - 2026-11-05
+
+- The shared chat transcript keeps only the newest 100 images
+  (`llamacpp.journalImageRetention`, 0–2000, 0 keeps none). In a long chat every
+  screenshot was stored and loaded again on the first request after a reload:
+  one chat already carried hundreds of them, which is why opening it took
+  seconds. Older images are replaced with `[earlier image removed to keep the
+  chat fast]` before any file is read, so a reload touches only the retained
+  ones.
+- The cap applies while loading, after every merged request and before each
+  save, so the file on disk stops referencing dropped images; the existing
+  unreferenced-asset cleanup then deletes their files.
+- Quick Access → Diagnostics → **Chat Images Kept** shows the current limit and
+  opens the setting.
+
 ## 1.20.16 (dev patch) - 2026-11-05
 
 - Links in answers open again. Chat prompts carry attachments as

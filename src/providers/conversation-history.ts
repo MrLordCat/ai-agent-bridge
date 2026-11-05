@@ -51,6 +51,101 @@ const isSystemMessage = (message: vscode.LanguageModelChatRequestMessage) => mes
 const JOURNAL_MAX_BYTES = 512 * 1024 * 1024;
 const JOURNAL_GARBAGE_MIN_BYTES = 8 * 1024 * 1024;
 const ASSET_PRUNE_MIN_AGE_MS = 24 * 60 * 60_000;
+/** Screenshots accumulate over a long chat; only the newest ones stay in the transcript. */
+export const DEFAULT_HISTORY_IMAGE_LIMIT = 100;
+export const MAX_HISTORY_IMAGE_LIMIT = 2_000;
+export const HISTORY_IMAGE_MARKER = "[earlier image removed to keep the chat fast]";
+
+export function resolveHistoryImageLimit(value: unknown): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return DEFAULT_HISTORY_IMAGE_LIMIT;
+	}
+	return Math.max(0, Math.min(MAX_HISTORY_IMAGE_LIMIT, Math.floor(value)));
+}
+
+const isImagePart = (part: Part): boolean =>
+	(part.type === "asset" || part.type === "data") && part.mimeType.startsWith("image/");
+
+function countStoredImages(parts: readonly Part[]): number {
+	let total = 0;
+	for (const part of parts) {
+		if (isImagePart(part)) { total++; } else if (part.type === "result") { total += countStoredImages(part.content); }
+	}
+	return total;
+}
+
+/**
+ * Replaces every image older than the newest `limit` with a short text marker.
+ * Messages are visited newest first, so a long chat keeps its recent screenshots
+ * and drops the ones that only made loading slow.
+ */
+export function capStoredImages(
+	messages: readonly Message[],
+	limit = DEFAULT_HISTORY_IMAGE_LIMIT
+): { messages: Message[]; removed: number } {
+	const budget = { left: resolveHistoryImageLimit(limit) };
+	const output: Message[] = [...messages];
+	let removed = 0;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		const total = countStoredImages(message.content);
+		if (total === 0) { continue; }
+		const keep = Math.max(0, Math.min(budget.left, total));
+		let drop = total - keep;
+		budget.left -= keep;
+		if (drop === 0) { continue; }
+		const rewrite = (parts: readonly Part[]): Part[] => parts.map(part => {
+			if (isImagePart(part)) {
+				if (drop > 0) { drop--; return { type: "text", text: HISTORY_IMAGE_MARKER }; }
+				return part;
+			}
+			return part.type === "result" ? { ...part, content: rewrite(part.content) } : part;
+		});
+		output[index] = { role: message.role, content: rewrite(message.content) };
+		removed += total - keep;
+	}
+	return { messages: output, removed };
+}
+
+function countMessageImages(parts: readonly unknown[]): number {
+	let total = 0;
+	for (const part of parts) {
+		if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) { total++; }
+		else if (part instanceof vscode.LanguageModelToolResultPart) { total += countMessageImages(part.content); }
+	}
+	return total;
+}
+
+/** The same cap for live messages, applied after every merge and before a save. */
+export function capHistoryImages(
+	messages: readonly vscode.LanguageModelChatRequestMessage[],
+	limit = DEFAULT_HISTORY_IMAGE_LIMIT
+): { messages: vscode.LanguageModelChatRequestMessage[]; removed: number } {
+	const budget = { left: resolveHistoryImageLimit(limit) };
+	const output = [...messages];
+	let removed = 0;
+	for (let index = messages.length - 1; index >= 0; index--) {
+		const message = messages[index];
+		const total = countMessageImages(message.content);
+		if (total === 0) { continue; }
+		const keep = Math.max(0, Math.min(budget.left, total));
+		let drop = total - keep;
+		budget.left -= keep;
+		if (drop === 0) { continue; }
+		const rewrite = (parts: readonly unknown[]): unknown[] => parts.map(part => {
+			if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) {
+				if (drop > 0) { drop--; return new vscode.LanguageModelTextPart(HISTORY_IMAGE_MARKER); }
+				return part;
+			}
+			return part instanceof vscode.LanguageModelToolResultPart
+				? new vscode.LanguageModelToolResultPart(part.callId, rewrite(part.content) as vscode.LanguageModelToolResultPart["content"])
+				: part;
+		});
+		output[index] = new vscode.LanguageModelChatMessage(message.role, rewrite(message.content) as vscode.LanguageModelChatMessage["content"]);
+		removed += total - keep;
+	}
+	return { messages: output, removed };
+}
 const sameMessage = (a: vscode.LanguageModelChatRequestMessage, b: vscode.LanguageModelChatRequestMessage) => a === b || messageKey(a) === messageKey(b);
 
 /** Version 2 is JSON Lines: header, then `systems`, `servedBy` and `message` records; the last `systems` record wins. */
@@ -191,7 +286,7 @@ export class ConversationHistory {
 	private readonly entries = new Map<string, Entry>();
 	private readonly loading = new Map<string, Promise<Entry>>();
 	private readonly savedImages = new Set<string>();
-	constructor(private readonly root: string) {}
+	constructor(private readonly root: string, private readonly imageLimit: () => number = () => DEFAULT_HISTORY_IMAGE_LIMIT) {}
 	/** Deletes images no saved chat references; recent ones may belong to a journal still being written. */
 	async pruneAssets(now = Date.now()): Promise<{ removed: number; bytes: number }> {
 		const referenced = new Set<string>(), chunk = 64 * 1024 * 1024;
@@ -288,16 +383,22 @@ export class ConversationHistory {
 				if (stat.size > JOURNAL_MAX_BYTES) { throw new Error("Saved conversation exceeds the supported size."); }
 				const buffer = await fs.readFile(file), journal = parseJournal(buffer);
 				servedBy = journal.servedBy;
+				// Capping happens before any asset is read: a chat with hundreds of
+				// screenshots no longer loads them all just to keep the newest ones.
+				const capped = capStoredImages(journal.body, this.imageLimit());
+				const body = capped.messages;
 				const assets = new Map<string, Uint8Array | undefined>();
-				for (const name of assetNames([...journal.systems, ...journal.body].flatMap(message => message.content))) {
+				for (const name of assetNames([...journal.systems, ...body].flatMap(message => message.content))) {
 					if (!/^[0-9a-f]{64}\.[a-z]+$/.test(name)) { continue; }
 					assets.set(name, await fs.readFile(path.join(this.root, "assets", name)).catch(() => undefined));
 					if (assets.get(name)) { this.savedImages.add(name); }
 				}
-				const systems = journal.systems.map(message => decode(message, assets)), body = journal.body.map(message => decode(message, assets));
-				stored = [...systems, ...body];
+				const systems = journal.systems.map(message => decode(message, assets));
+				const decodedBody = body.map(message => decode(message, assets));
+				stored = [...systems, ...decodedBody];
 				// A legacy file or a torn final line is rewritten in full by the next step.
-				if (journal.intact) { disk = { systems, body, servedBy, bytes: buffer.length, systemBytes: journal.systemBytes, garbage: journal.garbage }; }
+				// Dropped images also need that rewrite so their asset files stop being referenced.
+				if (journal.intact && capped.removed === 0) { disk = { systems, body: decodedBody, servedBy, bytes: buffer.length, systemBytes: journal.systemBytes, garbage: journal.garbage }; }
 			} catch (error) {
 				if ((error as NodeJS.ErrnoException).code !== "ENOENT") { throw new Error("Cannot restore the common Chat transcript. Check workspace storage before continuing or switching models.", { cause: error }); }
 			}
@@ -309,7 +410,9 @@ export class ConversationHistory {
 		const owner = entry, revision = ++owner.revision;
 		owner.active++;
 		this.entries.delete(key); this.entries.set(key, owner);
-		owner.messages = mergeConversationHistory(owner.messages, incoming);
+		// The cap runs on the merged history, so a provider handoff never carries
+		// hundreds of old screenshots and the journal on disk matches memory.
+		owner.messages = capHistoryImages(mergeConversationHistory(owner.messages, incoming), this.imageLimit()).messages;
 		const messages = [...owner.messages];
 		try { await this.persist(owner, file, revision, messages); }
 		catch (error) { owner.active--; throw new Error(`Cannot save the incoming Chat transcript (${error instanceof Error ? error.message : String(error)}). Check workspace storage before continuing or switching models.`, { cause: error }); }
@@ -327,6 +430,7 @@ export class ConversationHistory {
 				}
 				owner.messages = [...messages, decode({ role: vscode.LanguageModelChatMessageRole.Assistant, content: combined })];
 			}
+			owner.messages = capHistoryImages(owner.messages, this.imageLimit()).messages;
 			await this.persist(owner, file, revision, owner.messages);
 			// Disk retains older chats; bound the live index.
 			if (this.entries.size > 16) {
