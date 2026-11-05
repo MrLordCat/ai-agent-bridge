@@ -7,6 +7,7 @@ import type { ConversationHistory } from "./providers/conversation-history";
 import { detectLimitError, formatLimitNotice, type LimitProvider, type LimitMatch } from "./providers/limit-errors";
 import { detectBalanceError, formatBalanceNotice } from "./providers/balance-errors";
 import { PROVIDER_SWITCH_OPTION } from "./providers/provider-switch";
+import { ChatMarkdownLinkStream } from "./providers/markdown-links";
 
 interface CompositeProviderOptions { providers: readonly ChatProviderRegistration[]; history: ConversationHistory }
 /** Maps an escaped provider error to a subscription limit, using the model id as the provider hint. */
@@ -95,26 +96,40 @@ export class CompositeChatModelProvider implements vscode.LanguageModelChatProvi
 		const switchedFrom = history?.servedBy && history.servedBy !== model.id ? { [PROVIDER_SWITCH_OPTION]: history.servedBy } : {};
 		const responseOptions = usesHistory && history?.transcriptPath
 			? { ...options, modelOptions: { ...options.modelOptions, ...switchedFrom, _aabCocoTranscriptPath: history.transcriptPath, _aabTranscriptPath: history.transcriptPath } } : options;
+		// Prompts carry attachments as `http://_vscodecontentref_/N` placeholders. A model
+		// that quotes one back produces a link the chat view cannot resolve, and Windows or
+		// relative paths in a markdown destination open nothing. Rewrite them on the way out.
+		const links = new ChatMarkdownLinkStream();
+		const emit = (part: vscode.LanguageModelResponsePart): void => {
+			if (history) { emitted.push(part); }
+			progress.report(part);
+		};
+		const emitText = (value: string): void => { if (value) { emit(new vscode.LanguageModelTextPart(value)); } };
+		// A non-text part must not jump ahead of buffered prose.
+		const report = (part: vscode.LanguageModelResponsePart): void => {
+			if (part instanceof vscode.LanguageModelTextPart) { emitText(links.push(part.value)); return; }
+			emitText(links.flush());
+			emit(part);
+		};
 		try { await selected.provider.provideLanguageModelChatResponse(
 			model,
 			usesHistory ? history?.messages ?? messages : messages,
 			responseOptions,
-			history ? { report: part => { emitted.push(part); progress.report(part); } } : progress,
+			{ report },
 			token
 		); } catch (error) { failed = true; providerError = error; }
+			emitText(links.flush());
 			if (failed) {
 				// A subscription limit or an empty balance escapes as an error only when a provider
 				// could not answer itself; the short notice keeps the host from retrying.
 				const balance = detectBalanceError(providerError, providerLabelForModel(model.id));
 				if (balance) {
-					const notice = new vscode.LanguageModelTextPart(formatBalanceNotice(balance));
-					emitted.push(notice); progress.report(notice);
+					emit(new vscode.LanguageModelTextPart(formatBalanceNotice(balance)));
 					failed = false;
 				}
 				const limit = resolveLimit(model.id, providerError);
 				if (limit) {
-					const notice = new vscode.LanguageModelTextPart(formatLimitNotice(limit.provider, limit));
-					emitted.push(notice); progress.report(notice);
+					emit(new vscode.LanguageModelTextPart(formatLimitNotice(limit.provider, limit)));
 					failed = false;
 				}
 			}

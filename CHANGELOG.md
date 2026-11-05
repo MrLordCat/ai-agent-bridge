@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.20.16 (dev patch) - 2026-11-05
+
+- Links in answers open again. Chat prompts carry attachments as
+  `http://_vscodecontentref_/N` placeholders; a model that quotes one back (Codex
+  does this for files it worked on) produced a link the chat view could not
+  resolve, and clicking it opened nothing — for example
+  `file:///d%3A/%5BR2_PERFORMANCE_RECOVERY.md%5D%28http%3A/_vscodecontentref_/1%29`.
+  Every text part now passes through a link normalizer before the chat sees it:
+  a placeholder or Windows/relative destination that names an existing file
+  becomes a `file:` URI of that file, so the link opens; when no such file
+  exists the link becomes a plain code span instead of a dead link. Remote
+  links, anchors and data URIs are untouched. Text is streamed unchanged apart
+  from a short hold while a link is incomplete, so partial links are fixed even
+  when a delta splits them.
+- The same normalization is applied to escaped errors (limit and balance
+  notices) and to every provider, not only Codex.
+
 ## 1.20.15 (dev patch) - 2026-11-04
 
 - A reset ChatGPT window no longer keeps answering with "limit reached". The
