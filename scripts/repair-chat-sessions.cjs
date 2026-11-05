@@ -11,10 +11,12 @@
 // large binary payloads with a marker, trims huge text values, keeps the newest requests within a size
 // budget and writes <session>.repaired.jsonl next to the original. The original
 // file is never modified. Close the window that owns the session before
-// replacing the file.
+// replacing the file. The newest images are kept (100 by default) so a repaired
+// chat still shows its recent screenshots.
 //
 // Usage:
-//   node scripts/repair-chat-sessions.cjs <session.jsonl> [--budget-mb 20]
+//   node scripts/repair-chat-sessions.cjs <session.jsonl> [--budget-mb 20] [--keep-images 100]
+//        [--max-string-kb 2000] [--keep-recent 0]
 //   node scripts/repair-chat-sessions.cjs --list
 const fs = require("node:fs");
 const os = require("node:os");
@@ -28,12 +30,21 @@ const MAX_STRING = 2_000_000;
 const MIN_REQUESTS = 5;
 
 const args = process.argv.slice(2);
-const budgetIndex = args.indexOf("--budget-mb");
-const budgetMb = budgetIndex >= 0 ? Number(args[budgetIndex + 1]) : 20;
+const optionValue = (name, fallback) => {
+	const index = args.indexOf(name);
+	return index >= 0 ? Number(args[index + 1]) : fallback;
+};
+const budgetMb = optionValue("--budget-mb", 20);
+const keepImages = optionValue("--keep-images", 100);
+// Requests within the newest `keepRecent` keep their long tool outputs intact.
+const keepRecent = optionValue("--keep-recent", 0);
+// Older requests lose tool output beyond this size (0 keeps the 2 MB default).
+const maxStringKb = optionValue("--max-string-kb", 0);
 const listOnly = args.includes("--list");
-const positional = args.filter(
-	(arg, index) => !arg.startsWith("--") && !(budgetIndex >= 0 && index === budgetIndex + 1)
-);
+// Values of "--name value" options must not be mistaken for the session path.
+const optionValueIndexes = new Set(args
+	.flatMap((arg, index) => (arg === "--budget-mb" || arg === "--keep-images" || arg === "--keep-recent" || arg === "--max-string-kb" ? [index + 1] : [])));
+const positional = args.filter((arg, index) => !arg.startsWith("--") && !optionValueIndexes.has(index));
 const file = positional[0];
 
 function workspaceStorageRoots() {
@@ -92,6 +103,15 @@ if (!/\.jsonl$/i.test(source)) {
 if (!Number.isFinite(budgetMb) || budgetMb <= 0 || budgetMb > 1024) {
 	throw new Error("--budget-mb must be a number greater than 0 and at most 1024");
 }
+if (!Number.isInteger(keepImages) || keepImages < 0 || keepImages > 10_000) {
+	throw new Error("--keep-images must be an integer between 0 and 10000");
+}
+if (!Number.isInteger(keepRecent) || keepRecent < 0) {
+	throw new Error("--keep-recent must be a non-negative integer");
+}
+if (!Number.isFinite(maxStringKb) || maxStringKb < 0 || maxStringKb > 1_000_000) {
+	throw new Error("--max-string-kb must be a number between 0 and 1000000");
+}
 const target = source.replace(/\.jsonl$/i, ".repaired.jsonl");
 if (fs.existsSync(target)) {
 	throw new Error("repaired output already exists; move it aside before retrying");
@@ -103,6 +123,110 @@ let removedPayloads = 0;
 let removedPayloadChars = 0;
 let trimmedStrings = 0;
 let trimmedChars = 0;
+let removedImages = 0;
+let keptImages = 0;
+let trimmedOldStrings = 0;
+let trimmedOldChars = 0;
+
+const isDataImageUrl = (text) => /^data:[\w.+-]+\/image[\w.+-]*;base64,/i.test(text);
+
+/**
+ * A payload the pruning pass may keep: an image part, its data URL, a revived
+ * buffer, or an unrecognised base64 blob (which is never useful as text).
+ */
+function isImagePayload(node, key, value) {
+	if (typeof value !== "string") { return false; }
+	if (key === "$base64") { return value.length > MAX_BINARY; }
+	if (isDataImageUrl(value)) { return value.length > MAX_BINARY; }
+	const mime = typeof node.mimeType === "string" ? node.mimeType : undefined;
+	if ((key === "data" || key === "value") && mime && mime.startsWith("image/") && node.isText !== true) { return value.length > MAX_BINARY; }
+	return value.length > MAX_STRING && looksBase64(value);
+}
+
+function countImages(node) {
+	if (!node || typeof node !== "object") { return 0; }
+	let total = 0;
+	if (Array.isArray(node)) {
+		for (const item of node) { total += countImages(item); }
+		return total;
+	}
+	for (const [key, value] of Object.entries(node)) {
+		if (key !== "$mid" && isImagePayload(node, key, value)) { total++; }
+	}
+	for (const [key, value] of Object.entries(node)) {
+		if (key !== "$mid" && value && typeof value === "object") { total += countImages(value); }
+	}
+	return total;
+}
+
+/** Replaces image payloads in document order while `shouldDrop` says so. */
+function dropImages(node, shouldDrop) {
+	if (!node || typeof node !== "object") { return; }
+	if (Array.isArray(node)) {
+		for (const item of node) { dropImages(item, shouldDrop); }
+		return;
+	}
+	for (const [key, value] of Object.entries(node)) {
+		if (key === "$mid" || !isImagePayload(node, key, value) || !shouldDrop()) { continue; }
+		node[key] = isDataImageUrl(value) ? `data:image/png;base64,${PLACEHOLDER_PNG}` : PLACEHOLDER_PNG;
+		removedPayloads++; removedPayloadChars += value.length; removedImages++;
+	}
+	for (const [key, value] of Object.entries(node)) {
+		if (key !== "$mid" && value && typeof value === "object") { dropImages(value, shouldDrop); }
+	}
+}
+
+/** Keeps the newest `keepImages` images and leaves everything else to the budget pass. */
+function pruneImages(requests) {
+	let budget = keepImages;
+	for (let index = requests.length - 1; index >= 0; index--) {
+		const total = countImages(requests[index]);
+		if (!total) { continue; }
+		const keep = Math.max(0, Math.min(budget, total));
+		budget -= keep;
+		keptImages += keep;
+		let drop = total - keep;
+		if (!drop) { continue; }
+		dropImages(requests[index], () => drop-- > 0);
+	}
+}
+
+/**
+ * Tool outputs in old requests are what makes a chat session grow to hundreds
+ * of megabytes. The newest `keepRecent` requests stay untouched, so the model
+ * still sees the current work in full; older long strings are summarized.
+ */
+function trimOldRequests(requests, limit) {
+	if (!limit) { return; }
+	const cutoff = Math.max(0, requests.length - keepRecent);
+	for (let index = 0; index < cutoff; index++) {
+		trimLongStrings(requests[index], limit);
+	}
+}
+
+function trimLongStrings(node, limit) {
+	if (typeof node === "string") { return; }
+	if (!node || typeof node !== "object") { return; }
+	if (Array.isArray(node)) {
+		for (let index = 0; index < node.length; index++) {
+			const item = node[index];
+			if (typeof item === "string") { if (item.length > limit) { node[index] = trimText(item); } }
+			else { trimLongStrings(item, limit); }
+		}
+		return;
+	}
+	for (const [key, value] of Object.entries(node)) {
+		if (key === "$mid" || typeof value !== "string") {
+			if (value && typeof value === "object") { trimLongStrings(value, limit); }
+			continue;
+		}
+		if (isImagePayload(node, key, value) || isDataImageUrl(value)) { continue; }
+		if (value.length > limit) {
+			node[key] = trimText(value);
+			trimmedOldStrings++; trimmedOldChars += value.length - node[key].length;
+		}
+	}
+}
 
 function trimText(text) {
 	const marker = `\n... [${text.length - 6000} characters removed while repairing the chat session] ...\n`;
@@ -118,10 +242,12 @@ function removePayload(text, replacement) {
 	return replacement;
 }
 
-function sanitize(node) {
+function sanitize(node, preserveImages = true) {
 	if (typeof node === "string") {
 		if (node.length > MAX_STRING) {
+			if (isDataImageUrl(node) && preserveImages) { return node; }
 			if (/^data:[\w.+-]+\/[\w.+-]+;base64,/i.test(node)) { return removePayload(node, `data:image/png;base64,${PLACEHOLDER_PNG}`); }
+			if (looksBase64(node) && preserveImages) { return node; }
 			if (looksBase64(node)) { return removePayload(node, PLACEHOLDER_PNG); }
 			trimmedStrings++;
 			trimmedChars += node.length;
@@ -131,7 +257,7 @@ function sanitize(node) {
 	}
 	if (Array.isArray(node)) {
 		for (let index = 0; index < node.length; index++) {
-			node[index] = sanitize(node[index]);
+			node[index] = sanitize(node[index], preserveImages);
 		}
 		return node;
 	}
@@ -143,18 +269,22 @@ function sanitize(node) {
 	for (const field of ["data", "value"]) {
 		const payload = node[field];
 		if (typeof payload === "string" && payload.length > MAX_BINARY && mime && !mime.startsWith("text/") && node.isText !== true) {
+			if (preserveImages && mime.startsWith("image/") && payload.length > MAX_BINARY) { continue; }
 			node[field] = removePayload(payload, mime.startsWith("image/") ? PLACEHOLDER_PNG : "");
 		}
 	}
 	// Serialized buffers ({ $base64 }) are revived while the session loads.
-	if (typeof node.$base64 === "string" && node.$base64.length > MAX_BINARY) {
+	if (typeof node.$base64 === "string" && node.$base64.length > MAX_BINARY && !preserveImages) {
 		node.$base64 = removePayload(node.$base64, PLACEHOLDER_PNG);
 	}
 	for (const key of Object.keys(node)) {
 		if (key === "$mid") {
 			continue;
 		}
-		node[key] = sanitize(node[key]);
+		if (preserveImages && typeof node[key] === "string" && isImagePayload(node, key, node[key])) {
+			continue;
+		}
+		node[key] = sanitize(node[key], preserveImages);
 	}
 	return node;
 }
@@ -216,6 +346,10 @@ async function main() {
 	if (size > 1024 * 1024 * 1024) { throw new Error(`refusing to load a ${mb(size)} session`); }
 	const { value, records } = await readSession(source), requests = value.requests, budget = budgetMb * 1024 * 1024;
 	console.log(`original: ${mb(size)}, applied ${records} snapshot/delta record(s)`);
+	// Images are decided first, so the request budget reflects what is really stored.
+	pruneImages(requests);
+	const trimLimit = maxStringKb > 0 ? maxStringKb * 1000 : MAX_STRING;
+	trimOldRequests(requests, trimLimit);
 	let kept = 0, keptBytes = 0;
 	for (let index = requests.length - 1; index >= 0; index--) {
 		const bytes = sizeOf(requests[index]);
@@ -231,6 +365,10 @@ async function main() {
 	if (Buffer.byteLength(line, "utf8") + 1 > budget) { throw new Error("newest request or session metadata exceeds the budget; no repaired file was written"); }
 	fs.writeFileSync(target, line + "\n", { encoding: "utf8", flag: "wx" });
 	console.log(`removed ${removedPayloads} binary payload(s) (${mb(removedPayloadChars)}), trimmed ${trimmedStrings} string(s) (${mb(trimmedChars)}); requests kept ${value.requests.length}/${requests.length}`);
+	console.log(`images: kept ${keptImages}, replaced ${removedImages}`);
+	if (trimmedOldStrings) {
+		console.log(`old requests: trimmed ${trimmedOldStrings} long string(s) (${mb(trimmedOldChars)} freed), newest ${keepRecent} request(s) untouched`);
+	}
 	console.log(`wrote ${target} (${mb(fs.statSync(target).size)})`);
 	console.log("Next: close the owning window, move the original aside, rename the repaired file to its name, reopen the window.");
 }
