@@ -37,14 +37,30 @@ test("repairs binary/text payloads while preserving the original", t => {
 
 test("replaces oversized base64 buffers and data URLs with decodable placeholders", t => {
 	const png = "iVBORw0K" + "A".repeat(2_100_000);
-	const f = fixture(t, [{ kind: 0, v: { requests: [{ variableData: { variables: [{ value: { $base64: "A".repeat(300_000) } }] },
+	const f = fixture(t, [{ kind: 0, v: { requests: [{ variableData: { variables: [{ kind: "image", mimeType: "image/png", value: { $base64: "A".repeat(300_000) } }] },
 		result: { metadata: { image: { url: `data:image/png;base64,${png}` }, raw: png, log: "line ".repeat(500_000) } } }] } }]);
 	const result = f.run(["--keep-images", "0"]); assert.equal(result.status, 0, result.stderr); f.unchanged();
 	const request = f.read().requests[0], metadata = request.result.metadata;
 	assert.match(request.variableData.variables[0].value.$base64, /^iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
 	assert.match(metadata.image.url, /^data:image\/png;base64,iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
-	assert.match(metadata.raw, /^iVBORw0KGgo[A-Za-z0-9+/]+=*$/);
+	assert.match(metadata.raw, /^iVBORw0K/, "a bare base64 string without image context is kept as-is");
 	assert.match(metadata.log, /characters removed/);
+});
+
+test("prunes small images as well, not only payloads above the binary threshold", t => {
+	// Real chat sessions store most screenshots well below 200 KB; the cap must see them too.
+	const small = id => `${id}` + "B".repeat(60_000);
+	const requests = [0, 1, 2, 3].map(id => ({ id, content: [{ mimeType: "image/png", data: small(id) }] }));
+	const f = fixture(t, [{ kind: 0, v: { requests } }]);
+	const result = f.run(["--keep-images", "2"]);
+	assert.equal(result.status, 0, result.stderr);
+	const kept = f.read().requests;
+	assert.match(result.stdout, /images found: 4/);
+	assert.match(result.stdout, /images: kept 2 of 4, replaced 2/);
+	assert.match(kept[0].content[0].data, /^iVBORw0KGgo/, "the old small image is replaced");
+	assert.match(kept[1].content[0].data, /^iVBORw0KGgo/);
+	assert.match(kept[2].content[0].data, /^2B{60000}$/, "the newest two keep their pixels");
+	assert.match(kept[3].content[0].data, /^3B{60000}$/);
 });
 
 test("applies set, delete, append and truncate deltas before selecting recent requests", t => {
@@ -88,7 +104,7 @@ test("keeps the newest images and replaces only the older ones", t => {
 	assert.deepEqual(kept.slice(0, 4).map(request => request.content[0].data), Array(4).fill(kept[0].content[0].data));
 	assert.match(kept[0].content[0].data, placeholder);
 	for (const request of kept.slice(4)) { assert.match(request.content[0].data, /^[45]AAAA/); }
-	assert.match(result.stdout, /images: kept 2, replaced 4/);
+	assert.match(result.stdout, /images: kept 2 of 6, replaced 4/);
 });
 
 test("refuses an invalid image budget", t => {

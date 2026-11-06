@@ -130,49 +130,59 @@ let trimmedOldChars = 0;
 
 const isDataImageUrl = (text) => /^data:[\w.+-]+\/image[\w.+-]*;base64,/i.test(text);
 
-/**
- * A payload the pruning pass may keep: an image part, its data URL, a revived
- * buffer, or an unrecognised base64 blob (which is never useful as text).
- */
-function isImagePayload(node, key, value) {
-	if (typeof value !== "string") { return false; }
-	if (key === "$base64") { return value.length > MAX_BINARY; }
-	if (isDataImageUrl(value)) { return value.length > MAX_BINARY; }
-	const mime = typeof node.mimeType === "string" ? node.mimeType : undefined;
-	if ((key === "data" || key === "value") && mime && mime.startsWith("image/") && node.isText !== true) { return value.length > MAX_BINARY; }
-	return value.length > MAX_STRING && looksBase64(value);
+/** True when this object marks its children as image content. */
+function marksImage(node) {
+	return (typeof node.mimeType === "string" && node.mimeType.startsWith("image/"))
+		|| node.kind === "image";
 }
 
-function countImages(node) {
+/**
+ * A payload slot carrying image bytes. Images in a chat session appear in three
+ * shapes and at any size: a part `data`/`value` string next to `mimeType`
+ * (tool results), a `data:image/...` URL, and a revived `$base64` buffer inside
+ * a variable whose parent carries `mimeType`/`kind: "image"`.
+ */
+function isImagePayload(node, key, value, imageContext) {
+	if (typeof value !== "string" || !value) { return false; }
+	if (key === "$base64") { return imageContext; }
+	if (isDataImageUrl(value)) { return true; }
+	if ((key === "data" || key === "value") && imageContext && node.isText !== true) { return true; }
+	return false;
+}
+
+function countImages(node, imageContext = false) {
 	if (!node || typeof node !== "object") { return 0; }
-	let total = 0;
 	if (Array.isArray(node)) {
-		for (const item of node) { total += countImages(item); }
+		let total = 0;
+		for (const item of node) { total += countImages(item, imageContext); }
 		return total;
 	}
+	const context = imageContext || marksImage(node);
+	let total = 0;
 	for (const [key, value] of Object.entries(node)) {
-		if (key !== "$mid" && isImagePayload(node, key, value)) { total++; }
+		if (key !== "$mid" && isImagePayload(node, key, value, context)) { total++; }
 	}
 	for (const [key, value] of Object.entries(node)) {
-		if (key !== "$mid" && value && typeof value === "object") { total += countImages(value); }
+		if (key !== "$mid" && value && typeof value === "object") { total += countImages(value, context); }
 	}
 	return total;
 }
 
 /** Replaces image payloads in document order while `shouldDrop` says so. */
-function dropImages(node, shouldDrop) {
+function dropImages(node, shouldDrop, imageContext = false) {
 	if (!node || typeof node !== "object") { return; }
 	if (Array.isArray(node)) {
-		for (const item of node) { dropImages(item, shouldDrop); }
+		for (const item of node) { dropImages(item, shouldDrop, imageContext); }
 		return;
 	}
+	const context = imageContext || marksImage(node);
 	for (const [key, value] of Object.entries(node)) {
-		if (key === "$mid" || !isImagePayload(node, key, value) || !shouldDrop()) { continue; }
+		if (key === "$mid" || !isImagePayload(node, key, value, context) || !shouldDrop()) { continue; }
 		node[key] = isDataImageUrl(value) ? `data:image/png;base64,${PLACEHOLDER_PNG}` : PLACEHOLDER_PNG;
 		removedPayloads++; removedPayloadChars += value.length; removedImages++;
 	}
 	for (const [key, value] of Object.entries(node)) {
-		if (key !== "$mid" && value && typeof value === "object") { dropImages(value, shouldDrop); }
+		if (key !== "$mid" && value && typeof value === "object") { dropImages(value, shouldDrop, context); }
 	}
 }
 
@@ -191,6 +201,12 @@ function pruneImages(requests) {
 	}
 }
 
+function countAllImages(requests) {
+	let total = 0;
+	for (const request of requests) { total += countImages(request); }
+	return total;
+}
+
 /**
  * Tool outputs in old requests are what makes a chat session grow to hundreds
  * of megabytes. The newest `keepRecent` requests stay untouched, so the model
@@ -204,23 +220,24 @@ function trimOldRequests(requests, limit) {
 	}
 }
 
-function trimLongStrings(node, limit) {
+function trimLongStrings(node, limit, imageContext = false) {
 	if (typeof node === "string") { return; }
 	if (!node || typeof node !== "object") { return; }
 	if (Array.isArray(node)) {
 		for (let index = 0; index < node.length; index++) {
 			const item = node[index];
 			if (typeof item === "string") { if (item.length > limit) { node[index] = trimText(item); } }
-			else { trimLongStrings(item, limit); }
+			else { trimLongStrings(item, limit, imageContext); }
 		}
 		return;
 	}
+	const context = imageContext || marksImage(node);
 	for (const [key, value] of Object.entries(node)) {
 		if (key === "$mid" || typeof value !== "string") {
-			if (value && typeof value === "object") { trimLongStrings(value, limit); }
+			if (value && typeof value === "object") { trimLongStrings(value, limit, context); }
 			continue;
 		}
-		if (isImagePayload(node, key, value) || isDataImageUrl(value)) { continue; }
+		if (isImagePayload(node, key, value, context)) { continue; }
 		if (value.length > limit) {
 			node[key] = trimText(value);
 			trimmedOldStrings++; trimmedOldChars += value.length - node[key].length;
@@ -242,7 +259,7 @@ function removePayload(text, replacement) {
 	return replacement;
 }
 
-function sanitize(node, preserveImages = true) {
+function sanitize(node, preserveImages = true, imageContext = false) {
 	if (typeof node === "string") {
 		if (node.length > MAX_STRING) {
 			if (isDataImageUrl(node) && preserveImages) { return node; }
@@ -257,19 +274,20 @@ function sanitize(node, preserveImages = true) {
 	}
 	if (Array.isArray(node)) {
 		for (let index = 0; index < node.length; index++) {
-			node[index] = sanitize(node[index], preserveImages);
+			node[index] = sanitize(node[index], preserveImages, imageContext);
 		}
 		return node;
 	}
 	if (!node || typeof node !== "object") {
 		return node;
 	}
+	const context = imageContext || marksImage(node);
 	const mime = typeof node.mimeType === "string" ? node.mimeType : undefined;
 	// Tool outputs keep screenshots as base64 in `value`, other parts in `data`.
 	for (const field of ["data", "value"]) {
 		const payload = node[field];
 		if (typeof payload === "string" && payload.length > MAX_BINARY && mime && !mime.startsWith("text/") && node.isText !== true) {
-			if (preserveImages && mime.startsWith("image/") && payload.length > MAX_BINARY) { continue; }
+			if (preserveImages && (mime.startsWith("image/") || context)) { continue; }
 			node[field] = removePayload(payload, mime.startsWith("image/") ? PLACEHOLDER_PNG : "");
 		}
 	}
@@ -281,10 +299,10 @@ function sanitize(node, preserveImages = true) {
 		if (key === "$mid") {
 			continue;
 		}
-		if (preserveImages && typeof node[key] === "string" && isImagePayload(node, key, node[key])) {
+		if (preserveImages && typeof node[key] === "string" && isImagePayload(node, key, node[key], context)) {
 			continue;
 		}
-		node[key] = sanitize(node[key], preserveImages);
+		node[key] = sanitize(node[key], preserveImages, context);
 	}
 	return node;
 }
@@ -347,6 +365,8 @@ async function main() {
 	const { value, records } = await readSession(source), requests = value.requests, budget = budgetMb * 1024 * 1024;
 	console.log(`original: ${mb(size)}, applied ${records} snapshot/delta record(s)`);
 	// Images are decided first, so the request budget reflects what is really stored.
+	const foundImages = countAllImages(requests);
+	console.log(`images found: ${foundImages}, keeping the newest ${keepImages}`);
 	pruneImages(requests);
 	const trimLimit = maxStringKb > 0 ? maxStringKb * 1000 : MAX_STRING;
 	trimOldRequests(requests, trimLimit);
@@ -365,7 +385,7 @@ async function main() {
 	if (Buffer.byteLength(line, "utf8") + 1 > budget) { throw new Error("newest request or session metadata exceeds the budget; no repaired file was written"); }
 	fs.writeFileSync(target, line + "\n", { encoding: "utf8", flag: "wx" });
 	console.log(`removed ${removedPayloads} binary payload(s) (${mb(removedPayloadChars)}), trimmed ${trimmedStrings} string(s) (${mb(trimmedChars)}); requests kept ${value.requests.length}/${requests.length}`);
-	console.log(`images: kept ${keptImages}, replaced ${removedImages}`);
+	console.log(`images: kept ${keptImages} of ${foundImages}, replaced ${removedImages}`);
 	if (trimmedOldStrings) {
 		console.log(`old requests: trimmed ${trimmedOldStrings} long string(s) (${mb(trimmedOldChars)} freed), newest ${keepRecent} request(s) untouched`);
 	}
