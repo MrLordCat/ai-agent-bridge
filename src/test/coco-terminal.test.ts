@@ -63,6 +63,13 @@ class TerminalHost implements CocoTerminalHost, vscode.Disposable {
 		this.end.fire({ terminal: command.terminal, shellIntegration: command.terminal.shellIntegration!, execution: command.execution, exitCode });
 	}
 
+	/** Polls until the next execution exists, so a test never assumes event timing. */
+	async next(count: number): Promise<void> {
+		for (let attempt = 0; attempt < 400 && this.commands.length < count; attempt++) {
+			await new Promise<void>(resolve => setTimeout(resolve, 10));
+		}
+	}
+
 	dispose(): void { this.commands.forEach(command => command.finish()); this.change.dispose(); this.start.dispose(); this.end.dispose(); this.closed.dispose(); }
 }
 
@@ -117,22 +124,46 @@ suite("Coco interactive terminals", () => {
 		assert.notStrictEqual((await first).terminalId, (await second).terminalId);
 	});
 
-	test("reuses a requested directory without changing the cwd of another idle shell", async () => {
+	test("enters a requested directory in the idle shell instead of opening another terminal", async () => {
 		const cwd = path.resolve("coco-test-first");
 		const otherCwd = path.resolve("coco-test-other");
+		
 		const first = manager.run({ command: "first", cwd }, source.token);
 		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(0);
 		const firstResult = await first;
 		const matching = manager.run({ command: "matching", cwd }, source.token);
 		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(1);
 		assert.strictEqual((await matching).terminalId, firstResult.terminalId);
+		// The user changed directory in that shell; the next request for the
+		// original directory must reuse it by entering the directory, not open a tab.
 		Object.assign(host.terminals[0].terminal.shellIntegration!, { cwd: vscode.Uri.file(otherCwd) });
 		const different = manager.run({ command: "must start in requested cwd", cwd }, source.token);
-		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(2);
-		assert.notStrictEqual((await different).terminalId, firstResult.terminalId);
-		assert.strictEqual(host.terminals[1].options.cwd, cwd);
+		await host.next(3);
+		assert.deepStrictEqual(host.terminals[0].calls, ["first", "matching", `cd "${cwd}"`]);
+		host.complete(2);
+		await host.next(4);
+		host.commands[3].push("in requested directory"); host.complete(3);
+		const differentResult = await different;
+		assert.strictEqual(differentResult.terminalId, firstResult.terminalId);
+		assert.strictEqual(host.terminals.length, 1, "no extra terminal for the same chat");
+		assert.deepStrictEqual(host.terminals[0].calls, ["first", "matching", `cd "${cwd}"`, "must start in requested cwd"]);
 		await assert.rejects(manager.run({ command: "wrong cwd", terminalId: firstResult.terminalId, cwd }, source.token), /cwd does not match/);
-		assert.strictEqual(host.terminals.length, 2);
+	});
+
+	test("falls back to a new terminal when the shell cannot change directory", async () => {
+		const cwd = path.resolve("coco-test-target"), otherCwd = path.resolve("coco-test-elsewhere");
+		const first = manager.run({ command: "first" }, source.token);
+		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(0);
+		const firstResult = await first;
+		Object.assign(host.terminals[0].terminal.shellIntegration!, { cwd: vscode.Uri.file(otherCwd) });
+		const moved = manager.run({ command: "run here", cwd }, source.token);
+		await host.next(2);
+		host.complete(1, 1);
+		await host.next(3);
+		host.complete(2);
+		const movedResult = await moved;
+		assert.notStrictEqual(movedResult.terminalId, firstResult.terminalId);
+		assert.strictEqual(host.terminals[1].options.cwd, cwd, "the replacement opens in the requested directory");
 	});
 
 	test("creates a replacement after the user closes the idle terminal", async () => {
@@ -279,3 +310,5 @@ suite("Coco real terminal", () => {
 		} finally { manager.dispose(); source.dispose(); }
 	});
 });
+
+

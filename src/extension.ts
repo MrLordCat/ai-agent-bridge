@@ -584,7 +584,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	await Promise.all([logService.initialize(), memoryService.initialize()]);
 	registerMemoryTools(context, memoryService);
 	registerWaitForTerminalTool(context);
-	registerCocoTerminalTools(context);
+	registerCocoTerminalTools(context, (event, data) => logService.log(event, data));
 	registerCopilotPatchIntegration(context);
 
 	// Expose agent history caps to the prompt-tsx patch via globalThis.

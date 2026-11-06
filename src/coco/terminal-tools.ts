@@ -32,8 +32,11 @@ function confirm(title: string, message: string, command?: string): vscode.Prepa
 	return { invocationMessage: title, confirmationMessages: { title, message: markdown } };
 }
 
-export function registerCocoTerminalTools(context: vscode.ExtensionContext): void {
-	const manager = new CocoTerminalManager();
+export function registerCocoTerminalTools(
+	context: vscode.ExtensionContext,
+	onLog?: (event: string, data: Record<string, unknown>) => void,
+): void {
+	const manager = new CocoTerminalManager(vscode.window, undefined, onLog);
 	context.subscriptions.push(manager,
 		vscode.lm.registerTool<CocoTerminalRunInput>(COCO_TERMINAL_TOOLS.run, {
 			prepareInvocation: ({ input }) => confirm("Run command in a Coco terminal", "Execute in the interactive VS Code terminal panel.", input.command),

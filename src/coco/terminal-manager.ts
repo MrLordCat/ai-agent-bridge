@@ -30,6 +30,10 @@ interface Session {
 	starting: boolean;
 	busy?: vscode.TerminalShellExecution;
 	command?: Command;
+	/** Directory the terminal was created in; used until shell integration reports one. */
+	createdCwd?: string;
+	/** Directory reported by the last shell execution. */
+	lastCwd?: string;
 }
 
 export interface CocoTerminalRunInput {
@@ -62,11 +66,18 @@ export class CocoTerminalManager implements vscode.Disposable {
 	private disposed = false;
 	private sequence = 0;
 
-	constructor(private readonly host: CocoTerminalHost = vscode.window, private readonly integrationTimeoutMs = 20_000) {
+	constructor(
+		private readonly host: CocoTerminalHost = vscode.window,
+		private readonly integrationTimeoutMs = 20_000,
+		private readonly onLog?: (event: string, data: Record<string, unknown>) => void,
+	) {
 		this.subscriptions = [
 			host.onDidStartTerminalShellExecution(event => {
 				const session = this.find(event.terminal);
-				if (session) { session.busy = event.execution; }
+				if (session) {
+					session.busy = event.execution;
+					if (event.execution.cwd) { session.lastCwd = event.execution.cwd.fsPath; }
+				}
 			}),
 			host.onDidEndTerminalShellExecution(event => {
 				const session = this.find(event.terminal);
@@ -91,9 +102,20 @@ export class CocoTerminalManager implements vscode.Disposable {
 		if (typeof input.command !== "string" || !input.command.trim()) { throw new Error("A non-empty command is required."); }
 		if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
 		if (input.terminalId && input.newTerminal) { throw new Error("Use either terminalId or newTerminal, not both."); }
-		const session = input.terminalId ? this.get(input.terminalId)
-			: (!input.newTerminal ? [...this.sessions.values()].reverse().find(candidate =>
-				this.isIdle(candidate) && (!input.cwd || this.matchesCwd(candidate, input.cwd))) : undefined) ?? this.create(input.cwd);
+		const selection = this.select(input);
+		const session = selection.session;
+		this.onLog?.("coco.terminal.run", {
+			command: input.command.slice(0, 160),
+			cwd: input.cwd,
+			requestedId: input.terminalId,
+			newTerminal: input.newTerminal === true,
+			action: selection.created ? "create" : "reuse",
+			reason: selection.reason,
+			terminalId: session.id,
+			terminalName: (session.terminal as { name?: string }).name,
+			idleCount: [...this.sessions.values()].filter(candidate => this.isIdle(candidate)).length,
+			sessionCwd: this.knownCwd(session),
+		});
 		if (session.closed) { throw new Error("This terminal was closed. Omit terminalId to select another terminal."); }
 		if (session.starting || session.busy || session.command?.state === "running") {
 			throw new Error("This terminal is busy. Read its output, or use a new terminal; do not interrupt the user's command.");
@@ -111,19 +133,25 @@ export class CocoTerminalManager implements vscode.Disposable {
 			const integration = await this.waitForIntegration(session, token);
 			if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
 			if (session.closed || session.busy) { throw new Error("The terminal was closed or became busy before execution. No command was sent."); }
-			const execution = integration.executeCommand(input.command);
-			let finish!: () => void;
-			const command: Command = {
-				execution, output: "", truncated: false, state: "running",
-				done: new Promise<void>(resolve => { finish = resolve; }), finish: () => finish(), drain: Promise.resolve(),
-			};
-			session.command = command;
-			// Subscribe immediately: read() does not replay earlier terminal output.
-			command.drain = this.capture(execution.read(), command);
-			const waitMs = input.mode === "async" ? 1_000 : bounded(input.timeoutMs, 120_000, 3_600_000);
-			await this.waitFor(command.done, waitMs);
-			if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
-			return this.snapshot(session);
+			// Reusing a terminal that sits in another directory: enter the requested
+			// directory first instead of leaving an extra terminal behind.
+			if (!input.terminalId && input.cwd && !this.matchesCwd(session, input.cwd)) {
+				const entered = await this.enterDirectory(session, integration, input.cwd, token).catch(() => false);
+				if (!entered) {
+					// The shell refused the change; a terminal created there is the honest option.
+					const replacement = this.create(input.cwd);
+					this.onLog?.("coco.terminal.run", {
+						command: input.command.slice(0, 160), cwd: input.cwd,
+						action: "create", reason: "directory-change-failed",
+						terminalId: replacement.id, idleCount: [...this.sessions.values()].filter(candidate => this.isIdle(candidate)).length,
+					});
+					await this.prepareSession(replacement, token);
+					const replacementIntegration = replacement.terminal.shellIntegration
+						?? await this.waitForIntegration(replacement, token);
+					return await this.executeIn(replacement, input, token, replacementIntegration);
+				}
+			}
+			return await this.executeIn(session, input, token, integration);
 		} catch (error) {
 			// If initialization failed, leave no empty terminal behind. Never replay a command.
 			if (!session.command) { this.close(session); }
@@ -133,6 +161,63 @@ export class CocoTerminalManager implements vscode.Disposable {
 			session.starting = false;
 			cancellation.dispose();
 		}
+	}
+
+	/** Shows the terminal and waits until shell integration can execute commands. */
+	private async prepareSession(session: Session, token: vscode.CancellationToken): Promise<vscode.TerminalShellIntegration> {
+		this.sessions.delete(session.id);
+		this.sessions.set(session.id, session);
+		session.terminal.show(true);
+		return this.waitForIntegration(session, token);
+	}
+
+	private async executeIn(
+		session: Session,
+		input: CocoTerminalRunInput,
+		token: vscode.CancellationToken,
+		integration: vscode.TerminalShellIntegration,
+	): Promise<CocoTerminalSnapshot> {
+		if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
+		if (session.closed || session.busy) { throw new Error("The terminal was closed or became busy before execution. No command was sent."); }
+		const execution = integration.executeCommand(input.command);
+		let finish!: () => void;
+		const command: Command = {
+			execution, output: "", truncated: false, state: "running",
+			done: new Promise<void>(resolve => { finish = resolve; }), finish: () => finish(), drain: Promise.resolve(),
+		};
+		session.command = command;
+		// Subscribe immediately: read() does not replay earlier terminal output.
+		command.drain = this.capture(execution.read(), command);
+		const waitMs = input.mode === "async" ? 1_000 : bounded(input.timeoutMs, 120_000, 3_600_000);
+		await this.waitFor(command.done, waitMs);
+		if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
+		return this.snapshot(session);
+	}
+
+	/** Runs `cd` in the reused terminal; false when the shell could not enter the directory. */
+	private async enterDirectory(
+		session: Session,
+		integration: vscode.TerminalShellIntegration,
+		cwd: string,
+		token: vscode.CancellationToken,
+	): Promise<boolean> {
+		// A double-quoted path works in PowerShell, bash and cmd; characters a
+		// shell would expand are refused so a new terminal is used instead.
+		if (/["`$]/.test(cwd)) { return false; }
+		const command = `cd "${cwd}"`;
+		let finish!: () => void;
+		const directoryChange: Command = {
+			execution: integration.executeCommand(command), output: "", truncated: false, state: "running",
+			done: new Promise<void>(resolve => { finish = resolve; }), finish: () => finish(), drain: Promise.resolve(),
+		};
+		session.command = directoryChange;
+		directoryChange.drain = this.capture(directoryChange.execution.read(), directoryChange);
+		await this.waitFor(directoryChange.done, 10_000, token);
+		const entered = directoryChange.state === "completed" && directoryChange.exitCode === 0;
+		this.onLog?.("coco.terminal.change_directory", {
+			terminalId: session.id, cwd, exitCode: directoryChange.exitCode, state: directoryChange.state, entered,
+		});
+		return entered && !token.isCancellationRequested;
 	}
 
 	async read(terminalId: string, waitMs = 0, maxChars = 12_000, token?: vscode.CancellationToken): Promise<CocoTerminalSnapshot> {
@@ -180,6 +265,7 @@ export class CocoTerminalManager implements vscode.Disposable {
 		}
 		const session: Session = {
 			id: randomUUID(), closed: false, starting: false,
+			createdCwd: cwd,
 			terminal: this.host.createTerminal({
 				name: `Coco ${++this.sequence}`, cwd: cwd || vscode.workspace.workspaceFolders?.[0]?.uri,
 				location: vscode.TerminalLocation.Panel,
@@ -189,13 +275,48 @@ export class CocoTerminalManager implements vscode.Disposable {
 		return session;
 	}
 
+	/**
+	 * Picks the terminal for a run. A cwd only forces a new terminal when no idle
+	 * one is in that directory: models pass cwd on most calls, and creating a tab
+	 * per command left the panel full of terminals.
+	 */
+	private select(input: CocoTerminalRunInput): { session: Session; created: boolean; reason: string } {
+		if (input.terminalId) {
+			return { session: this.get(input.terminalId), created: false, reason: "explicit-terminal-id" };
+		}
+		const idle = [...this.sessions.values()].reverse().filter(candidate => this.isIdle(candidate));
+		if (input.newTerminal) {
+			return { session: this.create(input.cwd), created: true, reason: "new-terminal-requested" };
+		}
+		if (!input.cwd) {
+			const session = idle[0];
+			return session
+				? { session, created: false, reason: "idle-terminal" }
+				: { session: this.create(undefined), created: true, reason: "no-idle-terminal" };
+		}
+		const matching = idle.find(candidate => this.matchesCwd(candidate, input.cwd!));
+		if (matching) {
+			return { session: matching, created: false, reason: "idle-terminal-in-cwd" };
+		}
+		const reusable = idle[0];
+		if (reusable) {
+			return { session: reusable, created: false, reason: "idle-terminal-other-cwd" };
+		}
+		return { session: this.create(input.cwd), created: true, reason: "no-idle-terminal" };
+	}
+
+	/** Shell-reported directory, then the last execution's, then the creation directory. */
+	private knownCwd(session: Session): string | undefined {
+		return session.terminal.shellIntegration?.cwd?.fsPath ?? session.lastCwd ?? session.createdCwd;
+	}
+
 	private isIdle(session: Session): boolean {
 		return !session.closed && !session.terminal.exitStatus && !session.starting && !session.busy
 			&& session.command?.state !== "running";
 	}
 
 	private matchesCwd(session: Session, cwd: string): boolean {
-		const actual = session.terminal.shellIntegration?.cwd?.fsPath;
+		const actual = this.knownCwd(session);
 		if (!actual) { return false; }
 		const normalize = (directory: string) => {
 			const resolved = path.resolve(directory);

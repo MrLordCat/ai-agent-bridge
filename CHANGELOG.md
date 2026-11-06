@@ -1,5 +1,18 @@
 # Changelog
 
+## 1.20.18 (dev patch) - 2026-11-06
+
+- A chat no longer opens one Coco terminal per command. Models pass `cwd` on
+  most calls, and a terminal sitting in another directory used to force a new
+  tab every time. The run tool now reuses the last idle terminal and enters the
+  requested directory in it (`cd "…"`); a new terminal is created only when none
+  is idle, the shell cannot change directory, or `newTerminal` is true.
+- Terminal selection is logged (`coco.terminal.run` with the reuse reason,
+  `coco.terminal.change_directory`) so a future report can be traced.
+- The reported directory now also falls back to the last shell execution and the
+  terminal's creation directory, so a terminal is recognised before shell
+  integration publishes its own `cwd`.
+
 ## 1.20.17 (dev patch) - 2026-11-05
 
 - The shared chat transcript keeps only the newest 100 images
