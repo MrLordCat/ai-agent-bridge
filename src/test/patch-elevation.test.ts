@@ -6,7 +6,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import { ADMIN_PATCH_ACTION, USER_CODE_ACTION, createElevatedPatchRunner,
 	elevatedPatchCommand, findTerminalElevation, terminalPatchCommand, patchPermissionActions, quotePosixArgument, type ElevatedPatchJob } from "../patch-elevation";
-import { applyCopilotPatch, findCopilotBundles, restoreCopilotPatch } from "../copilot-patch";
+import { COPILOT_PATCH_MARKER, VSCODE_CHAT_HISTORY_PATCH_MARKER, applyCopilotPatch, findCopilotBundles, restoreCopilotPatch } from "../copilot-patch";
 
 suite("Patch permission recovery", () => {
 	let directory: string;
@@ -149,14 +149,15 @@ suite("Patch permission recovery", () => {
 		if (process.platform !== "linux" || process.getuid?.() === 0) { this.skip(); return; }
 		const bundlePath = path.join(directory, "extension.js"), workbenchPath = path.join(directory, "workbench.js");
 		const backup = bundlePath + ".llama-vscode-chat.backup", workbenchBackup = workbenchPath + ".llama-vscode-chat.backup";
-		fs.writeFileSync(bundlePath, "patched Copilot"); fs.writeFileSync(backup, "original Copilot");
-		fs.writeFileSync(workbenchPath, "patched workbench"); fs.writeFileSync(workbenchBackup, "original workbench");
+		const patchedCopilot = COPILOT_PATCH_MARKER + "patched Copilot";
+		fs.writeFileSync(bundlePath, patchedCopilot); fs.writeFileSync(backup, "original Copilot");
+		fs.writeFileSync(workbenchPath, VSCODE_CHAT_HISTORY_PATCH_MARKER + "patched workbench"); fs.writeFileSync(workbenchBackup, "original workbench");
 		fs.chmodSync(workbenchPath, 0o444);
 		const target = { bundlePath, workbenchPath, packagePath: path.join(directory, "package.json"), manifest: { version: "test" } };
 		try {
 			assert.throws(() => restoreCopilotPatch(target), /EACCES|permission denied/);
 			assert.ok(fs.existsSync(backup)); assert.ok(fs.existsSync(workbenchBackup));
-			assert.strictEqual(fs.readFileSync(bundlePath, "utf8"), "patched Copilot");
+			assert.strictEqual(fs.readFileSync(bundlePath, "utf8"), patchedCopilot);
 			fs.chmodSync(workbenchPath, 0o644);
 			assert.strictEqual(restoreCopilotPatch(target).changed, true);
 			assert.strictEqual(fs.readFileSync(bundlePath, "utf8"), "original Copilot");

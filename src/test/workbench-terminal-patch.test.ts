@@ -10,7 +10,14 @@ import {
         getWorkbenchTerminalPatchStatus,
         patchWorkbenchTerminalBundle,
         restoreWorkbenchTerminalPatch,
+        unpatchWorkbenchTerminalBundle,
 } from "../byok/workbench-terminal-patch";
+import {
+        COPILOT_PATCH_MARKER,
+        VSCODE_CHAT_HISTORY_PATCH_MARKER,
+        restoreCopilotPatch,
+        type CopilotPatchTarget,
+} from "../copilot-patch";
 
 const INIT_TERMINAL_SOURCE =
         `class X{` +
@@ -34,6 +41,10 @@ const INIT_TERMINAL_SOURCE =
 			`this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
 			`this._terminalChatService.registerTerminalInstanceWithToolSession(i,u.instance),` +
 			`this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}}}`;
+
+		test("reverts the 1.133 signature exactly", () => {
+			assert.strictEqual(unpatchWorkbenchTerminalBundle(patchWorkbenchTerminalBundle(INIT_TERMINAL_133)), INIT_TERMINAL_133);
+		});
 
 		test("patches the 1.133 signature (tool-session parameter i)", () => {
 			const patched = patchWorkbenchTerminalBundle(INIT_TERMINAL_133);
@@ -79,6 +90,33 @@ suite("Agents Bridge — workbench terminal reuse patch", () => {
                 assert.throws(() => patchWorkbenchTerminalBundle("class X{}"), /initTerminal pattern/);
         });
 
+        test("reverts only its own method and keeps the rest of the file", () => {
+                const source = `${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){return e}` + INIT_TERMINAL_SOURCE;
+                assert.strictEqual(unpatchWorkbenchTerminalBundle(patchWorkbenchTerminalBundle(source)), source);
+                assert.strictEqual(unpatchWorkbenchTerminalBundle(source), source, "an unpatched file is returned as is");
+        });
+
+        test("refuses to revert a patched method that was changed afterwards", () => {
+                const changed = patchWorkbenchTerminalBundle(INIT_TERMINAL_SOURCE).replace("u.isBackground=!1;", "u.isBackground=!1;x();");
+                assert.throws(() => unpatchWorkbenchTerminalBundle(changed), /cannot be reverted/);
+        });
+
+        test("does not write a patched bundle that fails syntax validation", function () {
+                this.timeout(30_000);
+                const dir = fs.mkdtempSync(path.join(os.tmpdir(), "workbench-terminal-invalid-"));
+                const bundlePath = path.join(dir, "workbench.desktop.main.js");
+                const broken = INIT_TERMINAL_SOURCE + "}";
+                fs.writeFileSync(bundlePath, broken);
+                try {
+                        assert.throws(() => applyWorkbenchTerminalPatch(bundlePath), /syntax validation/);
+                        assert.strictEqual(fs.readFileSync(bundlePath, "utf8"), broken);
+                        assert.ok(!fs.existsSync(bundlePath + ".llama-vscode-chat.bak"), "no backup for a refused patch");
+                        assert.ok(!fs.existsSync(bundlePath + ".llama-vscode-chat.lock"), "the lock is released");
+                } finally {
+                        fs.rmSync(dir, { recursive: true, force: true });
+                }
+        });
+
         test("applies and restores against a temporary bundle copy", () => {
                 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "workbench-terminal-patch-"));
                 const bundlePath = path.join(dir, "workbench.desktop.main.js");
@@ -110,6 +148,23 @@ suite("Agents Bridge — workbench terminal reuse patch", () => {
                 }
         });
 
+        test("restore keeps the chat-history patch even when the terminal backup is outdated", function () {
+                this.timeout(30_000);
+                const dir = fs.mkdtempSync(path.join(os.tmpdir(), "workbench-terminal-shared-"));
+                const bundlePath = path.join(dir, "workbench.desktop.main.js");
+                const historyPatched = `${VSCODE_CHAT_HISTORY_PATCH_MARKER}function __llamaBoundToolText(e){return e}` + INIT_TERMINAL_SOURCE;
+                fs.writeFileSync(bundlePath, historyPatched);
+                try {
+                        applyWorkbenchTerminalPatch(bundlePath);
+                        fs.writeFileSync(bundlePath + ".llama-vscode-chat.bak", INIT_TERMINAL_SOURCE);
+                        assert.strictEqual(restoreWorkbenchTerminalPatch(bundlePath).changed, true);
+                        assert.strictEqual(fs.readFileSync(bundlePath, "utf8"), historyPatched);
+                        assert.strictEqual(restoreWorkbenchTerminalPatch(bundlePath).changed, false, "nothing left to restore");
+                } finally {
+                        fs.rmSync(dir, { recursive: true, force: true });
+                }
+        });
+
         test("matches the installed workbench bundle exactly once (read-only)", function () {
                 let bundlePath: string;
                 try {
@@ -136,7 +191,70 @@ suite("Agents Bridge — workbench terminal reuse patch", () => {
                         }
                         assert.strictEqual(patternCount, 1, "unpatched bundle must contain the pattern exactly once");
                 }
+                if (markerCount === 1) {
+                        const reverted = unpatchWorkbenchTerminalBundle(source);
+                        assert.ok(!reverted.includes(WORKBENCH_TERMINAL_PATCH_MARKER));
+                        assert.strictEqual(patchWorkbenchTerminalBundle(reverted), source, "the revert must be exact");
+                }
                 const status = getWorkbenchTerminalPatchStatus(bundlePath);
                 assert.strictEqual(status.sha256.length, 64);
+        });
+});
+
+suite("Shared workbench — Copilot restore and the terminal patch", () => {
+        let dir: string;
+        setup(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), "shared-workbench-")); });
+        teardown(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+        function target(bundle: string, workbench: string, workbenchBackup: string, recordedVersion?: string): CopilotPatchTarget {
+                const bundlePath = path.join(dir, "extension.js");
+                const workbenchPath = path.join(dir, "workbench.desktop.main.js");
+                fs.writeFileSync(bundlePath, bundle);
+                fs.writeFileSync(bundlePath + ".llama-vscode-chat.backup", "var original=1;");
+                fs.writeFileSync(workbenchPath, workbench);
+                fs.writeFileSync(workbenchPath + ".llama-vscode-chat.backup", workbenchBackup);
+                if (recordedVersion) {
+                        fs.writeFileSync(bundlePath + ".llama-vscode-chat.patch.json", JSON.stringify({ copilotVersion: recordedVersion }));
+                }
+                return { bundlePath, workbenchPath, packagePath: path.join(dir, "package.json"), manifest: { name: "copilot-chat", version: "0.71.0" } };
+        }
+
+        test("keeps a terminal patch applied after the workbench backup was taken", function () {
+                this.timeout(30_000);
+                const terminalPatched = patchWorkbenchTerminalBundle(INIT_TERMINAL_SOURCE);
+                const copilot = target(COPILOT_PATCH_MARKER + "var patched=1;", VSCODE_CHAT_HISTORY_PATCH_MARKER + terminalPatched, INIT_TERMINAL_SOURCE);
+                const result = restoreCopilotPatch(copilot);
+                assert.strictEqual(result.changed, true);
+                assert.strictEqual(fs.readFileSync(copilot.workbenchPath as string, "utf8"), terminalPatched);
+                assert.strictEqual(fs.readFileSync(copilot.bundlePath, "utf8"), "var original=1;");
+                assert.ok(!fs.existsSync(copilot.workbenchPath + ".llama-vscode-chat.backup"));
+        });
+
+        test("drops a terminal patch reverted after the workbench backup was taken", () => {
+                const copilot = target(
+                        COPILOT_PATCH_MARKER + "var patched=1;",
+                        VSCODE_CHAT_HISTORY_PATCH_MARKER + INIT_TERMINAL_SOURCE,
+                        patchWorkbenchTerminalBundle(INIT_TERMINAL_SOURCE)
+                );
+                restoreCopilotPatch(copilot);
+                assert.strictEqual(fs.readFileSync(copilot.workbenchPath as string, "utf8"), INIT_TERMINAL_SOURCE);
+        });
+
+        test("leaves unpatched files alone instead of copying outdated backups", () => {
+                const copilot = target("var updated=2;", "updated workbench", "previous workbench", "0.70.0");
+                const result = restoreCopilotPatch(copilot);
+                assert.strictEqual(result.changed, false);
+                assert.strictEqual(fs.readFileSync(copilot.bundlePath, "utf8"), "var updated=2;");
+                assert.strictEqual(fs.readFileSync(copilot.workbenchPath as string, "utf8"), "updated workbench");
+                assert.ok(!fs.existsSync(copilot.bundlePath + ".llama-vscode-chat.backup"), "the outdated backup is removed");
+        });
+
+        test("refuses to downgrade a patched bundle from the backup of another version", () => {
+                const patched = COPILOT_PATCH_MARKER + "var patched=1;";
+                const copilot = target(patched, "updated workbench", "previous workbench", "0.70.0");
+                assert.throws(() => restoreCopilotPatch(copilot), /would downgrade Copilot Chat/);
+                assert.strictEqual(fs.readFileSync(copilot.bundlePath, "utf8"), patched);
+                assert.ok(fs.existsSync(copilot.bundlePath + ".llama-vscode-chat.backup"), "the backup is kept");
+                assert.ok(!fs.existsSync(copilot.workbenchPath + ".llama-vscode-chat.lock"), "both locks are released");
         });
 });

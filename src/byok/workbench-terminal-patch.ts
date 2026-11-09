@@ -2,6 +2,7 @@ import * as crypto from "crypto";
 import * as fs from "fs";
 import * as path from "path";
 
+import { checkModuleSyntax, withPatchLock, writeFileAtomic } from "../patch-io";
 import { findWorkbenchCandidates } from "../vscode-app-root";
 
 /**
@@ -28,6 +29,25 @@ export const WORKBENCH_TERMINAL_PATCH_MARKER = `/* ${WORKBENCH_TERMINAL_PATCH_ID
 // the original signature.
 const INIT_TERMINAL_PATTERN =
         /_initTerminal\(e,t,([A-Za-z_$][\w$]*),n,r\)\{if\(!n\)\{let u=this\._sessionTerminalAssociations\.get\(e\);if\(u&&!u\.isBackground&&!u\.instance\.isDisposed\)if\(u\.instance\.exitCode!==void 0\)this\._logService\.info\(`RunInTerminalTool: Cached terminal shell has exited \(code=\${u\.instance\.exitCode}\), creating a new terminal`\),this\._sessionTerminalAssociations\.delete\(e\);else return this\._logService\.debug\(`RunInTerminalTool: Using cached terminal with session resource \\`\${e}\\``\),this\._terminalToolCreator\.refreshShellIntegrationQuality\(u\),this\._terminalChatService\.registerTerminalInstanceWithToolSession\(([A-Za-z_$][\w$]*),u\.instance\),this\._backgroundNotifications\.deleteAndDispose\(u\.instance\.instanceId\),u\}/;
+
+/** The exact text INIT_TERMINAL_PATTERN matches, so the patch can be reverted without a backup. */
+function buildOriginalInitTerminal(sessionParam: string): string {
+        return (
+                `_initTerminal(e,t,${sessionParam},n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
+                `if(u&&!u.isBackground&&!u.instance.isDisposed)if(u.instance.exitCode!==void 0)` +
+                `this._logService.info(\`RunInTerminalTool: Cached terminal shell has exited (code=\${u.instance.exitCode}), creating a new terminal\`),` +
+                `this._sessionTerminalAssociations.delete(e);` +
+                `else return this._logService.debug(\`RunInTerminalTool: Using cached terminal with session resource \\\`\${e}\\\`\`),` +
+                `this._terminalToolCreator.refreshShellIntegrationQuality(u),` +
+                `this._terminalChatService.registerTerminalInstanceWithToolSession(${sessionParam},u.instance),` +
+                `this._backgroundNotifications.deleteAndDispose(u.instance.instanceId),u}`
+        );
+}
+
+const PATCHED_INIT_TERMINAL_HEAD = new RegExp(
+        "_initTerminal\\(e,t,([A-Za-z_$][\\w$]*),n,r\\)\\{if\\(!n\\)\\{let u=this\\._sessionTerminalAssociations\\.get\\(e\\);" +
+                WORKBENCH_TERMINAL_PATCH_MARKER.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")
+);
 
 function buildPatchedInitTerminal(sessionParam: string): string {
         return (
@@ -97,11 +117,36 @@ export function patchWorkbenchTerminalBundle(source: string): string {
         if (first[1] !== first[2]) {
                 throw new Error("workbench terminal patch: initTerminal parameter names differ unexpectedly.");
         }
+        if (first[0] !== buildOriginalInitTerminal(first[1])) {
+                throw new Error("workbench terminal patch: initTerminal could not be reproduced for a later restore.");
+        }
         return (
                 source.slice(0, first.index)
                 + buildPatchedInitTerminal(first[1])
                 + source.slice(first.index + first[0].length)
         );
+}
+
+/**
+ * Reverts only this patch. The workbench also carries the chat-history patch
+ * of the Copilot patch, so restoring a whole-file backup would drop that one.
+ */
+export function unpatchWorkbenchTerminalBundle(source: string): string {
+        const markerIndex = source.indexOf(WORKBENCH_TERMINAL_PATCH_MARKER);
+        if (markerIndex < 0) {
+                return source;
+        }
+        if (source.includes(WORKBENCH_TERMINAL_PATCH_MARKER, markerIndex + WORKBENCH_TERMINAL_PATCH_MARKER.length)) {
+                throw new Error("workbench terminal patch: the patch marker is not unique.");
+        }
+        const head = PATCHED_INIT_TERMINAL_HEAD.exec(source);
+        const patched = head ? buildPatchedInitTerminal(head[1]) : undefined;
+        if (!head || !patched || !source.startsWith(patched, head.index)) {
+                throw new Error(
+                        "workbench terminal patch: the patched initTerminal was changed, so it cannot be reverted. Reinstall VS Code to remove it."
+                );
+        }
+        return source.slice(0, head.index) + buildOriginalInitTerminal(head[1]) + source.slice(head.index + patched.length);
 }
 
 export interface WorkbenchTerminalPatchStatus {
@@ -136,6 +181,10 @@ export function getWorkbenchTerminalPatchStatus(bundlePath: string): WorkbenchTe
 
 /** Applies the patch to the installed bundle, backing up the original once. */
 export function applyWorkbenchTerminalPatch(bundlePath: string): WorkbenchTerminalPatchResult {
+        return withPatchLock(bundlePath, () => applyWorkbenchTerminalPatchLocked(bundlePath));
+}
+
+function applyWorkbenchTerminalPatchLocked(bundlePath: string): WorkbenchTerminalPatchResult {
         const status = getWorkbenchTerminalPatchStatus(bundlePath);
         if (status.applied) {
                 return {
@@ -144,12 +193,20 @@ export function applyWorkbenchTerminalPatch(bundlePath: string): WorkbenchTermin
                         message: "Workbench terminal reuse patch is already applied.",
                 };
         }
-        if (!status.backupExists) {
-                fs.copyFileSync(bundlePath, status.backupPath);
+        const sourceBytes = fs.readFileSync(bundlePath);
+        const patched = patchWorkbenchTerminalBundle(sourceBytes.toString("utf8"));
+        try {
+                checkModuleSyntax(patched, "workbench.mjs");
+        } catch (error) {
+                throw new Error(
+                        `Patched VS Code workbench failed syntax validation: ${error instanceof Error ? error.message : String(error)}`,
+                        { cause: error }
+                );
         }
-        const source = fs.readFileSync(bundlePath, "utf8");
-        const patched = patchWorkbenchTerminalBundle(source);
-        fs.writeFileSync(bundlePath, patched);
+        if (!status.backupExists) {
+                writeFileAtomic(status.backupPath, sourceBytes);
+        }
+        writeFileAtomic(bundlePath, patched);
         const after = getWorkbenchTerminalPatchStatus(bundlePath);
         return {
                 changed: true,
@@ -159,17 +216,21 @@ export function applyWorkbenchTerminalPatch(bundlePath: string): WorkbenchTermin
         };
 }
 
-/** Restores the original bundle from the backup and removes the metadata. */
+/** Reverts the patched method in place and removes the metadata. */
 export function restoreWorkbenchTerminalPatch(bundlePath: string): WorkbenchTerminalPatchResult {
+        return withPatchLock(bundlePath, () => restoreWorkbenchTerminalPatchLocked(bundlePath));
+}
+
+function restoreWorkbenchTerminalPatchLocked(bundlePath: string): WorkbenchTerminalPatchResult {
         const status = getWorkbenchTerminalPatchStatus(bundlePath);
-        if (!status.backupExists) {
+        if (!status.applied) {
                 return {
                         changed: false,
                         status,
-                        message: "No workbench terminal patch backup exists; nothing to restore.",
+                        message: "The workbench terminal reuse patch is not applied; nothing to restore.",
                 };
         }
-        fs.copyFileSync(status.backupPath, bundlePath);
+        writeFileAtomic(bundlePath, unpatchWorkbenchTerminalBundle(fs.readFileSync(bundlePath, "utf8")));
         if (fs.existsSync(status.metadataPath)) {
                 fs.unlinkSync(status.metadataPath);
         }

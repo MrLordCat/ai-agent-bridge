@@ -150,6 +150,36 @@ suite("Agents Bridge — agent-host thinking patch", () => {
 		}
 	});
 
+	test("restore leaves an unpatched bundle alone and drops its outdated backup", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agenthost-stale-"));
+		const file = path.join(dir, "agentHostMain.js");
+		fs.writeFileSync(file, SAMPLE_SOURCE, "utf8");
+		fs.writeFileSync(file + ".llama-vscode-chat.bak", "previous VS Code build", "utf8");
+		try {
+			const restored = restoreAgentHostThinkingPatch(file);
+			assert.strictEqual(restored.changed, false);
+			assert.strictEqual(fs.readFileSync(file, "utf8"), SAMPLE_SOURCE, "an older build must not be copied back");
+			assert.ok(!fs.existsSync(file + ".llama-vscode-chat.bak"), "the outdated backup is removed");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("apply replaces a backup identical to the unpatched bundle instead of refusing", () => {
+		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "agenthost-same-backup-"));
+		const file = path.join(dir, "agentHostMain.js");
+		const original = SAMPLE_SOURCE + "\n" + PROXY_SOURCE + "\n" + K1_SOURCE;
+		fs.writeFileSync(file, original, "utf8");
+		fs.writeFileSync(file + ".llama-vscode-chat.bak", original, "utf8");
+		try {
+			assert.strictEqual(applyAgentHostThinkingPatch(file).changed, true);
+			assert.strictEqual(fs.readFileSync(file + ".llama-vscode-chat.bak", "utf8"), original);
+			assert.ok(!fs.existsSync(file + ".llama-vscode-chat.lock"), "the lock is released");
+		} finally {
+			fs.rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	test("locates the real VS Code 1.131 agent host bundle and matches its pattern", function () {
 		const candidate = agentHostBundlePathFromAppRoot(vscode.env.appRoot);
 		if (!fs.existsSync(candidate)) {

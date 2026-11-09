@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.20.20 (dev patch) - 2026-11-09
+
+Patch safety hardening from the 1.20.19 audit.
+
+- The Copilot chat-history patch and the workbench terminal patch edit the
+  same `workbench.desktop.main.js` but kept separate whole-file backups, so
+  restoring one could drop the other. The terminal patch now reverts only its
+  own method in place, and a Copilot restore keeps the terminal patch exactly
+  as it currently is. A workbench backup that differs from the installed file
+  only by the terminal patch no longer blocks the Copilot patch with "Backup
+  already exists".
+- Every patch writes its bundle, backup and metadata through a temporary file
+  and a rename, so an interrupted write can no longer leave a truncated bundle.
+  A read-only file stays protected, and ownership and mode are kept.
+- The workbench terminal and agent-host patches take the same cross-window
+  lock as the Copilot patch (which now also locks the shared workbench), and
+  the terminal patch is syntax-checked before it is written. The syntax check
+  sets `ELECTRON_RUN_AS_NODE` itself instead of relying on the inherited
+  environment.
+- Restore no longer copies an outdated backup over a newer file: a file that
+  carries no patch is left alone and its leftover backup removed, and a patched
+  bundle whose backup belongs to another Copilot Chat version or VS Code build
+  is refused instead of downgraded. Apply replaces such leftovers (for example
+  after a Linux package update) instead of refusing.
+- `codexCliPath`, `claudeCliPath`, `cocoCliPath` and `codexAccounts` are
+  machine-scoped, so a workspace's settings cannot choose the executable or
+  Codex home the extension starts.
+
 ## 1.20.19 (dev patch) - 2026-11-09
 
 Code audit fixes.

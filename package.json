@@ -8,7 +8,7 @@
 		"type": "git",
 		"url": "https://github.com/MrLordCat/ai-agent-bridge.git"
 	},
-	"version": "1.20.19",
+	"version": "1.20.20",
 	"engines": {
 		"vscode": "^1.131.0",
 		"node": ">=20"
@@ -101,6 +101,7 @@
 				},
 				"llamacpp.cocoCliPath": {
 					"type": "string",
+					"scope": "machine",
 					"default": "",
 					"description": "Optional path to the Coco CLI executable. Empty uses the CLI bundled with the Snowflake VS Code extension."
 				},
@@ -169,11 +170,13 @@
 				},
 				"llamacpp.codexCliPath": {
 					"type": "string",
+					"scope": "machine",
 					"default": "",
 					"description": "Optional path to the Codex CLI executable. Empty uses the CLI bundled with the official OpenAI VS Code extension, then falls back to codex on PATH."
 				},
 				"llamacpp.codexAccounts": {
 					"type": "array",
+					"scope": "machine",
 					"default": [],
 					"items": {
 						"type": "object",
@@ -368,6 +371,7 @@
 				},
 				"llamacpp.claudeCliPath": {
 					"type": "string",
+					"scope": "machine",
 					"default": "",
 					"description": "Absolute path to the Claude Code CLI binary. Leave empty to use the binary bundled with the official 'anthropic.claude-code' extension."
 				},

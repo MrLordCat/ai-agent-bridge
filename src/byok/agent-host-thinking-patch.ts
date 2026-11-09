@@ -1,7 +1,7 @@
 import * as crypto from "crypto";
-import { execFileSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import { checkModuleSyntax, installationBuild, readPatchMetadata, withPatchLock, writeFileAtomic } from "../patch-io";
 import { findAgentHostBundles } from "../vscode-app-root";
 
 /**
@@ -22,6 +22,8 @@ export const AGENT_HOST_NON_STREAMING_PATCH_ID = "llama-vscode-chat:agent-host-n
 export const AGENT_HOST_NON_STREAMING_PATCH_MARKER = `/* ${AGENT_HOST_NON_STREAMING_PATCH_ID} */`;
 export const AGENT_HOST_REASONING_EFFORT_PATCH_ID = "llama-vscode-chat:agent-host-reasoning-effort:v1";
 export const AGENT_HOST_REASONING_EFFORT_PATCH_MARKER = `/* ${AGENT_HOST_REASONING_EFFORT_PATCH_ID} */`;
+/** Every marker this module writes starts with this. */
+const AGENT_HOST_MARKER_PREFIX = "/* llama-vscode-chat:agent-host-";
 
 const BYOK_SNAPSHOT_PATTERN = "maxContextWindow:e.maxContextWindowTokens,supportsVision:e.supportsVision??!1,...t&&{_meta:t}}}";
 
@@ -214,12 +216,24 @@ export function getAgentHostThinkingPatchStatus(bundlePath: string): AgentHostTh
 	};
 }
 
+/** The backup was taken from another VS Code build (a package update replaced the bundle in place). */
+function backupFromOtherBuild(status: AgentHostThinkingPatchStatus): boolean {
+	const recorded = readPatchMetadata(status.metadataPath)?.vscodeBuild;
+	const current = installationBuild(status.bundlePath);
+	return typeof recorded === "string" && current !== undefined && recorded !== current;
+}
+
 export function applyAgentHostThinkingPatch(bundlePath: string, force = false): AgentHostThinkingPatchResult {
+	return withPatchLock(bundlePath, () => applyAgentHostThinkingPatchLocked(bundlePath, force));
+}
+
+function applyAgentHostThinkingPatchLocked(bundlePath: string, force: boolean): AgentHostThinkingPatchResult {
 	const status = getAgentHostThinkingPatchStatus(bundlePath);
 	if (status.applied) {
 		return { changed: false, status, message: "The agent-host thinking patch is already applied." };
 	}
-	const original = fs.readFileSync(bundlePath, "utf8");
+	const originalBytes = fs.readFileSync(bundlePath);
+	const original = originalBytes.toString("utf8");
 	const capabilityIds = inspectAgentHostPatchSupport(original);
 	// An updated VS Code that implements all of this itself must not be reported
 	// as a version mismatch, and it needs no backup handling either.
@@ -233,7 +247,12 @@ export function applyAgentHostThinkingPatch(bundlePath: string, force = false): 
 				+"so no agent-host patch is needed.",
 		};
 	}
-	if (status.backupExists && !force) {
+	// An unpatched bundle is the true original of this build: a backup equal to it, or one of an older build, is replaced.
+	const refreshBackup =
+		status.backupExists &&
+		!original.includes(AGENT_HOST_MARKER_PREFIX) &&
+		(backupFromOtherBuild(status) || fs.readFileSync(status.backupPath).equals(originalBytes));
+	if (status.backupExists && !force && !refreshBackup) {
 		throw new Error(`Backup already exists: ${status.backupPath}. Restore it first or force the patch after inspection.`);
 	}
 	const patched = patchAgentHostBundle(original);
@@ -244,22 +263,24 @@ export function applyAgentHostThinkingPatch(bundlePath: string, force = false): 
 			+ `(VS Code version mismatch? unmatched: ${unmatched.map(capability => capability.id).join(", ")}).`,
 		);
 	}
-	const validationPath = bundlePath + ".llama-vscode-chat.tmp.mjs";
-	fs.writeFileSync(validationPath, patched);
 	try {
-		execFileSync(process.execPath, ["--check", validationPath], { stdio: "pipe" });
-	} finally {
-		fs.rmSync(validationPath, { force: true });
+		checkModuleSyntax(patched, "agentHostMain.mjs");
+	} catch (error) {
+		throw new Error(
+			`Patched agent host bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`,
+			{ cause: error },
+		);
 	}
-	if (!status.backupExists) {
-		fs.copyFileSync(bundlePath, status.backupPath);
+	if (!status.backupExists || refreshBackup) {
+		writeFileAtomic(status.backupPath, originalBytes);
 	}
-	fs.writeFileSync(bundlePath, patched);
-	fs.writeFileSync(
+	writeFileAtomic(bundlePath, patched);
+	writeFileAtomic(
 		status.metadataPath,
 		JSON.stringify({
 			patchId: AGENT_HOST_THINKING_PATCH_ID,
 			appliedAt: new Date().toISOString(),
+			vscodeBuild: installationBuild(bundlePath),
 			originalSha256: sha256(status.backupPath),
 			patchedSha256: sha256(bundlePath),
 		}, null, 2) + "\n",
@@ -272,16 +293,31 @@ export function applyAgentHostThinkingPatch(bundlePath: string, force = false): 
 }
 
 export function restoreAgentHostThinkingPatch(bundlePath: string): AgentHostThinkingPatchResult {
+	return withPatchLock(bundlePath, () => restoreAgentHostThinkingPatchLocked(bundlePath));
+}
+
+function restoreAgentHostThinkingPatchLocked(bundlePath: string): AgentHostThinkingPatchResult {
 	const status = getAgentHostThinkingPatchStatus(bundlePath);
 	if (!status.backupExists) {
 		throw new Error(`Backup not found: ${status.backupPath}`);
 	}
-	fs.copyFileSync(status.backupPath, bundlePath);
+	// Copying a backup over an unpatched bundle could only bring back an older build.
+	const patched = fs.readFileSync(bundlePath, "utf8").includes(AGENT_HOST_MARKER_PREFIX);
+	if (patched && backupFromOtherBuild(status)) {
+		throw new Error(
+			`The saved agent host bundle (${status.backupPath}) belongs to another VS Code build; restoring it would break the agent host. Reinstall VS Code to remove the patch.`,
+		);
+	}
+	if (patched) {
+		writeFileAtomic(bundlePath, fs.readFileSync(status.backupPath));
+	}
 	fs.rmSync(status.backupPath, { force: true });
 	fs.rmSync(status.metadataPath, { force: true });
 	return {
-		changed: true,
+		changed: patched,
 		status: getAgentHostThinkingPatchStatus(bundlePath),
-		message: "Restored the original agent host bundle. Reload all VS Code windows and restart the agent host to activate the change.",
+		message: patched
+			? "Restored the original agent host bundle. Reload all VS Code windows and restart the agent host to activate the change."
+			: "The agent host bundle carries no patch; removed its outdated backup.",
 	};
 }

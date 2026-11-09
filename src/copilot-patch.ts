@@ -1,10 +1,20 @@
 import { createHash } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { Script } from "node:vm";
 
+import {
+	WORKBENCH_TERMINAL_PATCH_MARKER,
+	patchWorkbenchTerminalBundle,
+	unpatchWorkbenchTerminalBundle,
+} from "./byok/workbench-terminal-patch";
+import {
+	checkModuleSyntax,
+	installationBuild,
+	readPatchMetadata,
+	withPatchLocks,
+	writeFileAtomic,
+} from "./patch-io";
 import {
 	collectAppRoots,
 	collectExtensionRoots,
@@ -31,15 +41,12 @@ function hasLegacyPatch(source: string): boolean {
 }
 const BACKUP_SUFFIX = ".llama-vscode-chat.backup";
 const METADATA_SUFFIX = ".llama-vscode-chat.patch.json";
-const LOCK_SUFFIX = ".llama-vscode-chat.lock";
-/** A lock older than this belongs to a process that died while patching. */
-const LOCK_STALE_MS = 120_000;
 /** Every marker this module writes into the Copilot bundle starts with this. */
 const COPILOT_BUNDLE_MARKER_PREFIX = "/* llama-vscode-chat:copilot-";
 const VSCODE_CHAT_HISTORY_MARKER_PREFIX = "/* llama-vscode-chat:vscode-chat-history-bounds:";
 
 /** Another process holds the patch lock; the caller should retry later. */
-export class CopilotPatchBusyError extends Error {}
+export { PatchBusyError as CopilotPatchBusyError } from "./patch-io";
 
 interface CopilotManifest {
 	name?: string;
@@ -870,49 +877,46 @@ function contaminatedBackupError(backupPath: string, what: string): Error {
 	);
 }
 
-/**
- * Serialises patching across VS Code windows and processes. Two windows that
- * start after an update would otherwise both copy the bundle to the backup,
- * and the slower one copies a file the faster one has already patched.
- */
-function withPatchLock<T>(bundlePath: string, action: () => T): T {
-	const lockPath = bundlePath + LOCK_SUFFIX;
-	let descriptor: number | undefined;
-	for (let attempt = 0; attempt < 2 && descriptor === undefined; attempt++) {
-		try {
-			descriptor = fs.openSync(lockPath, "wx");
-		} catch (error) {
-			const code = (error as NodeJS.ErrnoException).code;
-			if (code === "EPERM" || code === "EACCES" || code === "EROFS") {
-				// A read-only installation: the writes below fail with the same
-				// permission error, which drives the permission recovery flow.
-				return action();
-			}
-			if (code !== "EEXIST") {
-				throw error;
-			}
-			let age: number;
-			try {
-				age = Date.now() - fs.statSync(lockPath).mtimeMs;
-			} catch {
-				continue;
-			}
-			if (age < LOCK_STALE_MS) {
-				break;
-			}
-			fs.rmSync(lockPath, { force: true });
-		}
-	}
-	if (descriptor === undefined) {
-		throw new CopilotPatchBusyError(`Another VS Code process is updating the Copilot Chat patch (${lockPath}).`);
+/** The workbench terminal patch may have been applied or reverted since the backup was taken. */
+function sameIgnoringTerminalPatch(left: Buffer, right: Buffer): boolean {
+	if (left.equals(right)) {
+		return true;
 	}
 	try {
-		fs.writeSync(descriptor, `${process.pid}\n`);
-		return action();
-	} finally {
-		fs.closeSync(descriptor);
-		fs.rmSync(lockPath, { force: true });
+		return unpatchWorkbenchTerminalBundle(left.toString("utf8")) === unpatchWorkbenchTerminalBundle(right.toString("utf8"));
+	} catch {
+		return false;
 	}
+}
+
+/**
+ * The terminal patch shares the workbench file but has its own lifecycle, so
+ * the restored workbench keeps it exactly when the current one has it.
+ */
+function carryWorkbenchTerminalPatch(backup: Buffer, current: string, notices: string[]): string | Buffer {
+	const wanted = current.includes(WORKBENCH_TERMINAL_PATCH_MARKER);
+	const text = backup.toString("utf8");
+	if (text.includes(WORKBENCH_TERMINAL_PATCH_MARKER) === wanted) {
+		return backup;
+	}
+	try {
+		if (!wanted) {
+			return unpatchWorkbenchTerminalBundle(text);
+		}
+		const patched = patchWorkbenchTerminalBundle(text);
+		checkModuleSyntax(patched, "workbench.mjs");
+		return patched;
+	} catch (error) {
+		notices.push(
+			`The workbench terminal reuse patch could not be carried over: ${error instanceof Error ? error.message : String(error)}`
+		);
+		return backup;
+	}
+}
+
+/** Recorded value that differs from the installed one; unknown values never count as a mismatch. */
+function recordedMismatch(recorded: unknown, installed: string | undefined): boolean {
+	return typeof recorded === "string" && recorded !== "unknown" && installed !== undefined && recorded !== installed;
 }
 
 export interface CopilotPatchSummary {
@@ -1017,7 +1021,8 @@ export function formatCopilotPatchStatus(status: CopilotPatchStatus): string {
 }
 
 export function applyCopilotPatch(target: CopilotPatchTarget, force = false): CopilotPatchResult {
-	return withPatchLock(target.bundlePath, () => applyCopilotPatchLocked(target, force));
+	// The workbench lock is shared with the workbench terminal patch, which edits the same file.
+	return withPatchLocks([target.bundlePath, target.workbenchPath], () => applyCopilotPatchLocked(target, force));
 }
 
 function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): CopilotPatchResult {
@@ -1049,13 +1054,17 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 	if (!installedClean && !initialStatus.applied && !initialStatus.legacyPatch && !initialStatus.backupExists) {
 		throw new Error("The Copilot Chat bundle carries an unknown AI Agent Bridge patch and no original backup exists.");
 	}
+	const metadata = readPatchMetadata(initialStatus.metadataPath);
 	// An installed bundle without any marker is the true original. A backup that
-	// is identical to it, or that is itself patched (left by an interrupted or
-	// concurrent run), is replaced with it instead of blocking the upgrade.
+	// is identical to it, that is itself patched (left by an interrupted or
+	// concurrent run), or that a package update left behind for an older version
+	// is replaced with it instead of blocking the upgrade.
 	const refreshBackup =
 		installedClean &&
 		initialStatus.backupExists &&
-		(initialStatus.backupContaminated || fs.readFileSync(initialStatus.backupPath).equals(installedBytes));
+		(initialStatus.backupContaminated ||
+			recordedMismatch(metadata?.copilotVersion, target.manifest.version) ||
+			fs.readFileSync(initialStatus.backupPath).equals(installedBytes));
 	const original = initialStatus.applied
 		? installed
 		: initialStatus.legacyPatch
@@ -1079,13 +1088,18 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 	const installedWorkbenchClean = Boolean(
 		installedWorkbenchBefore && !installedWorkbenchBefore.includes(VSCODE_CHAT_HISTORY_MARKER_PREFIX)
 	);
+	const workbenchBuild = hasWorkbench ? installationBuild(workbenchPath as string) : undefined;
 	const refreshWorkbenchBackup =
 		installedWorkbenchClean &&
 		initialStatus.workbenchBackupExists &&
 		(initialStatus.workbenchBackupContaminated ||
+			recordedMismatch(metadata?.workbenchBuild, workbenchBuild) ||
 			Boolean(
 				initialStatus.workbenchBackupPath &&
-					fs.readFileSync(initialStatus.workbenchBackupPath).equals(installedWorkbenchBytes as Buffer)
+					sameIgnoringTerminalPatch(
+						fs.readFileSync(initialStatus.workbenchBackupPath),
+						installedWorkbenchBytes as Buffer
+					)
 			));
 	if (
 		initialStatus.workbenchBackupExists &&
@@ -1101,25 +1115,16 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 
 	const patched = patchCopilotGitRepositoriesGuard(patchCopilotBundle(original));
 	const patchedWorkbench = installedWorkbenchBefore ? patchVsCodeWorkbenchBundle(installedWorkbenchBefore) : undefined;
-	const validationDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "ai-agent-bridge-patch-check-"));
-	const validationPath = path.join(validationDirectory, "copilot.js");
-	const workbenchValidationPath = patchedWorkbench ? path.join(validationDirectory, "workbench.mjs") : undefined;
 	try {
-		fs.writeFileSync(validationPath, patched, { mode: 0o600 });
-		if (patchedWorkbench && workbenchValidationPath) {
-			fs.writeFileSync(workbenchValidationPath, patchedWorkbench, { mode: 0o600 });
-		}
-		new Script(patched, { filename: validationPath });
-		if (workbenchValidationPath) {
-			execFileSync(process.execPath, ["--check", workbenchValidationPath], { stdio: "pipe" });
+		new Script(patched, { filename: "copilot-extension.js" });
+		if (patchedWorkbench) {
+			checkModuleSyntax(patchedWorkbench, "workbench.mjs");
 		}
 	} catch (error) {
 		throw new Error(
 			`Patched VS Code bundle failed syntax validation: ${error instanceof Error ? error.message : String(error)}`,
 			{ cause: error }
 		);
-	} finally {
-		fs.rmSync(validationDirectory, { recursive: true, force: true });
 	}
 
 	if (
@@ -1132,14 +1137,15 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 		if (!installedClean) {
 			throw contaminatedBackupError(target.bundlePath, "Copilot Chat bundle");
 		}
-		fs.writeFileSync(initialStatus.backupPath, installedBytes);
+		writeFileAtomic(initialStatus.backupPath, installedBytes);
 	}
 	// The Copilot bundle is the part this function owns: write it first, so a
 	// permission problem on the workbench (a system-wide VS Code installation)
 	// cannot roll the whole patch back. The workbench is written on a best-effort
 	// basis and reported through a notice instead of throwing.
-	fs.writeFileSync(target.bundlePath, patched);
+	writeFileAtomic(target.bundlePath, patched);
 	let workbenchWritten = false;
+	let workbenchBackedUp = false;
 	let workbenchWriteError: string | undefined;
 	if (patchedWorkbench && workbenchPath) {
 		try {
@@ -1147,15 +1153,16 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 				if (!installedWorkbenchClean) {
 					throw contaminatedBackupError(workbenchPath, "VS Code workbench");
 				}
-				fs.writeFileSync(initialStatus.workbenchBackupPath as string, installedWorkbenchBytes as Buffer);
+				writeFileAtomic(initialStatus.workbenchBackupPath as string, installedWorkbenchBytes as Buffer);
+				workbenchBackedUp = true;
 			}
-			fs.writeFileSync(workbenchPath, patchedWorkbench);
+			writeFileAtomic(workbenchPath, patchedWorkbench);
 			workbenchWritten = true;
 		} catch (error) {
 			workbenchWriteError = error instanceof Error ? error.message : String(error);
 		}
 	}
-	const metadata: Record<string, string> = {
+	const newMetadata: Record<string, string> = {
 		patchId: COPILOT_PATCH_ID,
 		copilotVersion: target.manifest.version ?? "unknown",
 		appliedAt: new Date().toISOString(),
@@ -1163,13 +1170,19 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 		patchedSha256: sha256(target.bundlePath),
 	};
 	if (workbenchWritten && initialStatus.workbenchBackupPath && workbenchPath) {
-		metadata.originalWorkbenchSha256 = sha256(initialStatus.workbenchBackupPath);
-		metadata.patchedWorkbenchSha256 = sha256(workbenchPath);
+		newMetadata.originalWorkbenchSha256 = sha256(initialStatus.workbenchBackupPath);
+		newMetadata.patchedWorkbenchSha256 = sha256(workbenchPath);
+	}
+	// A workbench that carries the patch was backed up from this build.
+	if ((workbenchWritten || workbenchBackedUp || initialStatus.workbenchApplied) && workbenchBuild) {
+		newMetadata.workbenchBuild = workbenchBuild;
+	} else if (typeof metadata?.workbenchBuild === "string") {
+		newMetadata.workbenchBuild = metadata.workbenchBuild;
 	}
 	if (workbenchWriteError) {
-		metadata.workbenchError = workbenchWriteError;
+		newMetadata.workbenchError = workbenchWriteError;
 	}
-	fs.writeFileSync(initialStatus.metadataPath, JSON.stringify(metadata, null, 2) + "\n");
+	writeFileAtomic(initialStatus.metadataPath, JSON.stringify(newMetadata, null, 2) + "\n");
 
 	const status = getCopilotPatchStatus(target);
 	if (workbenchWriteError) {
@@ -1188,7 +1201,7 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 }
 
 export function restoreCopilotPatch(target: CopilotPatchTarget): CopilotPatchResult {
-	return withPatchLock(target.bundlePath, () => restoreCopilotPatchLocked(target));
+	return withPatchLocks([target.bundlePath, target.workbenchPath], () => restoreCopilotPatchLocked(target));
 }
 
 function restoreCopilotPatchLocked(target: CopilotPatchTarget): CopilotPatchResult {
@@ -1204,28 +1217,57 @@ function restoreCopilotPatchLocked(target: CopilotPatchTarget): CopilotPatchResu
 	if (initialStatus.workbenchBackupContaminated && initialStatus.workbenchBackupPath) {
 		throw contaminatedBackupError(initialStatus.workbenchBackupPath, "VS Code workbench");
 	}
-	if (initialStatus.workbenchBackupExists && initialStatus.workbenchPath && initialStatus.workbenchBackupPath) {
-		try {
-			fs.copyFileSync(initialStatus.workbenchBackupPath, initialStatus.workbenchPath);
-		} catch (error) {
-			// Keep both backups so a user can retry with administrator rights.
-			throw new Error(
-				"Could not restore the original VS Code workbench: " + (error instanceof Error ? error.message : String(error)),
-				{ cause: error }
-			);
+	// A file without the patch has nothing to restore; its backup is the same
+	// file or one a package update left behind, and copying it would downgrade.
+	const metadata = readPatchMetadata(initialStatus.metadataPath);
+	const bundlePatched = fileContains(target.bundlePath, COPILOT_BUNDLE_MARKER_PREFIX);
+	if (bundlePatched && recordedMismatch(metadata?.copilotVersion, target.manifest.version)) {
+		throw new Error(
+			`The saved original Copilot Chat bundle (${initialStatus.backupPath}) is version ${String(metadata?.copilotVersion)}, ` +
+				`but ${target.manifest.version} is installed; restoring it would downgrade Copilot Chat. Reinstall Copilot Chat to remove the patch.`
+		);
+	}
+	const notices: string[] = [];
+	const workbenchPath = initialStatus.workbenchPath;
+	let workbenchRestored = false;
+	if (initialStatus.workbenchBackupExists && workbenchPath && initialStatus.workbenchBackupPath) {
+		const current = fs.readFileSync(workbenchPath, "utf8");
+		if (current.includes(VSCODE_CHAT_HISTORY_MARKER_PREFIX)) {
+			if (recordedMismatch(metadata?.workbenchBuild, installationBuild(workbenchPath))) {
+				throw new Error(
+					`The saved original VS Code workbench (${initialStatus.workbenchBackupPath}) belongs to another VS Code build; ` +
+						"restoring it would break VS Code. Reinstall VS Code to remove the patch."
+				);
+			}
+			const restored = carryWorkbenchTerminalPatch(fs.readFileSync(initialStatus.workbenchBackupPath), current, notices);
+			try {
+				writeFileAtomic(workbenchPath, restored);
+			} catch (error) {
+				// Keep both backups so a user can retry with administrator rights.
+				throw new Error(
+					"Could not restore the original VS Code workbench: " + (error instanceof Error ? error.message : String(error)),
+					{ cause: error }
+				);
+			}
+			workbenchRestored = true;
 		}
 	}
-	fs.copyFileSync(initialStatus.backupPath, target.bundlePath);
+	if (bundlePatched) {
+		writeFileAtomic(target.bundlePath, fs.readFileSync(initialStatus.backupPath));
+	}
 	fs.rmSync(initialStatus.backupPath, { force: true });
 	if (initialStatus.workbenchBackupPath) {
 		fs.rmSync(initialStatus.workbenchBackupPath, { force: true });
 	}
 	fs.rmSync(initialStatus.metadataPath, { force: true });
 	const status = getCopilotPatchStatus(target);
+	status.notices.push(...notices);
 	return {
-		changed: true,
+		changed: bundlePatched || workbenchRestored,
 		status,
 		message:
-			"Restored the original Copilot Chat and VS Code workbench bundles. Reload all VS Code windows to activate them.",
+			bundlePatched || workbenchRestored
+				? "Restored the original Copilot Chat and VS Code workbench bundles. Reload all VS Code windows to activate them."
+				: "Copilot Chat and the VS Code workbench carry no patch; removed their outdated backups.",
 	};
 }
