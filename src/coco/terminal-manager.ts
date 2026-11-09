@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { stripVTControlCharacters } from "node:util";
 import * as vscode from "vscode";
@@ -56,6 +57,24 @@ export interface CocoTerminalSnapshot {
 }
 
 const OUTPUT_LIMIT = 128_000;
+
+/**
+ * The model-supplied cwd becomes a `cd` the user never approved, so it must be
+ * an existing directory: a newline would start a second command in cmd, and
+ * quotes, `$`, backticks or `%` would be expanded by one of the shells.
+ */
+export function directoryForCd(cwd: string, workspaceRoot?: string): string | undefined {
+	if (/["`$%]/.test(cwd) || [...cwd].some(character => character.charCodeAt(0) < 0x20)) { return undefined; }
+	const resolved = path.isAbsolute(cwd) ? cwd : workspaceRoot ? path.resolve(workspaceRoot, cwd) : undefined;
+	if (!resolved) { return undefined; }
+	try {
+		if (!fs.statSync(resolved).isDirectory()) { return undefined; }
+	} catch {
+		return undefined;
+	}
+	// In bash `cd "D:\"` escapes the closing quote and leaves the prompt waiting.
+	return /[\\/]$/.test(resolved) ? resolved + "." : resolved;
+}
 const bounded = (value: number | undefined, fallback: number, max: number): number =>
 	Math.min(max, Math.max(0, Number.isFinite(value) ? Math.round(value!) : fallback));
 
@@ -145,10 +164,16 @@ export class CocoTerminalManager implements vscode.Disposable {
 						action: "create", reason: "directory-change-failed",
 						terminalId: replacement.id, idleCount: [...this.sessions.values()].filter(candidate => this.isIdle(candidate)).length,
 					});
-					await this.prepareSession(replacement, token);
-					const replacementIntegration = replacement.terminal.shellIntegration
-						?? await this.waitForIntegration(replacement, token);
-					return await this.executeIn(replacement, input, token, replacementIntegration);
+					// A parallel run must not pick the replacement while it is still starting.
+					replacement.starting = true;
+					try {
+						await this.prepareSession(replacement, token);
+						const replacementIntegration = replacement.terminal.shellIntegration
+							?? await this.waitForIntegration(replacement, token);
+						return await this.executeIn(replacement, input, token, replacementIntegration);
+					} finally {
+						replacement.starting = false;
+					}
 				}
 			}
 			return await this.executeIn(session, input, token, integration);
@@ -201,10 +226,11 @@ export class CocoTerminalManager implements vscode.Disposable {
 		cwd: string,
 		token: vscode.CancellationToken,
 	): Promise<boolean> {
-		// A double-quoted path works in PowerShell, bash and cmd; characters a
-		// shell would expand are refused so a new terminal is used instead.
-		if (/["`$]/.test(cwd)) { return false; }
-		const command = `cd "${cwd}"`;
+		// A double-quoted path works in PowerShell, bash and cmd; anything else
+		// falls back to a new terminal opened in that directory.
+		const directory = directoryForCd(cwd, vscode.workspace.workspaceFolders?.[0]?.uri.fsPath);
+		if (!directory) { return false; }
+		const command = `cd "${directory}"`;
 		let finish!: () => void;
 		const directoryChange: Command = {
 			execution: integration.executeCommand(command), output: "", truncated: false, state: "running",

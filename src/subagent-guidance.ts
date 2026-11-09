@@ -1,4 +1,13 @@
+import { PROVIDER_VENDOR } from "./constants";
 import { isDeepSeekVisionModel } from "./model-sources/source-routing";
+
+/**
+ * VS Code resolves runSubagent.model with `matchesQualifiedName`: only the
+ * `copilot` vendor may be named bare, every other model needs "Name (vendor)".
+ */
+export function subagentModelReference(label: string): string {
+	return `${label} (${PROVIDER_VENDOR})`;
+}
 
 type SubagentProvider = "local" | "deepseek" | "codex" | "claude";
 
@@ -75,7 +84,7 @@ interface ToolWithInputSchema {
 const modelLabels = new Set<string>();
 
 function refreshModelLabels(): void {
-	const labels = new Set(getSubagentModelProfiles().map(profile => profile.label));
+	const labels = new Set(getSubagentModelProfiles().map(profile => subagentModelReference(profile.label)));
 	modelLabels.clear();
 	for (const label of labels) {
 		modelLabels.add(label);
@@ -169,7 +178,7 @@ let _cachedProfileIds: string | undefined;
 
 export function buildSubagentToolGuidance(): string {
 	const profiles = getSubagentModelProfiles();
-	const profileIds = profiles.map(p => p.id).join(",");
+	const profileIds = profiles.map(p => `${p.id}=${p.label}`).join(",");
 	if (_cachedGuidance !== undefined && _cachedProfileIds === profileIds) {
 		return _cachedGuidance;
 	}
@@ -178,9 +187,10 @@ export function buildSubagentToolGuidance(): string {
 	const profileText = profiles.length > 0
 		? profiles.map(profile => {
 			const effort = profile.defaultEffort ? `, ${profile.defaultEffort} thinking` : "";
-			return `model="${profile.label}"${effort}: ${profile.useWhen}.`;
+			return `model="${subagentModelReference(profile.label)}"${effort}: ${profile.useWhen}.`;
 		}).join(" ")
-		: `model="Qwen 3.6 27B (Local)": narrow economical tasks, visual inspection, unlimited tokens. model="DeepSeek V4 Pro (DeepSeek)", high thinking: focused complex multi-step reasoning. model="GPT-5.6 Luna (Codex)", high thinking: repository-wide coding (Sol excluded from subagents to conserve premium quota). model="Opus 5 (Claude)", high thinking: highest-capability complex analysis.`;
+		: `model="${subagentModelReference("Qwen 3.6 27B (Local)")}": narrow economical tasks, visual inspection, unlimited tokens. model="${subagentModelReference("DeepSeek V4 Pro (DeepSeek)")}", high thinking: focused complex multi-step reasoning. model="${subagentModelReference("GPT-5.6 Luna (Codex)")}", high thinking: repository-wide coding (Sol excluded from subagents to conserve premium quota). model="${subagentModelReference("Opus 5 (Claude)")}", high thinking: highest-capability complex analysis.`;
+	const example = subagentModelReference(profiles[0]?.label ?? "GPT-5.6 Luna (Codex)");
 	const budgetPolicy = buildBudgetRoutingPolicy(profiles);
 	const visionDelegation = hasLocal
 		? "Vision delegation: when you need visual inspection (screenshots, UI layouts, images, Unity scene captures) that you cannot see directly, delegate to a local-model subagent. The subagent has access to view_image and terminal tools — it can capture screenshots, inspect images, and report what it sees. Use agentName 'Explore' or any available agent type with a local model — the agent type does not limit which tools the subagent can use."
@@ -190,9 +200,9 @@ export function buildSubagentToolGuidance(): string {
 		profileText,
 		...(budgetPolicy ? [budgetPolicy] : []),
 		...(visionDelegation ? [visionDelegation] : []),
-		"Mandatory: set runSubagent.model to one of the quoted model= strings listed above, e.g. `\"GPT-5.6 Luna (Codex)\"`. Copy the exact string inside the quotes — do NOT guess or paraphrase. Never omit runSubagent.model and never pass \"Auto\": the schema only accepts the advertised labels, so \"Auto\" is rejected.",
+		`Mandatory: set runSubagent.model to one of the quoted model= strings listed above, e.g. \`"${example}"\`, including the trailing "(${PROVIDER_VENDOR})". Copy the exact string inside the quotes — do NOT guess or paraphrase. Never omit runSubagent.model and never pass "Auto": the schema only accepts the advertised labels, so "Auto" is rejected.`,
 		"Availability is enforced when the subagent starts; if the selected model is rejected, route to another available model from this catalog.",
-		"Qwen 3.6 27B runs locally with unlimited tokens and no rate limits — prefer it for any subagent task it can handle, especially large-output operations like log analysis, full-file reads, and exhaustive search.",
+		...(hasLocal ? ["The local model runs with unlimited tokens and no rate limits — prefer it for any subagent task it can handle, especially large-output operations like log analysis, full-file reads, and exhaustive search."] : []),
 		"agentName selects behaviour/custom instructions independently of model.",
 		"Require one bounded, independently verifiable task, explicit allowed files, and expected output.",
 	].join(" ");

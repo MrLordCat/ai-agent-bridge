@@ -1138,6 +1138,7 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 	// permission problem on the workbench (a system-wide VS Code installation)
 	// cannot roll the whole patch back. The workbench is written on a best-effort
 	// basis and reported through a notice instead of throwing.
+	fs.writeFileSync(target.bundlePath, patched);
 	let workbenchWritten = false;
 	let workbenchWriteError: string | undefined;
 	if (patchedWorkbench && workbenchPath) {
@@ -1154,7 +1155,6 @@ function applyCopilotPatchLocked(target: CopilotPatchTarget, force: boolean): Co
 			workbenchWriteError = error instanceof Error ? error.message : String(error);
 		}
 	}
-	fs.writeFileSync(target.bundlePath, patched);
 	const metadata: Record<string, string> = {
 		patchId: COPILOT_PATCH_ID,
 		copilotVersion: target.manifest.version ?? "unknown",

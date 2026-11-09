@@ -32,8 +32,9 @@ suite("subagent model guidance", () => {
 		}]);
 
 		const guidance = buildSubagentToolGuidance();
-		assert.ok(guidance.includes('model="DeepSeek V4 Pro", high thinking'));
-		assert.ok(guidance.includes('model="GPT-5.6 Codex", high thinking'));
+		assert.ok(guidance.includes('model="DeepSeek V4 Pro (llamacpp)", high thinking'));
+		assert.ok(guidance.includes('model="GPT-5.6 Codex (llamacpp)", high thinking'));
+		assert.ok(!guidance.includes('model="DeepSeek V4 Pro"'), "VS Code rejects a bare name for a non-Copilot vendor");
 		assert.ok(guidance.includes("Budget routing policy"));
 		assert.ok(guidance.includes("Never omit runSubagent.model"));
 		assert.ok(guidance.includes("agentName selects behaviour/custom instructions independently of model"));
@@ -79,7 +80,9 @@ suite("subagent model guidance", () => {
 		assert.strictEqual(modelProperty.type, "string");
 		// The injected enum lists the advertised catalog labels and forbids Auto.
 		assert.ok(Array.isArray(modelProperty.enum));
-		assert.ok(modelProperty.enum!.includes("DeepSeek V4 Pro"));
+		// VS Code's runSubagent resolves "Name (vendor)"; the bare name only works for Copilot's own models.
+		assert.ok(modelProperty.enum!.includes("DeepSeek V4 Pro (llamacpp)"));
+		assert.ok(!modelProperty.enum!.includes("DeepSeek V4 Pro"));
 		assert.ok(!modelProperty.enum!.includes("Auto"));
 		assert.deepStrictEqual(original.inputSchema.required, ["description"]);
 		assert.ok(!("model" in original.inputSchema.properties));
@@ -126,7 +129,7 @@ suite("subagent model guidance", () => {
 		}]);
 		const availableGuidance = buildSubagentToolGuidance();
 		assert.strictEqual(unavailableGuidance, availableGuidance);
-		assert.ok(availableGuidance.includes('model="Opus 5 (Claude)", high thinking'));
+		assert.ok(availableGuidance.includes('model="Opus 5 (Claude) (llamacpp)", high thinking'));
 		assert.ok(!availableGuidance.includes("5-hour limit"));
 		assert.ok(!availableGuidance.includes("Subscription limit reset"));
 	});
@@ -213,6 +216,7 @@ suite("subagent model guidance", () => {
 		setSubagentModelProfiles("claude", []);
 		const guidance = buildSubagentToolGuidance();
 		assert.ok(!guidance.includes("Vision delegation:"));
+		assert.ok(!guidance.includes("unlimited tokens and no rate limits"), "no local model is promised when none exists");
 	});
 
 	test("prefers Terra over Luna inside the premium tier and warns DeepSeek cannot see", () => {

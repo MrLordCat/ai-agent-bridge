@@ -1036,11 +1036,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				if (status.applied) {
 					const result = restoreWorkbenchTerminalPatch(target.bundlePath);
 					logService.log("byok.bridge.workbench_terminal_patch_restored", { sha256: result.status.sha256 });
+					// Startup re-applies the patch while the setting stays on.
+					await vscode.workspace.getConfiguration(CONFIG_SECTION).update("workbenchTerminalPatchEnabled", false, vscode.ConfigurationTarget.Global);
 					vscode.window.showInformationMessage(result.message);
 					return;
 				}
 				const result = applyWorkbenchTerminalPatch(target.bundlePath);
 				logService.log("byok.bridge.workbench_terminal_patch_applied", { sha256: result.status.sha256 });
+				await vscode.workspace.getConfiguration(CONFIG_SECTION).update("workbenchTerminalPatchEnabled", true, vscode.ConfigurationTarget.Global);
 				vscode.window.showInformationMessage(result.message);
 			} catch (error) {
 				logService.logError("byok.bridge.workbench_terminal_patch_failed", error);
@@ -1079,11 +1082,14 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 				if (status.applied) {
 					const result = restoreAgentHostThinkingPatch(target.bundlePath);
 					logService.log("byok.bridge.thinking_patch_restored", { sha256: result.status.sha256 });
+					// Startup re-applies the patch while the setting stays on.
+					await vscode.workspace.getConfiguration(CONFIG_SECTION).update("agentHostThinkingPatchEnabled", false, vscode.ConfigurationTarget.Global);
 					vscode.window.showInformationMessage(result.message);
 					return;
 				}
 				const result = applyAgentHostThinkingPatch(target.bundlePath);
 				logService.log("byok.bridge.thinking_patch_applied", { sha256: result.status.sha256 });
+				await vscode.workspace.getConfiguration(CONFIG_SECTION).update("agentHostThinkingPatchEnabled", true, vscode.ConfigurationTarget.Global);
 				vscode.window.showInformationMessage(result.message);
 			} catch (error) {
 				logService.logError("byok.bridge.thinking_patch_failed", error);

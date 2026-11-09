@@ -1,5 +1,32 @@
 # Changelog
 
+## 1.20.19 (dev patch) - 2026-11-09
+
+Code audit fixes.
+
+- Subagents on bridge models work again. VS Code resolves `runSubagent.model`
+  by its qualified name `Name (vendor)` and accepts a bare name only for
+  Copilot's own models, so every advertised label was rejected with "model not
+  found". The schema enum and the routing guidance now list
+  `Name (llamacpp)`; the local-model advice appears only when a local model
+  exists.
+- `package.json` no longer carries garbled settings text: the arrows and dash
+  added after 1.20.12 were re-read as ANSI on every PowerShell version bump and
+  had grown to 10,000 characters. `npm run check:metadata` now fails on such
+  text, and versions are bumped with `npm version`.
+- Coco terminal: the bridge only runs `cd` into an existing directory without
+  control or shell-expansion characters (a newline in a model-supplied `cwd`
+  was a second command in cmd), a trailing `\` no longer leaves bash waiting
+  for a closing quote, the confirmation shows the directory, and a parallel run
+  cannot grab a replacement terminal while it starts.
+- Copilot patch: when every found bundle failed, the result was reported as
+  "patches are already active"; it is now reported as a failure. The Copilot
+  bundle is written before the workbench, as documented, and "Show Log" in the
+  "Copilot Chat was not found" warning opens the log.
+- Turning the thinking-picker or workbench terminal patch off now persists:
+  the toggle updates its setting, so the next window start no longer re-applies
+  the patch.
+
 ## 1.20.18 (dev patch) - 2026-11-06
 
 - A chat no longer opens one Coco terminal per command. Models pass `cwd` on

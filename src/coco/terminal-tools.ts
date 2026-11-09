@@ -26,8 +26,10 @@ function result(value: unknown): vscode.LanguageModelToolResult {
 	return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(value))]);
 }
 
-function confirm(title: string, message: string, command?: string): vscode.PreparedToolInvocation {
+function confirm(title: string, message: string, command?: string, cwd?: string): vscode.PreparedToolInvocation {
 	const markdown = new vscode.MarkdownString(message);
+	// The bridge may cd into this directory before the command, so the user sees it too.
+	if (typeof cwd === "string" && cwd) { markdown.appendText("\n\nDirectory: " + cwd); }
 	if (command !== undefined) { markdown.appendCodeblock(command); }
 	return { invocationMessage: title, confirmationMessages: { title, message: markdown } };
 }
@@ -39,7 +41,7 @@ export function registerCocoTerminalTools(
 	const manager = new CocoTerminalManager(vscode.window, undefined, onLog);
 	context.subscriptions.push(manager,
 		vscode.lm.registerTool<CocoTerminalRunInput>(COCO_TERMINAL_TOOLS.run, {
-			prepareInvocation: ({ input }) => confirm("Run command in a Coco terminal", "Execute in the interactive VS Code terminal panel.", input.command),
+			prepareInvocation: ({ input }) => confirm("Run command in a Coco terminal", "Execute in the interactive VS Code terminal panel.", input.command, input.cwd),
 			invoke: async ({ input }, token) => {
 				if (!vscode.workspace.isTrusted) { throw new Error("Trust this workspace before running terminal commands."); }
 				return result(await manager.run(input, token));

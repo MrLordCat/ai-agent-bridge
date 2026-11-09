@@ -212,6 +212,7 @@ async function applyTargets(
 	targets: CopilotPatchTarget[]
 ): Promise<{ changed: boolean; permissionFailure: boolean; workbenchSkipped: boolean; results: CopilotPatchResult[] }> {
 	const results: CopilotPatchResult[] = [];
+	const failures: unknown[] = [];
 	let changed = false;
 	let permissionFailure = false;
 	let workbenchSkipped = false;
@@ -235,7 +236,12 @@ async function applyTargets(
 			if (targets.length === 1) {
 				throw error;
 			}
+			failures.push(error);
 		}
+	}
+	// Without this, every target failing looked like "patches are already active".
+	if (results.length === 0 && failures.length > 0 && !permissionFailure) {
+		throw failures[0];
 	}
 	return { changed, permissionFailure, workbenchSkipped, results };
 }
@@ -356,7 +362,8 @@ async function showStatus(output: vscode.OutputChannel): Promise<void> {
 			output.appendLine("No Copilot Chat bundle found.");
 			output.appendLine(describeSearch(vscode.env.appRoot).join("\n") + "\n");
 			output.appendLine("");
-			void vscode.window.showWarningMessage("Copilot Chat was not found; see the log for the search list.", "Show Log");
+			void vscode.window.showWarningMessage("Copilot Chat was not found; see the log for the search list.", "Show Log")
+				.then(choice => { if (choice === "Show Log") { output.show(true); } });
 			return;
 		}
 		const summaries: string[] = [];

@@ -1,8 +1,9 @@
 import * as assert from "node:assert";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
-import { CocoTerminalManager, type CocoTerminalHost } from "../coco/terminal-manager";
+import { CocoTerminalManager, directoryForCd, type CocoTerminalHost } from "../coco/terminal-manager";
 import { COCO_TERMINAL_TOOLS, selectCocoChatTools } from "../coco/terminal-tools";
 import { CocoTurnBridge } from "../coco/turn-bridge";
 
@@ -75,8 +76,17 @@ class TerminalHost implements CocoTerminalHost, vscode.Disposable {
 
 suite("Coco interactive terminals", () => {
 	let host: TerminalHost, manager: CocoTerminalManager, source: vscode.CancellationTokenSource;
+	const temporaryDirectories: string[] = [];
+	const temporaryDirectory = (prefix: string): string => {
+		const directory = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+		temporaryDirectories.push(directory);
+		return directory;
+	};
 	setup(() => { host = new TerminalHost(); manager = new CocoTerminalManager(host, 20); source = new vscode.CancellationTokenSource(); });
-	teardown(() => { manager.dispose(); host.dispose(); source.dispose(); });
+	teardown(() => {
+		manager.dispose(); host.dispose(); source.dispose();
+		for (const directory of temporaryDirectories.splice(0)) { fs.rmSync(directory, { recursive: true, force: true }); }
+	});
 
 	test("automatically reuses an idle shell after a failed command without a terminalId", async () => {
 		const pending = manager.run({ command: "first" }, source.token);
@@ -125,9 +135,9 @@ suite("Coco interactive terminals", () => {
 	});
 
 	test("enters a requested directory in the idle shell instead of opening another terminal", async () => {
-		const cwd = path.resolve("coco-test-first");
+		const cwd = temporaryDirectory("coco-test-first-");
 		const otherCwd = path.resolve("coco-test-other");
-		
+
 		const first = manager.run({ command: "first", cwd }, source.token);
 		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(0);
 		const firstResult = await first;
@@ -150,8 +160,40 @@ suite("Coco interactive terminals", () => {
 		await assert.rejects(manager.run({ command: "wrong cwd", terminalId: firstResult.terminalId, cwd }, source.token), /cwd does not match/);
 	});
 
+	test("only enters existing directories without shell-special characters", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "coco-cd-"));
+		try {
+			assert.strictEqual(directoryForCd(root), root);
+			assert.strictEqual(directoryForCd(""), undefined);
+			assert.strictEqual(directoryForCd(path.join(root, "missing")), undefined);
+			assert.strictEqual(directoryForCd(`${root}\nrm -rf ~`), undefined, "a newline would run a second command in cmd");
+			for (const special of ["$HOME", "`id`", "%PATH%", '"x']) {
+				assert.strictEqual(directoryForCd(path.join(root, special)), undefined, special);
+			}
+			assert.strictEqual(directoryForCd(path.basename(root), path.dirname(root)), root, "relative paths resolve against the workspace");
+			assert.strictEqual(directoryForCd(path.basename(root)), undefined, "no workspace means no relative cd");
+			assert.strictEqual(directoryForCd(root + path.sep), root + path.sep + ".", "a trailing separator must not escape the quote");
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("opens a new terminal instead of running cd for a directory that does not exist", async () => {
+		const first = manager.run({ command: "first" }, source.token);
+		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(0);
+		const firstResult = await first;
+		Object.assign(host.terminals[0].terminal.shellIntegration!, { cwd: vscode.Uri.file(path.resolve("coco-test-elsewhere")) });
+		const missing = path.resolve("coco-test-missing\nwhoami");
+		const moved = manager.run({ command: "run here", cwd: missing }, source.token);
+		await host.next(2);
+		host.complete(1);
+		const movedResult = await moved;
+		assert.deepStrictEqual(host.terminals[0].calls, ["first"], "no cd was sent to the reused shell");
+		assert.notStrictEqual(movedResult.terminalId, firstResult.terminalId);
+	});
+
 	test("falls back to a new terminal when the shell cannot change directory", async () => {
-		const cwd = path.resolve("coco-test-target"), otherCwd = path.resolve("coco-test-elsewhere");
+		const cwd = temporaryDirectory("coco-test-target-"), otherCwd = path.resolve("coco-test-elsewhere");
 		const first = manager.run({ command: "first" }, source.token);
 		await new Promise<void>(resolve => setImmediate(resolve)); host.complete(0);
 		const firstResult = await first;
