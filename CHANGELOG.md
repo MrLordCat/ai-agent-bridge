@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.21.0 (stable release) - 2026-11-10
+
+Consolidates the 1.20.13–1.20.23 development patches below.
+
+- Several ChatGPT subscriptions side by side, each with its own Codex home,
+  app-server, login and usage windows, managed from Quick Access.
+- Codex: a prompt sent while a native tool runs reaches the model, stale tool
+  results deep in the history no longer reject new prompts, a reset ChatGPT
+  window no longer keeps answering "limit reached", and failed or cancelled
+  turns record their tokens.
+- The Subscriptions tab keeps only windows tracked from start to end and
+  assigns every request to the provider window it ran in.
+- Patch safety: atomic writes, shared locks and in-place restore for the
+  Copilot, workbench terminal and agent-host patches; CLI paths are
+  machine-scoped.
+- Subagents on bridge models work again, links in answers open, Coco reuses
+  its terminal, and long chats keep only the newest 100 images.
+
 ## 1.20.23 (dev patch) - 2026-11-10
 
 Subscription diagnostics: only complete windows are recorded.
