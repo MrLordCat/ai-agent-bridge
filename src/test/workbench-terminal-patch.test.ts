@@ -175,26 +175,15 @@ suite("Agents Bridge — workbench terminal reuse patch", () => {
                 }
                 const source = fs.readFileSync(bundlePath, "utf8");
                 const markerCount = source.split(WORKBENCH_TERMINAL_PATCH_MARKER).length - 1;
-                const patternText =
-                        `_initTerminal(e,t,o,n,r){if(!n){let u=this._sessionTerminalAssociations.get(e);` +
-                        `if(u&&!u.isBackground&&!u.instance.isDisposed)`;
-                const patternCount = source.split(patternText).length - 1;
+                assert.ok(markerCount <= 1, "bundle must not be patched twice");
+                const original = markerCount === 1 ? unpatchWorkbenchTerminalBundle(source) : source;
+                assert.ok(!original.includes(WORKBENCH_TERMINAL_PATCH_MARKER));
+                // The extension's own matcher: a bundle shape it cannot patch fails here instead of skipping.
+                const patched = patchWorkbenchTerminalBundle(original);
+                assert.strictEqual(patched.split(WORKBENCH_TERMINAL_PATCH_MARKER).length - 1, 1);
+                assert.strictEqual(unpatchWorkbenchTerminalBundle(patched), original, "the revert must be exact");
                 if (markerCount === 1) {
-                        assert.strictEqual(patternCount, 0, "patched bundle must not contain the original pattern");
-                } else {
-                        assert.strictEqual(markerCount, 0, "bundle must not be half-patched");
-                        if (patternCount !== 1) {
-                                // Newer VS Code versions renamed the 1.131 parameters; the
-                                // pattern is still covered by the synthetic fixtures above.
-                                this.skip();
-                                return;
-                        }
-                        assert.strictEqual(patternCount, 1, "unpatched bundle must contain the pattern exactly once");
-                }
-                if (markerCount === 1) {
-                        const reverted = unpatchWorkbenchTerminalBundle(source);
-                        assert.ok(!reverted.includes(WORKBENCH_TERMINAL_PATCH_MARKER));
-                        assert.strictEqual(patchWorkbenchTerminalBundle(reverted), source, "the revert must be exact");
+                        assert.strictEqual(patched, source, "an installed patch matches a fresh one");
                 }
                 const status = getWorkbenchTerminalPatchStatus(bundlePath);
                 assert.strictEqual(status.sha256.length, 64);

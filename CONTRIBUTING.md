@@ -2,7 +2,7 @@
 
 Thanks for helping! This extension bridges local models and subscription
 providers (DeepSeek, Codex, Claude) into native VS Code Chat. It is
-Windows-first and validated against VS Code 1.131.
+Windows-first, tested on the current VS Code 1.143 and the minimum supported 1.131.
 
 ## Ground Rules
 
@@ -21,12 +21,13 @@ Windows with git-bash, Node 22+.
 ```bash
 npm ci
 npm run compile        # tsc -p ./
-npm test               # full suite on the pinned VS Code 1.131 (vscode-test)
+npm test               # full suite on the pinned VS Code 1.143.1 (vscode-test)
 npm run lint
 ```
 
-The test suite runs inside VS Code 1.131 pinned by `.vscode-test.mjs` because
-the agent-host / Copilot patch patterns are version-specific.
+The test suite runs inside VS Code 1.143.1 pinned by `.vscode-test.mjs` because
+the agent-host / Copilot patch patterns are version-specific. Check the minimum
+supported host with `npm test -- --code-version 1.131.0`.
 
 ## Build & Install
 

@@ -15,4 +15,4 @@ What does this PR change and why.
 ## Notes for reviewers
 
 Anything version-sensitive (agent-host / Copilot patch patterns are validated
-against VS Code 1.131), Windows-specific, or security-related.
+against VS Code 1.143 and the minimum 1.131), Windows-specific, or security-related.

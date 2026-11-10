@@ -180,23 +180,20 @@ suite("Agents Bridge — agent-host thinking patch", () => {
 		}
 	});
 
-	test("locates the real VS Code 1.131 agent host bundle and matches its pattern", function () {
+	test("the installed agent host bundle supports every capability natively or through the patch", function () {
 		const candidate = agentHostBundlePathFromAppRoot(vscode.env.appRoot);
 		if (!fs.existsSync(candidate)) {
 			this.skip();
 			return;
 		}
 		const bundle = fs.readFileSync(candidate, "utf8");
-		const status = getAgentHostThinkingPatchStatus(candidate);
+		const capabilities = inspectAgentHostPatchSupport(bundle);
+		// 1.131 needs the patch, 1.136+ is native; any other shape means the patch fell behind VS Code.
+		assert.deepStrictEqual(capabilities.filter(capability => capability.state === "unsupported"), []);
 		const patched = patchAgentHostBundle(bundle);
-		if (patched === bundle) {
-			// Newer VS Code versions no longer ship the 1.131 BYOK snapshot
-			// pattern; the patch patterns are still covered synthetically above.
-			this.skip();
-			return;
-		}
-		assert.notStrictEqual(patched, bundle, "the installed 1.131 bundle must contain the BYOK snapshot pattern");
-		assert.ok(patched.includes(AGENT_HOST_THINKING_PATCH_MARKER));
+		assert.strictEqual(patched !== bundle, capabilities.some(capability => capability.state === "patchable"));
+		assert.ok(inspectAgentHostPatchSupport(patched).every(capability => capability.state !== "patchable"));
+		const status = getAgentHostThinkingPatchStatus(candidate);
 		assert.ok(status.backupPath.endsWith(".llama-vscode-chat.bak"));
 		void findAgentHostBundle(vscode.env.appRoot);
 	});

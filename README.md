@@ -200,7 +200,7 @@ npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 964 extension-host tests in the current 1.21.0 build
+npm test              # 964 extension-host tests on VS Code 1.143.1 in the current 1.21.0 build
 npm run package       # builds the local VSIX
 code --install-extension ./llama-vscode-chat-1.21.0.vsix --force
 ```
