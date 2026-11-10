@@ -1,5 +1,26 @@
 # Changelog
 
+## 1.20.23 (dev patch) - 2026-11-10
+
+Subscription diagnostics: only complete windows are recorded.
+
+- Every request now counts in the provider window it ran in, a window spanning
+  `resetsAt` minus 5 hours or 7 days. Requests after a reset no longer land in
+  the old window, and the empty "after 100%" stretch is no longer saved as a
+  window of its own.
+- Codex starts a new weekly window right after the old one hits 100%. That
+  window was noticed only at 10% and lost its start to the old one, which split
+  one week into two rows. It now takes back every request since its real start.
+  An idle 0% sample no longer hides the reset until the 10% band.
+- Finished windows and the capacity median keep only windows tracked from
+  start to end. A window first seen already in use, or one that kept rising
+  without requests from this extension (more than 5 points), stays visible
+  while it runs, marked partial, and is never saved. A window whose reset time
+  passed moves to history without waiting for a new event.
+- Codex now records the tokens of a turn that failed or was cancelled. The turn
+  that runs into the usage limit always fails, so before this every exhausted
+  window was missing its last request (in the ledger, 10 to 90% of the window).
+
 ## 1.20.22 (dev patch) - 2026-11-10
 
 Codex: prompts sent while the agent is working.

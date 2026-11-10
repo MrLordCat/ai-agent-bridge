@@ -1415,7 +1415,7 @@ function renderSubscriptionProvider(provider) {
 	}
 	h += '</section>';
 
-	h += '<div class="section-heading"><h2>Current windows</h2><span class="section-note">Counted from zero since the last reset or 100%</span></div>';
+	h += '<div class="section-heading"><h2>Current windows</h2><span class="section-note">Counted from the start of the provider window</span></div>';
 	const current = provider.current;
 	if (!current.length) {
 		h += '<div class="empty">No window has been observed yet. Limits refresh every minute while the provider is signed in.</div>';
@@ -1436,13 +1436,13 @@ function renderSubscriptionProvider(provider) {
 	}
 
 	if (provider.completed.length) {
-		h += '<div class="section-heading"><h2>Finished windows</h2><span class="section-note">Newest first · only windows with tracked tokens are kept</span></div>';
+		h += '<div class="section-heading"><h2>Finished windows</h2><span class="section-note">Newest first · only windows tracked from start to end</span></div>';
 		h += '<div class="table-shell"><table><thead><tr><th>Window</th><th>Period</th><th>Duration</th><th>Ended by</th><th>Requests</th><th>Input</th><th>Cached</th><th>Output</th><th>Cache hit</th></tr></thead><tbody>';
 		for (const record of provider.completed) {
 			h += '<tr><td>' + esc(SUBSCRIPTION_WINDOW[record.kind] || record.kind) + '</td>';
 			h += '<td>' + STAMP(record.startedAt) + ' → ' + STAMP(record.endedAt) + '</td>';
 			h += '<td>' + SPAN(record.startedAt, record.endedAt) + '</td>';
-			h += '<td>' + (record.closedBy === "limit-hit" ? '100% used' : 'window reset') + (record.partial ? ' <span class="tag">partial</span>' : '') + '</td>';
+			h += '<td>' + (record.closedBy === "limit-hit" ? '100% used' : 'window reset') + '</td>';
 			h += '<td>' + FMT(record.totals.requests) + '</td>';
 			h += '<td>' + FMT_SHORT(record.totals.inputTokens) + '</td>';
 			h += '<td>' + FMT_SHORT(record.totals.cachedInputTokens) + '</td>';
@@ -1469,9 +1469,9 @@ function renderSubscriptionsTab(d) {
 		return '<div class="empty">No subscription usage recorded yet.<br>Codex and Claude limits are read every minute; token totals appear after the next completed request.</div>';
 	}
 	let h = '<p class="section-note">This ledger lives in extension global storage, so every VS Code window of this profile adds to the same numbers (last read '
-		+ CLOCK(data.generatedAt) + '). Each provider window starts at zero: a window that reaches 100% is saved as a finished window and the next one starts empty, instead of continuing mid-period.</p>';
+		+ CLOCK(data.generatedAt) + '). Each request counts in the provider window it ran in, and only windows tracked from their start to their end are saved, so window totals and capacity never mix in partial periods.</p>';
 	for (const provider of data.providers) h += renderSubscriptionProvider(provider);
-	h += '<p class="section-note">Cache miss counts input tokens the provider had to process fresh; cached tokens were served from the prompt cache. A window is marked partial when tracking started after it had already begun, so its totals are a lower bound.</p>';
+	h += '<p class="section-note">Cache miss counts input tokens the provider had to process fresh; cached tokens were served from the prompt cache. A current window is marked partial when it was first seen already in use or kept rising without requests from this extension; its totals are a lower bound and it is not saved when it ends.</p>';
 	return h;
 }
 

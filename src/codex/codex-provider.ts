@@ -2013,6 +2013,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				this.lastResponseEndedAtByConversation.set(copilotConversationId, Date.now());
 			}
 			if (!keepBridge) {
+				// The turn that hits a usage limit fails; its tokens still used up the window.
+				this.recordUnaccountedUsage(threadId, model.id, bridge.tokenUsage);
 				this.finishRuntimeMetrics(threadId);
 				this.dynamicToolContexts.delete(threadId);
 				bridge.dispose();
@@ -2404,6 +2406,19 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			updatedAt: Date.now(),
 		};
 		this.statusChanges.fire(this.status);
+	}
+
+	/** Reports tokens a failed or cancelled turn consumed that no completed turn accounted for. */
+	private recordUnaccountedUsage(threadId: string, modelId: string, usage: CodexThreadTokenUsage | undefined): void {
+		if (!usage) {
+			return;
+		}
+		const delta = diffCodexThreadUsage(usage, this.accountedTokenUsageByThread.get(threadId));
+		this.accountedTokenUsageByThread.set(threadId, usage);
+		if (delta) {
+			this.logSink?.log("codex.chat.usage_recorded_after_failure", { threadId, model: modelId, ...delta });
+			this.usageRecords.fire({ modelId, ...delta });
+		}
 	}
 
 	private recordTokenUsage(

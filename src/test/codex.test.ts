@@ -1456,6 +1456,32 @@ suite("Codex subscription provider", () => {
 		stops.dispose();
 	});
 
+	test("reports the tokens of a failed or cancelled turn exactly once", () => {
+		const provider = new CodexChatModelProvider("test");
+		const records: unknown[] = [];
+		const subscription = provider.onDidRecordUsage(record => records.push(record));
+		const internals = provider as unknown as {
+			recordUnaccountedUsage(threadId: string, modelId: string, usage: unknown): void;
+		};
+		const breakdown = { totalTokens: 1_060, inputTokens: 1_000, cachedInputTokens: 600, outputTokens: 50, reasoningOutputTokens: 10 };
+		const usage = { total: breakdown, last: breakdown, modelContextWindow: null };
+		try {
+			internals.recordUnaccountedUsage("thread-failed", "gpt-test", usage);
+			internals.recordUnaccountedUsage("thread-failed", "gpt-test", usage);
+			internals.recordUnaccountedUsage("thread-failed", "gpt-test", undefined);
+			assert.deepStrictEqual(records, [{
+				modelId: "gpt-test",
+				inputTokens: 1_000,
+				outputTokens: 50,
+				cachedInputTokens: 600,
+				reasoningOutputTokens: 10,
+			}]);
+		} finally {
+			subscription.dispose();
+			provider.dispose();
+		}
+	});
+
 	test("reuses a steered thread whose turn already ended before the interrupt", async () => {
 		assert.strictEqual(isCodexNoActiveTurnError(new Error("no active turn to interrupt")), true);
 		assert.strictEqual(isCodexNoActiveTurnError(new Error("turn/interrupt timed out")), false);

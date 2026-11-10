@@ -75,9 +75,9 @@ export interface SubscriptionWindowRecord {
 	startedAt: number;
 	endedAt?: number;
 	resetsAt?: string;
-	/** Why tracking restarted: the first event, a provider window reset, or the previous window hitting 100%. */
-	origin: "first-seen" | "reset" | "limit-hit";
-	/** True when tracking began inside an already-running window, so the totals are a lower bound. */
+	/** "first-seen" for the first window tracked for this provider, "reset" after a window the ledger already followed. */
+	origin: "first-seen" | "reset";
+	/** True when tracking began inside an already-running window: the totals are a lower bound and never become history. */
 	partial: boolean;
 	closedBy?: "limit-hit" | "reset";
 	peakUtilization?: number;
@@ -143,8 +143,41 @@ function sameWindow(left: string | undefined, right: string | undefined): boolea
 	return Math.abs(leftAt - rightAt) <= RESET_TOLERANCE_MS;
 }
 
-function hasActivity(record: SubscriptionWindowRecord): boolean {
-	return record.totals.requests > 0;
+const WINDOW_DURATION_MS: Record<SubscriptionWindowKind, number> = { fiveHour: 5 * 3_600_000, weekly: 7 * 86_400_000 };
+/** Points of a window used outside the ledger's view that still leave it complete. */
+const UNTRACKED_MAX_UTILIZATION = 5;
+/** Polls (1 min for Codex, ~6 min for Claude) see a new window this soon after it starts. */
+const FULL_START_GRACE_MS = 20 * 60_000;
+/** A request's own consumption can reach the next sample this late. */
+const SAMPLE_LAG_MS = 7 * 60_000;
+
+function parseReset(resetsAt: string | undefined): number | undefined {
+	const at = resetsAt === undefined ? Number.NaN : Date.parse(resetsAt);
+	return Number.isNaN(at) ? undefined : at;
+}
+
+interface WindowState {
+	record: SubscriptionWindowRecord;
+	usages: UsageEvent[];
+	resetAt?: number;
+	firstWindowAt?: number;
+	firstUtilization?: number;
+	/** The provider's start of the window (`resetsAt - duration`), once a reset time is known. */
+	windowStartAt?: number;
+	samples: Array<{ at: number; utilization: number }>;
+}
+
+/** Points the window rose after our last request: consumption the ledger never saw, e.g. an unrecorded failed turn. */
+function untrackedTail(state: WindowState): number {
+	const peak = state.record.peakUtilization;
+	const lastUsageAt = state.usages.at(-1)?.at;
+	if (peak === undefined || lastUsageAt === undefined) {
+		return 0;
+	}
+	const seen = state.samples
+		.filter(sample => sample.at <= lastUsageAt + SAMPLE_LAG_MS)
+		.reduce((highest, sample) => Math.max(highest, sample.utilization), state.samples[0]?.utilization ?? 0);
+	return peak - seen;
 }
 
 function createRecord(provider: SubscriptionProvider, kind: SubscriptionWindowKind, at: number,
@@ -154,8 +187,6 @@ function createRecord(provider: SubscriptionProvider, kind: SubscriptionWindowKi
 		kind,
 		startedAt: at,
 		origin,
-		// Only a window observed from its start has complete totals; a limit hit or an
-		// adoption mid-window both start counting from zero partway through.
 		partial: origin === "first-seen",
 		totals: emptyTotals(),
 		models: [],
@@ -168,12 +199,33 @@ function createRecord(provider: SubscriptionProvider, kind: SubscriptionWindowKi
 	return record;
 }
 
+function applyUsages(record: SubscriptionWindowRecord, usages: readonly UsageEvent[]): void {
+	for (const event of usages) {
+		const totals = record.totals;
+		totals.requests += 1;
+		totals.freshInputTokens += event.fresh;
+		totals.cachedInputTokens += event.cached;
+		totals.cacheWriteInputTokens += event.cacheWrite;
+		totals.outputTokens += event.output;
+		const modelId = event.modelId ?? "unknown";
+		let model = record.models.find(entry => entry.modelId === modelId);
+		if (!model) {
+			model = { modelId, ...emptyTotals() };
+			record.models.push(model);
+		}
+		model.requests += 1;
+		model.freshInputTokens += event.fresh;
+		model.cachedInputTokens += event.cached;
+		model.cacheWriteInputTokens += event.cacheWrite;
+		model.outputTokens += event.output;
+	}
+}
+
 /**
- * Turns the append-only ledger into per-window records. Every window starts
- * with zero totals when the provider reports a reset or a fully used window,
- * so a completed record never mixes usage from two periods.
+ * Turns the ledger into per-window records spanning `[resetsAt - duration, resetsAt)`. Only windows
+ * tracked from their start become history; one first seen mid-way is shown while it runs, never saved.
  */
-export function summarizeSubscriptionEvents(events: readonly LedgerEvent[]): SubscriptionReport {
+export function summarizeSubscriptionEvents(events: readonly LedgerEvent[], now = Date.now()): SubscriptionReport {
 	const sorted = [...events].sort((left, right) => left.at - right.at);
 	// A provider only has the windows it reports; usage alone cannot invent a weekly row.
 	const reportedKinds = new Map<SubscriptionProvider, Set<SubscriptionWindowKind>>();
@@ -195,97 +247,145 @@ export function summarizeSubscriptionEvents(events: readonly LedgerEvent[]): Sub
 		return created;
 	};
 	for (const windowKind of WINDOW_KINDS) {
-		const perProvider = new Map<SubscriptionProvider, SubscriptionWindowRecord>();
-		const ensure = (provider: SubscriptionProvider, at: number, origin: SubscriptionWindowRecord["origin"], observed?: WindowEvent) => {
-			const existing = perProvider.get(provider);
-			if (existing) {
-				return existing;
+		const duration = WINDOW_DURATION_MS[windowKind];
+		const open = new Map<SubscriptionProvider, WindowState>();
+		const previousEnd = new Map<SubscriptionProvider, number>();
+		const states: WindowState[] = [];
+		const begin = (provider: SubscriptionProvider, at: number, observed: WindowEvent | undefined): WindowState => {
+			const origin = previousEnd.has(provider) ? "reset" : "first-seen";
+			const state: WindowState = {
+				record: createRecord(provider, windowKind, at, origin, observed),
+				usages: [],
+				resetAt: parseReset(observed?.resetsAt),
+				firstWindowAt: observed?.at,
+				firstUtilization: observed?.utilization,
+				samples: observed ? [{ at: observed.at, utilization: observed.utilization }] : [],
+			};
+			if (state.resetAt !== undefined) {
+				state.windowStartAt = state.resetAt - duration;
 			}
-			const created = createRecord(provider, windowKind, at, origin, observed);
-			perProvider.set(provider, created);
-			reportFor(provider).current.push(created);
-			return created;
+			reportFor(provider);
+			open.set(provider, state);
+			states.push(state);
+			return state;
+		};
+		const close = (state: WindowState, at: number): void => {
+			const record = state.record;
+			if (!record.closedBy) {
+				record.closedBy = "reset";
+				record.endedAt = Math.max(record.startedAt, Math.min(at, state.resetAt ?? at));
+			}
+			previousEnd.set(record.provider, record.endedAt ?? at);
+			open.delete(record.provider);
+		};
+		// The provider's own start of a window, never before the previous window ended or after it was seen.
+		const windowStart = (provider: SubscriptionProvider, event: WindowEvent, floor: number | undefined): number => {
+			const resetAt = parseReset(event.resetsAt);
+			const start = resetAt === undefined ? event.at : resetAt - duration;
+			return Math.min(event.at, Math.max(start, floor ?? previousEnd.get(provider) ?? start));
 		};
 		for (const event of sorted) {
 			if (!reportedKinds.get(event.provider)?.has(windowKind)) {
 				continue;
 			}
-			if (event.type === "window") {
-				if (event.kind !== windowKind) {
+			const current = open.get(event.provider);
+			if (event.type === "usage") {
+				let state = current;
+				if (state?.resetAt !== undefined && event.at > state.resetAt) {
+					close(state, state.resetAt);
+					state = undefined;
+				}
+				state ??= begin(event.provider, event.at, undefined);
+				state.usages.push(event);
+				continue;
+			}
+			if (event.kind !== windowKind) {
+				continue;
+			}
+			if (!current) {
+				// An idle provider reports 0% with a moving reset time: no window until something is used.
+				if (event.utilization > 0) {
+					begin(event.provider, windowStart(event.provider, event, undefined), event);
+				}
+				continue;
+			}
+			const record = current.record;
+			// A timestamp the provider only sometimes reports must not split the window;
+			// both sides have to name a reset time that actually differs.
+			const windowChanged = record.resetsAt !== undefined && event.resetsAt !== undefined
+				&& !sameWindow(record.resetsAt, event.resetsAt);
+			// Without reset timestamps a deep drop is the only sign of a fresh window.
+			const dropped = (record.resetsAt === undefined || event.resetsAt === undefined)
+				&& (record.peakUtilization ?? 0) - event.utilization >= 50;
+			if (windowChanged || dropped) {
+				const start = windowStart(event.provider, event, record.startedAt);
+				close(current, start);
+				if (event.utilization <= 0) {
 					continue;
 				}
-				const current = perProvider.get(event.provider);
-				if (!current && event.utilization <= 0) {
-					// Nothing has been used and no window is running: do not create a record.
-					continue;
+				const next = begin(event.provider, start, event);
+				// Codex restarts a window early (right after a weekly 100%); requests since then are the new window's.
+				next.usages = current.usages.filter(usage => usage.at >= start);
+				current.usages = current.usages.filter(usage => usage.at < start);
+				continue;
+			}
+			if (event.utilization <= 0) {
+				continue;
+			}
+			if (current.firstWindowAt === undefined) {
+				current.firstWindowAt = event.at;
+				current.firstUtilization = event.utilization;
+				const resetAt = parseReset(event.resetsAt);
+				if (resetAt !== undefined) {
+					// The request that opened this window started before it was recorded.
+					current.windowStartAt = resetAt - duration;
+					const start = Math.max(current.windowStartAt, previousEnd.get(event.provider) ?? current.windowStartAt);
+					record.startedAt = Math.min(record.startedAt, start, event.at);
 				}
-				const report = reportFor(event.provider);
-				// A timestamp the provider only sometimes reports must not split the window;
-				// both sides have to name a reset time that actually differs.
-				const windowChanged = current?.resetsAt !== undefined && event.resetsAt !== undefined
-					&& !sameWindow(current.resetsAt, event.resetsAt);
-				// Some providers omit the reset timestamp; a deep drop still means a fresh window.
-				const dropped = current !== undefined && hasActivity(current)
-					&& (current.peakUtilization ?? 0) - event.utilization >= 50;
-				if (current && (windowChanged || dropped)) {
-					// An idle provider reports 0% with a reset time that keeps moving; that is not a
-					// window worth keeping. Only a window with tracked tokens becomes history.
-					if (hasActivity(current)) {
-						if (!current.closedBy) {
-							current.endedAt = event.at;
-							current.closedBy = "reset";
-						}
-						report.completed.push(current);
-					}
-					report.current = report.current.filter(record => record !== current);
-					const next = createRecord(event.provider, windowKind, event.at, hasActivity(current) ? "reset" : "first-seen", event);
-					perProvider.set(event.provider, next);
-					report.current.push(next);
-					continue;
-				}
-				const record = ensure(event.provider, event.at, current ? current.origin : "first-seen", event);
-				record.plan = event.plan ?? record.plan;
-				record.resetsAt = event.resetsAt ?? record.resetsAt;
-				const previousPeak = record.peakUtilization ?? 0;
-				record.peakUtilization = Math.max(previousPeak, event.utilization);
-				if (event.utilization >= 100 && previousPeak < 100 && !record.closedBy && hasActivity(record)) {
-					// Full window: keep the totals and start the next window from zero.
-					record.endedAt = event.at;
-					record.closedBy = "limit-hit";
-					report.completed.push(record);
+			}
+			current.samples.push({ at: event.at, utilization: event.utilization });
+			record.plan = event.plan ?? record.plan;
+			record.resetsAt = event.resetsAt ?? record.resetsAt;
+			current.resetAt = parseReset(record.resetsAt);
+			const previousPeak = record.peakUtilization ?? 0;
+			record.peakUtilization = Math.max(previousPeak, event.utilization);
+			if (event.utilization >= 100 && previousPeak < 100 && !record.closedBy) {
+				// Exhausted: the totals so far are the window's capacity; it still runs until the reset.
+				record.closedBy = "limit-hit";
+				record.endedAt = event.at;
+			}
+		}
+		for (const state of [...open.values()]) {
+			if (state.resetAt !== undefined && state.resetAt <= now) {
+				close(state, state.resetAt);
+			}
+		}
+		for (const state of states) {
+			const record = state.record;
+			const firstWindowAt = state.firstWindowAt;
+			const sawStart = firstWindowAt === undefined
+				|| (state.firstUtilization ?? 0) <= UNTRACKED_MAX_UTILIZATION
+				|| (state.windowStartAt !== undefined && firstWindowAt - state.windowStartAt <= FULL_START_GRACE_MS)
+				// Our own requests ran before the first sample, so tracking was live when it opened.
+				|| state.usages.some(usage => usage.at <= firstWindowAt);
+			const sawEnd = !record.closedBy || untrackedTail(state) <= UNTRACKED_MAX_UTILIZATION;
+			record.partial = record.origin === "first-seen" || !sawStart || !sawEnd;
+			applyUsages(record, state.usages);
+			const report = reportFor(record.provider);
+			if (open.get(record.provider) === state) {
+				report.current.push(record);
+			}
+			// Only a window tracked from its start, with tokens of ours, becomes history.
+			if (record.closedBy && !record.partial && state.usages.length > 0) {
+				report.completed.push(record);
+				if (record.closedBy === "limit-hit") {
 					report.exhausted.push(record);
-					report.current = report.current.filter(candidate => candidate !== record);
-					// The next window starts after the hit, so the 100% report is not its usage.
-					const next = createRecord(event.provider, windowKind, event.at, "limit-hit", undefined);
-					next.resetsAt = event.resetsAt;
-					perProvider.set(event.provider, next);
-					report.current.push(next);
 				}
-				continue;
 			}
-			if (event.type !== "usage") {
-				continue;
-			}
-			const record = ensure(event.provider, event.at, "first-seen");
-			const totals = record.totals;
-			totals.requests += 1;
-			totals.freshInputTokens += event.fresh;
-			totals.cachedInputTokens += event.cached;
-			totals.cacheWriteInputTokens += event.cacheWrite;
-			totals.outputTokens += event.output;
-			const modelId = event.modelId ?? "unknown";
-			let model = record.models.find(entry => entry.modelId === modelId);
-			if (!model) {
-				model = { modelId, ...emptyTotals() };
-				record.models.push(model);
-			}
-			model.requests += 1;
-			model.freshInputTokens += event.fresh;
-			model.cachedInputTokens += event.cached;
-			model.cacheWriteInputTokens += event.cacheWrite;
-			model.outputTokens += event.output;
 		}
 	}
+	const newestFirst = (left: SubscriptionWindowRecord, right: SubscriptionWindowRecord) =>
+		(right.endedAt ?? right.startedAt) - (left.endedAt ?? left.startedAt);
 	const output: SubscriptionProviderReport[] = [];
 	for (const report of providers.values()) {
 		const finish = (record: SubscriptionWindowRecord) => ({
@@ -296,13 +396,14 @@ export function summarizeSubscriptionEvents(events: readonly LedgerEvent[]): Sub
 		});
 		output.push({
 			provider: report.provider,
-			plan: report.current.find(record => record.plan)?.plan ?? report.completed.at(-1)?.plan,
+			plan: report.current.find(record => record.plan)?.plan
+				?? [...report.completed].sort(newestFirst).find(record => record.plan)?.plan,
 			current: report.current.map(finish),
-			completed: [...report.completed].reverse().map(finish),
-			exhausted: [...report.exhausted].reverse().map(finish),
+			completed: [...report.completed].sort(newestFirst).map(finish),
+			exhausted: [...report.exhausted].sort(newestFirst).map(finish),
 		});
 	}
-	return { generatedAt: Date.now(), providers: output.sort((left, right) => left.provider.localeCompare(right.provider)) };
+	return { generatedAt: now, providers: output.sort((left, right) => left.provider.localeCompare(right.provider)) };
 }
 
 const BAND_SIZE = 10;
@@ -413,6 +514,10 @@ export class SubscriptionUsageLedger {
 	}
 
 	summary(): SubscriptionReport {
+		// A window whose reset passed moves to history even when no new event arrived.
+		if (Date.now() - this.report.generatedAt > 60_000) {
+			this.report = summarizeSubscriptionEvents(this.events);
+		}
 		return this.report;
 	}
 
@@ -453,12 +558,12 @@ export class SubscriptionUsageLedger {
 			const resetWithoutTimestamp = last !== undefined && last.resetsAt === resetsAt
 				&& utilization + RESET_DROP <= last.utilization;
 			const bandChanged = last === undefined || Math.floor(utilization / BAND_SIZE) !== Math.floor(last.utilization / BAND_SIZE);
-			this.windows.set(key, { utilization, resetsAt });
-			// An idle provider reports 0% with a reset time that moves every minute; storing that
-			// only creates empty windows. A real reset is detected from the next used sample.
+			// Idle 0% samples (with a moving reset) are neither stored nor remembered, so the first
+			// used sample of a new window still reads as a reset instead of waiting for the 10% band.
 			if (utilization <= 0 && !hitLimit) {
 				continue;
 			}
+			this.windows.set(key, { utilization, resetsAt });
 			if (!windowChanged && !hitLimit && !resetWithoutTimestamp && !bandChanged) {
 				continue;
 			}
