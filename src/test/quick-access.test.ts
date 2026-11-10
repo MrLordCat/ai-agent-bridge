@@ -163,8 +163,15 @@ test("opens centralized API provider management from Quick Access", async () => 
 		assert.ok(diagnostics);
 
 		const children = await getItems(provider, diagnostics);
-		assert.ok(children.some(item => labelOf(item) === "Throughput"));
+		// The group row already shows the throughput; its tooltip keeps the full values.
+		assert.ok(!children.some(item => labelOf(item) === "Throughput"));
+		assert.ok(String(diagnostics.tooltip).includes("Throughput: 24.5 tok/s"));
 		assert.ok(children.some(item => labelOf(item) === "Context Usage"));
+		assert.ok(!children.some(item => labelOf(item) === "Subscription Tokens"), "it opened the same Live Report");
+		const logs = children.find(item => labelOf(item) === "Logs");
+		assert.deepStrictEqual(logs?.children?.map(labelOf), ["Latest Log", "Logs Folder", "Copy Latest Log Path", "File Logging", "Stream Logging"]);
+		const statusBar = children.find(item => labelOf(item) === "Status Bar");
+		assert.deepStrictEqual(statusBar?.children?.map(item => item.command?.command), ["llamacpp.togglePerformanceStatusBar", "llamacpp.toggleContextUsageStatusBar"]);
 		assert.ok(!children.some(item => labelOf(item) === "Prompt Cache"));
 		const usage = (await getItems(provider)).find(item => labelOf(item) === "Token Usage");
 		assert.ok(String(usage?.tooltip).includes("Last local cache snapshot: 75.0% (75/100)"));
@@ -278,22 +285,68 @@ test("opens centralized API provider management from Quick Access", async () => 
 			() => undefined,
 			() => undefined,
 			() => [
-				{ id: "fiveHour", label: "Session Limit (5h)", description: "42% used" },
-				{ id: "sevenDay", label: "Weekly Limit", description: "87% used" },
+				{ id: "fiveHour", label: "Session Limit (5h)", description: "42% used / resets 11/10/2026, 3:00:00 PM" },
+				{ id: "sevenDay", label: "Weekly Limit", description: "87% used / resets 11/14/2026, 9:00:00 AM" },
 				{ id: "sevenDayOpus", label: "Weekly Opus Limit", description: "12% used" },
 			]
 		);
 		const claude = (await getItems(provider)).find(item => labelOf(item) === "Claude");
 		assert.ok(claude);
 
+		// Same layout as Codex: one row per window, the reset moment on its own child row.
 		const children = await getItems(provider, claude);
-		const limits = children.find(item => labelOf(item) === "Subscription Limits");
-		assert.ok(limits);
-		assert.ok(String(limits.description).includes("5h: 42% used"));
-		const limitChildren = await getItems(provider, limits);
-		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Session Limit (5h)")?.description, "42% used");
-		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Limit")?.description, "87% used");
-		assert.strictEqual(limitChildren.find(item => labelOf(item) === "Weekly Opus Limit")?.description, "12% used");
+		assert.ok(!children.some(item => labelOf(item) === "Subscription Limits"));
+		const fiveHour = children.find(item => labelOf(item) === "Session Limit (5h)");
+		assert.strictEqual(fiveHour?.description, "42% used");
+		assert.strictEqual(fiveHour?.collapsibleState, vscode.TreeItemCollapsibleState.Expanded);
+		assert.strictEqual(
+			(await getItems(provider, fiveHour)).find(item => labelOf(item) === "Next Reset")?.description,
+			"11/10/2026, 3:00:00 PM"
+		);
+		const weekly = children.find(item => labelOf(item) === "Weekly Limit");
+		assert.strictEqual(weekly?.description, "87% used");
+		assert.strictEqual((await getItems(provider, weekly)).find(item => labelOf(item) === "Next Reset")?.description, "11/14/2026, 9:00:00 AM");
+		const opus = children.find(item => labelOf(item) === "Weekly Opus Limit");
+		assert.strictEqual(opus?.description, "12% used");
+		assert.deepStrictEqual(await getItems(provider, opus), [], "a window without a reset time has no child row");
+		assert.strictEqual(fiveHour?.command?.command, "llamacpp.claudeShowStatus");
+	});
+
+	test("shows a Claude usage placeholder before the first limit report", async () => {
+		const claude = (await getItems(new LlamaQuickActionsProvider({}))).find(item => labelOf(item) === "Claude");
+		assert.ok(claude);
+		const placeholder = claude.children?.find(item => labelOf(item) === "Usage Limit");
+		assert.strictEqual(placeholder?.description, "No data yet");
+	});
+
+	test("merges rows that repeated another row or opened the same action", async () => {
+		const provider = new LlamaQuickActionsProvider({
+			getCodexStatus: () => "Connected (Plus)",
+			getClaudeStatus: () => "Connected (Max)",
+			getCodexAccounts: () => [{ id: "", label: "Default", active: true, state: "connected", summary: "Connected (Plus)" }],
+		});
+		const roots = await getItems(provider);
+		const child = (root: string, label: string) => roots.find(item => labelOf(item) === root)?.children?.find(item => labelOf(item) === label);
+		const labels = (root: string) => roots.find(item => labelOf(item) === root)?.children?.map(labelOf) ?? [];
+
+		assert.ok(!labels("Codex").includes("Account"), "the Codex status lives on ChatGPT Accounts");
+		assert.strictEqual(child("Codex", "ChatGPT Accounts")?.command?.command, "llamacpp.codexShowStatus");
+		assert.ok(String(child("Codex", "ChatGPT Accounts")?.tooltip).startsWith("Connected (Plus)"));
+		const codexSettings = child("Codex", "Settings")?.children?.map(labelOf) ?? [];
+		assert.deepStrictEqual(codexSettings, ["Subscription Source", "Deferred Tools", "Cache Keep-Alive", "Ignore usage-limit pause"]);
+
+		assert.ok(!labels("Claude").includes("Account Controls"));
+		assert.deepStrictEqual(child("Claude", "Account")?.children?.map(labelOf), ["Subscription Source", "Sign In"]);
+		assert.strictEqual(child("Claude", "Account")?.command?.command, "llamacpp.claudeShowStatus");
+
+		assert.strictEqual(child("Local LLM", "Endpoint")?.command?.command, "llamacpp.setLocalServerUrl");
+		assert.ok(!labels("Local LLM").includes("Connection"));
+		assert.strictEqual(child("DeepSeek", "Endpoint & API Key")?.command?.command, "llamacpp.configureDeepSeek");
+		assert.ok(!labels("DeepSeek").includes("Connection"));
+
+		const thinking = child("Copilot Patches", "Thinking Picker (Agents)");
+		assert.strictEqual(thinking?.description, "On");
+		assert.strictEqual(thinking?.command?.command, "llamacpp.toggleAgentHostThinkingPatch");
 	});
 
 	test("opens provider context sliders from Claude and Codex quick access", async () => {

@@ -1,5 +1,23 @@
 # Changelog
 
+## 1.20.21 (dev patch) - 2026-11-10
+
+Quick Access cleanup.
+
+- Claude subscription limits use the Codex layout: each window is its own row
+  with the used percentage, and the reset moment sits on an expanded
+  "Next Reset" row, so the time is no longer cut off at the sidebar edge. The
+  "Subscription Limits" group that repeated the same numbers is gone.
+- Rows that repeated another row or ran the same action are merged: the Codex
+  status opens from ChatGPT Accounts, Claude's source and sign-in sit under
+  Account, Local LLM and DeepSeek show their endpoint on one row, and the
+  Diagnostics "Throughput" and "Subscription Tokens" rows (the group row and
+  the Live Report already show them) are removed. Codex "Sign In" (every
+  account has its own) and the static "VS Code Tools Only" row are gone; the
+  group is now "Settings".
+- Diagnostics groups the log actions under Logs and the two status-bar
+  toggles under Status Bar. The thinking-picker patch row shows On/Off.
+
 ## 1.20.20 (dev patch) - 2026-11-09
 
 Patch safety hardening from the 1.20.19 audit.

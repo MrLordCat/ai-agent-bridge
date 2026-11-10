@@ -379,34 +379,54 @@ export function formatProviderUsageLine(
 		: `${status}: ${percent}%`;
 }
 
-/** Separates the used percentage from the reset moment in a limit description. */
-const USAGE_LIMIT_RESET_MARKER = " · resets ";
+/** Separates the used percentage from the reset moment: Codex writes "· resets", Claude "/ resets". */
+const USAGE_LIMIT_RESET_MARKER = /\s+[·/]\s+resets\s+/;
+
+interface UsageLimitSource {
+	tooltip: string;
+	resetTooltip: string;
+	command: vscode.Command;
+}
 
 /**
- * Codex subscription window row: the short "87% used" summary stays on the
- * parent row and the reset moment moves to an indented child row. The combined
+ * Subscription window row: the short "87% used" summary stays on the parent
+ * row and the reset moment moves to an indented child row. The combined
  * "87% used · resets 9/23/2026, 3:11:00 PM" text did not fit the sidebar width
  * and was truncated exactly where the reset time starts.
  */
-function codexUsageLimitItem(id: string, label: string, description: string): QuickAccessItem {
-	const markerIndex = description.indexOf(USAGE_LIMIT_RESET_MARKER);
-	const used = markerIndex >= 0 ? description.slice(0, markerIndex) : description;
-	const reset = markerIndex >= 0
-		? description.slice(markerIndex + USAGE_LIMIT_RESET_MARKER.length).trim()
-		: undefined;
+function usageLimitItem(id: string, label: string, description: string, source: UsageLimitSource): QuickAccessItem {
+	const marker = USAGE_LIMIT_RESET_MARKER.exec(description);
+	const used = marker ? description.slice(0, marker.index) : description;
+	const reset = marker ? description.slice(marker.index + marker[0].length).trim() : "";
 	return new QuickAccessItem(id, label, {
 		description: used,
-		tooltip: "ChatGPT subscription usage windows from the official Codex rate-limits endpoint (5-hour and weekly windows on Plus/Pro plans). Refreshes automatically every minute so you can see when each limit resets.",
+		tooltip: source.tooltip,
 		icon: new vscode.ThemeIcon("dashboard"),
-		command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+		command: source.command,
 		expanded: true,
-		children: reset && reset.length > 0
+		children: reset
 			? [new QuickAccessItem(`${id}.reset`, "Next Reset", {
 				description: reset,
-				tooltip: "Reset moment of this subscription window (local time), reported by the Codex rate-limits endpoint.",
+				tooltip: source.resetTooltip,
 				icon: new vscode.ThemeIcon("clock"),
 			})]
 			: undefined,
+	});
+}
+
+function codexUsageLimitItem(id: string, label: string, description: string): QuickAccessItem {
+	return usageLimitItem(id, label, description, {
+		tooltip: "ChatGPT subscription usage windows from the official Codex rate-limits endpoint (5-hour and weekly windows on Plus/Pro plans). Refreshes automatically every minute so you can see when each limit resets.",
+		resetTooltip: "Reset moment of this subscription window (local time), reported by the Codex rate-limits endpoint.",
+		command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
+	});
+}
+
+function claudeUsageLimitItem(id: string, label: string, description: string): QuickAccessItem {
+	return usageLimitItem(id, label, description, {
+		tooltip: "Claude subscription rate-limit window reported by the Claude Agent SDK. Refreshes automatically, so you can see when each limit resets.",
+		resetTooltip: "Reset moment of this subscription window (local time), reported by the Claude Agent SDK.",
+		command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
 	});
 }
 
@@ -656,6 +676,7 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const streamChunkLoggingEnabled = config.get<boolean>("logStreamChunks", false) === true;
 		const performanceStatusBarEnabled = config.get<boolean>("showPerformanceStatusBar", true) !== false;
 		const contextUsageStatusBarEnabled = config.get<boolean>("showContextUsageStatusBar", true) !== false;
+		const agentHostThinkingPatchEnabled = config.get<boolean>("agentHostThinkingPatchEnabled", true) !== false;
 		const memoryEnabled = config.get<boolean>("memoryEnabled", true) !== false;
 		const memoryCount = this.getMemoryCount();
 		const expiredMemoryCount = this.getExpiredMemoryCount();
@@ -737,17 +758,11 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("output"),
 					command: command("llamacpp.openSettings", "Open Output Settings"),
 				}),
-				new QuickAccessItem("local.settings", "Connection", {
+				new QuickAccessItem("local.endpoint", "Endpoint", {
 					description: formatEndpointLabel(localServerUrl),
-					icon: new vscode.ThemeIcon("settings-gear"),
-					children: [
-						new QuickAccessItem("local.endpoint", "Endpoint", {
-							description: formatEndpointLabel(localServerUrl),
-							tooltip: localServerUrl,
-							icon: new vscode.ThemeIcon("link"),
-							command: command("llamacpp.setLocalServerUrl", "Set Local Server URL"),
-						}),
-					],
+					tooltip: localServerUrl,
+					icon: new vscode.ThemeIcon("link"),
+					command: command("llamacpp.setLocalServerUrl", "Set Local Server URL"),
 				}),
 			],
 		});
@@ -808,21 +823,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: toggleIcon(deepSeekCompactionSummary),
 					command: command("llamacpp.toggleDeepSeekCompactionSummary", "Toggle DeepSeek Compaction Summaries"),
 				}),
-				new QuickAccessItem("deepseek.settings", "Connection", {
+				// The endpoint and the API key are set in the same dialog.
+				new QuickAccessItem("deepseek.endpoint", "Endpoint & API Key", {
 					description: formatEndpointLabel(deepSeekServerUrl),
-					icon: new vscode.ThemeIcon("settings-gear"),
-					children: [
-						new QuickAccessItem("deepseek.endpoint", "Endpoint", {
-							description: formatEndpointLabel(deepSeekServerUrl),
-							tooltip: deepSeekServerUrl,
-							icon: new vscode.ThemeIcon("link"),
-							command: command("llamacpp.configureDeepSeek", "Configure DeepSeek"),
-						}),
-						new QuickAccessItem("deepseek.setup", "API Key & Profile", {
-							icon: new vscode.ThemeIcon("key"),
-							command: command("llamacpp.configureDeepSeek", "Configure DeepSeek"),
-						}),
-					],
+					tooltip: deepSeekServerUrl,
+					icon: new vscode.ThemeIcon("key"),
+					command: command("llamacpp.configureDeepSeek", "Configure DeepSeek"),
 				}),
 			],
 		});
@@ -871,18 +877,13 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 				: "Off",
 			icon: new vscode.ThemeIcon("hubot"),
 			children: [
-				new QuickAccessItem("codex.status", "Account", {
-					description: codexStatus ?? "Checking...",
-					tooltip: "ChatGPT subscription account used by Codex",
-					icon: new vscode.ThemeIcon("account"),
-					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
-				}),
 				// Always present: adding a second subscription starts here, and each
 				// account keeps its own sign-in without editing settings by hand.
 				new QuickAccessItem("codex.accounts", "ChatGPT Accounts", {
 					description: `Active: ${activeCodexAccount?.label ?? "Default"} · ${codexAccounts.length} total`,
-					tooltip: "Switch between ChatGPT subscriptions. Each account keeps its own Codex home, login, threads and usage windows; only the active account's models appear in the picker.",
-					icon: new vscode.ThemeIcon("organization"),
+					tooltip: `${codexStatus ?? "Checking..."}\nClick for the subscription status. Expand to switch, sign in to or add ChatGPT subscriptions; each account keeps its own Codex home, login, threads and usage windows, and only the active account's models appear in the picker.`,
+					icon: new vscode.ThemeIcon("account"),
+					command: command("llamacpp.codexShowStatus", "Show Codex Subscription Status"),
 					children: [
 						...codexAccountItems,
 						new QuickAccessItem("codex.accounts.add", "Add Account…", {
@@ -914,19 +915,15 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 							this.getCodexSubscriptionUsage() ?? "Usage unavailable"
 						),
 					]),
-				new QuickAccessItem("codex.settings", "Tools & Account", {
-					description: `VS Code-only · deferred ${codexDeferredToolsEnabled ? "on" : "off"}`,
+				new QuickAccessItem("codex.settings", "Settings", {
+					description: `deferred ${codexDeferredToolsEnabled ? "on" : "off"} · keep-alive ${codexCacheKeepAliveEnabled ? "on" : "off"}`,
+					tooltip: "Codex works only through VS Code tools: its built-in command, file, web, MCP, browser, plugin and subagent actions are blocked, so every action uses a native VS Code tool card.",
 					icon: new vscode.ThemeIcon("settings-gear"),
 					children: [
 						new QuickAccessItem("codex.source", "Subscription Source", {
 							description: codexEnabled ? "On" : "Off",
 							icon: toggleIcon(codexEnabled),
 							command: command("llamacpp.toggleCodexSubscription", "Toggle Codex Subscription Source"),
-						}),
-						new QuickAccessItem("codex.vsCodeTools", "VS Code Tools Only", {
-							description: "Required",
-							tooltip: "Codex built-in command, file, web, MCP, browser, plugin, and subagent actions are blocked; all actions use native VS Code tool cards.",
-							icon: toggleIcon(true),
 						}),
 						new QuickAccessItem("codex.deferredTools", "Deferred Tools", {
 							description: codexDeferredToolsEnabled ? "On" : "Off",
@@ -949,10 +946,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 							icon: toggleIcon(config.get<boolean>("codexCacheKeepAliveIgnoreUsageLimit", false) === true),
 							command: command("llamacpp.toggleCodexCacheKeepAliveIgnoreUsageLimit", "Toggle Codex Ignore Usage-Limit Pause"),
 						}),
-						new QuickAccessItem("codex.signIn", "Sign In", {
-							icon: new vscode.ThemeIcon("sign-in"),
-							command: command("llamacpp.codexSignIn", "Sign In to Codex Subscription"),
-						}),
 					],
 				}),
 			],
@@ -966,10 +959,35 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 			children: [
 				new QuickAccessItem("claude.status", "Account", {
 					description: claudeStatus ?? "Checking...",
-					tooltip: "Read the Claude subscription status, session usage, and rate-limit state",
+					tooltip: "Click for the Claude subscription status, session usage and rate-limit state. Expand to sign in or turn the source off.",
 					icon: new vscode.ThemeIcon("account"),
 					command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
+					children: [
+						new QuickAccessItem("claude.source", "Subscription Source", {
+							description: claudeEnabled ? "On" : "Off",
+							icon: toggleIcon(claudeEnabled),
+							command: command("llamacpp.toggleClaudeSubscription", "Toggle Claude Subscription Source"),
+						}),
+						new QuickAccessItem("claude.signIn", "Sign In", {
+							icon: new vscode.ThemeIcon("sign-in"),
+							command: command("llamacpp.claudeSignIn", "Sign In to Claude Subscription"),
+						}),
+					],
 				}),
+				new QuickAccessItem("claude.contextLimit", "Working Context", {
+					description: `${formatCompactTokenCount(claudeContextLength)} shared / 1M max`,
+					tooltip: `Shared working context ${formatCompactTokenCount(sharedContext)} for Codex, Claude, Coco and Cursor. Claude uses the real Opus 5 1M runtime and this value as its auto-compaction threshold, bounded to 258.4K-967K.`,
+					icon: new vscode.ThemeIcon("settings"),
+					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
+				}),
+				...(claudeUsageLimits.length > 0
+					? claudeUsageLimits.map(limit => claudeUsageLimitItem(`claude.limit.${limit.id}`, limit.label, limit.description))
+					: [new QuickAccessItem("claude.limit.none", "Usage Limit", {
+						description: "No data yet",
+						tooltip: "Subscription limits appear after the first Claude request in this session",
+						icon: new vscode.ThemeIcon("dashboard"),
+						command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
+					})]),
 				new QuickAccessItem("claude.cacheKeepAlive", "Cache Keep-Alive", {
 					description: claudeCacheKeepAliveEnabled
 						? `On (every ${Math.round(claudeKeepAlive.intervalMs / 60_000)} min, up to ${Number((claudeKeepAlive.maxIdleMs / 3_600_000).toFixed(1))} h idle)`
@@ -985,49 +1003,6 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					tooltip: "When on, keep-alive continues even when the 5-hour usage limit reaches 90%. Useful when you need the prefix cache to survive across the usage-limit window.",
 					icon: toggleIcon(config.get<boolean>("claudeCacheKeepAliveIgnoreUsageLimit", false) === true),
 					command: command("llamacpp.toggleClaudeCacheKeepAliveIgnoreUsageLimit", "Toggle Ignore Usage-Limit Pause"),
-				}),
-				new QuickAccessItem("claude.limits", "Subscription Limits", {
-					description: claudeUsageLimits.length > 0
-						? claudeUsageLimits.map(limit => `${limit.label.replace("Session Limit (5h)", "5h").replace("Weekly Limit", "7d").replace("Weekly ", "")}: ${limit.description.split(" / ")[0]}`).join(" · ")
-						: "No data yet",
-					icon: new vscode.ThemeIcon("dashboard"),
-					children: claudeUsageLimits.length > 0
-						? claudeUsageLimits.map(limit =>
-						new QuickAccessItem(`claude.limit.${limit.id}`, limit.label, {
-							description: limit.description,
-							tooltip: "Claude subscription rate-limit window reported by the Claude Agent SDK",
-							icon: new vscode.ThemeIcon("dashboard"),
-							command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
-						}))
-						: [
-						new QuickAccessItem("claude.limit.none", "Usage Limits", {
-							description: "No data yet",
-							tooltip: "Subscription limits appear after the first Claude request in this session",
-							icon: new vscode.ThemeIcon("dashboard"),
-							command: command("llamacpp.claudeShowStatus", "Show Claude Subscription Status"),
-						}),
-						],
-				}),
-				new QuickAccessItem("claude.contextLimit", "Working Context", {
-					description: `${formatCompactTokenCount(claudeContextLength)} shared / 1M max`,
-					tooltip: `Shared working context ${formatCompactTokenCount(sharedContext)} for Codex, Claude, Coco and Cursor. Claude uses the real Opus 5 1M runtime and this value as its auto-compaction threshold, bounded to 258.4K-967K.`,
-					icon: new vscode.ThemeIcon("settings"),
-					command: command("llamacpp.openContextControl", "Open Provider Context Control"),
-				}),
-				new QuickAccessItem("claude.settings", "Account Controls", {
-					description: claudeEnabled ? "On" : "Off",
-					icon: new vscode.ThemeIcon("settings-gear"),
-					children: [
-						new QuickAccessItem("claude.source", "Subscription Source", {
-							description: claudeEnabled ? "On" : "Off",
-							icon: toggleIcon(claudeEnabled),
-							command: command("llamacpp.toggleClaudeSubscription", "Toggle Claude Subscription Source"),
-						}),
-						new QuickAccessItem("claude.signIn", "Sign In", {
-							icon: new vscode.ThemeIcon("sign-in"),
-							command: command("llamacpp.claudeSignIn", "Sign In to Claude Subscription"),
-						}),
-					],
 				}),
 			],
 		});
@@ -1239,19 +1214,15 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 
 		const diagnostics = new QuickAccessItem("diagnostics", "Diagnostics", {
 			description: `${lastThroughput ?? "n/a"} · ctx ${lastContextUsage?.summary ?? "n/a"}`,
+			tooltip: [`Throughput: ${lastThroughput ?? "n/a"}`, `Context: ${lastContextUsage?.summary ?? "n/a"}`, lastContextUsage?.breakdown]
+				.filter(Boolean).join("\n"),
 			icon: new vscode.ThemeIcon("pulse"),
 			children: [
 				new QuickAccessItem("diagnostics.session", "Live Report", {
 					description: sessionSummary ?? "No turns",
-					tooltip: "Cache, performance, errors and provider health in one live webview.",
+					tooltip: "Cache, performance, errors and provider health in one live webview. Its Subscriptions tab shows input, output, cache hits and misses per 5-hour and weekly Codex and Claude window.",
 					icon: new vscode.ThemeIcon("graph"),
 					command: command("llamacpp.openSessionReport", "Open Live Report"),
-				}),
-				new QuickAccessItem("diagnostics.subscriptions", "Subscription Tokens", {
-					description: "Codex & Claude windows",
-					tooltip: "Input, output, cache hits and misses per 5-hour and weekly subscription window in the Subscriptions tab of the Live Report.",
-					icon: new vscode.ThemeIcon("credit-card"),
-					command: command("llamacpp.openSessionReport", "Open Subscriptions"),
 				}),
 				new QuickAccessItem("diagnostics.resetSession", "Reset Session Metrics", {
 					icon: new vscode.ThemeIcon("clear-all"),
@@ -1263,48 +1234,55 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 					icon: new vscode.ThemeIcon("files"),
 					command: command("workbench.action.openSettings", "Open Chat Image Retention Setting", "@id:llamacpp.journalImageRetention"),
 				}),
-				new QuickAccessItem("diagnostics.throughput", "Throughput", {
-					description: lastThroughput ?? "n/a",
-					icon: new vscode.ThemeIcon("dashboard"),
-					command: command("llamacpp.openLatestLog", "Open Latest Log"),
-				}),
 				new QuickAccessItem("diagnostics.context", "Context Usage", {
 					description: lastContextUsage?.summary ?? "n/a",
 					tooltip: lastContextUsage?.breakdown,
 					icon: new vscode.ThemeIcon("pie-chart"),
 					command: command("llamacpp.openLatestLog", "Open Latest Log"),
 				}),
-				new QuickAccessItem("diagnostics.latestLog", "Latest Log", {
+				new QuickAccessItem("diagnostics.logs", "Logs", {
+					description: `file ${fileLoggingEnabled ? "on" : "off"} · stream ${streamChunkLoggingEnabled ? "on" : "off"}`,
 					icon: new vscode.ThemeIcon("file-text"),
-					command: command("llamacpp.openLatestLog", "Open Latest Log"),
+					children: [
+						new QuickAccessItem("diagnostics.latestLog", "Latest Log", {
+							icon: new vscode.ThemeIcon("file-text"),
+							command: command("llamacpp.openLatestLog", "Open Latest Log"),
+						}),
+						new QuickAccessItem("diagnostics.logsFolder", "Logs Folder", {
+							icon: new vscode.ThemeIcon("folder-opened"),
+							command: command("llamacpp.openLogsFolder", "Open Logs Folder"),
+						}),
+						new QuickAccessItem("diagnostics.copyLogPath", "Copy Latest Log Path", {
+							icon: new vscode.ThemeIcon("copy"),
+							command: command("llamacpp.copyLatestLogPath", "Copy Latest Log Path"),
+						}),
+						new QuickAccessItem("diagnostics.fileLogging", "File Logging", {
+							description: fileLoggingEnabled ? "On" : "Off",
+							icon: toggleIcon(fileLoggingEnabled),
+							command: command("llamacpp.toggleFileLogging", "Toggle File Logging"),
+						}),
+						new QuickAccessItem("diagnostics.streamLogging", "Stream Logging", {
+							description: streamChunkLoggingEnabled ? "On" : "Off",
+							icon: toggleIcon(streamChunkLoggingEnabled),
+							command: command("llamacpp.toggleStreamChunkLogging", "Toggle Stream Chunk Logging"),
+						}),
+					],
 				}),
-				new QuickAccessItem("diagnostics.logsFolder", "Logs Folder", {
-					icon: new vscode.ThemeIcon("folder-opened"),
-					command: command("llamacpp.openLogsFolder", "Open Logs Folder"),
-				}),
-				new QuickAccessItem("diagnostics.copyLogPath", "Copy Latest Log Path", {
-					icon: new vscode.ThemeIcon("copy"),
-					command: command("llamacpp.copyLatestLogPath", "Copy Latest Log Path"),
-				}),
-				new QuickAccessItem("diagnostics.fileLogging", "File Logging", {
-					description: fileLoggingEnabled ? "On" : "Off",
-					icon: toggleIcon(fileLoggingEnabled),
-					command: command("llamacpp.toggleFileLogging", "Toggle File Logging"),
-				}),
-				new QuickAccessItem("diagnostics.streamLogging", "Stream Logging", {
-					description: streamChunkLoggingEnabled ? "On" : "Off",
-					icon: toggleIcon(streamChunkLoggingEnabled),
-					command: command("llamacpp.toggleStreamChunkLogging", "Toggle Stream Chunk Logging"),
-				}),
-				new QuickAccessItem("diagnostics.performanceStatus", "Throughput Status Bar", {
-					description: performanceStatusBarEnabled ? "On" : "Off",
-					icon: toggleIcon(performanceStatusBarEnabled),
-					command: command("llamacpp.togglePerformanceStatusBar", "Toggle Throughput Status Bar"),
-				}),
-				new QuickAccessItem("diagnostics.contextStatus", "Context Status Bar", {
-					description: contextUsageStatusBarEnabled ? "On" : "Off",
-					icon: toggleIcon(contextUsageStatusBarEnabled),
-					command: command("llamacpp.toggleContextUsageStatusBar", "Toggle Context Status Bar"),
+				new QuickAccessItem("diagnostics.statusBar", "Status Bar", {
+					description: `throughput ${performanceStatusBarEnabled ? "on" : "off"} · context ${contextUsageStatusBarEnabled ? "on" : "off"}`,
+					icon: new vscode.ThemeIcon("layout-statusbar"),
+					children: [
+						new QuickAccessItem("diagnostics.performanceStatus", "Throughput", {
+							description: performanceStatusBarEnabled ? "On" : "Off",
+							icon: toggleIcon(performanceStatusBarEnabled),
+							command: command("llamacpp.togglePerformanceStatusBar", "Toggle Throughput Status Bar"),
+						}),
+						new QuickAccessItem("diagnostics.contextStatus", "Context", {
+							description: contextUsageStatusBarEnabled ? "On" : "Off",
+							icon: toggleIcon(contextUsageStatusBarEnabled),
+							command: command("llamacpp.toggleContextUsageStatusBar", "Toggle Context Status Bar"),
+						}),
+					],
 				}),
 			],
 		});
@@ -1314,12 +1292,12 @@ export class LlamaQuickActionsProvider implements vscode.TreeDataProvider<QuickA
 		const patches = new QuickAccessItem("patches", "Copilot Patches", {
 			description: `${controls} \u00b7 ${patchStatus.workbenchApplied ? "bounds \u2713" : "bounds \u2717"}`,
 			icon: new vscode.ThemeIcon("pinned"),
-			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : patchStatus.legacyPatch ? "outdated (an older patch version is installed)" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. The agent-host thinking patch is toggled below. Click to open the detailed status log.`,
+			tooltip: `Copilot Chat ${patchStatus.copilotVersion}: native model controls ${patchStatus.applied ? "applied" : patchStatus.legacyPatch ? "outdated (an older patch version is installed)" : "not applied"}, chat-history bounds ${patchStatus.workbenchApplied ? "applied" : "not applied"}. Show Patch Status opens the detailed log.`,
 			children: [
-				new QuickAccessItem("patches.thinking", "Thinking picker (Agents)", {
-					description: "toggle the thinking-level picker for BYOK models",
-					tooltip: "Patches the VS Code agent-host bundle so the Agents model picker gets a Thinking level switch (low/medium/high/extra-high) and answers non-streaming SDK requests with JSON.",
-					icon: new vscode.ThemeIcon("symbol-boolean"),
+				new QuickAccessItem("patches.thinking", "Thinking Picker (Agents)", {
+					description: agentHostThinkingPatchEnabled ? "On" : "Off",
+					tooltip: "Patches the VS Code agent-host bundle so the Agents model picker gets a Thinking level switch (low/medium/high/extra-high) and answers non-streaming SDK requests with JSON. VS Code builds that already provide this are left unpatched.",
+					icon: toggleIcon(agentHostThinkingPatchEnabled),
 					command: command("llamacpp.toggleAgentHostThinkingPatch", "Toggle Thinking Picker Patch"),
 				}),
 				new QuickAccessItem("patches.status", "Show Patch Status", {
