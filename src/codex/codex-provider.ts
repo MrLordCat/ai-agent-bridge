@@ -42,8 +42,10 @@ import {
 	createCodexConversationAnchor,
 	convertCodexToolResult,
 	collectPromptImagePaths,
+	endsWithCodexUserPrompt,
 	extractImageDataUrisFromText,
 	findCodexToolContinuations,
+	findCodexTurnTail,
 	latestUserPromptText,
 	matchCodexConversationTail,
 	MAX_PROMPT_IMAGE_BYTES,
@@ -65,6 +67,7 @@ import {
 	CodexStaleTurnError,
 	CodexTurnBridge,
 	createCodexNativeContextUsage,
+	isCodexNoActiveTurnError,
 	type CodexDelegatedToolCall,
 	type CodexTurnBoundary,
 	type CodexTurnInputDiagnostics,
@@ -626,6 +629,11 @@ function normalizeCopilotConversationId(value: unknown): string | undefined {
 	return normalized.length > 0 && normalized.length <= 256 ? normalized : undefined;
 }
 
+/** True only when both indexes are known and the current Copilot turn is later. */
+export function isNewerCopilotTurn(current: number | undefined, previous: number | undefined): boolean {
+	return current !== undefined && previous !== undefined && current > previous;
+}
+
 function codexConversationKey(value: string | undefined): string | undefined {
 	return value
 		? createHash("sha256").update(value).digest("hex").slice(0, 16)
@@ -672,7 +680,9 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	private readonly dynamicToolContexts = new Map<string, ActiveDynamicToolContext>();
 	private readonly activeToolTurns = new Map<string, ActiveCodexToolTurn>();
 	private readonly interruptedToolThreads = new Map<string, RecoverableInterruptedCodexThread>();
-	private readonly staleToolCalls = new Map<string, { reason: string; expiresAt: number }>();
+	private readonly staleToolCalls = new Map<string, { reason: string; expiresAt: number; copilotTurnIndex?: number }>();
+	/** Fire-and-forget interrupts of abandoned turns; a reused thread waits for its interrupt first. */
+	private readonly pendingInterrupts = new Map<string, Promise<void>>();
 	private readonly conversationThreads = new Map<string, CodexConversationThread>();
 	private readonly lastResponseEndedAtByConversation = new Map<string, number>();
 	private pendingRollover: PendingCodexThreadRollover | undefined;
@@ -1194,7 +1204,14 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			dynamicTools: dynamicToolSet.runtimeSignatures,
 		});
 		this.pruneStaleToolCalls();
-		const staleContinuations = findCodexToolContinuations(messages, new Set(this.staleToolCalls.keys()));
+		// A prompt sent while a tool ran arrives together with that tool's result: a new user turn,
+		// not a continuation. Normal tool rounds always end with the result and keep the turn index.
+		const userPromptFollows = endsWithCodexUserPrompt(messages);
+		const staleContinuations = userPromptFollows
+			? []
+			: findCodexToolContinuations(messages, new Set(this.staleToolCalls.keys())).filter(continuation =>
+				!isNewerCopilotTurn(copilotTurnIndex, this.staleToolCalls.get(continuation.callId)?.copilotTurnIndex)
+			);
 		if (staleContinuations.length > 0) {
 			for (const continuation of staleContinuations) {
 				const stale = this.staleToolCalls.get(continuation.callId);
@@ -1212,7 +1229,10 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		const storedActiveTurn = continuationMatch
 			? this.activeToolTurns.get(continuationMatch.callId)
 			: undefined;
-		const resumable = canResumeCodexToolTurn(storedActiveTurn, {
+		// Resuming would hand Codex only the tool result and silently drop the new prompt.
+		const steeringPrompt = storedActiveTurn !== undefined
+			&& (userPromptFollows || isNewerCopilotTurn(copilotTurnIndex, storedActiveTurn.copilotTurnIndex));
+		const resumable = !steeringPrompt && canResumeCodexToolTurn(storedActiveTurn, {
 			modelId: model.id,
 			runtimeKey,
 			processGeneration: this.client.generation,
@@ -1252,14 +1272,28 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				this.activeToolTurns.delete(call.callId);
 			}
 		}
-		if (storedActiveTurn && !activeTurn) {
+		let interruptedContinuation: RecoverableInterruptedCodexThread | undefined;
+		if (storedActiveTurn && steeringPrompt) {
+			this.logSink?.log("codex.chat.steering_prompt", {
+				threadId: storedActiveTurn.bridge.threadId,
+				turnId: storedActiveTurn.bridge.turnId,
+				callIds: continuationMatches.map(match => match.callId),
+				previousTurnIndex: storedActiveTurn.copilotTurnIndex,
+				currentTurnIndex: copilotTurnIndex,
+				userPromptFollows,
+			});
+			// The same thread takes the tool results and the prompt as one new user turn.
+			interruptedContinuation = await this.interruptActiveToolTurn(storedActiveTurn, "interrupted");
+			if (interruptedContinuation) {
+				this.interruptedToolThreads.delete(interruptedContinuation.threadId);
+			}
+		} else if (storedActiveTurn && !activeTurn) {
 			this.abandonActiveToolTurn(storedActiveTurn, "abandoned");
 			if (toolsMissingFromTurn.length > 0) {
 				// These results travel to the new thread with the handoff; later requests still carry them.
 				for (const match of continuationMatches) { this.staleToolCalls.delete(match.callId); }
 			}
 		}
-		let interruptedContinuation: RecoverableInterruptedCodexThread | undefined;
 		if (!activeTurn && !continuationMatch && copilotConversationId) {
 			// A follow-up user message often arrives with the SAME Copilot turn
 			// index as the turn it interrupts (VS Code does not always bump it),
@@ -1421,7 +1455,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		}
 		const inputMessages = activeTurn
 			? continuationMatch!.messages
-			: interruptedContinuation ? findLatestCodexUserTail(messages) : conversationTail ?? messages;
+			: interruptedContinuation ? findCodexTurnTail(messages) : conversationTail ?? messages;
 		const inputMode = activeTurn
 			? "tool-result"
 			: interruptedContinuation || conversationContinuation ? "user-turn" : "full";
@@ -1578,6 +1612,8 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 			});
 		} else if (interruptedContinuation) {
 			threadId = interruptedContinuation.threadId;
+			// turn/start must not race the abandoned turn's interrupt.
+			await this.pendingInterrupts.get(threadId);
 			this.logSink?.log("codex.chat.interrupted_thread_reused", {
 				threadId,
 				inputMode,
@@ -2021,6 +2057,7 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.activeToolTurns.clear();
 		this.interruptedToolThreads.clear();
 		this.staleToolCalls.clear();
+		this.pendingInterrupts.clear();
 		this.dynamicToolContexts.clear();
 		this.conversationThreads.clear();
 		this.tokenUsageByThread.clear();
@@ -2072,14 +2109,18 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 	}
 
 	private rememberStaleToolCalls(active: ActiveCodexToolTurn, reason: string): void {
-		const expiresAt = Date.now() + CODEX_CONTINUATION_TTL_MS;
+		const stale = {
+			reason,
+			expiresAt: Date.now() + CODEX_CONTINUATION_TTL_MS,
+			copilotTurnIndex: active.copilotTurnIndex,
+		};
 		for (const [callId, candidate] of this.activeToolTurns) {
 			if (candidate === active) {
-				this.staleToolCalls.set(callId, { reason, expiresAt });
+				this.staleToolCalls.set(callId, stale);
 			}
 		}
 		for (const pending of active.bridge.pendingCalls) {
-			this.staleToolCalls.set(pending.callId, { reason, expiresAt });
+			this.staleToolCalls.set(pending.callId, stale);
 		}
 		this.pruneStaleToolCalls();
 	}
@@ -2156,12 +2197,22 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 				: "The active native VS Code tool turn was abandoned before completion."
 		);
 		this.finishRuntimeMetrics(active.bridge.threadId);
-		void active.bridge.interrupt().catch(error => {
-			this.logSink?.logError("codex.chat.abandon_interrupt_failed", error, {
-				threadId: active.bridge.threadId,
-				turnId: active.bridge.turnId,
+		const threadId = active.bridge.threadId;
+		const turnId = active.bridge.turnId;
+		const settled: Promise<void> = active.bridge.interrupt()
+			.catch(error => {
+				if (isCodexNoActiveTurnError(error)) {
+					this.logSink?.log("codex.chat.abandon_interrupt_skipped", { threadId, turnId, reason: "no-active-turn" }, "debug");
+					return;
+				}
+				this.logSink?.logError("codex.chat.abandon_interrupt_failed", error, { threadId, turnId });
+			})
+			.finally(() => {
+				if (this.pendingInterrupts.get(threadId) === settled) {
+					this.pendingInterrupts.delete(threadId);
+				}
 			});
-		});
+		this.pendingInterrupts.set(threadId, settled);
 	}
 
 	private async interruptActiveToolTurn(
@@ -2171,7 +2222,19 @@ export class CodexChatModelProvider implements vscode.LanguageModelChatProvider,
 		this.rememberStaleToolCalls(active, reason);
 		this.removeActiveToolTurn(active);
 		try {
-			await active.bridge.interrupt();
+			try {
+				await active.bridge.interrupt();
+			} catch (error) {
+				// The turn already ended on its own; the thread is idle and safe to reuse.
+				if (!isCodexNoActiveTurnError(error)) {
+					throw error;
+				}
+				this.logSink?.log("codex.chat.steering_interrupt_skipped", {
+					threadId: active.bridge.threadId,
+					turnId: active.bridge.turnId,
+					reason: "no-active-turn",
+				}, "debug");
+			}
 			const recoverable = this.rememberInterruptedToolThread(active, reason);
 			active.bridge.dispose();
 			this.emitLiveTurnUpdate(

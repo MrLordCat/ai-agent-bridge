@@ -520,12 +520,54 @@ export function findCodexToolContinuation(
 	return findCodexToolContinuations(messages, pendingCallIds)[0];
 }
 
+/** Index of the first message after the newest assistant message: the current round's results and prompt. */
+function codexTurnTailStart(messages: readonly vscode.LanguageModelChatRequestMessage[]): number {
+	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index].role === vscode.LanguageModelChatMessageRole.Assistant) {
+			return index + 1;
+		}
+	}
+	return 0;
+}
+
+/**
+ * The messages the newest assistant message has not seen: tool results of the current round and
+ * any user prompt sent with them. Without an assistant message, only the newest user message.
+ */
+export function findCodexTurnTail(
+	messages: readonly vscode.LanguageModelChatRequestMessage[]
+): readonly vscode.LanguageModelChatRequestMessage[] {
+	const start = codexTurnTailStart(messages);
+	if (start > 0 && start < messages.length) {
+		return messages.slice(start);
+	}
+	for (let index = messages.length - 1; index >= 0; index--) {
+		if (messages[index].role === vscode.LanguageModelChatMessageRole.User) {
+			return messages.slice(index);
+		}
+	}
+	return messages.slice(-1);
+}
+
+/** True when the request ends with a user prompt rather than a native tool result. */
+export function endsWithCodexUserPrompt(messages: readonly vscode.LanguageModelChatRequestMessage[]): boolean {
+	const last = messages[messages.length - 1];
+	return last !== undefined
+		&& last.role === vscode.LanguageModelChatMessageRole.User
+		&& !last.content.some(part => part instanceof vscode.LanguageModelToolResultPart);
+}
+
+/**
+ * Tool results for `pendingCallIds` in the current round only. Results deeper in the history were
+ * already answered by a later assistant message and must not resume or reject anything.
+ */
 export function findCodexToolContinuations(
 	messages: readonly vscode.LanguageModelChatRequestMessage[],
 	pendingCallIds: ReadonlySet<string>
 ): CodexToolContinuation[] {
 	const found = new Map<string, CodexToolContinuation>();
-	for (let messageIndex = messages.length - 1; messageIndex >= 0; messageIndex--) {
+	const tailStart = codexTurnTailStart(messages);
+	for (let messageIndex = messages.length - 1; messageIndex >= tailStart; messageIndex--) {
 		const message = messages[messageIndex];
 		for (let partIndex = message.content.length - 1; partIndex >= 0; partIndex--) {
 			const part = message.content[partIndex];

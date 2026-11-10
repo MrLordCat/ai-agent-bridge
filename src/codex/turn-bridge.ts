@@ -116,6 +116,35 @@ export class CodexStaleTurnError extends Error {
 	}
 }
 
+/** turn/interrupt on a turn that already finished: harmless, the thread is idle. */
+export function isCodexNoActiveTurnError(error: unknown): boolean {
+	return error instanceof Error && /\bno active turn\b/i.test(error.message);
+}
+
+/** Reads an app-server `error` notification: v2 `{ error: TurnError, willRetry }`, or a bare `message`. */
+export function parseCodexErrorNotification(params: unknown): {
+	message: string;
+	willRetry: boolean;
+	codexErrorInfo?: unknown;
+	additionalDetails?: string;
+} {
+	const record = asRecord(params);
+	const error = asRecord(record.error);
+	const message = typeof error.message === "string" && error.message.trim()
+		? error.message
+		: typeof record.message === "string" && record.message.trim()
+			? record.message
+			: "Codex runtime error";
+	return {
+		message: truncate(message, 800),
+		willRetry: record.willRetry === true,
+		codexErrorInfo: error.codexErrorInfo ?? undefined,
+		additionalDetails: typeof error.additionalDetails === "string" && error.additionalDetails
+			? truncate(error.additionalDetails, 800)
+			: undefined,
+	};
+}
+
 export class CodexInternalToolBlockedError extends Error {
 	constructor(readonly itemType: string) {
 		super(`Blocked internal Codex ${itemType}; all actions must use native VS Code tools`);
@@ -512,6 +541,14 @@ export class CodexTurnBridge implements vscode.Disposable {
 		this.cancellation?.dispose();
 		this.cancellation = token.onCancellationRequested(() => {
 			void this.interrupt().catch(error => {
+				if (isCodexNoActiveTurnError(error)) {
+					this.logSink?.log("codex.chat.interrupt_skipped", {
+						threadId: this.threadId,
+						turnId: this.turnId,
+						reason: "no-active-turn",
+					}, "debug");
+					return;
+				}
 				this.logSink?.logError("codex.chat.interrupt_failed", error, {
 					threadId: this.threadId,
 					turnId: this.turnId,
@@ -633,12 +670,20 @@ export class CodexTurnBridge implements vscode.Disposable {
 					this.resolveBoundary({ kind: "completed", completed: this.completedTurn });
 					break;
 				case "error": {
-					const message = asRecord(notification.params).message;
-					this.logSink?.logError(
-						"codex.chat.notification_error",
-						new Error(typeof message === "string" ? message : "Codex runtime error"),
-						{ threadId: this.threadId, turnId: this.turnId }
-					);
+					const parsed = parseCodexErrorNotification(notification.params);
+					const context = {
+						threadId: this.threadId,
+						turnId: this.turnId,
+						willRetry: parsed.willRetry,
+						codexErrorInfo: parsed.codexErrorInfo,
+						additionalDetails: parsed.additionalDetails,
+					};
+					// Codex retries transient stream/network errors itself; the turn goes on.
+					if (parsed.willRetry) {
+						this.logSink?.log("codex.chat.notification_retry", { ...context, message: parsed.message }, "warn");
+					} else {
+						this.logSink?.logError("codex.chat.notification_error", new Error(parsed.message), context);
+					}
 					break;
 				}
 			}

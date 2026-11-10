@@ -18,6 +18,7 @@ import {
 	diffCodexThreadUsage,
 	findLatestCodexUserTail,
 	intersectCodexThreadTools,
+	isNewerCopilotTurn,
 	codexToolsMissingFromThread,
 	copilotToolGroupingEnabled,
 	isCodexCodeModeConfigRejection,
@@ -39,11 +40,13 @@ import {
 	collectPromptImagePaths,
 	createCodexConversationAnchor,
 	convertCodexToolResult,
+	endsWithCodexUserPrompt,
 	extractImageDataUrisFromText,
 	extractImagePathsFromText,
 	findCodexConversationTail,
 	findCodexToolContinuation,
 	findCodexToolContinuations,
+	findCodexTurnTail,
 	matchCodexConversationTail,
 	MAX_PROMPT_IMAGES,
 	resolveLocalImagePath,
@@ -67,7 +70,10 @@ import {
 	CodexStaleTurnError,
 	CodexTurnBridge,
 	isCodexInternalActionItem,
+	isCodexNoActiveTurnError,
+	parseCodexErrorNotification,
 } from "../codex/turn-bridge";
+import type { LlamaLogSink } from "../logger";
 
 const model: CodexModel = {
 	id: "gpt-test",
@@ -1331,6 +1337,185 @@ suite("Codex subscription provider", () => {
 		])];
 		const matches = findCodexToolContinuations(messages, new Set(["call-a", "call-b"]));
 		assert.deepStrictEqual(new Set(matches.map(match => match.callId)), new Set(["call-a", "call-b"]));
+	});
+
+	const toolCall = (callId: string) => vscode.LanguageModelChatMessage.Assistant([
+		new vscode.LanguageModelToolCallPart(callId, "run_in_terminal", { command: "npm test" }),
+	]);
+	const toolResult = (callId: string) => vscode.LanguageModelChatMessage.User([
+		new vscode.LanguageModelToolResultPart(callId, [new vscode.LanguageModelTextPart(`output of ${callId}`)]),
+	]);
+
+	test("ignores native tool results that a later assistant message already answered", () => {
+		const messages = [
+			vscode.LanguageModelChatMessage.User("first task"),
+			toolCall("exec-old"),
+			toolResult("exec-old"),
+			vscode.LanguageModelChatMessage.Assistant("Done with the first task."),
+			vscode.LanguageModelChatMessage.User("second task"),
+		];
+		assert.deepStrictEqual(findCodexToolContinuations(messages, new Set(["exec-old"])), []);
+		const current = [...messages, toolCall("exec-new"), toolResult("exec-new")];
+		assert.deepStrictEqual(
+			findCodexToolContinuations(current, new Set(["exec-old", "exec-new"])).map(match => match.callId),
+			["exec-new"]
+		);
+	});
+
+	test("recognizes a prompt sent while a native tool was running", () => {
+		const prompt = vscode.LanguageModelChatMessage.User("stop, use the other approach");
+		const toolRound = [vscode.LanguageModelChatMessage.User("task"), toolCall("exec-1"), toolResult("exec-1")];
+		const steered = [...toolRound, prompt];
+		assert.strictEqual(endsWithCodexUserPrompt(toolRound), false);
+		assert.strictEqual(endsWithCodexUserPrompt(steered), true);
+		assert.strictEqual(endsWithCodexUserPrompt([...steered, vscode.LanguageModelChatMessage.Assistant("ok")]), false);
+		// The pending call is still found, so the provider sees the tool turn it has to supersede.
+		assert.deepStrictEqual(findCodexToolContinuations(steered, new Set(["exec-1"])).map(match => match.callId), ["exec-1"]);
+		// The reused thread gets the tool result together with the prompt, not the prompt alone.
+		assert.deepStrictEqual(findCodexTurnTail(steered), [steered[2], prompt]);
+		assert.deepStrictEqual(findLatestCodexUserTail(steered), [prompt]);
+	});
+
+	test("keeps the newest user message as the turn tail without an assistant message", () => {
+		const messages = [vscode.LanguageModelChatMessage.User("old"), vscode.LanguageModelChatMessage.User("new")];
+		assert.deepStrictEqual(findCodexTurnTail(messages), [messages[1]]);
+		const answered = [vscode.LanguageModelChatMessage.User("old"), vscode.LanguageModelChatMessage.Assistant("done")];
+		assert.deepStrictEqual(findCodexTurnTail(answered), findLatestCodexUserTail(answered));
+	});
+
+	test("compares Copilot turn indexes only when both are known", () => {
+		assert.strictEqual(isNewerCopilotTurn(5, 4), true);
+		assert.strictEqual(isNewerCopilotTurn(4, 4), false);
+		assert.strictEqual(isNewerCopilotTurn(3, 4), false);
+		assert.strictEqual(isNewerCopilotTurn(undefined, 4), false);
+		assert.strictEqual(isNewerCopilotTurn(5, undefined), false);
+	});
+
+	test("reads the message and retry flag of Codex error notifications", () => {
+		assert.deepStrictEqual(parseCodexErrorNotification({
+			threadId: "thread",
+			turnId: "turn",
+			willRetry: true,
+			error: { message: "Reconnecting... 2/5", codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } }, additionalDetails: "stream closed" },
+		}), {
+			message: "Reconnecting... 2/5",
+			willRetry: true,
+			codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } },
+			additionalDetails: "stream closed",
+		});
+		assert.deepStrictEqual(parseCodexErrorNotification({ message: "legacy shape" }), {
+			message: "legacy shape",
+			willRetry: false,
+			codexErrorInfo: undefined,
+			additionalDetails: undefined,
+		});
+		assert.strictEqual(parseCodexErrorNotification({ error: { message: "  " } }).message, "Codex runtime error");
+	});
+
+	test("logs retryable Codex errors as retries and terminal ones as errors", async () => {
+		const notifications = new vscode.EventEmitter<CodexServerNotification>();
+		const stops = new vscode.EventEmitter<Error>();
+		const fakeClient = {
+			onNotification: notifications.event,
+			onDidStop: stops.event,
+			request: async (method: string) => method === "turn/start"
+				? { turn: { id: "turn-errors", status: "inProgress" } }
+				: {},
+		} as unknown as CodexAppServerClient;
+		const events: Array<{ event: string; level: string; message: string }> = [];
+		const logSink: LlamaLogSink = {
+			log: (event, data, level) => {
+				if (event.startsWith("codex.chat.notification_")) {
+					events.push({ event, level: level ?? "info", message: String((data as { message?: unknown }).message) });
+				}
+			},
+			logError: (event, error) => {
+				events.push({ event, level: "error", message: error instanceof Error ? error.message : String(error) });
+			},
+			shouldLogStreamChunks: () => false,
+		};
+		const bridge = new CodexTurnBridge(fakeClient, "thread-errors", logSink);
+		const tokenSource = new vscode.CancellationTokenSource();
+		void bridge.start({ threadId: "thread-errors", input: [] }, { report: () => undefined }, tokenSource.token).catch(() => undefined);
+		await new Promise<void>(resolve => setImmediate(resolve));
+		notifications.fire({
+			method: "error",
+			params: { threadId: "thread-errors", turnId: "turn-errors", willRetry: true, error: { message: "Reconnecting... 1/5" } },
+		} as unknown as CodexServerNotification);
+		notifications.fire({
+			method: "error",
+			params: { threadId: "thread-errors", turnId: "turn-errors", willRetry: false, error: { message: "usage limit reached" } },
+		} as unknown as CodexServerNotification);
+		assert.deepStrictEqual(events, [
+			{ event: "codex.chat.notification_retry", level: "warn", message: "Reconnecting... 1/5" },
+			{ event: "codex.chat.notification_error", level: "error", message: "usage limit reached" },
+		]);
+		bridge.dispose();
+		tokenSource.dispose();
+		notifications.dispose();
+		stops.dispose();
+	});
+
+	test("reuses a steered thread whose turn already ended before the interrupt", async () => {
+		assert.strictEqual(isCodexNoActiveTurnError(new Error("no active turn to interrupt")), true);
+		assert.strictEqual(isCodexNoActiveTurnError(new Error("turn/interrupt timed out")), false);
+		const notifications = new vscode.EventEmitter<CodexServerNotification>();
+		const stops = new vscode.EventEmitter<Error>();
+		const fakeClient = {
+			onNotification: notifications.event,
+			onDidStop: stops.event,
+			request: async (method: string) => {
+				if (method === "turn/start") {
+					return { turn: { id: "turn-steer", status: "inProgress" } };
+				}
+				if (method === "turn/interrupt") {
+					throw new Error("no active turn to interrupt");
+				}
+				return {};
+			},
+		} as unknown as CodexAppServerClient;
+		const bridge = new CodexTurnBridge(fakeClient, "thread-steer");
+		const tokenSource = new vscode.CancellationTokenSource();
+		const first = bridge.start({ threadId: "thread-steer", input: [] }, { report: () => undefined }, tokenSource.token);
+		void bridge.delegate({ callId: "call-steer", tool: "run_in_terminal", input: {} });
+		assert.strictEqual((await first).kind, "delegated");
+		const provider = new CodexChatModelProvider("test");
+		const internals = provider as unknown as {
+			client: { generation: number };
+			activeToolTurns: Map<string, unknown>;
+			staleToolCalls: Map<string, { reason: string; copilotTurnIndex?: number }>;
+			interruptActiveToolTurn(active: unknown, reason: "interrupted"): Promise<{ threadId: string; copilotTurnIndex?: number } | undefined>;
+		};
+		const active = {
+			bridge,
+			modelId: "gpt-test",
+			runtimeKey: "runtime",
+			toolCatalogKey: "catalog",
+			callableNames: new Set(["run_in_terminal"]),
+			toolNamespaces: new Map<string, string>(),
+			toolSignatures: new Map<string, string>(),
+			copilotConversationId: "chat",
+			copilotTurnIndex: 4,
+			processGeneration: internals.client.generation,
+			createdAt: Date.now(),
+		};
+		internals.activeToolTurns.set("call-steer", active);
+		try {
+			const recoverable = await internals.interruptActiveToolTurn(active, "interrupted");
+			assert.strictEqual(recoverable?.threadId, "thread-steer");
+			assert.strictEqual(recoverable?.copilotTurnIndex, 4);
+			assert.strictEqual(internals.activeToolTurns.size, 0);
+			assert.deepStrictEqual(
+				{ ...internals.staleToolCalls.get("call-steer"), expiresAt: undefined },
+				{ reason: "interrupted", copilotTurnIndex: 4, expiresAt: undefined }
+			);
+		} finally {
+			provider.dispose();
+			bridge.dispose();
+			tokenSource.dispose();
+			notifications.dispose();
+			stops.dispose();
+		}
 	});
 
 	test("keeps an active Codex tool turn when the outer tool catalog changes", () => {

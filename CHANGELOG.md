@@ -1,5 +1,29 @@
 # Changelog
 
+## 1.20.22 (dev patch) - 2026-11-10
+
+Codex: prompts sent while the agent is working.
+
+- A prompt sent while a native VS Code tool was running reached Codex without
+  the prompt: VS Code delivers it together with the finished tool's result,
+  and Codex resumed the old turn with only that result. Such a request now
+  interrupts the waiting turn and continues the same thread with the tool
+  result and the prompt as one new user turn.
+- An interrupted turn's tool result left anywhere in the chat history could
+  reject every later request with "This native VS Code tool result belongs to
+  an interrupted Codex turn", including a newly typed prompt, until the window
+  was reloaded. Only the current round's results are checked now, and never
+  when the request ends with a user prompt or comes from a newer Copilot turn.
+- After an interrupt the reused thread receives the pending tool results along
+  with the new prompt instead of the prompt alone.
+- "no active turn to interrupt" (the turn had already finished) is no longer
+  logged as an error, and a steered turn in that state reuses its thread
+  instead of starting a new one. A reused interrupted thread waits for the
+  previous turn's interrupt before starting.
+- Codex error notifications log their real message. Errors Codex retries
+  itself (`willRetry`, e.g. reconnecting) are logged as warnings
+  (`codex.chat.notification_retry`) instead of errors.
+
 ## 1.20.21 (dev patch) - 2026-11-10
 
 Quick Access cleanup.
