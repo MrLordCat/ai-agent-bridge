@@ -4,7 +4,7 @@ import * as path from "node:path";
 import * as vscode from "vscode";
 import type { CocoPromptContent } from "./acp-client";
 import { serializeCocoTranscript } from "./message-adapter";
-import { convertCocoToolResult } from "./turn-bridge";
+import { COCO_TOOL_IMAGE_LIMITS, cocoImageHash, convertCocoToolResult, type CocoPreservedResult } from "./turn-bridge";
 import { prepareSharedHandoff, sharedContextBudget, sharedImageName } from "../context/provider-handoff";
 import { canonicalConversationUserAnchors } from "../providers/conversation-anchors";
 
@@ -98,10 +98,30 @@ export class CocoHistoryArchive {
 		const size = (blocks: readonly CocoPromptContent[]) => blocks.reduce((sum, part) => sum + (part.type === "text" ? part.text.length : 0), 0);
 		return { imports: [], prompt, archivePath, compacted: plan.wasCompacted, originalChars: size(parts), sentChars: size(prompt), estimatedTokens: plan.tokenEstimateAfter, tokenBudget };
 	}
-	async toolResult(result: vscode.LanguageModelToolResultPart, scope: string): Promise<{ output: string }> {
-		const full = convertCocoToolResult(result, Infinity).output;
-		if (full.length <= 100_000) { return { output: full }; }
+	async toolResult(result: vscode.LanguageModelToolResultPart, scope: string): Promise<CocoPreservedResult> {
+		// Saved image files let Coco open the image with its built-in read in the same turn.
+		const imageFiles: { file: string; hash: string }[] = [];
+		const names = new Map<vscode.LanguageModelDataPart, string>();
+		for (const part of result.content) {
+			if (!(part instanceof vscode.LanguageModelDataPart) || !part.mimeType.startsWith("image/") || part.data.byteLength === 0
+				|| part.data.byteLength > COCO_TOOL_IMAGE_LIMITS.bytes || !COCO_READABLE_IMAGE_TYPES.has(part.mimeType)) { continue; }
+			const file = await this.saveImage(part.data, part.mimeType, scope).catch(() => undefined);
+			if (file) { names.set(part, file); imageFiles.push({ file, hash: cocoImageHash(part.data) }); }
+		}
+		const imageFile = (part: vscode.LanguageModelDataPart) => names.get(part);
+		const full = convertCocoToolResult(result, Infinity, imageFile).output;
+		if (full.length <= 100_000) { return { output: full, imageFiles }; }
 		const file = await this.save([{ type: "text", text: full }], scope);
-		return { output: `${convertCocoToolResult(result).output}\nFull tool output: ${JSON.stringify(file)}. The omitted middle is available in that file. Read/search it with VS Code tools before relying on omitted content.` };
+		return { output: `${convertCocoToolResult(result, undefined, imageFile).output}\nFull tool output: ${JSON.stringify(file)}. The omitted middle is available in that file. Read/search it with VS Code tools before relying on omitted content.`, imageFiles };
+	}
+	private async saveImage(data: Uint8Array, mimeType: string, scope: string): Promise<string> {
+		const directory = path.join(this.root, createHash("sha256").update(scope).digest("hex"));
+		await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+		const file = path.join(directory, sharedImageName(data, mimeType));
+		await fs.writeFile(file, data, { mode: 0o600 });
+		return file;
 	}
 }
+
+/** Image types Cortex's built-in read recognises by file extension. */
+const COCO_READABLE_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);

@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.21.3 (development patch) - 2026-11-14
+
+- Coco now sees a tool image in the same turn, like the other providers. The
+  bridge saves PNG, JPEG, GIF or WebP images from a tool result (up to 4 MB) in
+  its Coco archive and names the file in the result. Coco opens it with the
+  Cortex built-in `read`, the only CLI path that puts an image inside a tool
+  result. The bridge permits that read only for files it saved during the
+  current turn and answers with the one-time `allow_once` option; every other
+  internal action stays blocked. The follow-up image prompt from 1.21.2 remains
+  the fallback and skips images Coco already read.
+- Verified live against Cortex CLI 1.42.3: client tool, built-in read,
+  permission and the description of the image in one native turn.
+
+## 1.21.2 (development patch) - 2026-11-14
+
+- Coco still missed tool images in 1.21.1: they are attached only after its
+  native turn ends, but Coco kept calling tools in the same turn and concluded
+  that it could not see them. The tool result and the policy now tell Coco to
+  end its turn at once so the image follows in the next message. Up to eight
+  rounds per turn; when several image tools ran first, the newest four images
+  (8 MB together) are sent.
+
+## 1.21.1 (development patch) - 2026-11-14
+
+- Coco now receives images a tool returns (`view_image`, subagent screenshots,
+  any `image/*` tool result). The Cortex CLI turns every client-tool result into
+  text, so the image is attached to a follow-up prompt in the same native
+  session right after the turn: up to four images, 4 MB each and 8 MB together,
+  deduplicated, at most twice per turn. The tool result names the image and the
+  policy tells Coco to wait for it; a binary part that is neither text nor an
+  image keeps a text note.
+- Validated with the full extension suite (966 passing) and new Coco vision
+  tests for the collection bounds and the follow-up prompt.
+
 ## 1.21.0 (stable release) - 2026-11-10
 
 Consolidates the 1.20.13–1.20.23 development patches below.

@@ -310,9 +310,12 @@ suite("Coco native Chat tools", () => {
 		assert.strictEqual(collectCocoToolResults(continuation(call, "latest"))[0].callId, call.callId);
 		const binary = vscode.LanguageModelDataPart.image(new Uint8Array([1, 2]), "image/png");
 		const encoded = convertCocoToolResult(new vscode.LanguageModelToolResultPart(call.callId, [binary, new vscode.LanguageModelTextPart("x".repeat(120_000))]));
-		assert.match(String(encoded.output), /Non-text tool result/);
+		assert.match(String(encoded.output), /Image tool result: image\/png, 2 bytes; it follows as an image attachment/);
 		assert.match(String(encoded.output), /Tool result truncated/);
 		assert.ok(String(encoded.output).length < 101_000);
+		const other = convertCocoToolResult(new vscode.LanguageModelToolResultPart(call.callId,
+			[new vscode.LanguageModelDataPart(new Uint8Array([1, 2]), "application/octet-stream")]));
+		assert.match(String(other.output), /Non-text tool result: this Coco bridge accepts text and image results only/);
 	});
 
 	test("isolates parallel conversations and rejects stale results after prompt completion", async () => {

@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
+import * as path from "node:path";
 import * as vscode from "vscode";
+import type { CocoPermissionRequest } from "./acp-client";
 import { DelegatedTurnState } from "../tools/delegated-turn-state";
 import { enhanceSubagentToolDescription, withRequiredSubagentModel } from "../subagent-guidance";
 import { stripCocoAttributionFromInput } from "./attribution";
@@ -16,6 +18,54 @@ interface PendingCall {
 }
 
 export { COCO_CHAT_TOOL_POLICY } from "./tool-policy";
+
+/** An image a tool returned. The native runtime only accepts images in a prompt, never inside a client-tool result. */
+export interface CocoToolImage { type: "image"; mimeType: string; data: string }
+/** Bounds for the images attached to one follow-up prompt; JSON-RPC over stdio carries them. */
+export const COCO_TOOL_IMAGE_LIMITS = Object.freeze({ count: 4, bytes: 4 * 1024 * 1024, totalBytes: 8 * 1024 * 1024 });
+/**
+ * A turn may attach images from tool results at most this many times, so a looping model cannot run forever.
+ * Each round costs one native turn: Coco ends its turn to receive the image, then continues.
+ */
+export const COCO_TOOL_IMAGE_ROUNDS = 8;
+
+/**
+ * Image parts of a tool result, as prompt blocks. The CLI turns every client-tool result into text
+ * (`registerClientTools` stringifies it), so this is the only way the image reaches the model: the
+ * caller attaches these to a follow-up prompt in the same native session.
+ */
+export function collectCocoToolImages(result: vscode.LanguageModelToolResultPart, seen: Set<string> = new Set<string>(),
+	limits: { count: number; bytes: number; totalBytes: number } = COCO_TOOL_IMAGE_LIMITS): CocoToolImage[] {
+	return collectCocoToolImageEntries(result, seen, limits).map(entry => entry.image);
+}
+
+function collectCocoToolImageEntries(result: vscode.LanguageModelToolResultPart, seen: Set<string>,
+	limits: { count: number; bytes: number; totalBytes: number } = COCO_TOOL_IMAGE_LIMITS): { hash: string; image: CocoToolImage }[] {
+	const entries: { hash: string; image: CocoToolImage }[] = [];
+	let total = 0;
+	for (const part of result.content) {
+		if (!(part instanceof vscode.LanguageModelDataPart) || !part.mimeType.startsWith("image/") || part.data.byteLength === 0) { continue; }
+		if (entries.length >= limits.count || total + part.data.byteLength > limits.totalBytes || part.data.byteLength > limits.bytes) { continue; }
+		const hash = cocoImageHash(part.data);
+		if (seen.has(hash)) { continue; }
+		seen.add(hash);
+		entries.push({ hash, image: { type: "image", mimeType: part.mimeType, data: Buffer.from(part.data).toString("base64") } });
+		total += part.data.byteLength;
+	}
+	return entries;
+}
+
+export function cocoImageHash(data: Uint8Array): string { return createHash("sha256").update(data).digest("hex"); }
+
+/** A tool result for the native client-tool protocol, plus the image files the bridge saved for Coco's built-in read. */
+export interface CocoPreservedResult { output: string; imageFiles?: readonly { file: string; hash: string }[] }
+
+/**
+ * Coco's built-in `read` is the only CLI path that puts an image inside a tool result, in the same turn.
+ * The bridge allows it, read-only and once per call, for image files it saved itself; every other internal action stays blocked.
+ */
+const COCO_READ_TOOL = "read";
+const imageFileKey = (file: string) => { const resolved = path.resolve(file); return process.platform === "win32" ? resolved.toLowerCase() : resolved; };
 
 /**
  * Built-in CLI actions that only read Coco's own tool catalog. With many client
@@ -37,6 +87,13 @@ export class CocoTurnBridge implements vscode.Disposable {
 	private readonly historicalCalls = new Set<string>();
 	private readonly issued = new Set<string>();
 	private readonly state = new DelegatedTurnState<PendingCall, JsonObject>();
+	private readonly toolImages: { hash: string; image: CocoToolImage }[] = [];
+	private readonly seenImageHashes = new Set<string>();
+	/** Image files saved for this turn, by normalized path; only these may be opened with the built-in read. */
+	private readonly imageFiles = new Map<string, { file: string; hash: string }>();
+	private readonly viewedImageHashes = new Set<string>();
+	/** Accepted `read` calls still waiting for their permission request. */
+	private readonly pendingImageReads: string[] = [];
 	private get pending() { return this.state.pending; }
 	private stream?: CocoResponseStream;
 	private latestUsage?: JsonObject;
@@ -51,7 +108,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		advertisedTools: readonly vscode.LanguageModelChatTool[],
 		private readonly onStop: (error?: Error) => void,
 		_legacyIdleTimeoutMs = 0,
-		private readonly preserveResult?: (result: vscode.LanguageModelToolResultPart) => Promise<{ output: string }>
+		private readonly preserveResult?: (result: vscode.LanguageModelToolResultPart) => Promise<CocoPreservedResult>
 	) {
 		const seen = new Set<string>();
 		for (const original of selectCocoChatTools(advertisedTools).sort((a, b) => a.name.localeCompare(b.name))) {
@@ -77,6 +134,49 @@ export class CocoTurnBridge implements vscode.Disposable {
 	get awaitingOutput(): boolean { return this.state.attached && !this.terminal && !this.segmentOutput; }
 	get pendingCallIds(): ReadonlySet<string> { return new Set(this.pending.keys()); }
 	get issuedCallIds(): ReadonlySet<string> { return this.issued; }
+	/** Images collected from tool results since the last call; the provider attaches them to a follow-up prompt. */
+	takeImages(): CocoToolImage[] { return this.toolImages.splice(0, this.toolImages.length).map(entry => entry.image); }
+	private collectToolImages(result: vscode.LanguageModelToolResultPart): void {
+		this.toolImages.push(...collectCocoToolImageEntries(result, this.seenImageHashes).filter(entry => !this.viewedImageHashes.has(entry.hash)));
+		// When Coco keeps calling tools before ending its turn, the newest images are the relevant ones.
+		const bytes = () => this.toolImages.reduce((total, entry) => total + Math.ceil(entry.image.data.length * 3 / 4), 0);
+		while (this.toolImages.length > COCO_TOOL_IMAGE_LIMITS.count || this.toolImages.length > 1 && bytes() > COCO_TOOL_IMAGE_LIMITS.totalBytes) { this.toolImages.shift(); }
+	}
+	/** Converts a result for the CLI and registers the image files saved for it; the file list never reaches the CLI. */
+	private async preserve(result: vscode.LanguageModelToolResultPart): Promise<JsonObject> {
+		const preserved: CocoPreservedResult = this.preserveResult ? await this.preserveResult(result) : convertCocoToolResult(result);
+		for (const entry of preserved.imageFiles ?? []) { this.imageFiles.set(imageFileKey(entry.file), entry); }
+		return { output: preserved.output };
+	}
+	/** A built-in `read` of an image file the bridge saved in this turn: Coco sees the image in the same turn. */
+	private acceptImageRead(update: JsonObject): boolean {
+		const title = update.title;
+		if (title !== COCO_READ_TOOL && !(typeof title === "string" && title.startsWith(`${COCO_READ_TOOL}: `))) { return false; }
+		const input = update.rawInput as JsonObject | undefined;
+		const file = typeof input?.file_path === "string" ? input.file_path : typeof input?.path === "string" ? input.path : undefined;
+		const saved = file ? this.imageFiles.get(imageFileKey(file)) : undefined;
+		if (!saved) { return false; }
+		this.viewedImageHashes.add(saved.hash);
+		for (let index = this.toolImages.length - 1; index >= 0; index--) { if (this.toolImages[index].hash === saved.hash) { this.toolImages.splice(index, 1); } }
+		this.pendingImageReads.push(imageFileKey(saved.file));
+		return true;
+	}
+	/**
+	 * The permission answer for an accepted image read: the CLI's one-time `allow_once` option, never a standing grant.
+	 * Undefined for anything else, which the caller treats as a blocked internal action.
+	 */
+	permitImageRead(request: CocoPermissionRequest): string | undefined {
+		const title = request.toolCall?.title;
+		if (this.terminal || typeof title !== "string" || !title.startsWith(`${COCO_READ_TOOL}: `)) { return undefined; }
+		const target = title.slice(COCO_READ_TOOL.length + 2);
+		// The CLI may shorten a long title to 119 characters plus an ellipsis.
+		const prefix = target.endsWith("\u2026") ? imageFileKey(target.slice(0, -1)) : undefined;
+		const index = this.pendingImageReads.findIndex(key => prefix ? key.startsWith(prefix) : key === imageFileKey(target));
+		if (index < 0) { return undefined; }
+		const option = request.options?.find(candidate => candidate.kind === "allow_once")?.optionId;
+		if (option) { this.pendingImageReads.splice(index, 1); }
+		return option;
+	}
 	rememberResults(messages: readonly vscode.LanguageModelChatRequestMessage[]): void {
 		for (const message of messages) { for (const part of message.content) {
 			if (part instanceof vscode.LanguageModelToolResultPart && part.callId.startsWith("coco-")) { this.historicalResults.set(part.callId, part); }
@@ -106,9 +206,10 @@ export class CocoTurnBridge implements vscode.Disposable {
 			this.finish(new Error("Coco needs the results of every Chat tool call in the batch before continuing."));
 			return completion;
 		}
-		void Promise.all(results.map(async result => ({ result, converted: this.preserveResult ? await this.preserveResult(result) : convertCocoToolResult(result) })))
+		void Promise.all(results.map(async result => ({ result, converted: await this.preserve(result) })))
 			.then(converted => {
 				if (this.terminal) { return; }
+				for (const item of converted) { this.collectToolImages(item.result); }
 				this.pending.accept(converted, item => item.result.callId, (call, item) => { this.completed.set(item.result.callId,item.converted); call.resolve(item.converted); }, call => call.reported);
 				this.reportCalls();
 			}, error => this.finish(error instanceof Error ? error : new Error(String(error))));
@@ -127,7 +228,7 @@ export class CocoTurnBridge implements vscode.Disposable {
 		}
 		if (update.sessionUpdate === "tool_call") {
 			// Client tools emit an ACP event too; Chat renders their delegated call, once.
-			if (typeof update.title !== "string" || (!this.tools.has(update.title) && !COCO_CATALOG_ACTIONS.has(update.title))) {
+			if (typeof update.title !== "string" || (!this.tools.has(update.title) && !COCO_CATALOG_ACTIONS.has(update.title) && !this.acceptImageRead(update))) {
 				this.blockInternalAction(typeof update.title === "string" ? update.title : "unknown tool");
 			}
 			return;
@@ -151,7 +252,9 @@ export class CocoTurnBridge implements vscode.Disposable {
 		const callId = nativeCallId ? `coco-${createHash("sha256").update(nativeCallId).digest("hex")}` : `coco-${randomUUID()}`;
 		if (this.completed.has(callId)) { return Promise.resolve(this.completed.get(callId)!); }
 		const historical = this.historicalResults.get(callId);
-		if (historical) { return this.preserveResult ? this.preserveResult(historical) : Promise.resolve(convertCocoToolResult(historical)); }
+		if (historical) {
+			return this.preserve(historical).then(converted => { this.collectToolImages(historical); return converted; });
+		}
 		if (this.historicalCalls.has(callId)) { return Promise.reject(new Error("The earlier Coco tool completion is unknown. Verify its outcome before retrying; no action was repeated.")); }
 		if (this.pending.has(callId)) { return Promise.reject(new Error("Duplicate pending Coco callback; no action was repeated.")); }
 		const response = new Promise<JsonObject>(resolve => this.pending.set(callId, {
@@ -220,18 +323,34 @@ export class CocoTurnBridge implements vscode.Disposable {
 
 	private finish(error?: Error): void {
 		if (!this.state.finish(error, call => call.resolve({ error: "Chat tool delegation stopped." }))) { return; }
+		this.toolImages.length = 0;
+		this.seenImageHashes.clear();
+		this.imageFiles.clear();
+		this.viewedImageHashes.clear();
+		this.pendingImageReads.length = 0;
 		this.detach(error);
 		this.onStop(error);
 	}
 }
 
-export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart, limit = 100_000): { output: string } {
+export function convertCocoToolResult(result: vscode.LanguageModelToolResultPart, limit = 100_000,
+	imageFile?: (part: vscode.LanguageModelDataPart) => string | undefined): { output: string } {
 	const output = result.content.map(part => {
 		if (part instanceof vscode.LanguageModelTextPart) { return part.value; }
+		const file = part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/") ? imageFile?.(part) : undefined;
+		if (file && part instanceof vscode.LanguageModelDataPart) {
+			return `[Image tool result: ${part.mimeType}, ${part.data.byteLength} bytes, saved as ${JSON.stringify(file)}. `
+				+ "To see it now, call your built-in read tool with exactly this file_path; it returns the image itself in this turn. Do not end your turn to wait for it.]";
+		}
+		if (part instanceof vscode.LanguageModelDataPart && part.mimeType.startsWith("image/")) {
+			// collectCocoToolImages attaches it to a follow-up prompt; the text only says where it went.
+			return `[Image tool result: ${part.mimeType}, ${part.data.byteLength} bytes; it follows as an image attachment in the next message. `
+				+ "You cannot see it yet: end your turn now with a one-line note, without further tool calls or conclusions about the image, then continue from the attachment.]";
+		}
 		if (part instanceof vscode.LanguageModelDataPart && (part.mimeType.startsWith("text/") || part.mimeType === "application/json")) {
 			return new TextDecoder().decode(part.data);
 		}
-		return "[Non-text tool result: this Coco bridge accepts text only]";
+		return "[Non-text tool result: this Coco bridge accepts text and image results only; read the file or extract its text instead]";
 	}).join("\n");
 	const marker = "\n[Tool result truncated]\n";
 	const keep = Math.floor((limit - marker.length) / 2);

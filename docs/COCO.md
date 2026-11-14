@@ -123,6 +123,29 @@ so image turns use ACP with the same native session ID. Replay stays hidden;
 images retain their original bytes and MIME types. The next text turn resumes
 that same history through SDK. This capability choice happens before inference.
 
+Images returned by a tool (`view_image`, a screenshot from a subagent, any tool
+result with an `image/*` part) also reach Coco. The native client-tool protocol
+cannot carry them: the Cortex CLI turns every client-tool result into text
+(`registerClientTools` stringifies the JSON-RPC result). Only the CLI's own
+built-in `read` puts an image inside a tool result. The bridge therefore saves
+PNG, JPEG, GIF and WebP images (up to 4 MB) in its Coco archive and names the
+file in the tool result; Coco opens it with `read` and sees it in the same turn.
+That `read` is the single built-in action the bridge permits, only for files it
+saved during the current turn, and only with the one-time `allow_once` option.
+The `tool_call` event carries the path in `rawInput.file_path`; the permission
+request carries it in its `read: <path>` title. Any other internal action still
+stops the turn.
+
+If the image could not be saved or Coco does not read it, the bridge attaches
+the bytes to a follow-up prompt
+in the same native session, right after the current turn: up to four images, at
+most 4 MB each and 8 MB together, deduplicated by SHA-256, at most eight times
+per turn. When Coco called several image tools before ending its turn, the
+newest images are sent. The attachment can only follow a finished native turn,
+so the tool result and the policy tell Coco to end its turn at once with a
+one-line note instead of continuing (or concluding that it cannot see images).
+Binary parts that are neither text nor images stay a text note.
+
 The model picker exposes **Thinking Effort** using the levels advertised by
 Coco (currently Auto, Minimal, Low, Medium, High, and Max). The chosen value is
 sent to the session before the prompt. Native thought deltas appear in the
