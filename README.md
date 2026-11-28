@@ -224,16 +224,16 @@ See [development and release workflow](docs/DEVELOPMENT_WORKFLOW.md) and
 [provider contracts](docs/ARCHITECTURE.md#provider-contracts) for the current
 maintenance contracts.
 
-**Latest release: 2.1.0. Current build: 2.1.3.**
+**Latest release: 2.1.0. Current build: 2.1.4.**
 
 ```sh
 npm ci
 npm run compile
 npm run check:metadata
 npm run lint
-npm test              # 1627 extension-host tests on VS Code 1.143.1 in the current 2.1.3 build
+npm test              # 1713 extension-host tests passed on VS Code 1.143.1 in the 2.1.4 build
 npm run package       # builds the local VSIX
-code --install-extension ./llama-vscode-chat-2.1.3.vsix --force
+code --install-extension ./llama-vscode-chat-2.1.4.vsix --force
 ```
 
 The extension ID is `mrlordcat.llama-vscode-chat`; settings and commands retain

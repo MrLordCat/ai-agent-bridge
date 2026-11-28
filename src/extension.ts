@@ -764,6 +764,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
 	);
 	registerChatWindow(context, {
 		composite: compositeProvider,
+		getCompactionDeepSeekApiKey: () => llamaProvider.getCompactionDeepSeekApiKey(),
 		log: (event, data) => logService.log(event, data),
 		userAgent: ua,
 		memory: memoryService,

@@ -60,6 +60,7 @@ type CompositeChatProvider = Pick<vscode.LanguageModelChatProvider, "provideLang
 
 export interface ChatWindowDeps {
 	composite: CompositeChatProvider;
+	getCompactionDeepSeekApiKey: () => Promise<string | undefined>;
 	log?: (event: string, data: Record<string, unknown>) => void;
 	/** Sent with DeepSeek summary requests. */
 	userAgent?: string;
@@ -71,8 +72,6 @@ export interface ChatWindowDeps {
 	/** Session Quality tracker that records finished context cleanings. */
 	sessionQuality?: Pick<SessionQualityTracker, "recordCleaning" | "recordBreakdown">;
 }
-
-const DEEPSEEK_KEY_SECRET = "llamacpp.deepSeekApiKey";
 
 const NEVER_FIRES: vscode.Event<void> = () => new vscode.Disposable(() => undefined);
 const CHANGE_SCHEME = "aab-chat-change";
@@ -341,7 +340,7 @@ export function registerChatWindow(context: vscode.ExtensionContext, deps: ChatW
 		contextSettings,
 		compaction: {
 			summarize: createChatSummarizer({
-				apiKey: async () => (await context.secrets.get(DEEPSEEK_KEY_SECRET))?.trim() || undefined,
+				apiKey: deps.getCompactionDeepSeekApiKey,
 				userAgent: deps.userAgent ?? "ai-agent-bridge",
 				log: deps.log,
 			}),

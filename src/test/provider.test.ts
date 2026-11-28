@@ -235,6 +235,7 @@ suite("Llama.cpp Chat Provider Extension", () => {
 			const sources = await providerAny.getModelSources();
 			assert.strictEqual(sources.find(source => source.key === "primary")?.apiKey, "primary-key");
 			assert.strictEqual(sources.find(source => source.key === "deepseek")?.apiKey, "deepseek-key");
+			assert.strictEqual(await isolatedProvider.getCompactionDeepSeekApiKey(), "deepseek-key");
 		});
 
         test("does not send the global primary key to a workspace server override", async () => {
@@ -271,15 +272,20 @@ suite("Llama.cpp Chat Provider Extension", () => {
                 getConfig: () => vscode.WorkspaceConfiguration;
                 getModelSources: () => Promise<Array<{ key: string; apiKey?: string }>>;
             };
+            let globalUrl = "https://api.deepseek.com";
             isolatedAny.getConfig = () => ({
                 get: <T>(_section: string, fallback?: T) => fallback,
                 inspect: (section: string) => section === "serverUrl"
-                    ? { globalValue: "https://api.deepseek.com" }
+                    ? { globalValue: globalUrl, workspaceValue: "https://api.deepseek.com" }
                     : undefined,
             } as unknown as vscode.WorkspaceConfiguration);
 
             const sources = await isolatedAny.getModelSources();
             assert.strictEqual(sources.find(source => source.key === "deepseek")?.apiKey, "primary-key");
+            assert.strictEqual(await isolated.getCompactionDeepSeekApiKey(), "primary-key");
+
+            globalUrl = "https://trusted.example/v1";
+            assert.strictEqual(await isolated.getCompactionDeepSeekApiKey(), undefined);
         });
 
 		test("health check warns about retired DeepSeek aliases", async () => {

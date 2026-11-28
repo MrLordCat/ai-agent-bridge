@@ -7297,8 +7297,9 @@ export class LlamaCppChatModelProvider extends BaseChatModelProvider {
             : undefined;
     }
 
-    private async getCompactionDeepSeekApiKey(): Promise<string | undefined> {
-        return this.getDeepSeekApiKey();
+    /** Resolves the credential used for summaries sent to the official DeepSeek API. */
+    async getCompactionDeepSeekApiKey(): Promise<string | undefined> {
+        return (await this.getDeepSeekApiKey())?.trim() || undefined;
     }
 
     /**

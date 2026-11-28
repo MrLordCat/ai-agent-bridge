@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.1.4 - 2026-11-28
+
+- Fixed: SubHarness chat compaction can use the primary API key when the
+  trusted primary server is the official DeepSeek API and no dedicated
+  DeepSeek key is configured.
+
 ## 2.1.3 (stable release) - 2026-11-28
 
 Also brings the 2.1.1 and 2.1.2 development builds below.
